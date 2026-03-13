@@ -62,7 +62,7 @@ $ARGUMENTS
 実行前に `--dry-run` での確認をユーザーに提案する:
 
 ```bash
-~/claude-skills/loops/claude-loop.sh --mode=<mode> --project=<path> --max-rounds=<N> --dry-run
+~/agents-harnesses/loops/claude-loop.sh --mode=<mode> --project=<path> --max-rounds=<N> --dry-run
 ```
 
 dry-run の出力を確認し、問題がなければ本実行に進む。
@@ -84,7 +84,7 @@ dry-run の出力を確認し、問題がなければ本実行に進む。
 Bash ツールで以下を実行する。**timeout を十分に長く設定すること**（1ラウンドあたり数分かかる場合がある）:
 
 ```bash
-~/claude-skills/loops/claude-loop.sh \
+~/agents-harnesses/loops/claude-loop.sh \
   --mode=<mode> \
   --project=<project_path> \
   --max-rounds=<N> \
