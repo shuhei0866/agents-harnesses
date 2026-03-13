@@ -59,7 +59,7 @@ if [ -f "$MENTION_MAP_FILE" ]; then
     [[ "$pattern" =~ ^#.*$ || -z "$pattern" ]] && continue
     # パターンの @ を除去して grep 用パターンを構築
     grep_pattern=$(echo "$pattern" | sed 's/@//')
-    if echo "$CLEANED" | grep -qi "$grep_pattern"; then
+    if echo "$CLEANED" | grep -qiF "$grep_pattern"; then
       FOUND_MENTIONS="${FOUND_MENTIONS}${pattern} → ${replacement}\n"
     fi
   done < "$MENTION_MAP_FILE"

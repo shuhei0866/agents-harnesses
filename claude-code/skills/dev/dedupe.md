@@ -1,4 +1,5 @@
 ---
+name: dedupe
 allowed-tools: Bash(gh issue view:*), Bash(gh search:*), Bash(gh issue list:*), Bash(./scripts/comment-on-duplicates.sh:*)
 description: Find similar GitHub issues
 ---

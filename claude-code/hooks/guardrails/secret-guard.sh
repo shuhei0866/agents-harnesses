@@ -45,7 +45,7 @@ if echo "$COMMAND" | grep -qE 'secret-tool\s+lookup'; then
 fi
 
 # --- echo/printf で API キー系変数を展開表示 ---
-if echo "$COMMAND" | grep -qiE '(echo|printf)\s.*\$\{?(ANTHROPIC_API_KEY|OPENAI_API_KEY|API_KEY|SECRET|TOKEN)\}?'; then
+if echo "$COMMAND" | grep -qiE '(echo|printf)\s.*\$\{?(ANTHROPIC_API_KEY|OPENAI_API_KEY|API_KEY|SECRET|TOKEN|AWS_SECRET_ACCESS_KEY|GITHUB_TOKEN|DATABASE_URL|PRIVATE_KEY|PASSWORD)\}?'; then
   guard_respond "critical" "シークレット保護ガード" "API キー系環境変数の echo/printf 表示はブロックされています。設定確認には printenv VAR_NAME | wc -c を使ってください。"
 fi
 

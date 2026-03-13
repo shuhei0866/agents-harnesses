@@ -64,9 +64,13 @@ if [ -z "$REPO_OWNER" ] || [ -z "$REPO_NAME" ]; then
   exit 0
 fi
 
-THREADS=$(gh api graphql -f query="query {
-  repository(owner: \"$REPO_OWNER\", name: \"$REPO_NAME\") {
-    pullRequest(number: $PR_NUMBER) {
+THREADS=$(gh api graphql \
+  -F owner="$REPO_OWNER" \
+  -F name="$REPO_NAME" \
+  -F prNum="$PR_NUMBER" \
+  -f query='query {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $prNum) {
       reviewDecision
       mergeStateStatus
       reviewThreads(first: 20) {
@@ -84,7 +88,7 @@ THREADS=$(gh api graphql -f query="query {
       }
     }
   }
-}" 2>/dev/null)
+}' 2>/dev/null)
 
 if [ -z "$THREADS" ]; then
   exit 0

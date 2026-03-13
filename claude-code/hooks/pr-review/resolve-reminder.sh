@@ -56,9 +56,13 @@ OWNER=$(echo "$REPO" | cut -d/ -f1)
 NAME=$(echo "$REPO" | cut -d/ -f2)
 
 # 未 resolve のレビュースレッドを取得
-UNRESOLVED=$(gh api graphql -f query="
-  { repository(owner:\"${OWNER}\", name:\"${NAME}\") {
-    pullRequest(number:${PR_NUMBER}) {
+UNRESOLVED=$(gh api graphql \
+  -F owner="$OWNER" \
+  -F name="$NAME" \
+  -F prNum="$PR_NUMBER" \
+  -f query='
+  { repository(owner: $owner, name: $name) {
+    pullRequest(number: $prNum) {
       reviewThreads(first:50) {
         nodes {
           id
@@ -70,12 +74,16 @@ UNRESOLVED=$(gh api graphql -f query="
       }
     }
   }
-" --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length' 2>/dev/null || echo "0")
+' --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length' 2>/dev/null || echo "0")
 
 if [ "$UNRESOLVED" -gt 0 ] 2>/dev/null; then
-  THREAD_IDS=$(gh api graphql -f query="
-    { repository(owner:\"${OWNER}\", name:\"${NAME}\") {
-      pullRequest(number:${PR_NUMBER}) {
+  THREAD_IDS=$(gh api graphql \
+    -F owner="$OWNER" \
+    -F name="$NAME" \
+    -F prNum="$PR_NUMBER" \
+    -f query='
+    { repository(owner: $owner, name: $name) {
+      pullRequest(number: $prNum) {
         reviewThreads(first:50) {
           nodes {
             id
@@ -87,7 +95,7 @@ if [ "$UNRESOLVED" -gt 0 ] 2>/dev/null; then
         }
       }
     }
-  " --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false) | {id: .id, path: .comments.nodes[0].path, body: (.comments.nodes[0].body[:80])}]' 2>/dev/null || echo "[]")
+  ' --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false) | {id: .id, path: .comments.nodes[0].path, body: (.comments.nodes[0].body[:80])}]' 2>/dev/null || echo "[]")
 
   echo "[PR レビュースレッド] PR #${PR_NUMBER} に未 resolve のレビュースレッドが ${UNRESOLVED} 件あります。対応済みのスレッドは gh api graphql の resolveReviewThread mutation で resolve してください。" >&2
   echo "未 resolve スレッド: ${THREAD_IDS}" >&2

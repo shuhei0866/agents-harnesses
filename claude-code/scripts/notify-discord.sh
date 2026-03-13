@@ -69,6 +69,7 @@ build_embed_payload() {
     --arg description "$MESSAGE" \
     --arg timestamp "$TIMESTAMP" \
     --arg pr "$PR_URL" \
+    --arg hostname "${HOSTNAME:-unknown}" \
     --argjson color "$COLOR" '
     {
       content: $content,
@@ -79,7 +80,7 @@ build_embed_payload() {
           color: $color,
           fields: (
             [
-              { name: "環境", value: "'"${HOSTNAME:-unknown}"'", inline: true },
+              { name: "環境", value: $hostname, inline: true },
               { name: "時刻", value: $timestamp, inline: true }
             ] +
             (if $pr == "" then [] else [{ name: "PR", value: $pr, inline: false }] end)
@@ -106,6 +107,11 @@ send_via_bot_token() {
   token="$(get_discord_token)"
   if [ -z "$token" ]; then
     echo "Discord credentials are not set. Skipping notification."
+    exit 0
+  fi
+
+  if [ -z "$CHANNEL_ID" ]; then
+    echo "DISCORD_CHANNEL_ID is not set. Skipping notification."
     exit 0
   fi
 

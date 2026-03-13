@@ -1,6 +1,7 @@
 #!/bin/bash
 # Stop hook: セッション完了時に Discord へ通知
 # PROJECT_DIR が設定されていればそのディレクトリ内でのみ発火する
+set -uo pipefail
 
 CWD=$(pwd)
 PROJECT_DIR="${PROJECT_DIR:-$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null || echo "")}"
@@ -8,7 +9,7 @@ if [ -z "$PROJECT_DIR" ]; then
   exit 0
 fi
 
-source ~/.claude/.env 2>/dev/null || exit 0
+source ~/.claude/.env 2>/dev/null || true
 
 # スクリプトのパス（リポジトリ内のシンボリックリンク先）
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

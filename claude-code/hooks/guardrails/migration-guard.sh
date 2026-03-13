@@ -48,7 +48,7 @@ if [ -z "$NEW_NUMBER" ]; then
 fi
 
 # 既存のマイグレーション番号一覧を取得
-EXISTING_NUMBERS=$(ls "$MIGRATIONS_DIR"/*.sql 2>/dev/null | xargs -I{} basename {} | grep -oE '^[0-9]+' | sort -n)
+EXISTING_NUMBERS=$(find "$MIGRATIONS_DIR" -maxdepth 1 -name '*.sql' -exec basename {} \; 2>/dev/null | grep -oE '^[0-9]+' | sort -n)
 LATEST_NUMBER=$(echo "$EXISTING_NUMBERS" | tail -1)
 
 # 重複チェック

@@ -106,7 +106,13 @@ fi
 # --- チェック 4: main ブランチへの直接マージ防止（hotfix/* 除く） ---
 if echo "$COMMAND_FOR_MATCH" | grep -qE 'git\s+(-C\s+\S+\s+)?merge\s'; then
   if ! echo "$COMMAND_FOR_MATCH" | grep -qE 'git\s+(-C\s+\S+\s+)?merge\s.*hotfix/'; then
-    GIT_C_PATH=$(echo "$COMMAND" | sed -nE 's/.*git[[:space:]]+-C[[:space:]]+([^ ]+).*/\1/p')
+    GIT_C_PATH=$(echo "$COMMAND" | sed -nE 's/.*git[[:space:]]+-C[[:space:]]+"([^"]+)".*/\1/p')
+    if [ -z "$GIT_C_PATH" ]; then
+      GIT_C_PATH=$(echo "$COMMAND" | sed -nE "s/.*git[[:space:]]+-C[[:space:]]+'([^']+)'.*/\1/p")
+    fi
+    if [ -z "$GIT_C_PATH" ]; then
+      GIT_C_PATH=$(echo "$COMMAND" | sed -nE 's/.*git[[:space:]]+-C[[:space:]]+([^ "'"'"']+).*/\1/p')
+    fi
 
     if [ -n "$GIT_C_PATH" ]; then
       CURRENT_BRANCH=$(git -C "$GIT_C_PATH" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")

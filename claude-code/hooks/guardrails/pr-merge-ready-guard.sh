@@ -53,10 +53,14 @@ NAME=$(echo "$REPO_NWO" | cut -d/ -f2)
 ISSUES=""
 
 # --- チェック 1: 未解決レビューコメント ---
-UNRESOLVED=$(gh api graphql -f query="
+UNRESOLVED=$(gh api graphql \
+  -F owner="$OWNER" \
+  -F name="$NAME" \
+  -F prNum="$PR_NUM" \
+  -f query='
 {
-  repository(owner: \"$OWNER\", name: \"$NAME\") {
-    pullRequest(number: $PR_NUM) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $prNum) {
       reviewThreads(first: 50) {
         nodes {
           isResolved
@@ -65,7 +69,7 @@ UNRESOLVED=$(gh api graphql -f query="
       }
     }
   }
-}" --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false and .isOutdated == false)] | length' 2>/dev/null) || true
+}' --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false and .isOutdated == false)] | length' 2>/dev/null) || true
 
 if [ -n "$UNRESOLVED" ] && [ "$UNRESOLVED" -gt 0 ]; then
   ISSUES="${ISSUES}未解決のレビューコメントが ${UNRESOLVED} 件あります。resolve してからマージしてください。"

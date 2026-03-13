@@ -12,20 +12,33 @@ INPUT=$(cat)
 
 # vdd.config の探索（オプショナル）
 # 探索順: $CLAUDE_PROJECT_DIR/.claude/vdd.config → プロジェクトルート/.claude/vdd.config
-VDD_CONFIG_LOADED=false
+# source ではなく grep で必要な変数のみ抽出する（任意コード実行防止）
+_config_file=""
 if [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -f "$CLAUDE_PROJECT_DIR/.claude/vdd.config" ]; then
-  source "$CLAUDE_PROJECT_DIR/.claude/vdd.config" 2>/dev/null && VDD_CONFIG_LOADED=true
+  _config_file="$CLAUDE_PROJECT_DIR/.claude/vdd.config"
 else
   PROJECT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
   if [ -n "$PROJECT_ROOT" ] && [ -f "$PROJECT_ROOT/.claude/vdd.config" ]; then
-    source "$PROJECT_ROOT/.claude/vdd.config" 2>/dev/null && VDD_CONFIG_LOADED=true
+    _config_file="$PROJECT_ROOT/.claude/vdd.config"
   fi
 fi
 
+_extract_var() {
+  local var_name="$1" file="$2"
+  grep -E "^${var_name}=" "$file" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '"'"'" | tr -d '[:space:]'
+}
+
 # デフォルト値（vdd.config が見つからない場合は空文字列）
-CHECK_CMD="${CHECK_COMMAND:-}"
-TEST_CMD="${TEST_COMMAND:-}"
-INTEGRATION="${INTEGRATION_BRANCH:-develop}"
+if [ -n "$_config_file" ]; then
+  CHECK_CMD="$(_extract_var CHECK_COMMAND "$_config_file")"
+  TEST_CMD="$(_extract_var TEST_COMMAND "$_config_file")"
+  INTEGRATION="$(_extract_var INTEGRATION_BRANCH "$_config_file")"
+  INTEGRATION="${INTEGRATION:-develop}"
+else
+  CHECK_CMD=""
+  TEST_CMD=""
+  INTEGRATION="develop"
+fi
 
 # agent_type を取得
 if command -v jq &>/dev/null; then

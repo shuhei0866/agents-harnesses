@@ -144,7 +144,7 @@ ls <log_dir>/
 ### 例 1: PR 前のレビュー収束
 
 ```
-/claude-loop --mode=converge --project=~/learning-with
+/claude-loop --mode=converge --project=~/my-project
 ```
 
 ### 例 2: 技術的負債の自動解消

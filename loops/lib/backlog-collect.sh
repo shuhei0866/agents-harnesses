@@ -78,17 +78,7 @@ _collect_lint_errors() {
 
   # Parse ESLint JSON output if available
   if [[ -n "${lint_output:-}" ]] && command -v jq &>/dev/null; then
-    echo "$lint_output" | jq -r '
-      .[] | select(.errorCount > 0 or .warningCount > 0) |
-      .filePath as $file |
-      .messages[] |
-      {
-        file: $file,
-        line: .line,
-        text: .ruleId,
-        severity: .severity
-      } | @json
-    ' 2>/dev/null | while IFS= read -r item; do
+    while IFS= read -r item; do
       counter=$((counter + 1))
       local file line_num text severity priority
 
@@ -103,7 +93,17 @@ _collect_lint_errors() {
 
       printf '{"id":"lint-%d","type":"lint","file":"%s","line":%s,"text":"%s","priority":"%s"}\n' \
         "$counter" "$(_escape_json "$file")" "$line_num" "$(_escape_json "$text")" "$priority"
-    done || true
+    done < <(echo "$lint_output" | jq -r '
+      .[] | select(.errorCount > 0 or .warningCount > 0) |
+      .filePath as $file |
+      .messages[] |
+      {
+        file: $file,
+        line: .line,
+        text: .ruleId,
+        severity: .severity
+      } | @json
+    ' 2>/dev/null || true)
   fi
 }
 
@@ -123,14 +123,14 @@ _collect_github_issues() {
     return
   fi
 
-  echo "$issues_json" | jq -r '.[] | @json' 2>/dev/null | while IFS= read -r item; do
+  while IFS= read -r item; do
     local number title
     number="$(echo "$item" | jq -r '.number' 2>/dev/null)"
     title="$(echo "$item" | jq -r '.title' 2>/dev/null)"
 
     printf '{"id":"issue-%s","type":"github","number":%s,"title":"%s","priority":"high"}\n' \
       "$number" "$number" "$(_escape_json "$title")"
-  done || true
+  done < <(echo "$issues_json" | jq -r '.[] | @json' 2>/dev/null || true)
 }
 
 _collect_tsc_errors() {

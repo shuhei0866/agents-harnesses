@@ -1,3 +1,8 @@
+---
+name: worktree-clean
+description: 不要な git worktree を整理・削除する。/worktree-clean と呼ばれた時に使用する。
+---
+
 # /worktree-clean
 
 git worktree を整理するコマンド。不要な worktree を削除し、リポジトリを綺麗に保つ。
