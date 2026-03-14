@@ -68,6 +68,7 @@ agents-harnesses/
 | **port-kill** | 指定ポートで動いているプロセスを停止 | `/port-kill` |
 | **worktree-clean** | 不要な git worktree を整理・削除 | `/worktree-clean` |
 | **dedupe** | 類似 GitHub Issue の重複候補を検索してコメント | `/dedupe` |
+| **browser-context** | ブラウザの状態（URL・タブ名・ページ内容）を取得してコンテキストに注入 | `/browser-context` |
 
 #### design/ — 設計・委譲
 
@@ -232,6 +233,7 @@ Hooks は `settings.json` で設定する。シンボリックリンクではな
 | **notify-discord.sh** | Discord 通知（Webhook / Bot Token 対応） |
 | **hook-stop-notify.sh** | セッション終了時の自動 Discord 通知（Stop hook 用） |
 | **launch-discord-mcp.sh** | Discord MCP サーバー起動 |
+| **browser-context.sh** | ブラウザの状態（URL, タイトル, タブ一覧, ページ内容）を JSON で出力 (macOS) |
 
 ## Codex
 

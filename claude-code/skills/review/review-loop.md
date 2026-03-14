@@ -29,6 +29,7 @@ $ARGUMENTS
 - `--auto-fix` (default: true): 発見した問題を自動修正する。false なら報告のみ
 - `--scope=staged|all|file=<path>` (default: all): レビュー対象
 - `--codex` (default: false): OpenAI Codex にも並列でレビューさせる（モデル多様性）
+- `--coderabbit` (default: false): CodeRabbit CLI にも並列でレビューさせる（ルールベース + AI のハイブリッド視点）
 
 ## ワークフロー
 
@@ -132,6 +133,28 @@ $ARGUMENTS
 `--codex` が指定された場合、追加で Codex にもレビューさせる。
 Bash ツールで `codex` CLI を呼び出し、diff を渡してレビュー結果を取得する。
 異なるモデルファミリーは異なる盲点を持つため、多様性が品質を高める。
+
+##### Reviewer 6 (オプション: --coderabbit 指定時): CodeRabbit レビュー
+
+`--coderabbit` が指定された場合、追加で CodeRabbit CLI にもレビューさせる。
+Bash ツールで `coderabbit` コマンドを呼び出し、レビュー結果を取得する。
+CodeRabbit は LLM + ルールベース解析のハイブリッドで、Opus 単体では見落としやすいパターン（依存脆弱性、ライセンス問題、フレームワーク固有の anti-pattern 等）を補完する。
+
+```bash
+# 未コミット変更をレビュー（トークン効率重視の出力）
+coderabbit review --prompt-only --type uncommitted --no-color
+
+# 通常の詳細出力が欲しい場合
+coderabbit review --plain --type uncommitted --no-color
+```
+
+CodeRabbit の出力はテキスト形式のため、統合時に以下のルールで severity を判定する:
+- "critical", "security", "vulnerability" を含む → critical
+- "bug", "error", "incorrect" を含む → high
+- それ以外 → medium
+
+**前提条件**: `coderabbit` CLI がインストール済みであること (`npm install -g coderabbit`)。
+未インストールの場合はスキップし、他のレビュワーの結果のみで続行する。
 
 #### 各レビュワー共通のプロンプトテンプレート
 
@@ -354,6 +377,9 @@ CodeRabbit のようなレビューボットが高品質な指摘を出せる理
 ### Codex (if --codex)
 {output from codex, if applicable}
 
+### CodeRabbit (if --coderabbit)
+{output from coderabbit, if applicable}
+
 ## Aggregated Issues (after dedup + cross-validation)
 | # | Severity | File | Line | Title | Reviewers | Status |
 |---|----------|------|------|-------|-----------|--------|
@@ -392,7 +418,7 @@ Write ツールで `.claude/reviews/` ディレクトリに書き出す。ディ
 
 **Rounds:** {completed}/{max}
 **Status:** Converged (zero new findings) | Max rounds reached | Stopped by user
-**Reviewers:** Security(opus) + Logic(opus) + Performance(opus) + Completeness(opus) [+ Codex]
+**Reviewers:** Security(opus) + Logic(opus) + Performance(opus) + Completeness(opus) [+ Codex] [+ CodeRabbit]
 
 ### Issues by Round
 | Round | Reviewers | Found | Fixed | Skipped | Cross-validated |
@@ -416,7 +442,7 @@ Write ツールで `.claude/reviews/` ディレクトリに書き出す。ディ
 
 1. **観点の分離**: 各レビュワーは自分の専門領域のみに集中。「セキュリティ担当がスタイルを指摘する」ような雑音を排除し、深いレビューを実現
 2. **4 軸カバレッジ**: Security / Logic / Performance / Completeness の 4 軸で、実行時バグだけでなくデッドコード・仕様乖離・UI 不整合もカバー。これは PR ボット（CodeRabbit, Cubic 等）の検出パターンを分析して導出した軸
-3. **モデル多様性**: 異なるモデル（Opus + Codex）は異なる盲点を持つ。複数モデルで同じ問題を発見したら確信度が上がる
+3. **モデル多様性**: 異なるモデル（Opus + Codex + CodeRabbit）は異なる盲点を持つ。複数モデルで同じ問題を発見したら確信度が上がる
 4. **並列実行**: 4〜5 レビュワーを同時起動し、待ち時間を最小化
 5. **独立コンテキスト**: 各ラウンド・各レビュワーは新しいサブエージェント。修正バイアスを排除
 6. **cross-validation**: 複数レビュワーが同じ問題を独立に発見 → severity を上げる。単独指摘より信頼度が高い
