@@ -1,0 +1,26 @@
+# .sensitive-patterns.local
+# ユーザー固有の個人情報パターン（grep -E 形式）
+# このファイルは .gitignore に含まれるためリポジトリにはプッシュされない。
+#
+# セットアップ:
+#   cp .sensitive-patterns.local.example .sensitive-patterns.local
+#   エディタで自分の情報を記入
+#
+# 書式: 1行1パターン。# で始まる行と空行は無視。
+
+# --- あなたの GitHub ユーザー名 ---
+# your-github-username
+
+# --- あなたのメールアドレス ---
+# your-email@example.com
+
+# --- ローカルホスト名・デバイス名 ---
+# my-hostname
+# my-macbook
+
+# --- Tailscale IP ---
+# 100\.xxx\.xxx\.xxx
+
+# --- その他プロジェクト固有の情報 ---
+# my-gcp-project-id
+# my-company-name

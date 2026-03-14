@@ -1,0 +1,28 @@
+# .sensitive-patterns
+# コミット前チェックで検出する汎用パターン（正規表現）
+# このファイルはリポジトリに含まれ、全コントリビュータに適用される。
+# ユーザー固有のパターンは .sensitive-patterns.local に記載する。
+#
+# 書式: 1行1パターン（grep -E 形式）。# で始まる行と空行は無視。
+
+# --- ローカルパス ---
+/Users/[a-zA-Z0-9_-]+/
+/home/[a-zA-Z0-9_-]+/
+C:\\Users\\
+
+# --- API キー・トークン（値がハードコードされている場合） ---
+(ANTHROPIC_API_KEY|OPENAI_API_KEY|GITHUB_TOKEN|DISCORD_WEBHOOK|SLACK_WEBHOOK)\s*=\s*['"][^'"]+['"]
+(sk-[a-zA-Z0-9]{20,})
+(xoxb-[0-9]+-[0-9]+-[a-zA-Z0-9]+)
+(ghp_[a-zA-Z0-9]{36,})
+
+# --- Webhook URL ---
+https://discord(app)?\.com/api/webhooks/[0-9]+/
+https://hooks\.slack\.com/services/
+
+# --- IP アドレス（プライベート Tailscale 等） ---
+\b100\.\d{1,3}\.\d{1,3}\.\d{1,3}\b
+
+# --- メールアドレス（汎用） ---
+[a-zA-Z0-9._%+-]+@gmail\.com
+[a-zA-Z0-9._%+-]+@yahoo\.co\.jp

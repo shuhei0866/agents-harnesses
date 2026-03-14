@@ -1,0 +1,82 @@
+name: Sensitive Info Check
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  check-sensitive-patterns:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for sensitive patterns in PR diff
+        run: |
+          set -uo pipefail
+
+          PATTERNS_FILE=".sensitive-patterns"
+          if [ ! -f "$PATTERNS_FILE" ]; then
+            echo "No .sensitive-patterns file found, skipping check."
+            exit 0
+          fi
+
+          # パターン読み込み（コメント・空行除外）
+          PATTERNS=$(grep -v '^\s*#' "$PATTERNS_FILE" | grep -v '^\s*$' || true)
+          if [ -z "$PATTERNS" ]; then
+            echo "No patterns defined, skipping check."
+            exit 0
+          fi
+
+          # PR の差分を取得（追加行のみ）
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          DIFF=$(git diff "$BASE_SHA"..."$HEAD_SHA" --diff-filter=ACMR -U0 -- . \
+            ':!.sensitive-patterns' \
+            ':!.sensitive-patterns.local' \
+            ':!.sensitive-patterns.local.example' \
+            ':!scripts/hooks/pre-commit' \
+            ':!.github/workflows/sensitive-check.yml' \
+            || true)
+
+          ADDED_LINES=$(echo "$DIFF" | grep '^+' | grep -v '^+++' || true)
+
+          if [ -z "$ADDED_LINES" ]; then
+            echo "✅ No added lines to check."
+            exit 0
+          fi
+
+          FOUND=0
+          REPORT=""
+
+          while IFS= read -r pattern; do
+            [ -z "$pattern" ] && continue
+            MATCHES=$(echo "$ADDED_LINES" | grep -nE "$pattern" 2>/dev/null || true)
+            if [ -n "$MATCHES" ]; then
+              FOUND=1
+              REPORT+="
+          ⚠️  Pattern: $pattern"
+              REPORT+="
+          $(echo "$MATCHES" | head -10)"
+              MATCH_COUNT=$(echo "$MATCHES" | wc -l | tr -d ' ')
+              if [ "$MATCH_COUNT" -gt 10 ]; then
+                REPORT+="
+            ... and $((MATCH_COUNT - 10)) more"
+              fi
+              REPORT+="
+          "
+            fi
+          done <<< "$PATTERNS"
+
+          if [ "$FOUND" -eq 1 ]; then
+            echo "❌ Sensitive patterns detected in PR diff:"
+            echo "$REPORT"
+            echo ""
+            echo "Please remove or anonymize these patterns before merging."
+            exit 1
+          fi
+
+          echo "✅ No sensitive patterns detected."
+          exit 0

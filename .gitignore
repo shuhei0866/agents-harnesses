@@ -12,3 +12,6 @@ Thumbs.db
 # Logs
 loops/logs/
 *.log
+
+# Local sensitive patterns (user-specific, never commit)
+.sensitive-patterns.local

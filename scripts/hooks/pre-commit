@@ -1,0 +1,105 @@
+#!/bin/bash
+# pre-commit: コミット対象ファイルに個人情報・機密パターンが含まれていないかチェック
+#
+# .sensitive-patterns（共有）と .sensitive-patterns.local（ローカル専用）から
+# パターンを読み込み、ステージ済みファイルの diff をスキャンする。
+#
+# インストール:
+#   scripts/setup-hooks.sh を実行するか、手動で:
+#   ln -sf ../../scripts/hooks/pre-commit .git/hooks/pre-commit
+
+set -uo pipefail
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+SHARED_PATTERNS="$REPO_ROOT/.sensitive-patterns"
+LOCAL_PATTERNS="$REPO_ROOT/.sensitive-patterns.local"
+
+# パターンファイルからパターンを読み込む（コメント・空行を除外）
+load_patterns() {
+  local file="$1"
+  if [ -f "$file" ]; then
+    grep -v '^\s*#' "$file" | grep -v '^\s*$'
+  fi
+}
+
+# 全パターンを結合
+PATTERNS=""
+if [ -f "$SHARED_PATTERNS" ]; then
+  PATTERNS=$(load_patterns "$SHARED_PATTERNS")
+fi
+if [ -f "$LOCAL_PATTERNS" ]; then
+  LOCAL=$(load_patterns "$LOCAL_PATTERNS")
+  if [ -n "$LOCAL" ]; then
+    if [ -n "$PATTERNS" ]; then
+      PATTERNS="$PATTERNS"$'\n'"$LOCAL"
+    else
+      PATTERNS="$LOCAL"
+    fi
+  fi
+fi
+
+if [ -z "$PATTERNS" ]; then
+  # パターンなし → チェックをスキップ
+  exit 0
+fi
+
+# ステージ済みファイルの差分を取得（追加・変更行のみ）
+STAGED_DIFF=$(git diff --cached --diff-filter=ACMR -U0 -- . \
+  ':!.sensitive-patterns' \
+  ':!.sensitive-patterns.local' \
+  ':!.sensitive-patterns.local.example' \
+  ':!scripts/hooks/pre-commit' \
+  ':!.github/workflows/sensitive-check.yml' \
+  2>/dev/null || true)
+
+if [ -z "$STAGED_DIFF" ]; then
+  exit 0
+fi
+
+# 追加行のみ抽出（diff ヘッダの +++ は除外）
+ADDED_LINES=$(echo "$STAGED_DIFF" | grep '^+' | grep -v '^+++' || true)
+
+if [ -z "$ADDED_LINES" ]; then
+  exit 0
+fi
+
+FOUND=0
+REPORT=""
+
+while IFS= read -r pattern; do
+  [ -z "$pattern" ] && continue
+
+  MATCHES=$(echo "$ADDED_LINES" | grep -nE "$pattern" 2>/dev/null || true)
+  if [ -n "$MATCHES" ]; then
+    FOUND=1
+    REPORT+=$'\n'"  パターン: $pattern"
+    REPORT+=$'\n'"  マッチ:"
+    # 最大5行まで表示
+    echo "$MATCHES" | head -5 | while IFS= read -r line; do
+      REPORT+=$'\n'"    $line"
+    done
+    MATCH_COUNT=$(echo "$MATCHES" | wc -l | tr -d ' ')
+    if [ "$MATCH_COUNT" -gt 5 ]; then
+      REPORT+=$'\n'"    ... 他 $((MATCH_COUNT - 5)) 件"
+    fi
+    REPORT+=$'\n'
+  fi
+done <<< "$PATTERNS"
+
+if [ "$FOUND" -eq 1 ]; then
+  echo "========================================" >&2
+  echo " 個人情報チェック: ブロック" >&2
+  echo "========================================" >&2
+  echo "" >&2
+  echo "コミット対象に個人情報・機密パターンが検出されました:" >&2
+  echo "$REPORT" >&2
+  echo "" >&2
+  echo "対処方法:" >&2
+  echo "  1. 該当箇所を修正してから再コミット" >&2
+  echo "  2. 誤検出の場合: git commit --no-verify でスキップ" >&2
+  echo "     (パブリックリポジトリでは慎重に!)" >&2
+  echo "========================================" >&2
+  exit 1
+fi
+
+exit 0
