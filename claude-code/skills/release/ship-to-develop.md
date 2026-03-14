@@ -46,7 +46,7 @@ EXISTING_PR=$(gh pr list --head "$BRANCH" --base develop --state open --json num
 
 ### 3. Discord で OpenClaw にレビュー依頼
 
-VDD チャンネル（ID: `$DISCORD_CHANNEL_ID`）にレビュアーをメンションしてレビュー依頼を送信。
+Discord チャンネル（ID: `$DISCORD_CHANNEL_ID`）にレビュアーをメンションしてレビュー依頼を送信。
 
 メッセージに含める内容:
 - メンション: `$DISCORD_REVIEWER_MENTION`

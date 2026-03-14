@@ -39,7 +39,7 @@ description: 複数ファイル/ディレクトリにまたがる大規模な変
 3. **Makefile** --- check/test/install ターゲットの検出
 4. **pyproject.toml** --- Python プロジェクトの設定検出
 5. **Cargo.toml** --- Rust プロジェクトの設定検出
-6. **.claude/vdd.config** --- VDD 設定ファイル（あれば優先使用）
+6. **.claude/harness.config** --- プロジェクト設定ファイル（あれば優先使用）
 
 検出できない場合はユーザーに確認してから進める。
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 # discord-response-poll: PostToolUse (mcp__discord__discord_send) - Discord 送信後に応答待ちをリマインド [L3]
 #
-# VDD 議論チャンネルに OpenClaw 宛てのメッセージを送信した後、
+# Discord チャンネルにレビュアー宛てのメッセージを送信した後、
 # 応答を確認するようリマインダーを注入する。
 # これにより「送りっぱなし」で実装に進むことを防ぐ。
 
@@ -41,7 +41,7 @@ cat << CONTEXT
 {
   "hookSpecificOutput": {
     "hookEventName": "PostToolUse",
-    "additionalContext": "[VDD応答待ち] レビュアーにメッセージを送信しました。\n\n**必須アクション**: 30秒待ってから discord_read_messages でチャンネル ${REMIND_CHANNEL} の最新メッセージを確認してください。レビュアーの返答が来るまで実装に進まないこと（VDD プロセス: 議論→合意→実装）。\n\n返答が来ていない場合は、さらに30秒待って再確認してください（最大3回）。3回確認しても返答がない場合は、他の作業を進めつつ定期的に確認してください。"
+    "additionalContext": "[応答待ち] レビュアーにメッセージを送信しました。\n\n**必須アクション**: 30秒待ってから discord_read_messages でチャンネル ${REMIND_CHANNEL} の最新メッセージを確認してください。レビュアーの返答が来るまで実装に進まないこと（議論→合意→実装）。\n\n返答が来ていない場合は、さらに30秒待って再確認してください（最大3回）。3回確認しても返答がない場合は、他の作業を進めつつ定期的に確認してください。"
   }
 }
 CONTEXT

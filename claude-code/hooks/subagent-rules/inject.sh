@@ -4,22 +4,35 @@
 # agent_type に応じて適切なルールセットを additionalContext として注入する。
 # これにより CLAUDE.md を読み忘れても必須ルールがコンテキストに存在する。
 #
-# vdd.config はオプショナル: プロジェクトローカルにあれば読み込み、なければデフォルト値を使用。
+# harness.config はオプショナル: プロジェクトローカルにあれば読み込み、なければデフォルト値を使用。
+# vdd.config からのフォールバックもサポート（後方互換）。
 
 set -uo pipefail
 
 INPUT=$(cat)
 
-# vdd.config の探索（オプショナル）
-# 探索順: $CLAUDE_PROJECT_DIR/.claude/vdd.config → プロジェクトルート/.claude/vdd.config
+# harness.config の探索（オプショナル）
+# 探索順: harness.config → vdd.config（後方互換）
 # source ではなく grep で必要な変数のみ抽出する（任意コード実行防止）
 _config_file=""
-if [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -f "$CLAUDE_PROJECT_DIR/.claude/vdd.config" ]; then
-  _config_file="$CLAUDE_PROJECT_DIR/.claude/vdd.config"
+if [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -f "$CLAUDE_PROJECT_DIR/.claude/harness.config" ]; then
+  _config_file="$CLAUDE_PROJECT_DIR/.claude/harness.config"
 else
   PROJECT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
-  if [ -n "$PROJECT_ROOT" ] && [ -f "$PROJECT_ROOT/.claude/vdd.config" ]; then
-    _config_file="$PROJECT_ROOT/.claude/vdd.config"
+  if [ -n "$PROJECT_ROOT" ] && [ -f "$PROJECT_ROOT/.claude/harness.config" ]; then
+    _config_file="$PROJECT_ROOT/.claude/harness.config"
+  fi
+fi
+
+# harness.config が見つからなければ vdd.config にフォールバック
+if [ -z "$_config_file" ]; then
+  if [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -f "$CLAUDE_PROJECT_DIR/.claude/vdd.config" ]; then
+    _config_file="$CLAUDE_PROJECT_DIR/.claude/vdd.config"
+  else
+    PROJECT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+    if [ -n "$PROJECT_ROOT" ] && [ -f "$PROJECT_ROOT/.claude/vdd.config" ]; then
+      _config_file="$PROJECT_ROOT/.claude/vdd.config"
+    fi
   fi
 fi
 
@@ -28,7 +41,7 @@ _extract_var() {
   grep -E "^${var_name}=" "$file" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '"'"'" | tr -d '[:space:]'
 }
 
-# デフォルト値（vdd.config が見つからない場合は空文字列）
+# デフォルト値（設定ファイルが見つからない場合は空文字列）
 if [ -n "$_config_file" ]; then
   CHECK_CMD="$(_extract_var CHECK_COMMAND "$_config_file")"
   TEST_CMD="$(_extract_var TEST_COMMAND "$_config_file")"

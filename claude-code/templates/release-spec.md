@@ -26,21 +26,20 @@
 - サブタスク分解: なし / あり（N個）
 - リモートプッシュ: PR作成時 / 不要
 
-## VDD 入力（参照）
+## 設計入力（参照）
 
-<!-- VDD を使う場合のみ記入。使わない場合は「なし」と記入。 -->
-<!-- 共通仕様: process/VDD.md -->
+<!-- 設計ドキュメントがある場合のみ記入。ない場合は「なし」と記入。 -->
 
-- VISION 参照: `.claude/vdd/VISION.md` / なし
-- DECISIONS 参照: `.claude/vdd/DECISIONS.md` / なし
+- VISION 参照: `.claude/vision/VISION.md` / なし
+- DECISIONS 参照: `.claude/decisions/DECISIONS.md` / なし
 - 今回のリリースに効いている意思決定ID（1-3件）:
   - `D-YYYYMMDD-01`
 - 条件付き承認（`conditional`）の扱い:
   - なし / あり（条件: ）
   - `conditional` の条件が満たされるまで実装着手しない
   - 条件達成の判定者: AI
-- VDD起点の作成理由（AI提案ベース）:
-  - 
+- 作成理由:
+  -
 
 ## release/* マージ前の必須チェック
 
