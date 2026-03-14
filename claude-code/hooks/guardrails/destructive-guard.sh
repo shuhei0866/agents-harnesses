@@ -29,23 +29,26 @@ if [ -z "${COMMAND:-}" ]; then
   exit 0
 fi
 
+# 引用符・heredoc 内のテキストを除外してからマッチ
+SAFE_CMD=$(guard_sanitize_command "$COMMAND")
+
 # --- rm -rf /（ルート・ホーム・重要ディレクトリ）: ブロック ---
-if echo "$COMMAND" | grep -qE 'rm\s+(-[a-zA-Z]*r[a-zA-Z]*f|(-[a-zA-Z]*f[a-zA-Z]*r))\s+(/|~|\$HOME|/etc|/var|/usr)\b'; then
+if echo "$SAFE_CMD" | grep -qE 'rm\s+(-[a-zA-Z]*r[a-zA-Z]*f|(-[a-zA-Z]*f[a-zA-Z]*r))\s+(/|~|\$HOME|/etc|/var|/usr)\b'; then
   guard_respond "critical" "破壊的操作ガード" "ルートやシステムディレクトリに対する rm -rf はブロックされています。"
 fi
 
 # --- rm -rf（一般）: 警告 ---
-if echo "$COMMAND" | grep -qE 'rm\s+(-[a-zA-Z]*r[a-zA-Z]*f|(-[a-zA-Z]*f[a-zA-Z]*r))'; then
+if echo "$SAFE_CMD" | grep -qE 'rm\s+(-[a-zA-Z]*r[a-zA-Z]*f|(-[a-zA-Z]*f[a-zA-Z]*r))'; then
   guard_respond "advisory" "破壊的操作ガード" "rm -rf を実行しようとしています。対象ディレクトリが正しいか確認してください。"
 fi
 
 # --- git reset --hard: 警告 ---
-if echo "$COMMAND" | grep -qE 'git\s+reset\s+--hard'; then
+if echo "$SAFE_CMD" | grep -qE 'git\s+reset\s+--hard'; then
   guard_respond "advisory" "破壊的操作ガード" "git reset --hard はコミットされていない変更を全て失います。git stash を検討してください。"
 fi
 
 # --- git clean -f: 警告 ---
-if echo "$COMMAND" | grep -qE 'git\s+clean\s+-[a-zA-Z]*f'; then
+if echo "$SAFE_CMD" | grep -qE 'git\s+clean\s+-[a-zA-Z]*f'; then
   guard_respond "advisory" "破壊的操作ガード" "git clean -f は未追跡ファイルを削除します。git clean -n で対象を確認してください。"
 fi
 
@@ -55,12 +58,12 @@ if echo "$COMMAND" | grep -qiE 'DROP\s+(TABLE|DATABASE|SCHEMA)'; then
 fi
 
 # --- docker system prune / docker volume rm: 警告 ---
-if echo "$COMMAND" | grep -qE 'docker\s+(system\s+prune|volume\s+rm)'; then
+if echo "$SAFE_CMD" | grep -qE 'docker\s+(system\s+prune|volume\s+rm)'; then
   guard_respond "advisory" "破壊的操作ガード" "Docker の破壊的操作を検出しました。対象が正しいか確認してください。"
 fi
 
 # --- kubectl delete: 警告 ---
-if echo "$COMMAND" | grep -qE 'kubectl\s+delete'; then
+if echo "$SAFE_CMD" | grep -qE 'kubectl\s+delete'; then
   guard_respond "advisory" "破壊的操作ガード" "kubectl delete を実行しようとしています。対象リソースが正しいか確認してください。"
 fi
 

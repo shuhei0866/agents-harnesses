@@ -111,6 +111,21 @@ _check_skip() {
   done
 }
 
+# --- コマンドサニタイズ ---
+# 引用符内・heredoc 内・コマンド置換内のテキストをプレースホルダーに置換し、
+# 実際のコマンド部分のみを残す。誤検出防止用。
+#
+# 使い方:
+#   SANITIZED=$(guard_sanitize_command "$COMMAND")
+#   echo "$SANITIZED" | grep -qE 'terraform\s+apply' && ...
+guard_sanitize_command() {
+  local cmd="$1"
+  echo "$cmd" \
+    | sed -E "s/\"[^\"]*\"/_Q_/g; s/'[^']*'/_Q_/g" \
+    | sed -E 's/\$\([^)]*\)/_SUBST_/g' \
+    | sed 's/<<[[:space:]]*'\''*[A-Za-z_]*'\''*//g'
+}
+
 # --- レスポンス出力 ---
 # guard_respond severity tag message
 #   severity: "critical" | "advisory"

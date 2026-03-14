@@ -25,8 +25,11 @@ if [ -z "${COMMAND:-}" ]; then
   exit 0
 fi
 
+# 引用符・heredoc 内のテキストを除外してからマッチ
+SAFE_CMD=$(guard_sanitize_command "$COMMAND")
+
 # terraform コマンド以外はスキップ
-case "$COMMAND" in
+case "$SAFE_CMD" in
   *terraform\ *)
     ;;
   *)
@@ -35,20 +38,20 @@ case "$COMMAND" in
 esac
 
 # --- terraform destroy: 常にブロック ---
-if echo "$COMMAND" | grep -qE 'terraform\s+destroy'; then
+if echo "$SAFE_CMD" | grep -qE 'terraform\s+destroy'; then
   guard_respond "critical" "Terraform ガード" "terraform destroy はブロックされています。本当に必要な場合はユーザーに確認してから手動で実行してください。"
 fi
 
 # --- terraform apply -auto-approve: ブロック ---
-if echo "$COMMAND" | grep -qE 'terraform\s+apply\s.*-auto-approve'; then
+if echo "$SAFE_CMD" | grep -qE 'terraform\s+apply\s.*-auto-approve'; then
   guard_respond "critical" "Terraform ガード" "terraform apply -auto-approve はブロックされています。terraform plan -out=tfplan で確認してから terraform apply tfplan を実行してください。"
 fi
 
 # --- terraform apply（plan ファイル未指定）: 警告 ---
-if echo "$COMMAND" | grep -qE 'terraform\s+apply'; then
+if echo "$SAFE_CMD" | grep -qE 'terraform\s+apply'; then
   # plan ファイルが指定されているかチェック（.tfplan や tfplan 等のファイル引数）
   # terraform apply tfplan / terraform apply plan.out のパターン
-  if ! echo "$COMMAND" | grep -qE 'terraform\s+apply\s+\S+\.(tfplan|out)\b|terraform\s+apply\s+tfplan\b'; then
+  if ! echo "$SAFE_CMD" | grep -qE 'terraform\s+apply\s+\S+\.(tfplan|out)\b|terraform\s+apply\s+tfplan\b'; then
     guard_respond "advisory" "Terraform ガード" "terraform apply を plan ファイルなしで実行しようとしています。terraform plan -out=tfplan で変更内容を確認してから terraform apply tfplan を実行することを推奨します。"
   fi
 fi

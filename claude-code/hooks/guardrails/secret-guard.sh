@@ -28,31 +28,34 @@ if [ -z "${COMMAND:-}" ]; then
   exit 0
 fi
 
+# 引用符・heredoc 内のテキストを除外してからマッチ
+SAFE_CMD=$(guard_sanitize_command "$COMMAND")
+
 # --- secret-tool search: 常にブロック (シークレット値が出力に含まれる) ---
-if echo "$COMMAND" | grep -qE 'secret-tool\s+search'; then
+if echo "$SAFE_CMD" | grep -qE 'secret-tool\s+search'; then
   guard_respond "critical" "シークレット保護ガード" "secret-tool search はシークレット値を平文で表示するためブロックされています。属性の確認には secret-tool lookup ... | wc -c を使ってください。"
 fi
 
 # --- secret-tool lookup: 単体実行をブロック (パイプ/リダイレクト/変数代入なし) ---
-if echo "$COMMAND" | grep -qE 'secret-tool\s+lookup'; then
+if echo "$SAFE_CMD" | grep -qE 'secret-tool\s+lookup'; then
   # パイプ、リダイレクト、$() による代入がなければブロック
-  if ! echo "$COMMAND" | grep -qE 'secret-tool\s+lookup\s.*(\||>|2>|\$\()'; then
+  if ! echo "$SAFE_CMD" | grep -qE 'secret-tool\s+lookup\s.*(\||>|2>|\$\()'; then
     # コマンド全体で見てもパイプ等がなければブロック
-    if ! echo "$COMMAND" | grep -qE '\|\s|>\s|2>\s'; then
+    if ! echo "$SAFE_CMD" | grep -qE '\|\s|>\s|2>\s'; then
       guard_respond "critical" "シークレット保護ガード" "secret-tool lookup の単体実行はシークレット値が平文表示されるためブロックされています。代わりに secret-tool lookup ... | wc -c （長さ確認）を使ってください。"
     fi
   fi
 fi
 
 # --- echo/printf で API キー系変数を展開表示 ---
-if echo "$COMMAND" | grep -qiE '(echo|printf)\s.*\$\{?(ANTHROPIC_API_KEY|OPENAI_API_KEY|API_KEY|SECRET|TOKEN|AWS_SECRET_ACCESS_KEY|GITHUB_TOKEN|DATABASE_URL|PRIVATE_KEY|PASSWORD)\}?'; then
+if echo "$SAFE_CMD" | grep -qiE '(echo|printf)\s.*\$\{?(ANTHROPIC_API_KEY|OPENAI_API_KEY|API_KEY|SECRET|TOKEN|AWS_SECRET_ACCESS_KEY|GITHUB_TOKEN|DATABASE_URL|PRIVATE_KEY|PASSWORD)\}?'; then
   guard_respond "critical" "シークレット保護ガード" "API キー系環境変数の echo/printf 表示はブロックされています。設定確認には printenv VAR_NAME | wc -c を使ってください。"
 fi
 
 # --- printenv で直接キー表示 ---
-if echo "$COMMAND" | grep -qiE 'printenv\s+(ANTHROPIC_API_KEY|OPENAI_API_KEY|API_KEY)'; then
+if echo "$SAFE_CMD" | grep -qiE 'printenv\s+(ANTHROPIC_API_KEY|OPENAI_API_KEY|API_KEY)'; then
   # パイプがあれば OK (wc -c 等)
-  if ! echo "$COMMAND" | grep -qE '\|'; then
+  if ! echo "$SAFE_CMD" | grep -qE '\|'; then
     guard_respond "critical" "シークレット保護ガード" "printenv でのキー直接表示はブロックされています。printenv VAR_NAME | wc -c を使ってください。"
   fi
 fi
