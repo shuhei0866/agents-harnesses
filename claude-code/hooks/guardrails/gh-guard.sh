@@ -30,8 +30,18 @@ if [ -z "${COMMAND:-}" ]; then
   exit 0
 fi
 
-# パターンマッチ用: 引用符内のテキストをプレースホルダーに置換（body テキスト誤検出防止）
-COMMAND_FOR_MATCH=$(echo "$COMMAND" | sed -E "s/\"[^\"]*\"/_Q_/g; s/'[^']*'/_Q_/g")
+# パターンマッチ用: 引用符 / HEREDOC 内のテキストをプレースホルダーに置換（body テキスト誤検出防止）
+# perl で全文一括処理することで、改行を跨ぐ引用符や HEREDOC body 内の "gh pr ..." が
+# 誤検出されないようにする（例: git commit -m "...gh pr merge..." の本文は無視）。
+if command -v perl &>/dev/null; then
+  COMMAND_FOR_MATCH=$(printf '%s' "$COMMAND" | perl -0777 -pe '
+    s/<<-?\s*'\''?(\w+)'\''?[\s\S]*?\n\1\b/_HEREDOC_/g;
+    s/"[^"]*"/_Q_/g;
+    s/'\''[^'\'']*'\''/_Q_/g;
+  ')
+else
+  COMMAND_FOR_MATCH=$(echo "$COMMAND" | sed -E "s/\"[^\"]*\"/_Q_/g; s/'[^']*'/_Q_/g")
+fi
 
 # --- クラウド環境判定 ---
 IS_CLOUD="${CLAUDE_CLOUD:-0}"
