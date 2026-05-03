@@ -58,14 +58,36 @@ case "$COMMAND_FOR_MATCH" in
 esac
 
 # --- ヘルパー: PR のターゲットブランチを取得 ---
+# COMMAND 内の `cd <path>` や `--repo <owner/repo>` を尊重して PR view を実行する。
+# hook の cwd は Claude Code の起動 dir なので、コマンド側の context を読まないと
+# 別リポの PR 番号を hook の cwd リポで探してしまい __UNKNOWN__ になる（false positive）。
 get_pr_base() {
   local pr_num="$1"
-  local result
-  if [ -n "$pr_num" ]; then
-    result=$(gh pr view "$pr_num" --json baseRefName -q .baseRefName 2>/dev/null) || true
-  else
-    result=$(gh pr view --json baseRefName -q .baseRefName 2>/dev/null) || true
+  local cmd="${2:-}"
+  local result repo_arg="" working_dir=""
+
+  if [ -n "$cmd" ]; then
+    repo_arg=$(echo "$cmd" | grep -oE -- '(--repo|-R)[[:space:]]+[^[:space:]]+' | head -1 | sed -E 's/^(--repo|-R)[[:space:]]+//')
+    working_dir=$(echo "$cmd" | grep -oE 'cd[[:space:]]+[^[:space:]&|;]+' | head -1 | sed -E 's/^cd[[:space:]]+//')
+    working_dir="${working_dir/#~/$HOME}"
   fi
+
+  if [ -n "$pr_num" ]; then
+    if [ -n "$repo_arg" ]; then
+      result=$(gh pr view "$pr_num" --repo "$repo_arg" --json baseRefName -q .baseRefName 2>/dev/null) || true
+    elif [ -n "$working_dir" ] && [ -d "$working_dir" ]; then
+      result=$(cd "$working_dir" 2>/dev/null && gh pr view "$pr_num" --json baseRefName -q .baseRefName 2>/dev/null) || true
+    else
+      result=$(gh pr view "$pr_num" --json baseRefName -q .baseRefName 2>/dev/null) || true
+    fi
+  else
+    if [ -n "$working_dir" ] && [ -d "$working_dir" ]; then
+      result=$(cd "$working_dir" 2>/dev/null && gh pr view --json baseRefName -q .baseRefName 2>/dev/null) || true
+    else
+      result=$(gh pr view --json baseRefName -q .baseRefName 2>/dev/null) || true
+    fi
+  fi
+
   if [ -z "$result" ]; then
     echo "__UNKNOWN__"
   else
@@ -97,12 +119,30 @@ extract_pr_number() {
 # --- ヘルパー: 代理 approve 判定（クラウド環境用）---
 is_proxy_approve() {
   local pr_num="$1"
+  local cmd="${2:-}"
   local pr_author current_user
+  local repo_arg="" working_dir=""
+
+  if [ -n "$cmd" ]; then
+    repo_arg=$(echo "$cmd" | grep -oE -- '(--repo|-R)[[:space:]]+[^[:space:]]+' | head -1 | sed -E 's/^(--repo|-R)[[:space:]]+//')
+    working_dir=$(echo "$cmd" | grep -oE 'cd[[:space:]]+[^[:space:]&|;]+' | head -1 | sed -E 's/^cd[[:space:]]+//')
+    working_dir="${working_dir/#~/$HOME}"
+  fi
 
   if [ -n "$pr_num" ]; then
-    pr_author=$(gh pr view "$pr_num" --json author -q .author.login 2>/dev/null) || true
+    if [ -n "$repo_arg" ]; then
+      pr_author=$(gh pr view "$pr_num" --repo "$repo_arg" --json author -q .author.login 2>/dev/null) || true
+    elif [ -n "$working_dir" ] && [ -d "$working_dir" ]; then
+      pr_author=$(cd "$working_dir" 2>/dev/null && gh pr view "$pr_num" --json author -q .author.login 2>/dev/null) || true
+    else
+      pr_author=$(gh pr view "$pr_num" --json author -q .author.login 2>/dev/null) || true
+    fi
   else
-    pr_author=$(gh pr view --json author -q .author.login 2>/dev/null) || true
+    if [ -n "$working_dir" ] && [ -d "$working_dir" ]; then
+      pr_author=$(cd "$working_dir" 2>/dev/null && gh pr view --json author -q .author.login 2>/dev/null) || true
+    else
+      pr_author=$(gh pr view --json author -q .author.login 2>/dev/null) || true
+    fi
   fi
 
   current_user=$(gh api user -q .login 2>/dev/null) || true
@@ -129,10 +169,10 @@ should_deny_merge() {
 # --- チェック 1: gh pr review --approve ---
 if echo "$COMMAND_FOR_MATCH" | grep -qE 'gh\s+pr\s+review\s.*(-a\b|--approve)'; then
   PR_NUM=$(extract_pr_number "$COMMAND" "review")
-  BASE=$(get_pr_base "$PR_NUM")
+  BASE=$(get_pr_base "$PR_NUM" "$COMMAND")
 
   if [ "$IS_CLOUD" = "1" ]; then
-    if is_proxy_approve "$PR_NUM"; then
+    if is_proxy_approve "$PR_NUM" "$COMMAND"; then
       if should_deny_approve "$BASE"; then
         REASON="main 向け PR は代理 approve でもブロックされています。"
         [ "$BASE" = "__UNKNOWN__" ] && REASON="PR のターゲットブランチを確認できなかったため、安全のためブロックしました。"
@@ -151,7 +191,7 @@ fi
 # --- チェック 2: gh pr merge ---
 if echo "$COMMAND_FOR_MATCH" | grep -qE 'gh\s+pr\s+merge'; then
   PR_NUM=$(extract_pr_number "$COMMAND" "merge")
-  BASE=$(get_pr_base "$PR_NUM")
+  BASE=$(get_pr_base "$PR_NUM" "$COMMAND")
 
   if should_deny_merge "$BASE"; then
     REASON="main 向け PR のマージはブロックされています。"
