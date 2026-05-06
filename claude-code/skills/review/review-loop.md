@@ -28,6 +28,7 @@ $ARGUMENTS
 - `--severity=critical|high|medium|all` (default: high): 自動修正する最低重要度（収束判定は全 severity で行う）
 - `--auto-fix` (default: true): 発見した問題を自動修正する。false なら報告のみ
 - `--scope=staged|all|file=<path>` (default: all): レビュー対象
+- `--spec=<path>` (default: none): スペック文書のパスを指定すると、Spec Compliance Reviewer を追加起動
 - `--codex` (default: false): OpenAI Codex にも並列でレビューさせる（モデル多様性）
 - `--coderabbit` (default: false): CodeRabbit CLI にも並列でレビューさせる（ルールベース + AI のハイブリッド視点）
 
@@ -128,13 +129,72 @@ $ARGUMENTS
     - 状態変更後にシグナル/通知が発火して関連ビューが更新されるか
     - dispose/cleanup チェーンが正しく呼ばれるか（フレームワーク仕様を確認）
 
-##### Reviewer 5 (オプション: --codex 指定時): Codex レビュー
+##### Reviewer 5 (オプション: --spec 指定時): Spec Compliance Reviewer
+
+`--spec=<path>` が指定された場合、仕様準拠レビューを追加で実行する。
+実装がスペック通りに作られたか（過不足なく）を検証する専用レビュワー。
+
+- **subagent_type**: `general-purpose`
+- **model**: `opus`
+- **入力**: diff + スペック文書の全文
+- **チェック項目**:
+  - **欠落した要件**: スペックで要求されたものが実装されていないか
+  - **余分な実装**: スペックにないものが追加されていないか（over-engineering）
+  - **仕様の誤解**: 要件を異なる意味で解釈していないか
+  - **実装の主張 vs 実際のコード**: 「実装した」と主張しているが実際のコードが存在しない、またはプレースホルダーのケース
+
+**重要**: 実装者のレポートや git コミットメッセージを信用しない。**実際のコードを読んで**スペックと1行ずつ照合すること。
+
+**プロンプトテンプレート**:
+
+```
+あなたは仕様準拠の専門レビュワーです。
+実装がスペック通りに作られたか（過不足なく）を検証してください。
+
+## スペック文書
+
+{スペック文書の全文}
+
+## 実装の diff
+
+{git diff の内容}
+
+## レビュー方法論
+
+### Step 1: スペックの要件を列挙する
+スペック文書を読み、全ての要件・仕様を箇条書きで列挙する。
+
+### Step 2: 各要件に対応するコードを特定する
+各要件について、それを実装しているコードを Read/Grep で特定する。
+見つからない場合は「欠落」として報告。
+
+### Step 3: 余分な実装を検出する
+diff に含まれるが、スペックのどの要件にも対応しないコードを検出する。
+意図的な追加（エラーハンドリング等）か、scope creep かを判定。
+
+### Step 4: 実装の正確性を検証する
+コードがスペックの意図通りに動くか確認。特に:
+- データ型・形式がスペックの記述と一致するか
+- エッジケースの扱いがスペックに沿っているか
+- API 契約がスペックの定義と一致するか
+
+## 出力フォーマット
+
+各 issue を以下の JSON Lines で出力:
+
+{"severity":"critical|high|medium","file":"path","line":42,"title":"短い要約","description":"①スペックの該当要件 ②実装との乖離 ③影響","evidence":"スペックの引用 + コードの引用","fix_code":"修正後コード"}
+
+issue がない場合:
+{"severity":"none","title":"Spec compliant — all requirements implemented correctly"}
+```
+
+##### Reviewer 6 (オプション: --codex 指定時): Codex レビュー
 
 `--codex` が指定された場合、追加で Codex にもレビューさせる。
 Bash ツールで `codex` CLI を呼び出し、diff を渡してレビュー結果を取得する。
 異なるモデルファミリーは異なる盲点を持つため、多様性が品質を高める。
 
-##### Reviewer 6 (オプション: --coderabbit 指定時): CodeRabbit レビュー
+##### Reviewer 7 (オプション: --coderabbit 指定時): CodeRabbit レビュー
 
 `--coderabbit` が指定された場合、追加で CodeRabbit CLI にもレビューさせる。
 Bash ツールで `coderabbit` コマンドを呼び出し、レビュー結果を取得する。
