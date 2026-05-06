@@ -434,6 +434,9 @@ CodeRabbit のようなレビューボットが高品質な指摘を出せる理
 ### Completeness & Integration (opus)
 {JSON Lines output from reviewer, as-is}
 
+### Spec Compliance (if --spec)
+{JSON Lines output from reviewer, as-is}
+
 ### Codex (if --codex)
 {output from codex, if applicable}
 
@@ -478,7 +481,7 @@ Write ツールで `.claude/reviews/` ディレクトリに書き出す。ディ
 
 **Rounds:** {completed}/{max}
 **Status:** Converged (zero new findings) | Max rounds reached | Stopped by user
-**Reviewers:** Security(opus) + Logic(opus) + Performance(opus) + Completeness(opus) [+ Codex] [+ CodeRabbit]
+**Reviewers:** Security(opus) + Logic(opus) + Performance(opus) + Completeness(opus) [+ Spec Compliance] [+ Codex] [+ CodeRabbit]
 
 ### Issues by Round
 | Round | Reviewers | Found | Fixed | Skipped | Cross-validated |
