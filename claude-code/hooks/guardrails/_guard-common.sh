@@ -111,6 +111,46 @@ _check_skip() {
   done
 }
 
+# --- GUARD_FORCE_DENY のロード ---
+# harness.config の GUARD_FORCE_DENY にカンマ区切りでスクリプト名を指定すると、
+# そのガードは advisory severity でも deny として扱う（GUARD_LEVEL=warn を上書き）
+# 例: GUARD_FORCE_DENY="worktree-guard"
+_load_guard_force_deny() {
+  GUARD_FORCE_DENY_LIST=""
+
+  # 環境変数で設定済みならそれを使う
+  if [ -n "${GUARD_FORCE_DENY:-}" ]; then
+    GUARD_FORCE_DENY_LIST="$GUARD_FORCE_DENY"
+    return
+  fi
+
+  local config_file
+  config_file=$(_find_config_file)
+
+  if [ -n "$config_file" ]; then
+    GUARD_FORCE_DENY_LIST=$(grep -E '^GUARD_FORCE_DENY=' "$config_file" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '"'"'" | tr -d '[:space:]')
+  fi
+}
+
+# --- 呼び出し元 guard が GUARD_FORCE_DENY に含まれているか判定 ---
+# 含まれていれば 0、それ以外は 1 を返す
+_is_force_deny() {
+  if [ -z "${GUARD_FORCE_DENY_LIST:-}" ]; then
+    return 1
+  fi
+
+  local caller_script
+  caller_script=$(basename "${BASH_SOURCE[${#BASH_SOURCE[@]}-1]}" .sh)
+
+  IFS=',' read -ra DENY_ARRAY <<< "$GUARD_FORCE_DENY_LIST"
+  for deny_name in "${DENY_ARRAY[@]}"; do
+    if [ "$deny_name" = "$caller_script" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 # --- コマンドサニタイズ ---
 # 引用符内・heredoc 内・コマンド置換内のテキストをプレースホルダーに置換し、
 # 実際のコマンド部分のみを残す。誤検出防止用。
@@ -150,8 +190,8 @@ DENY
     exit 0
   fi
 
-  # advisory: GUARD_LEVEL に従う
-  if [ "${GUARD_LEVEL:-warn}" = "deny" ]; then
+  # advisory: GUARD_LEVEL または GUARD_FORCE_DENY に従う
+  if [ "${GUARD_LEVEL:-warn}" = "deny" ] || _is_force_deny; then
     cat << DENY
 {
   "hookSpecificOutput": {
@@ -198,5 +238,6 @@ _check_branch_context() {
 # 初期化: source された時点で設定をロード
 _load_guard_level
 _load_guard_skip
+_load_guard_force_deny
 _check_skip
 _check_branch_context
