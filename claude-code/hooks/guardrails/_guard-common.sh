@@ -91,6 +91,7 @@ _load_guard_skip() {
 
 # --- スキップ判定 ---
 # 呼び出し元スクリプトのファイル名が GUARD_SKIP_LIST に含まれていれば exit 0
+# ただし GUARD_FORCE_DENY_LIST に含まれる guard は skip 不可（force_deny が skip より優先）
 _check_skip() {
   if [ -z "${GUARD_SKIP_LIST:-}" ]; then
     return
@@ -101,6 +102,17 @@ _check_skip() {
   # 最後の要素が source を実行したスクリプト
   local caller_script
   caller_script=$(basename "${BASH_SOURCE[${#BASH_SOURCE[@]}-1]}" .sh)
+
+  # GUARD_FORCE_DENY に含まれる guard は skip 不可
+  # 環境変数 GUARD_SKIP=worktree-guard 等で force_deny を回避できないようにする
+  if [ -n "${GUARD_FORCE_DENY_LIST:-}" ]; then
+    IFS=',' read -ra DENY_ARRAY <<< "$GUARD_FORCE_DENY_LIST"
+    for deny_name in "${DENY_ARRAY[@]}"; do
+      if [ "$deny_name" = "$caller_script" ]; then
+        return
+      fi
+    done
+  fi
 
   # カンマ区切りリストをチェック
   IFS=',' read -ra SKIP_ARRAY <<< "$GUARD_SKIP_LIST"
