@@ -77,7 +77,7 @@ get_pr_base() {
   local result repo_arg="" working_dir=""
 
   if [ -n "$cmd" ]; then
-    repo_arg=$(echo "$cmd" | grep -oE -- '(--repo|-R)[[:space:]]+[^[:space:]]+' | head -1 | sed -E 's/^(--repo|-R)[[:space:]]+//')
+    repo_arg=$(echo "$cmd" | grep -oE -- '(--repo|-R)[[:space:]]+[^[:space:]]+' | head -1 | sed -E 's/^(--repo|-R)[[:space:]]+//' | tr -d "\"'")
     working_dir=$(echo "$cmd" | grep -oE 'cd[[:space:]]+[^[:space:]&|;]+' | head -1 | sed -E 's/^cd[[:space:]]+//')
     working_dir="${working_dir/#~/$HOME}"
   fi
@@ -134,7 +134,7 @@ is_proxy_approve() {
   local repo_arg="" working_dir=""
 
   if [ -n "$cmd" ]; then
-    repo_arg=$(echo "$cmd" | grep -oE -- '(--repo|-R)[[:space:]]+[^[:space:]]+' | head -1 | sed -E 's/^(--repo|-R)[[:space:]]+//')
+    repo_arg=$(echo "$cmd" | grep -oE -- '(--repo|-R)[[:space:]]+[^[:space:]]+' | head -1 | sed -E 's/^(--repo|-R)[[:space:]]+//' | tr -d "\"'")
     working_dir=$(echo "$cmd" | grep -oE 'cd[[:space:]]+[^[:space:]&|;]+' | head -1 | sed -E 's/^cd[[:space:]]+//')
     working_dir="${working_dir/#~/$HOME}"
   fi
