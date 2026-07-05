@@ -104,9 +104,13 @@ codex exec \
 
 ```bash
 # 1. worktree を作成（実装はメインブランチから隔離する）
-BRANCH_NAME="codex/$(date +%s)"
-WORKTREE_DIR="/tmp/codex-worktree-$(date +%s)"
+TS=$(date +%s)
+BRANCH_NAME="codex/$TS"
+WORKTREE_DIR="/tmp/codex-worktree-$TS"
 git worktree add "$WORKTREE_DIR" -b "$BRANCH_NAME"
+# Codex 実行前の base SHA を sidecar に記録する（Step 4/5 の差分基準）。
+# HEAD~1 は Codex のコミット数が 0 や複数だと別物を指すので使わない。
+git -C "$WORKTREE_DIR" rev-parse HEAD > "$WORKTREE_DIR.base"
 
 # 2. 結果ファイルのパスを生成
 RESULT_FILE="/tmp/codex-$(date +%s)-impl.md"
@@ -155,13 +159,15 @@ cat "$RESULT_FILE"
 ### impl の評価
 
 1. **結果ファイルを読む** — 何をしたか、テスト結果、判断事項
-2. **差分を確認:**
+2. **差分を確認**（コミット数に依存しない。base SHA から取る）:
    ```bash
-   git -C "$WORKTREE_DIR" diff HEAD~1 --stat
-   git -C "$WORKTREE_DIR" diff HEAD~1
+   BASE_SHA=$(cat "$WORKTREE_DIR.base")
+   git -C "$WORKTREE_DIR" add -A          # Codex が未コミットのまま残した変更も差分に含める
+   git -C "$WORKTREE_DIR" diff --stat "$BASE_SHA"
+   git -C "$WORKTREE_DIR" diff "$BASE_SHA"
    ```
 3. **設計意図との整合性チェック** — 対話で決めた方針に沿っているか
-4. **テスト再実行（必要に応じて）** — worktree 内でテストを走らせる
+4. **テスト再実行** — Codex のレポートにテスト結果が無い、または impl がテスト対象コードを変更した場合は worktree 内でテストを走らせる（それ以外は省略可）
 5. **ユーザーに提示** — 変更サマリーと評価を伝え、取り込み判断を仰ぐ
 
 ## Step 5: 取り込み（impl のみ）
@@ -169,10 +175,13 @@ cat "$RESULT_FILE"
 ユーザーが承認した場合:
 
 ```bash
-# worktree の変更をメインの作業ブランチに取り込む
-CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-git -C "$WORKTREE_DIR" diff HEAD~1 | git apply
-# または: cherry-pick / merge（コミット履歴を保持したい場合）
+# worktree の変更をメインの作業ブランチに取り込む。base SHA からの差分を常にパッチで
+# 当てる。コミット済み分も未コミット分もこれ一本で入る（メインに未コミットで乗る。履歴は残さない）。
+# cherry-pick はここでは使わない。この行はメイン側で走るので HEAD が worktree のブランチ
+# ではなくメインの HEAD を指し、通常ケース（メインが base SHA のまま）だと空振りするため。
+BASE_SHA=$(cat "$WORKTREE_DIR.base")
+git -C "$WORKTREE_DIR" add -A          # Codex が未コミットのまま残した変更も差分に含める
+git -C "$WORKTREE_DIR" diff "$BASE_SHA" | git apply
 
 # worktree の後片付け
 git worktree remove "$WORKTREE_DIR"
