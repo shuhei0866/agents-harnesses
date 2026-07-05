@@ -175,16 +175,13 @@ cat "$RESULT_FILE"
 ユーザーが承認した場合:
 
 ```bash
-# worktree の変更をメインの作業ブランチに取り込む（base SHA から。コミット有無で分岐）
+# worktree の変更をメインの作業ブランチに取り込む。base SHA からの差分を常にパッチで
+# 当てる。コミット済み分も未コミット分もこれ一本で入る（メインに未コミットで乗る。履歴は残さない）。
+# cherry-pick はここでは使わない。この行はメイン側で走るので HEAD が worktree のブランチ
+# ではなくメインの HEAD を指し、通常ケース（メインが base SHA のまま）だと空振りするため。
 BASE_SHA=$(cat "$WORKTREE_DIR.base")
-if git -C "$WORKTREE_DIR" log --oneline "$BASE_SHA"..HEAD | grep -q .; then
-  # コミットあり → 履歴を保って cherry-pick / merge する
-  git cherry-pick "$BASE_SHA"..HEAD
-else
-  # 未コミット変更 → パッチ適用
-  git -C "$WORKTREE_DIR" add -A
-  git -C "$WORKTREE_DIR" diff "$BASE_SHA" | git apply
-fi
+git -C "$WORKTREE_DIR" add -A          # Codex が未コミットのまま残した変更も差分に含める
+git -C "$WORKTREE_DIR" diff "$BASE_SHA" | git apply
 
 # worktree の後片付け
 git worktree remove "$WORKTREE_DIR"
