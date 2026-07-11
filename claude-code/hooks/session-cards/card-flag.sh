@@ -29,6 +29,18 @@ CARDS_ROOT="${CLAUDE_SESSION_CARDS_ROOT:-$HOME/.claude/session-cards}"
 CARD="$CARDS_ROOT/$(basename "$(dirname "$TRANSCRIPT")")/$SESSION_ID.md"
 [ -f "$CARD" ] || exit 0
 
-/usr/bin/sed -i '' "s/^waiting_on_input: $OLD\$/waiting_on_input: $NEW/" "$CARD" 2>/dev/null || true
+# sed -i は GNU/BSD で非互換なので使わず、temp+mv で原子的に書く。
+# 反転対象の行が無ければ何もしない (mtime を無駄に動かさない)。
+if grep -q "^waiting_on_input: $OLD\$" "$CARD" 2>/dev/null; then
+  CARD_DIR=$(dirname "$CARD")
+  TMP_FLIP=$(mktemp "$CARD_DIR/.flag.XXXXXX" 2>/dev/null || true)
+  if [ -n "$TMP_FLIP" ]; then
+    if sed "s/^waiting_on_input: $OLD\$/waiting_on_input: $NEW/" "$CARD" > "$TMP_FLIP" 2>/dev/null; then
+      mv -f "$TMP_FLIP" "$CARD"
+    else
+      rm -f "$TMP_FLIP"
+    fi
+  fi
+fi
 
 exit 0

@@ -21,6 +21,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CARDS_ROOT="${CLAUDE_SESSION_CARDS_ROOT:-$HOME/.claude/session-cards}"
 DEBOUNCE_SECS="${CLAUDE_SESSION_CARDS_DEBOUNCE:-300}"
 
+# mtime 取得は GNU (stat -c %Y) と BSD/macOS (stat -f %m) で分岐する
+if stat -c %Y . >/dev/null 2>&1; then
+  mtime() { stat -c %Y "$1" 2>/dev/null || echo 0; }
+else
+  mtime() { stat -f %m "$1" 2>/dev/null || echo 0; }
+fi
+
 INPUT=$(cat)
 # jq の spawn は 1 回に抑える（wrapper の復帰時間を削るため）
 SESSION_ID=""; TRANSCRIPT=""; CWD=""
@@ -36,9 +43,17 @@ PROJECT_SLUG=$(basename "$(dirname "$TRANSCRIPT")")
 CARD_DIR="$CARDS_ROOT/$PROJECT_SLUG"
 CARD="$CARD_DIR/$SESSION_ID.md"
 
-# ターンが完了した = permission prompt では止まっていない。同期で解除（LLM なし）
-if [ -f "$CARD" ]; then
-  /usr/bin/sed -i '' 's/^waiting_on_input: true$/waiting_on_input: false/' "$CARD" 2>/dev/null || true
+# ターンが完了した = permission prompt では止まっていない。同期で解除（LLM なし）。
+# sed -i は GNU/BSD で非互換なので使わず、distill.sh と同じ temp+mv で原子的に書く。
+if [ -f "$CARD" ] && grep -q '^waiting_on_input: true$' "$CARD" 2>/dev/null; then
+  TMP_FLIP=$(mktemp "$CARD_DIR/.flag.XXXXXX" 2>/dev/null || true)
+  if [ -n "$TMP_FLIP" ]; then
+    if sed 's/^waiting_on_input: true$/waiting_on_input: false/' "$CARD" > "$TMP_FLIP" 2>/dev/null; then
+      mv -f "$TMP_FLIP" "$CARD"
+    else
+      rm -f "$TMP_FLIP"
+    fi
+  fi
 fi
 
 # デバウンス。カード本体の mtime は flag 反転でも動くため、
@@ -46,7 +61,7 @@ fi
 STAMP="$CARD_DIR/.$SESSION_ID.stamp"
 if [ -f "$STAMP" ]; then
   NOW=$(date +%s)
-  LAST=$(stat -f %m "$STAMP" 2>/dev/null || echo 0)
+  LAST=$(mtime "$STAMP")
   if [ $((NOW - LAST)) -lt "$DEBOUNCE_SECS" ]; then
     exit 0
   fi
@@ -63,10 +78,12 @@ if [ -d "$REGISTRY_DIR" ]; then
   for f in "$REGISTRY_DIR"/*.json; do
     [ -f "$f" ] || continue
     grep -q "$SESSION_ID" "$f" 2>/dev/null || continue
+    # 同一 sessionId のエントリが複数あるケース (stale ファイル残存 +
+    # claude -p --resume 併用など) に備え、interactive cli が見つかるまで走査する
     if jq -e '.kind == "interactive" and .entrypoint == "cli"' "$f" >/dev/null 2>&1; then
       IS_INTERACTIVE=1
+      break
     fi
-    break
   done
 fi
 [ "$IS_INTERACTIVE" = "1" ] || exit 0
@@ -77,7 +94,7 @@ mkdir -p "$CARD_DIR"
 LOCK="$CARD_DIR/.$SESSION_ID.lock"
 if ! mkdir "$LOCK" 2>/dev/null; then
   NOW=$(date +%s)
-  LOCK_MTIME=$(stat -f %m "$LOCK" 2>/dev/null || echo 0)
+  LOCK_MTIME=$(mtime "$LOCK")
   if [ $((NOW - LOCK_MTIME)) -lt 600 ]; then
     exit 0
   fi
