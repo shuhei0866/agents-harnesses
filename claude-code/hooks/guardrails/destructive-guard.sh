@@ -30,10 +30,13 @@ if [ -z "${COMMAND:-}" ]; then
 fi
 
 # 引用符・heredoc 内のテキストを除外してからマッチ
-SAFE_CMD=$(guard_sanitize_command "$COMMAND")
+# （heredoc は複数行の本文ごと落とす。マーカー除去だけでは本文中の rm -rf 等に誤反応する）
+SAFE_CMD=$(guard_sanitize_command "$(guard_strip_heredoc_bodies "$COMMAND")")
 
 # --- rm -rf /（ルート・ホーム・重要ディレクトリ）: ブロック ---
-if echo "$SAFE_CMD" | grep -qE 'rm\s+(-[a-zA-Z]*r[a-zA-Z]*f|(-[a-zA-Z]*f[a-zA-Z]*r))\s+(/|~|\$HOME|/etc|/var|/usr)\b'; then
+# 注: \b は / や ~ の直後では一致しない（非単語文字同士に語境界が立たない）ため、
+# 「対象の直後が空白か行末」で判定する。/etc /var /usr は配下のパスも含める
+if echo "$SAFE_CMD" | grep -qE 'rm\s+(-[a-zA-Z]*r[a-zA-Z]*f|(-[a-zA-Z]*f[a-zA-Z]*r))\s+(/(etc|var|usr)(/[^[:space:]]*)?|/|~/?|\$HOME/?)(\s|$)'; then
   guard_respond "critical" "破壊的操作ガード" "ルートやシステムディレクトリに対する rm -rf はブロックされています。"
 fi
 

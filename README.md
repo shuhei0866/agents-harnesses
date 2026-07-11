@@ -100,6 +100,8 @@ Hooks は `settings.json` で設定する。シンボリックリンクではな
 | **pr-merge-ready-guard** | `guardrails/` | 未解決レビュースレッド・マージコンフリクトがある PR のマージを防止 |
 | **toolchain-guard** | `guardrails/` | sudo npm/node をブロック、gh 認証チェック |
 | **worktree-guard** | `guardrails/` | メインワークツリーでの直接編集を制限（worktree 分離を強制） |
+| **worktree-rm-guard** | `guardrails/` | `.worktrees/` 配下への再帰 rm をブロックし、`git worktree remove` 経由に強制 |
+| **merged-pr-push-guard** | `guardrails/` | merge 済み PR の branch への push をブロック（孤児コミット防止） |
 | **migration-guard** | `guardrails/` | マイグレーション番号の重複を警告 |
 | **discord-mention** | `discord-mention/` | Discord メッセージの `@username` を `<@USER_ID>` 形式に変換を促す |
 
