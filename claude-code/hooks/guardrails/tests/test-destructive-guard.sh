@@ -22,7 +22,7 @@ run_guard() {
   local cmd="$1"
   local errf="$TMPDIR_TEST/stderr"
   OUT=$( (cd "$TMPDIR_TEST" && jq -n --arg c "$cmd" '{tool_input:{command:$c}}' \
-    | env -u CLAUDE_PROJECT_DIR -u GUARD_SKIP -u GUARD_LEVEL -u GUARD_FORCE_DENY bash "$GUARD" 2>"$errf") )
+    | env -u CLAUDE_PROJECT_DIR -u GUARD_SKIP -u GUARD_LEVEL -u GUARD_FORCE_DENY -u GIT_WORKFLOW bash "$GUARD" 2>"$errf") )
   STATUS=$?
   ERR=$(cat "$errf" 2>/dev/null || echo "")
 }

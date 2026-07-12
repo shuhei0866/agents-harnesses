@@ -13,6 +13,19 @@
 #   source "$GUARD_COMMON"
 #   guard_respond "advisory" "heredoc" "heredoc は使わないでください"
 
+# source 後に config 値を GIT_WORKFLOW へ格納しても、明示的な環境変数と
+# 取り違えないよう、初回ロード前の有無と値を保持する。
+if [ "${_GUARD_GIT_WORKFLOW_ENV_CAPTURED:-0}" != "1" ]; then
+  _GUARD_GIT_WORKFLOW_ENV_CAPTURED=1
+  if [ "${GIT_WORKFLOW+x}" = "x" ]; then
+    _GUARD_GIT_WORKFLOW_ENV_IS_SET=1
+    _GUARD_GIT_WORKFLOW_ENV_VALUE="$GIT_WORKFLOW"
+  else
+    _GUARD_GIT_WORKFLOW_ENV_IS_SET=0
+    _GUARD_GIT_WORKFLOW_ENV_VALUE=""
+  fi
+fi
+
 # --- 設定ファイルの探索 ---
 # 優先順位: harness.config > vdd.config（後方互換）
 _find_config_file() {
@@ -141,6 +154,279 @@ _load_guard_force_deny() {
 
   if [ -n "$config_file" ]; then
     GUARD_FORCE_DENY_LIST=$(grep -E '^GUARD_FORCE_DENY=' "$config_file" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '"'"'" | tr -d '[:space:]')
+  fi
+}
+
+# --- GIT_WORKFLOW のロード ---
+# 優先順位: 環境変数 GIT_WORKFLOW > harness.config > 未設定
+#
+# 許可される値は呼び出し側で明示的に判定する。未設定・空文字・不正値は
+# trunk-direct とみなさず、従来の安全側の挙動を維持する。
+_load_git_workflow() {
+  # 空文字や不正値を含め、環境変数が明示されていれば config へ fallback しない。
+  if [ "${_GUARD_GIT_WORKFLOW_ENV_IS_SET:-0}" = "1" ]; then
+    GIT_WORKFLOW="$_GUARD_GIT_WORKFLOW_ENV_VALUE"
+    return
+  fi
+
+  GIT_WORKFLOW=""
+
+  local config_file
+  config_file=$(_find_config_file)
+
+  if [ -n "$config_file" ]; then
+    GIT_WORKFLOW=$(grep -E '^GIT_WORKFLOW=' "$config_file" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d "\"'" | tr -d '[:space:]')
+  fi
+}
+
+# trunk-direct だけが workflow 固有の制限を緩和する。
+# worktree-pr・未設定・不正値はすべて false を返す。
+guard_is_trunk_direct() {
+  [ "${GIT_WORKFLOW:-}" = "trunk-direct" ]
+}
+
+# 指定ディレクトリが属する repo の GIT_WORKFLOW を出力する。
+# config がない・repo でない場合は空文字を返す。
+_guard_git_workflow_from_dir() {
+  local dir="$1" repo_root="" config_file="" workflow=""
+
+  if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+    return
+  fi
+
+  repo_root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null || echo "")
+  if [ -z "$repo_root" ]; then
+    return
+  fi
+
+  if [ -f "$repo_root/.claude/harness.config" ]; then
+    config_file="$repo_root/.claude/harness.config"
+  elif [ -f "$repo_root/.claude/vdd.config" ]; then
+    config_file="$repo_root/.claude/vdd.config"
+  fi
+
+  if [ -n "$config_file" ]; then
+    workflow=$(grep -E '^GIT_WORKFLOW=' "$config_file" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d "\"'" | tr -d '[:space:]')
+  fi
+
+  printf '%s\n' "$workflow"
+}
+
+# base を基準に path を実在ディレクトリへ解決する。
+_guard_resolve_directory() {
+  local base="$1" path="$2" candidate=""
+
+  if [ -z "$path" ]; then
+    return 1
+  fi
+
+  path="${path/#~/$HOME}"
+  case "$path" in
+    /*) candidate="$path" ;;
+    *)  candidate="$base/$path" ;;
+  esac
+
+  if [ ! -d "$candidate" ]; then
+    return 1
+  fi
+
+  (cd "$candidate" 2>/dev/null && pwd -P)
+}
+
+# shell の先頭引数を、single/double quote を外して取り出す。
+# command context の path / repo selector 専用であり eval は行わない。
+_guard_first_shell_arg() {
+  local text="$1" value=""
+  text=$(printf '%s\n' "$text" | sed -E 's/^[[:space:]]+//')
+
+  case "$text" in
+    \"*)
+      value="${text#\"}"
+      case "$value" in
+        *\"*) value="${value%%\"*}" ;;
+        *) return 1 ;;
+      esac
+      ;;
+    \'*)
+      value="${text#\'}"
+      case "$value" in
+        *\'*) value="${value%%\'*}" ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *)
+      value="${text%%[[:space:]]*}"
+      ;;
+  esac
+
+  if [ -z "$value" ]; then
+    return 1
+  fi
+  printf '%s\n' "$value"
+}
+
+# shell segment を quote-aware に引数へ分割し、1 token/line で出力する。
+# 危険 option の判定で quoted option と message/value を区別するために使う。
+guard_shell_tokens() {
+  local segment="$1"
+  printf '%s\n' "$segment" | awk '
+    BEGIN { SQ = sprintf("%c", 39); q = ""; tok = ""; esc = 0; have = 0 }
+    function emit() {
+      if (have) print tok
+      tok = ""; have = 0
+    }
+    {
+      if (NR > 1) {
+        if (q == "") emit()
+        else { tok = tok "\n"; have = 1 }
+      }
+      for (i = 1; i <= length($0); i++) {
+        c = substr($0, i, 1)
+        if (q == SQ) {
+          if (c == SQ) q = ""
+          else { tok = tok c; have = 1 }
+        } else if (q == "\"") {
+          if (esc) { tok = tok c; have = 1; esc = 0 }
+          else if (c == "\\") esc = 1
+          else if (c == "\"") q = ""
+          else { tok = tok c; have = 1 }
+        } else if (esc) {
+          tok = tok c; have = 1; esc = 0
+        } else if (c == "\\") {
+          esc = 1; have = 1
+        } else if (c == SQ || c == "\"") {
+          q = c; have = 1
+        } else if (c ~ /[[:space:]]/) {
+          emit()
+        } else {
+          tok = tok c; have = 1
+        }
+      }
+    }
+    END {
+      if (esc) tok = tok "\\"
+      emit()
+    }
+  '
+}
+
+# cd の効果範囲を逐次 segment として安全に追えない shell 構造なら 0 を返す。
+guard_command_context_is_ambiguous() {
+  local command="$1" stripped="" structure=""
+  stripped=$(guard_strip_heredoc_bodies "$command")
+
+  case "$stripped" in
+    *'$('*|*'`'*) return 0 ;;
+  esac
+
+  structure=$(guard_sanitize_command "$stripped")
+  case "$structure" in
+    *"|"*|*"("*|*")"*) return 0 ;;
+  esac
+  structure=$(printf '%s\n' "$structure" | sed 's/&&//g')
+  case "$structure" in
+    *"&"*) return 0 ;;
+  esac
+  return 1
+}
+
+# command が実際に操作する repo を基準に GIT_WORKFLOW を再ロードする。
+# - 明示的な環境変数（空・不正値を含む）は常に最優先
+# - git -C / cd / hook input cwd を解決
+# - 複数 repo が混在する場合は、全 target が trunk-direct の時だけ緩和
+# - --repo / -R は local config に確実に対応付けられないため fail closed
+guard_reload_git_workflow_for_command() {
+  local command="$1" hook_cwd="${2:-}" base_dir="" active_dir=""
+  local stripped="" segments="" segment="" rest="" path="" target_dir="" workflow=""
+  local seen_target=0 all_trunk_direct=1 command_for_match=""
+
+  if [ "${_GUARD_GIT_WORKFLOW_ENV_IS_SET:-0}" = "1" ]; then
+    GIT_WORKFLOW="$_GUARD_GIT_WORKFLOW_ENV_VALUE"
+    return
+  fi
+
+  if [ -n "$hook_cwd" ]; then
+    base_dir=$(_guard_resolve_directory "$(pwd -P)" "$hook_cwd" 2>/dev/null || echo "")
+  elif [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
+    base_dir=$(_guard_resolve_directory "$(pwd -P)" "$CLAUDE_PROJECT_DIR" 2>/dev/null || echo "")
+  else
+    base_dir=$(pwd -P)
+  fi
+
+  if [ -z "$base_dir" ]; then
+    GIT_WORKFLOW=""
+    return
+  fi
+  active_dir="$base_dir"
+
+  stripped=$(guard_strip_heredoc_bodies "$command")
+  if guard_command_context_is_ambiguous "$stripped"; then
+    GIT_WORKFLOW=""
+    return
+  fi
+
+  segments=$(guard_split_segments "$stripped")
+
+  while IFS= read -r segment; do
+    segment=$(printf '%s\n' "$segment" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    if [ -z "$segment" ]; then
+      continue
+    fi
+
+    case "$segment" in
+      cd[[:space:]]*)
+        rest="${segment#cd}"
+        path=$(_guard_first_shell_arg "$rest" 2>/dev/null || echo "")
+        active_dir=$(_guard_resolve_directory "$active_dir" "$path" 2>/dev/null || echo "")
+        if [ -z "$active_dir" ]; then
+          all_trunk_direct=0
+        fi
+        ;;
+      git[[:space:]]*)
+        seen_target=1
+        target_dir="$active_dir"
+        rest="${segment#git}"
+        rest=$(printf '%s\n' "$rest" | sed -E 's/^[[:space:]]+//')
+        case "$rest" in
+          -C[[:space:]]*)
+            rest="${rest#-C}"
+            path=$(_guard_first_shell_arg "$rest" 2>/dev/null || echo "")
+            target_dir=$(_guard_resolve_directory "$target_dir" "$path" 2>/dev/null || echo "")
+            ;;
+        esac
+        workflow=$(_guard_git_workflow_from_dir "$target_dir")
+        if [ "$workflow" != "trunk-direct" ]; then
+          all_trunk_direct=0
+        fi
+        ;;
+      gh[[:space:]]*)
+        seen_target=1
+        command_for_match=$(guard_sanitize_command "$segment")
+        if echo "$command_for_match" | grep -qE '(^|[[:space:]])(--repo|-R)(=|[[:space:]])'; then
+          all_trunk_direct=0
+        else
+          workflow=$(_guard_git_workflow_from_dir "$active_dir")
+          if [ "$workflow" != "trunk-direct" ]; then
+            all_trunk_direct=0
+          fi
+        fi
+        ;;
+      *)
+        # command prefix や未対応構文に git/gh が含まれる場合、別 repo を見落として
+        # 緩和しないよう target 不明として扱う。
+        command_for_match=$(guard_sanitize_command "$segment")
+        if echo "$command_for_match" | grep -qE '(^|[[:space:]])(git|gh)[[:space:]]'; then
+          seen_target=1
+          all_trunk_direct=0
+        fi
+        ;;
+    esac
+  done <<< "$segments"
+
+  if [ "$seen_target" -eq 1 ] && [ "$all_trunk_direct" -eq 1 ]; then
+    GIT_WORKFLOW="trunk-direct"
+  else
+    GIT_WORKFLOW=""
   fi
 }
 
@@ -400,5 +686,6 @@ _check_branch_context() {
 _load_guard_level
 _load_guard_skip
 _load_guard_force_deny
+_load_git_workflow
 _check_skip
 _check_branch_context

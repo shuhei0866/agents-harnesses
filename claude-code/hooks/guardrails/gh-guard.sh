@@ -30,6 +30,10 @@ if [ -z "${COMMAND:-}" ]; then
   exit 0
 fi
 
+# hook 起動元ではなく、command が実際に操作する repo の workflow policy を使う。
+HOOK_CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
+guard_reload_git_workflow_for_command "$COMMAND" "$HOOK_CWD"
+
 # パターンマッチ用: 引用符 / HEREDOC 内のテキストをプレースホルダーに置換（body テキスト誤検出防止）
 # perl で全文一括処理することで、改行を跨ぐ引用符や HEREDOC body 内の "gh pr ..." が
 # 誤検出されないようにする（例: git commit -m "...gh pr merge..." の本文は無視）。
@@ -183,7 +187,7 @@ should_deny_merge() {
 }
 
 # --- チェック 1: gh pr review --approve ---
-if echo "$COMMAND_FOR_MATCH" | grep -qE 'gh\s+pr\s+review\s.*(-a\b|--approve)'; then
+if echo "$COMMAND_FOR_MATCH" | grep -qE 'gh\s+pr\s+review\s.*(-a\b|--approve)' && ! guard_is_trunk_direct; then
   PR_NUM=$(extract_pr_number "$COMMAND" "review")
   BASE=$(get_pr_base "$PR_NUM" "$COMMAND")
 
@@ -205,7 +209,7 @@ if echo "$COMMAND_FOR_MATCH" | grep -qE 'gh\s+pr\s+review\s.*(-a\b|--approve)'; 
 fi
 
 # --- チェック 2: gh pr merge ---
-if echo "$COMMAND_FOR_MATCH" | grep -qE 'gh\s+pr\s+merge'; then
+if echo "$COMMAND_FOR_MATCH" | grep -qE 'gh\s+pr\s+merge' && ! guard_is_trunk_direct; then
   PR_NUM=$(extract_pr_number "$COMMAND" "merge")
   BASE=$(get_pr_base "$PR_NUM" "$COMMAND")
 
