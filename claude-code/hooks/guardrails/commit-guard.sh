@@ -366,6 +366,11 @@ _commit_guard_find_git_index() {
 
     base="${token##*/}"
     case "$base" in
+      if|then|elif|else|while|until|for|select|do|time|'!'|'{')
+        # guard_split_segments 後に command position へ残る shell reserved word。
+        # その直後の git は条件・body として実行され得るため検査を続ける。
+        i=$((i + 1))
+        ;;
       git)
         printf '%s\n' "$i"
         return 0

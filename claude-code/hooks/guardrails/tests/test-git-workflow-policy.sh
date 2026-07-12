@@ -484,6 +484,12 @@ assert_deny "quoted command substitution 後の quoted --no-verify もcritical d
 run_bash_guard "$COMMIT_GUARD" 'echo "$(git commit --no-verify -m nested)"' trunk-direct warn
 assert_deny "command substitution body 内のcritical git commandも検査する"
 
+run_bash_guard "$COMMIT_GUARD" 'if true; then git commit --no-verify -m controlled; fi' trunk-direct warn
+assert_deny "if/then control flow 内の --no-verify もcritical denyする"
+
+run_bash_guard "$COMMIT_GUARD" 'for x in one; do git push origin main --force; done' trunk-direct warn
+assert_deny "for/do control flow 内の main force push もcritical denyする"
+
 run_bash_guard "$COMMIT_GUARD" "env -S 'git commit --no-verify -m split'" trunk-direct warn
 assert_deny "env -S payload 内の --no-verify をcritical denyする"
 
