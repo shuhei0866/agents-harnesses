@@ -890,6 +890,7 @@ guard_reload_git_workflow_for_command() {
   local command="$1" hook_cwd="${2:-}" base_dir="" active_dir=""
   local stripped="" segments="" segment="" path="" target_dir="" workflow="" token=""
   local seen_target=0 all_trunk_direct=1 i=0 token_count=0 command_index=0 command_base="" cd_index=-1
+  local conditional_context=0 conditional_depth=0
   local -a command_tokens=()
 
   if [ "${_GUARD_GIT_WORKFLOW_ENV_IS_SET:-0}" = "1" ]; then
@@ -935,6 +936,7 @@ guard_reload_git_workflow_for_command() {
     fi
 
     command_index=0
+    conditional_context="$conditional_depth"
     command_base="${command_tokens[0]##*/}"
     cd_index=$(guard_cd_command_index "$segment" 2>/dev/null || echo -1)
     if [ "$cd_index" -ge 0 ]; then
@@ -959,7 +961,49 @@ guard_reload_git_workflow_for_command() {
         fi
         command_base="${token##*/}"
         case "$command_base" in
-          if|then|elif|else|while|until|for|select|do|time|'!'|'{')
+          if|while|until|for|select|case)
+            # False-positive nesting is safe here; unlike a false terminator it
+            # cannot turn a conditional cwd change into an unconditional one.
+            conditional_depth=$((conditional_depth + 1))
+            conditional_context=1
+            command_index=$((command_index + 1))
+            ;;
+          then|elif|else|do|in)
+            conditional_context=1
+            command_index=$((command_index + 1))
+            ;;
+          fi|done|esac)
+            if ! [[ "$segment" =~ ^${command_base}([[:space:]]|$) ]]; then
+              break
+            fi
+            if [ "$conditional_depth" -gt 0 ]; then
+              conditional_depth=$((conditional_depth - 1))
+            fi
+            conditional_context="$conditional_depth"
+            command_index=$((command_index + 1))
+            ;;
+          time)
+            if ! [[ "$segment" =~ ^time([[:space:]]|$) ]]; then
+              break
+            fi
+            command_index=$((command_index + 1))
+            ;;
+          '!')
+            if ! [[ "$segment" =~ ^!([[:space:]]|$) ]]; then
+              break
+            fi
+            command_index=$((command_index + 1))
+            ;;
+          '{')
+            if ! [[ "$segment" =~ ^\{([[:space:]]|$) ]]; then
+              break
+            fi
+            command_index=$((command_index + 1))
+            ;;
+          '}')
+            if ! [[ "$segment" =~ ^\}([[:space:]]|$) ]]; then
+              break
+            fi
             command_index=$((command_index + 1))
             ;;
           command)
@@ -1006,6 +1050,12 @@ guard_reload_git_workflow_for_command() {
 
     case "$command_base" in
       cd)
+        if [ "$conditional_context" -gt 0 ]; then
+          # 条件付き branch/body の cd は実行有無を静的に確定できないため、
+          # 後続 segment へ cwd を継承せず fail closed にする。
+          active_dir=""
+          continue
+        fi
         i=$((command_index + 1))
         while [ "$i" -lt "$token_count" ]; do
           token="${command_tokens[$i]}"

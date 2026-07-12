@@ -269,6 +269,35 @@ set_config 'GIT_WORKFLOW="trunk-direct"'
 set_config_b 'GIT_WORKFLOW="worktree-pr"'
 set_config_c 'GIT_WORKFLOW="worktree-pr"'
 
+set_config 'GIT_WORKFLOW="worktree-pr"'
+set_config_b 'GIT_WORKFLOW="trunk-direct"'
+run_bash_guard "$COMMIT_GUARD" "if false; then cd \"$REPO_B\"; fi; git commit -m test"
+assert_deny "未実行の conditional cd から trunk-direct policy を後続 commit に漏らさない"
+run_bash_guard "$COMMIT_GUARD" $'if false\nthen\n  cd '"\"$REPO_B\""$'\nfi\ngit commit -m test'
+assert_deny "改行された conditional cd からも trunk-direct policy を漏らさない"
+run_bash_guard "$COMMIT_GUARD" $'if true\nthen\n  if false\n  then\n    cd '"\"$REPO_B\""$'\n  fi\nfi\ngit commit -m test'
+assert_deny "nested conditional cd からも trunk-direct policy を漏らさない"
+run_bash_guard "$COMMIT_GUARD" "if false; then command fi; cd \"$REPO_B\"; fi; git commit -m test"
+assert_deny "fi という executable name で conditional depth を閉じない"
+run_bash_guard "$COMMIT_GUARD" "if false; then 'fi'; cd \"$REPO_B\"; fi; git commit -m test"
+assert_deny "quoted fi を shell terminator と誤認しない"
+run_bash_guard "$COMMIT_GUARD" "if true; then :; else if false; then :; fi; cd \"$REPO_B\"; fi; git commit -m test"
+assert_deny "else if の nested conditional depth を保持する"
+run_bash_guard "$COMMIT_GUARD" "{ cd \"$REPO_B\"; }; git commit -m test"
+assert_silent_allow "unconditional command group の cd は後続 commit に反映する"
+run_bash_guard "$COMMIT_GUARD" "time cd \"$REPO_B\"; git commit -m test"
+assert_silent_allow "time prefix の cd は後続 commit に反映する"
+run_bash_guard "$COMMIT_GUARD" "'time' cd \"$REPO_B\"; git commit -m test"
+assert_deny "quoted time executable を shell keyword と誤認しない"
+run_bash_guard "$COMMIT_GUARD" "! cd \"$REPO_B\"; git commit -m test"
+assert_silent_allow "negation prefix の cd 自体は実行されるため後続 commit に反映する"
+set_config 'GIT_WORKFLOW="trunk-direct"'
+set_config_b 'GIT_WORKFLOW="worktree-pr"'
+run_bash_guard "$COMMIT_GUARD" "git commit -m test; if false; then cd \"$REPO_B\"; fi"
+assert_silent_allow "後続 conditional cd は先に解決済みの trunk-direct commit を否定しない"
+set_config 'GIT_WORKFLOW="trunk-direct"'
+set_config_b 'GIT_WORKFLOW="worktree-pr"'
+
 run_bash_guard "$COMMIT_GUARD" "git -C $REPO_C commit -m test"
 assert_deny "git -C の unquoted absolute target は target repo の worktree-pr を使う"
 
