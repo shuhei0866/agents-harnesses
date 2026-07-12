@@ -36,6 +36,7 @@ COMMAND_FOR_MATCH=$(echo "$COMMAND" | sed -E "s/\"[^\"]*\"/_Q_/g; s/'[^']*'/_Q_/
 # quote-aware token 列を使い、quoted option を検出しつつ message/option value は誤検出しない。
 
 _COMMIT_GUARD_TOKENS=()
+_COMMIT_GUARD_TILDE_LITERAL=()
 _COMMIT_GUARD_ADVISORY_OPS=()
 _COMMIT_GUARD_ADVISORY_DIRS=()
 _COMMIT_GUARD_ADVISORY_UNKNOWN=()
@@ -423,7 +424,7 @@ _commit_guard_find_git_index() {
 }
 
 _commit_guard_check_universal_critical() {
-  local stripped="" segments="" outer="" segment="" token="" count=0 i=0 subcommand="" git_index=""
+  local stripped="" segments="" outer="" segment="" token="" tilde_literal=0 count=0 i=0 subcommand="" git_index=""
   local base_dir="" active_dir="" git_dir="" path=""
   local ambiguous_context=0 context_unknown=0 k=0 detail="" action="" cd_index=-1
 
@@ -453,9 +454,11 @@ _commit_guard_check_universal_critical() {
 
   while IFS= read -r segment; do
     _COMMIT_GUARD_TOKENS=()
-    while IFS= read -r token; do
+    _COMMIT_GUARD_TILDE_LITERAL=()
+    while IFS=$'\034' read -r tilde_literal token; do
       _COMMIT_GUARD_TOKENS[${#_COMMIT_GUARD_TOKENS[@]}]="$token"
-    done < <(guard_shell_tokens_expanding_env_split "$segment")
+      _COMMIT_GUARD_TILDE_LITERAL[${#_COMMIT_GUARD_TILDE_LITERAL[@]}]="$tilde_literal"
+    done < <(guard_shell_tokens_expanding_env_split "$segment" tilde-meta)
 
     count=${#_COMMIT_GUARD_TOKENS[@]}
     if [ "$count" -eq 0 ]; then
@@ -477,7 +480,7 @@ _commit_guard_check_universal_critical() {
       fi
       if [ "$i" -lt "$count" ]; then
         path="${_COMMIT_GUARD_TOKENS[$i]}"
-        active_dir=$(_guard_resolve_directory "$active_dir" "$path" 2>/dev/null || echo "")
+        active_dir=$(_guard_resolve_directory "$active_dir" "$path" "${_COMMIT_GUARD_TILDE_LITERAL[$i]:-0}" 2>/dev/null || echo "")
       else
         active_dir=""
       fi
@@ -503,7 +506,7 @@ _commit_guard_check_universal_critical() {
           ;;
         -C|-D|--chdir)
           if [ $((k + 1)) -lt "$git_index" ]; then
-            git_dir=$(_guard_resolve_directory "$git_dir" "${_COMMIT_GUARD_TOKENS[$((k + 1))]}" 2>/dev/null || echo "")
+            git_dir=$(_guard_resolve_directory "$git_dir" "${_COMMIT_GUARD_TOKENS[$((k + 1))]}" "${_COMMIT_GUARD_TILDE_LITERAL[$((k + 1))]:-0}" 2>/dev/null || echo "")
           else
             context_unknown=1
           fi
@@ -511,7 +514,7 @@ _commit_guard_check_universal_critical() {
           continue
           ;;
         --chdir=*)
-          git_dir=$(_guard_resolve_directory "$git_dir" "${token#*=}" 2>/dev/null || echo "")
+          git_dir=$(_guard_resolve_directory "$git_dir" "${token#*=}" "${_COMMIT_GUARD_TILDE_LITERAL[$k]:-0}" 2>/dev/null || echo "")
           ;;
       esac
       k=$((k + 1))
@@ -525,14 +528,14 @@ _commit_guard_check_universal_critical() {
       case "$GUARD_GIT_GLOBAL_KIND" in
         cwd-value)
           if [ $((i + 1)) -lt "$count" ]; then
-            git_dir=$(_guard_resolve_directory "$git_dir" "${_COMMIT_GUARD_TOKENS[$((i + 1))]}" 2>/dev/null || echo "")
+            git_dir=$(_guard_resolve_directory "$git_dir" "${_COMMIT_GUARD_TOKENS[$((i + 1))]}" "${_COMMIT_GUARD_TILDE_LITERAL[$((i + 1))]:-0}" 2>/dev/null || echo "")
           else
             git_dir=""
           fi
           i=$((i + 2))
           ;;
         cwd-attached)
-          git_dir=$(_guard_resolve_directory "$git_dir" "$GUARD_GIT_GLOBAL_VALUE" 2>/dev/null || echo "")
+          git_dir=$(_guard_resolve_directory "$git_dir" "$GUARD_GIT_GLOBAL_VALUE" "${_COMMIT_GUARD_TILDE_LITERAL[$i]:-0}" 2>/dev/null || echo "")
           i=$((i + 1))
           ;;
         context-value)

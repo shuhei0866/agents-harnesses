@@ -242,6 +242,10 @@ assert_deny "不正な環境変数値は config にfallbackせず緩和しない
 run_bash_guard "$COMMIT_GUARD" 'git commit -m test' ''
 assert_deny "空の環境変数値も config にfallbackせず緩和しない"
 
+set_config 'GIT_WORKFLOW="trunk- direct"'
+run_bash_guard "$COMMIT_GUARD" 'git commit -m test'
+assert_deny "config value の内部空白を除去して trunk-direct に正規化しない"
+
 set_config 'GIT_WORKFLOW="worktree-pr"'
 run_bash_guard "$COMMIT_GUARD" 'git checkout main'
 assert_silent_allow "worktree-pr でも protected branch への通常switchは許可する"
@@ -271,6 +275,28 @@ set_config_c 'GIT_WORKFLOW="worktree-pr"'
 
 set_config 'GIT_WORKFLOW="worktree-pr"'
 set_config_b 'GIT_WORKFLOW="trunk-direct"'
+ln -s "$REPO_B" "$TMPDIR_TEST/tilde-trunk"
+HOME="$TMPDIR_TEST" run_bash_guard "$COMMIT_GUARD" "cd '~/tilde-trunk'; git commit -m test"
+assert_deny "quoted tilde path を HOME 展開して別 repo policy に切り替えない"
+HOME="$TMPDIR_TEST" run_bash_guard "$COMMIT_GUARD" "git -C ~/tilde-trunk commit -m '~ cleanup'"
+assert_silent_allow "unquoted tilde path は別の quoted tilde argument に影響されず展開する"
+ln -s "$REPO_B" "$TMPDIR_TEST/repo~name"
+HOME="$TMPDIR_TEST" run_bash_guard "$COMMIT_GUARD" "git -C ~/'repo~name' commit -m test"
+assert_silent_allow "leading unquoted tilde は後続 quoted tilde に影響されず展開する"
+HOME="$TMPDIR_TEST" run_bash_guard "$COMMIT_GUARD" "cd ''~/tilde-trunk; git commit -m test"
+assert_deny "empty quote prefix 後の tilde を HOME 展開しない"
+HOME="$TMPDIR_TEST" run_bash_guard "$COMMIT_GUARD" "cd ~''/tilde-trunk; git commit -m test"
+assert_deny "leading tilde と slash の間の empty quote を無視して展開しない"
+HOME="$TMPDIR_TEST" run_bash_guard "$COMMIT_GUARD" "git -C~/tilde-trunk commit -m test"
+assert_deny "attached -C の word-middle tilde を HOME 展開しない"
+mkdir -p "$REPO/__GUARD_LITERAL_TILDE__~/repo"
+git init -q "$REPO/__GUARD_LITERAL_TILDE__~/repo"
+git -C "$REPO/__GUARD_LITERAL_TILDE__~/repo" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+git -C "$REPO/__GUARD_LITERAL_TILDE__~/repo" branch -M main
+mkdir -p "$REPO/__GUARD_LITERAL_TILDE__~/repo/.claude"
+printf '%s\n' 'GIT_WORKFLOW="worktree-pr"' > "$REPO/__GUARD_LITERAL_TILDE__~/repo/.claude/harness.config"
+HOME="$TMPDIR_TEST" run_bash_guard "$COMMIT_GUARD" "git -C __GUARD_LITERAL_TILDE__~/repo commit -m test"
+assert_deny "literal path から tilde metadata を偽装できない"
 run_bash_guard "$COMMIT_GUARD" "if false; then cd \"$REPO_B\"; fi; git commit -m test"
 assert_deny "未実行の conditional cd から trunk-direct policy を後続 commit に漏らさない"
 run_bash_guard "$COMMIT_GUARD" $'if false\nthen\n  cd '"\"$REPO_B\""$'\nfi\ngit commit -m test'

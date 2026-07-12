@@ -162,6 +162,17 @@ _load_guard_force_deny() {
 #
 # 許可される値は呼び出し側で明示的に判定する。未設定・空文字・不正値は
 # trunk-direct とみなさず、従来の安全側の挙動を維持する。
+_guard_read_config_value() {
+  local config_file="$1" key="$2" value=""
+  value=$(grep -E "^${key}=" "$config_file" 2>/dev/null | tail -1 | cut -d= -f2-)
+  value=$(printf '%s\n' "$value" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+  case "$value" in
+    \"*\") value="${value#\"}"; value="${value%\"}" ;;
+    \'*\') value="${value#\'}"; value="${value%\'}" ;;
+  esac
+  printf '%s\n' "$value"
+}
+
 _load_git_workflow() {
   # 空文字や不正値を含め、環境変数が明示されていれば config へ fallback しない。
   if [ "${_GUARD_GIT_WORKFLOW_ENV_IS_SET:-0}" = "1" ]; then
@@ -175,7 +186,7 @@ _load_git_workflow() {
   config_file=$(_find_config_file)
 
   if [ -n "$config_file" ]; then
-    GIT_WORKFLOW=$(grep -E '^GIT_WORKFLOW=' "$config_file" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d "\"'" | tr -d '[:space:]')
+    GIT_WORKFLOW=$(_guard_read_config_value "$config_file" GIT_WORKFLOW)
   fi
 }
 
@@ -206,7 +217,7 @@ _guard_git_workflow_from_dir() {
   fi
 
   if [ -n "$config_file" ]; then
-    workflow=$(grep -E '^GIT_WORKFLOW=' "$config_file" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d "\"'" | tr -d '[:space:]')
+    workflow=$(_guard_read_config_value "$config_file" GIT_WORKFLOW)
   fi
 
   printf '%s\n' "$workflow"
@@ -214,13 +225,19 @@ _guard_git_workflow_from_dir() {
 
 # base を基準に path を実在ディレクトリへ解決する。
 _guard_resolve_directory() {
-  local base="$1" path="$2" candidate=""
+  local base="$1" path="$2" literal_tilde="${3:-0}" candidate=""
 
   if [ -z "$path" ]; then
     return 1
   fi
 
-  path="${path/#~/$HOME}"
+  if [ "$literal_tilde" -ne 1 ]; then
+    case "$path" in
+      '~') path="$HOME" ;;
+      '~/'*) path="$HOME/${path#\~/}" ;;
+      '~'*) return 1 ;;
+    esac
+  fi
   case "$path" in
     /*) candidate="$path" ;;
     *)  candidate="$base/$path" ;;
@@ -268,12 +285,15 @@ _guard_first_shell_arg() {
 # shell segment を quote-aware に引数へ分割し、1 token/line で出力する。
 # 危険 option の判定で quoted option と message/value を区別するために使う。
 guard_shell_tokens() {
-  local segment="$1"
-  printf '%s\n' "$segment" | awk '
-    BEGIN { SQ = sprintf("%c", 39); q = ""; tok = ""; esc = 0; have = 0 }
+  local segment="$1" mode="${2:-plain}"
+  printf '%s\n' "$segment" | awk -v mode="$mode" '
+    BEGIN { SQ = sprintf("%c", 39); SEP = sprintf("%c", 28); q = ""; tok = ""; esc = 0; have = 0; tilde_blocked = 0; tilde_seen = 0; tilde_pending = 0; literal_tilde = 0 }
     function emit() {
-      if (have) print tok
-      tok = ""; have = 0
+      if (have) {
+        if (mode == "tilde-meta") print literal_tilde SEP tok
+        else print tok
+      }
+      tok = ""; have = 0; tilde_blocked = 0; tilde_seen = 0; tilde_pending = 0; literal_tilde = 0
     }
     {
       if (NR > 1) {
@@ -284,21 +304,52 @@ guard_shell_tokens() {
         c = substr($0, i, 1)
         if (q == SQ) {
           if (c == SQ) q = ""
+          else if (c == "~") {
+            tok = tok c
+            if (!tilde_seen) { literal_tilde = 1; tilde_seen = 1 }
+            have = 1
+          }
           else { tok = tok c; have = 1 }
         } else if (q == "\"") {
-          if (esc) { tok = tok c; have = 1; esc = 0 }
+          if (esc) {
+            tok = tok c
+            if (c == "~" && !tilde_seen) { literal_tilde = 1; tilde_seen = 1 }
+            have = 1; esc = 0
+          }
           else if (c == "\\") esc = 1
           else if (c == "\"") q = ""
+          else if (c == "~") {
+            tok = tok c
+            if (!tilde_seen) { literal_tilde = 1; tilde_seen = 1 }
+            have = 1
+          }
           else { tok = tok c; have = 1 }
         } else if (esc) {
-          tok = tok c; have = 1; esc = 0
+          tok = tok c
+          if (c == "~" && !tilde_seen) { literal_tilde = 1; tilde_seen = 1 }
+          have = 1; esc = 0
         } else if (c == "\\") {
+          if (tilde_pending) { literal_tilde = 1; tilde_pending = 0 }
+          if (tok == "") tilde_blocked = 1
           esc = 1; have = 1
         } else if (c == SQ || c == "\"") {
+          if (tilde_pending) { literal_tilde = 1; tilde_pending = 0 }
+          if (tok == "") tilde_blocked = 1
           q = c; have = 1
         } else if (c ~ /[[:space:]]/) {
           emit()
+        } else if (c == "~") {
+          if (!tilde_seen) {
+            if (tok != "" || tilde_blocked) literal_tilde = 1
+            else tilde_pending = 1
+            tilde_seen = 1
+          }
+          tok = tok c; have = 1
         } else {
+          if (tilde_pending) {
+            if (c != "/") literal_tilde = 1
+            tilde_pending = 0
+          }
           tok = tok c; have = 1
         }
       }
@@ -314,13 +365,14 @@ guard_shell_tokens() {
 # command/sudo wrapper と nested env を扱い、動的 payload の policy 判定自体は
 # guard_command_context_is_ambiguous が fail closed にする。
 guard_shell_tokens_expanding_env_split() {
-  local segment="$1" token="" base="" payload=""
+  local segment="$1" mode="${2:-plain}" token="" base="" payload="" tilde_literal=0
   local i=0 count=0 option_index=-1 suffix_index=-1 k=0
-  local -a tokens=() expanded=()
+  local -a tokens=() tilde_literals=() expanded=() expanded_tilde_literals=()
 
-  while IFS= read -r token; do
+  while IFS=$'\034' read -r tilde_literal token; do
     tokens[${#tokens[@]}]="$token"
-  done < <(guard_shell_tokens "$segment")
+    tilde_literals[${#tilde_literals[@]}]="$tilde_literal"
+  done < <(guard_shell_tokens "$segment" tilde-meta)
 
   while :; do
     count=${#tokens[@]}
@@ -395,25 +447,37 @@ guard_shell_tokens_expanding_env_split() {
 
     [ "$option_index" -ge 0 ] || break
     expanded=()
+    expanded_tilde_literals=()
     k=0
     while [ "$k" -lt "$option_index" ]; do
       expanded[${#expanded[@]}]="${tokens[$k]}"
+      expanded_tilde_literals[${#expanded_tilde_literals[@]}]="${tilde_literals[$k]}"
       k=$((k + 1))
     done
     while IFS= read -r token; do
       expanded[${#expanded[@]}]="$token"
+      case "$token" in
+        *~*) expanded_tilde_literals[${#expanded_tilde_literals[@]}]=1 ;;
+        *) expanded_tilde_literals[${#expanded_tilde_literals[@]}]=0 ;;
+      esac
     done < <(guard_shell_tokens "$payload")
     k="$suffix_index"
     while [ "$k" -lt "$count" ]; do
       expanded[${#expanded[@]}]="${tokens[$k]}"
+      expanded_tilde_literals[${#expanded_tilde_literals[@]}]="${tilde_literals[$k]}"
       k=$((k + 1))
     done
     tokens=("${expanded[@]}")
+    tilde_literals=("${expanded_tilde_literals[@]}")
   done
 
   if [ "${#tokens[@]}" -gt 0 ]; then
-    for token in "${tokens[@]}"; do
-      printf '%s\n' "$token"
+    for i in "${!tokens[@]}"; do
+      if [ "$mode" = "tilde-meta" ]; then
+        printf '%s\034%s\n' "${tilde_literals[$i]}" "${tokens[$i]}"
+      else
+        printf '%s\n' "${tokens[$i]}"
+      fi
     done
   fi
 }
@@ -888,10 +952,10 @@ guard_command_context_is_ambiguous() {
 # - --repo / -R は local config に確実に対応付けられないため fail closed
 guard_reload_git_workflow_for_command() {
   local command="$1" hook_cwd="${2:-}" base_dir="" active_dir=""
-  local stripped="" segments="" segment="" path="" target_dir="" workflow="" token=""
+  local stripped="" segments="" segment="" path="" target_dir="" workflow="" token="" tilde_literal=0
   local seen_target=0 all_trunk_direct=1 i=0 token_count=0 command_index=0 command_base="" cd_index=-1
   local conditional_context=0 conditional_depth=0
-  local -a command_tokens=()
+  local -a command_tokens=() command_tilde_literal=()
 
   if [ "${_GUARD_GIT_WORKFLOW_ENV_IS_SET:-0}" = "1" ]; then
     GIT_WORKFLOW="$_GUARD_GIT_WORKFLOW_ENV_VALUE"
@@ -927,9 +991,11 @@ guard_reload_git_workflow_for_command() {
     fi
 
     command_tokens=()
-    while IFS= read -r token; do
+    command_tilde_literal=()
+    while IFS=$'\034' read -r tilde_literal token; do
+      command_tilde_literal[${#command_tilde_literal[@]}]="$tilde_literal"
       command_tokens[${#command_tokens[@]}]="$token"
-    done < <(guard_shell_tokens "$segment")
+    done < <(guard_shell_tokens "$segment" tilde-meta)
     token_count=${#command_tokens[@]}
     if [ "$token_count" -eq 0 ]; then
       continue
@@ -1066,7 +1132,7 @@ guard_reload_git_workflow_for_command() {
           esac
         done
         path="${command_tokens[$i]:-}"
-        active_dir=$(_guard_resolve_directory "$active_dir" "$path" 2>/dev/null || echo "")
+        active_dir=$(_guard_resolve_directory "$active_dir" "$path" "${command_tilde_literal[$i]:-0}" 2>/dev/null || echo "")
         if [ -z "$active_dir" ]; then
           all_trunk_direct=0
         fi
@@ -1081,14 +1147,15 @@ guard_reload_git_workflow_for_command() {
           case "$GUARD_GIT_GLOBAL_KIND" in
             cwd-value)
               if [ $((i + 1)) -lt "$token_count" ]; then
-                target_dir=$(_guard_resolve_directory "$target_dir" "${command_tokens[$((i + 1))]}" 2>/dev/null || echo "")
+                path="${command_tokens[$((i + 1))]}"
+                target_dir=$(_guard_resolve_directory "$target_dir" "$path" "${command_tilde_literal[$((i + 1))]:-0}" 2>/dev/null || echo "")
               else
                 target_dir=""
               fi
               i=$((i + 2))
               ;;
             cwd-attached)
-              target_dir=$(_guard_resolve_directory "$target_dir" "$GUARD_GIT_GLOBAL_VALUE" 2>/dev/null || echo "")
+              target_dir=$(_guard_resolve_directory "$target_dir" "$GUARD_GIT_GLOBAL_VALUE" "${command_tilde_literal[$i]:-0}" 2>/dev/null || echo "")
               i=$((i + 1))
               ;;
             value)
