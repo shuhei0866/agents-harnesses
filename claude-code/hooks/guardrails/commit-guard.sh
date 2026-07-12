@@ -396,7 +396,7 @@ _commit_guard_find_git_index() {
 }
 
 _commit_guard_check_universal_critical() {
-  local stripped="" segments="" segment="" token="" count=0 i=0 subcommand="" git_index=""
+  local stripped="" segments="" outer="" segment="" token="" count=0 i=0 subcommand="" git_index=""
   local base_dir="" active_dir="" git_dir="" path=""
   local ambiguous_context=0 context_unknown=0 k=0 detail="" action="" cd_index=-1
 
@@ -415,6 +415,14 @@ _commit_guard_check_universal_critical() {
 
   stripped=$(guard_strip_heredoc_bodies "$COMMAND")
   segments=$(guard_split_segments "$stripped")
+  case "$stripped" in
+    *'$('*|*'`'*)
+      # split 済みの置換本体に加え、置換を 1 引数へ畳んだ外側も検査する。
+      # これにより置換後方の --no-verify / --force を同じ git command として扱える。
+      outer=$(guard_mask_command_substitutions "$stripped")
+      segments="${segments}"$'\n'"$(guard_split_segments "$outer")"
+      ;;
+  esac
 
   while IFS= read -r segment; do
     _COMMIT_GUARD_TOKENS=()

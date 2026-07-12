@@ -444,6 +444,18 @@ assert_deny "double-quote 内の literal parentheses 後も --no-verify をcriti
 run_bash_guard "$COMMIT_GUARD" 'git commit -m "fix (parser)"' trunk-direct warn
 assert_silent_allow "double-quote 内の literal parentheses は message data として保持する"
 
+run_bash_guard "$COMMIT_GUARD" 'git push "$(echo origin)" main --force' trunk-direct warn
+assert_deny "quoted command substitution 後の main force push をcritical denyする"
+
+run_bash_guard "$COMMIT_GUARD" 'git commit -m "$(echo message)" --no-verify' trunk-direct warn
+assert_deny "quoted command substitution 後の --no-verify をcritical denyする"
+
+run_bash_guard "$COMMIT_GUARD" 'git commit -m "$(echo message)" "--no-verify"' trunk-direct warn
+assert_deny "quoted command substitution 後の quoted --no-verify もcritical denyする"
+
+run_bash_guard "$COMMIT_GUARD" 'echo "$(git commit --no-verify -m nested)"' trunk-direct warn
+assert_deny "command substitution body 内のcritical git commandも検査する"
+
 run_bash_guard "$COMMIT_GUARD" 'git --no-optional-locks push origin main --force' trunk-direct warn
 assert_deny "no-value global option 後の push でも critical check を維持する"
 

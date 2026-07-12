@@ -1024,6 +1024,86 @@ guard_split_segments() {
   '
 }
 
+# コマンド置換の本体だけを placeholder に置き換え、置換の外側にある引数列を
+# 保持する。guard_split_segments は置換本体の検査に使い、この出力は
+# `git ... "$(...)" --no-verify` のような外側の critical option 検査に使う。
+guard_mask_command_substitutions() {
+  local text="$1"
+  text="${text//\\$'\n'/ }"
+  printf '%s\n' "$text" | awk '
+    BEGIN { SQ = sprintf("%c", 39); out = ""; outer_q = ""; mode = ""; depth = 0; sub_q = ""; sub_bt = 0 }
+    function escaped(s, pos,    j, count) {
+      count = 0
+      for (j = pos - 1; j >= 1 && substr(s, j, 1) == "\\"; j--) count++
+      return (count % 2) == 1
+    }
+    {
+      if (NR > 1 && mode == "") out = out " "
+      line = $0
+      n = length(line)
+      for (i = 1; i <= n; i++) {
+        c = substr(line, i, 1)
+        nextc = (i < n) ? substr(line, i + 1, 1) : ""
+
+        if (mode == "bt") {
+          if (c == "`" && !escaped(line, i)) mode = ""
+          continue
+        }
+
+        if (mode == "dollar") {
+          if (sub_bt) {
+            if (c == "`" && !escaped(line, i)) sub_bt = 0
+            continue
+          }
+          if (sub_q != "") {
+            if (c == sub_q && !(sub_q == "\"" && escaped(line, i))) sub_q = ""
+            continue
+          }
+          if (c == SQ) {
+            sub_q = SQ
+          } else if (c == "\"") {
+            sub_q = "\""
+          } else if (c == "`" && !escaped(line, i)) {
+            sub_bt = 1
+          } else if (c == "(" && !escaped(line, i)) {
+            depth++
+          } else if (c == ")" && !escaped(line, i)) {
+            depth--
+            if (depth == 0) mode = ""
+          }
+          continue
+        }
+
+        if (outer_q == SQ) {
+          out = out c
+          if (c == SQ) outer_q = ""
+          continue
+        }
+
+        if (c == "$" && nextc == "(" && !escaped(line, i)) {
+          out = out "_SUBST_"
+          mode = "dollar"
+          depth = 1
+          sub_q = ""
+          sub_bt = 0
+          i++
+        } else if (c == "`" && !escaped(line, i)) {
+          out = out "_SUBST_"
+          mode = "bt"
+        } else {
+          out = out c
+          if (c == SQ && outer_q == "") outer_q = SQ
+          else if (c == "\"" && !escaped(line, i)) {
+            if (outer_q == "\"") outer_q = ""
+            else if (outer_q == "") outer_q = "\""
+          }
+        }
+      }
+    }
+    END { print out }
+  '
+}
+
 # --- レスポンス出力 ---
 # guard_respond severity tag message
 #   severity: "critical" | "advisory"
