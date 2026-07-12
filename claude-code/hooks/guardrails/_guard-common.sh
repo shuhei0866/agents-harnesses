@@ -959,6 +959,9 @@ guard_reload_git_workflow_for_command() {
         fi
         command_base="${token##*/}"
         case "$command_base" in
+          if|then|elif|else|while|until|for|select|do|time|'!'|'{')
+            command_index=$((command_index + 1))
+            ;;
           command)
             command_index=$((command_index + 1))
             while [ "$command_index" -lt "$token_count" ]; do

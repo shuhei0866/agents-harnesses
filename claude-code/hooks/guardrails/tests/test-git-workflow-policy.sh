@@ -225,6 +225,9 @@ assert_silent_allow "env assignment wrapper 後の git は config の trunk-dire
 run_bash_guard "$COMMIT_GUARD" 'env -u HOME GIT_AUTHOR_NAME=bot git commit -m test'
 assert_silent_allow "env option と assignment wrapper 後の git も trunk-direct を使う"
 
+run_bash_guard "$COMMIT_GUARD" 'if true; then git commit -m controlled; fi'
+assert_silent_allow "config-based trunk-direct は control flow 内の direct commit も許可する"
+
 set_config 'GIT_WORKFLOW="worktree-pr"'
 run_bash_guard "$COMMIT_GUARD" 'git commit -m test' trunk-direct
 assert_silent_allow "環境変数 trunk-direct が config worktree-pr より優先される"
