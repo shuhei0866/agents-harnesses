@@ -57,7 +57,7 @@ run_guard() {
   local mode="$1" cmd="$2"
   local errf="$TMPDIR_TEST/stderr"
   OUT=$( (cd "$TMPDIR_TEST" && jq -n --arg c "$cmd" --arg cwd "$TMPDIR_TEST/repo" '{tool_input:{command:$c}, cwd:$cwd}' \
-    | env -u CLAUDE_PROJECT_DIR -u GUARD_SKIP -u GUARD_LEVEL -u GUARD_FORCE_DENY \
+    | env -u CLAUDE_PROJECT_DIR -u GUARD_SKIP -u GUARD_LEVEL -u GUARD_FORCE_DENY -u GIT_WORKFLOW \
         PATH="$TMPDIR_TEST/bin:$PATH" MOCK_GH_MODE="$mode" bash "$GUARD" 2>"$errf") )
   STATUS=$?
   ERR=$(cat "$errf" 2>/dev/null || echo "")
@@ -68,7 +68,7 @@ run_guard_nocwd() {
   local mode="$1" cmd="$2"
   local errf="$TMPDIR_TEST/stderr"
   OUT=$( (cd "$TMPDIR_TEST" && jq -n --arg c "$cmd" '{tool_input:{command:$c}}' \
-    | env -u CLAUDE_PROJECT_DIR -u GUARD_SKIP -u GUARD_LEVEL -u GUARD_FORCE_DENY \
+    | env -u CLAUDE_PROJECT_DIR -u GUARD_SKIP -u GUARD_LEVEL -u GUARD_FORCE_DENY -u GIT_WORKFLOW \
         PATH="$TMPDIR_TEST/bin:$PATH" MOCK_GH_MODE="$mode" bash "$GUARD" 2>"$errf") )
   STATUS=$?
   ERR=$(cat "$errf" 2>/dev/null || echo "")
@@ -78,7 +78,7 @@ run_guard_matchany() {
   local mode="$1" cmd="$2"
   local errf="$TMPDIR_TEST/stderr"
   OUT=$( (cd "$TMPDIR_TEST" && jq -n --arg c "$cmd" --arg cwd "$TMPDIR_TEST/repo" '{tool_input:{command:$c}, cwd:$cwd}' \
-    | env -u CLAUDE_PROJECT_DIR -u GUARD_SKIP -u GUARD_LEVEL -u GUARD_FORCE_DENY \
+    | env -u CLAUDE_PROJECT_DIR -u GUARD_SKIP -u GUARD_LEVEL -u GUARD_FORCE_DENY -u GIT_WORKFLOW \
         PATH="$TMPDIR_TEST/bin:$PATH" MOCK_GH_MODE="$mode" MOCK_MATCH_ANY=1 bash "$GUARD" 2>"$errf") )
   STATUS=$?
   ERR=$(cat "$errf" 2>/dev/null || echo "")
@@ -88,7 +88,7 @@ run_guard_with_skip() {
   local mode="$1" cmd="$2"
   local errf="$TMPDIR_TEST/stderr"
   OUT=$( (cd "$TMPDIR_TEST" && jq -n --arg c "$cmd" --arg cwd "$TMPDIR_TEST/repo" '{tool_input:{command:$c}, cwd:$cwd}' \
-    | env -u CLAUDE_PROJECT_DIR -u GUARD_LEVEL -u GUARD_FORCE_DENY GUARD_SKIP=merged-pr-push-guard \
+    | env -u CLAUDE_PROJECT_DIR -u GUARD_LEVEL -u GUARD_FORCE_DENY -u GIT_WORKFLOW GUARD_SKIP=merged-pr-push-guard \
         PATH="$TMPDIR_TEST/bin:$PATH" MOCK_GH_MODE="$mode" bash "$GUARD" 2>"$errf") )
   STATUS=$?
   ERR=$(cat "$errf" 2>/dev/null || echo "")

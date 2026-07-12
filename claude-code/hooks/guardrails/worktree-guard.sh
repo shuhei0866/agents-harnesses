@@ -55,6 +55,12 @@ export CLAUDE_PROJECT_DIR="$PROJECT_ROOT"
 GUARD_COMMON="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_guard-common.sh"
 source "$GUARD_COMMON"
 
+# trunk-direct はメインワークツリーでの Edit/Write を明示的に許可する。
+# ただし GUARD_FORCE_DENY=worktree-guard は policy より優先して通常の deny 判定へ進む。
+if guard_is_trunk_direct && ! _is_force_deny; then
+  exit 0
+fi
+
 # 現在のディレクトリがワークツリーかどうかを判定
 # git worktree 内では git rev-parse --git-dir が .git/worktrees/<name> を返す
 # メインワークツリーでは git の common dir と toplevel が一致する

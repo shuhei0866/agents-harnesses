@@ -89,6 +89,20 @@ agents-harnesses/
 
 Hooks は `settings.json` で設定する。シンボリックリンクではなく、`.claude/settings.json`（または `~/.claude/settings.json`）に hook 定義を追加する。
 
+#### Git workflow policy
+
+リポジトリごとの `.claude/harness.config` に `GIT_WORKFLOW` を設定すると、ガードの Git 運用ルールを切り替えられる。環境変数 `GIT_WORKFLOW` が設定されている場合は config より優先する。
+
+| 値 | 挙動 |
+|----|------|
+| `worktree-pr` | メインワークツリーでの編集・保護ブランチへの直接 commit・branch 切り替え・main 向け merge/approve を従来どおり制限 |
+| `trunk-direct` | メインワークツリーでの Edit/Write、直接 commit、checkout/switch、stash pop/apply、main への `git merge`、main 向け `gh pr review --approve` / `gh pr merge` を許可 |
+| 未設定・不正値 | `worktree-pr` と同じ安全側の挙動（不正な環境変数値から config へは fallback しない） |
+
+`commit-guard` / `gh-guard` は hook の起動元ではなく、`git -C`、`cd ... &&`、hook input の `cwd` から操作対象 repo の config を選ぶ。複数 repo の policy が混在する command や、local repo へ確実に対応付けられない `gh --repo` / `-R` は安全側に倒す。必要な場合は対象を明示して実行するセッションの環境変数で上書きする。
+
+`trunk-direct` でも、`--no-verify`、main/master への force push、develop 削除、GitHub API 経由の merge/approve、merge 済み PR branch への push、`.worktrees/` の再帰削除、critical path の破壊操作は常にブロックする。
+
 #### PreToolUse（ツール実行前のガード）
 
 | Hook | ディレクトリ | 説明 |
