@@ -143,7 +143,7 @@ _gh_guard_collect_pr_invocations() {
     tokens=()
     while IFS= read -r token; do
       tokens[${#tokens[@]}]="$token"
-    done < <(guard_shell_tokens "$segment")
+    done < <(guard_shell_tokens_expanding_env_split "$segment")
     count=${#tokens[@]}
     [ "$count" -gt 0 ] || continue
 
@@ -236,7 +236,7 @@ extract_pr_target() {
 
   while IFS= read -r token; do
     tokens[${#tokens[@]}]="$token"
-  done < <(guard_shell_tokens "$cmd")
+  done < <(guard_shell_tokens_expanding_env_split "$cmd")
   count=${#tokens[@]}
 
   while [ "$i" -lt "$count" ]; do
@@ -358,7 +358,7 @@ _gh_guard_review_is_approve() {
   local -a tokens=()
   while IFS= read -r token; do
     tokens[${#tokens[@]}]="$token"
-  done < <(guard_shell_tokens "$segment")
+  done < <(guard_shell_tokens_expanding_env_split "$segment")
   count=${#tokens[@]}
   while [ "$i" -lt "$count" ]; do
     token="${tokens[$i]}"

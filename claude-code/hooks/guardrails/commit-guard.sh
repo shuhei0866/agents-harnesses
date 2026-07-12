@@ -149,7 +149,7 @@ _commit_guard_ref_name() {
 
 _commit_guard_check_push_args() {
   local i="$1" git_dir="$2" count="${#_COMMIT_GUARD_TOKENS[@]}" token="" cluster="" ch=""
-  local j=0 cluster_len=0 force=0 delete=0 all_branches=0 repo_via_option=0 option_mode=1
+  local j=0 cluster_len=0 force=0 delete=0 mirror=0 all_branches=0 repo_via_option=0 option_mode=1
   local -a positional=()
   local ref_start=1 ref="" ref_without_plus="" destination="" normalized="" plus=0 current_branch=""
 
@@ -177,6 +177,11 @@ _commit_guard_check_push_args() {
           ;;
         --all|--branches)
           all_branches=1
+          i=$((i + 1))
+          continue
+          ;;
+        --mirror)
+          mirror=1
           i=$((i + 1))
           continue
           ;;
@@ -228,6 +233,10 @@ _commit_guard_check_push_args() {
 
   if [ "$repo_via_option" -eq 1 ]; then
     ref_start=0
+  fi
+
+  if [ "$mirror" -eq 1 ]; then
+    guard_respond "critical" "コミット衛生ガード" "--mirror は protected refs の force 更新・削除を含むためブロックされています。"
   fi
 
   if [ "$force" -eq 1 ] && [ "$all_branches" -eq 1 ]; then

@@ -523,7 +523,7 @@ guard_extract_gh_pr_segment() {
     tokens=()
     while IFS= read -r token; do
       tokens[${#tokens[@]}]="$token"
-    done < <(guard_shell_tokens "$segment")
+    done < <(guard_shell_tokens_expanding_env_split "$segment")
     count=${#tokens[@]}
     gh_index=-1
     i=0
@@ -604,7 +604,7 @@ guard_extract_gh_repo_selector() {
     tokens=()
     while IFS= read -r token; do
       tokens[${#tokens[@]}]="$token"
-    done < <(guard_shell_tokens "$segment")
+    done < <(guard_shell_tokens_expanding_env_split "$segment")
     count=${#tokens[@]}
     gh_index=-1
     i=0

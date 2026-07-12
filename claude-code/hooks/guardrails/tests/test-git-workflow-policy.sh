@@ -607,6 +607,9 @@ assert_deny "feature branch 上でも --force --all は main を含むため cri
 
 run_bash_guard "$COMMIT_GUARD" 'git push --branches --force origin' trunk-direct warn
 assert_deny "--branches alias の force push も critical deny する"
+
+run_bash_guard "$COMMIT_GUARD" 'git push --mirror origin' trunk-direct warn
+assert_deny "--mirror による protected refs の force 更新・削除を critical deny する"
 git -C "$REPO" switch -q main
 
 run_bash_guard "$COMMIT_GUARD" 'git push origin main --no-verify' trunk-direct warn
@@ -699,8 +702,14 @@ assert_deny "env --split-string= payload 内の curl API direct approve も deny
 run_bash_guard "$GH_GUARD" 'gh pr merge 42' worktree-pr
 assert_deny "worktree-pr は main 向け gh pr merge 防御を維持する"
 
+run_bash_guard "$GH_GUARD" "env -S 'gh pr merge 42'" worktree-pr
+assert_deny "env -S payload 内の gh pr merge も worktree-pr で deny する"
+
 run_bash_guard "$GH_GUARD" 'gh pr review 42 --approve' worktree-pr
 assert_deny "worktree-pr は main 向け gh pr approve 防御を維持する"
+
+run_bash_guard "$GH_GUARD" "env -S 'gh pr review 42 --approve'" worktree-pr
+assert_deny "env -S payload 内の gh pr approve も worktree-pr で deny する"
 
 run_bash_guard "$GH_GUARD" 'gh pr merge 42' invalid-policy
 assert_deny "不正値は main 向け gh pr merge 防御を緩和しない"
