@@ -275,6 +275,12 @@ assert_deny "git -C の quoted absolute target は target repo の worktree-pr �
 run_bash_guard "$COMMIT_GUARD" "git -c user.name=test -C \"$REPO_B\" commit -m test"
 assert_deny "別の git global option 後の -C も target repo の worktree-pr を使う"
 
+run_bash_guard "$COMMIT_GUARD" "GIT_DIR=\"$REPO_B/.git\" GIT_WORK_TREE=\"$REPO_B\" git commit -m test"
+assert_deny "GIT_DIR/GIT_WORK_TREE assignment で target が変わる commit は fail closed"
+
+run_bash_guard "$COMMIT_GUARD" "env GIT_DIR=\"$REPO_B/.git\" GIT_WORK_TREE=\"$REPO_B\" git commit -m test"
+assert_deny "env 内の GIT_DIR/GIT_WORK_TREE assignment も fail closed"
+
 run_bash_guard "$COMMIT_GUARD" "git -P -C \"$REPO_B\" commit -m test"
 assert_deny "pager global option 後の -C でも direct commit advisory を維持する"
 
@@ -477,6 +483,15 @@ assert_deny "quoted command substitution 後の quoted --no-verify もcritical d
 
 run_bash_guard "$COMMIT_GUARD" 'echo "$(git commit --no-verify -m nested)"' trunk-direct warn
 assert_deny "command substitution body 内のcritical git commandも検査する"
+
+run_bash_guard "$COMMIT_GUARD" "env -S 'git commit --no-verify -m split'" trunk-direct warn
+assert_deny "env -S payload 内の --no-verify をcritical denyする"
+
+run_bash_guard "$COMMIT_GUARD" 'env "--split-string=git commit --no-verify -m split"' trunk-direct warn
+assert_deny "env --split-string= payload 内の --no-verify もcritical denyする"
+
+run_bash_guard "$COMMIT_GUARD" "env -S 'git commit -m split'" worktree-pr deny
+assert_deny "env -S payload 内の direct commit を workflow advisory でdenyする"
 
 run_bash_guard "$COMMIT_GUARD" 'git --no-optional-locks push origin main --force' trunk-direct warn
 assert_deny "no-value global option 後の push でも critical check を維持する"

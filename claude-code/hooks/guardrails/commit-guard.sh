@@ -332,6 +332,93 @@ _commit_guard_check_branch_args() {
 }
 
 # standard command prefix を読み飛ばし、実行される git token の index を返す。
+_commit_guard_expand_env_split_once() {
+  local i=0 count="${#_COMMIT_GUARD_TOKENS[@]}" token="" base="" payload=""
+  local option_index=-1 suffix_index=-1 k=0
+  local -a expanded=()
+
+  # command position にある env wrapper だけを対象にする。
+  while [ "$i" -lt "$count" ]; do
+    token="${_COMMIT_GUARD_TOKENS[$i]}"
+    if [[ "$token" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+      i=$((i + 1))
+      continue
+    fi
+    base="${token##*/}"
+    case "$base" in
+      command)
+        i=$((i + 1))
+        while [ "$i" -lt "$count" ]; do
+          token="${_COMMIT_GUARD_TOKENS[$i]}"
+          case "$token" in
+            --) i=$((i + 1)); break ;;
+            -p) i=$((i + 1)) ;;
+            -*) return 1 ;;
+            *) break ;;
+          esac
+        done
+        ;;
+      sudo)
+        i=$((i + 1))
+        while [ "$i" -lt "$count" ]; do
+          token="${_COMMIT_GUARD_TOKENS[$i]}"
+          case "$token" in
+            --) i=$((i + 1)); break ;;
+            -u|-g|-h|-p|-C|-D|-T|-r|-t|-U|--user|--group|--host|--prompt|--chdir|--command-timeout|--role|--type|--other-user) i=$((i + 2)) ;;
+            --*=*|-*) i=$((i + 1)) ;;
+            *=*) i=$((i + 1)) ;;
+            *) break ;;
+          esac
+        done
+        ;;
+      env)
+        i=$((i + 1))
+        while [ "$i" -lt "$count" ]; do
+          token="${_COMMIT_GUARD_TOKENS[$i]}"
+          case "$token" in
+            -S|--split-string)
+              [ $((i + 1)) -lt "$count" ] || return 1
+              option_index="$i"
+              payload="${_COMMIT_GUARD_TOKENS[$((i + 1))]}"
+              suffix_index=$((i + 2))
+              break
+              ;;
+            --split-string=*)
+              option_index="$i"
+              payload="${token#*=}"
+              suffix_index=$((i + 1))
+              break
+              ;;
+            -u|--unset|-C|--chdir) i=$((i + 2)) ;;
+            --) i=$((i + 1)); break ;;
+            --unset=*|--chdir=*|*=*|-*) i=$((i + 1)) ;;
+            *) break ;;
+          esac
+        done
+        break
+        ;;
+      *) return 1 ;;
+    esac
+  done
+
+  [ "$option_index" -ge 0 ] || return 1
+  k=0
+  while [ "$k" -lt "$option_index" ]; do
+    expanded[${#expanded[@]}]="${_COMMIT_GUARD_TOKENS[$k]}"
+    k=$((k + 1))
+  done
+  while IFS= read -r token; do
+    expanded[${#expanded[@]}]="$token"
+  done < <(guard_shell_tokens "$payload")
+  k="$suffix_index"
+  while [ "$k" -lt "$count" ]; do
+    expanded[${#expanded[@]}]="${_COMMIT_GUARD_TOKENS[$k]}"
+    k=$((k + 1))
+  done
+  _COMMIT_GUARD_TOKENS=("${expanded[@]}")
+  return 0
+}
+
 _commit_guard_find_git_index() {
   local i=0 count="${#_COMMIT_GUARD_TOKENS[@]}" token="" base=""
 
@@ -429,6 +516,10 @@ _commit_guard_check_universal_critical() {
     while IFS= read -r token; do
       _COMMIT_GUARD_TOKENS[${#_COMMIT_GUARD_TOKENS[@]}]="$token"
     done < <(guard_shell_tokens "$segment")
+
+    # env -S/--split-string payload は実行時に argv へ展開されるため、通常の
+    # git token 検査へ合流させる。nested env も有限回の置換で処理する。
+    while _commit_guard_expand_env_split_once; do :; done
 
     count=${#_COMMIT_GUARD_TOKENS[@]}
     if [ "$count" -eq 0 ]; then

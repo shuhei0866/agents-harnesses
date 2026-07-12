@@ -699,6 +699,9 @@ guard_command_context_is_ambiguous() {
     while [ "$i" -lt "$count" ]; do
       token="${tokens[$i]}"
       if [[ "$token" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+        case "$token" in
+          GIT_DIR=*|GIT_WORK_TREE=*) return 0 ;;
+        esac
         i=$((i + 1))
         continue
       fi
@@ -731,10 +734,12 @@ guard_command_context_is_ambiguous() {
             token="${tokens[$i]}"
             case "$token" in
               -C|--chdir|-C?*|--chdir=*) return 0 ;;
-              -u|--unset|-S|--split-string) i=$((i + 2)); continue ;;
-              --unset=*|--split-string=*) i=$((i + 1)); continue ;;
+              -S|--split-string|--split-string=*) return 0 ;;
+              -u|--unset) i=$((i + 2)); continue ;;
+              --unset=*) i=$((i + 1)); continue ;;
               --help|--version) i="$count"; break ;;
               --) i=$((i + 1)); break ;;
+              GIT_DIR=*|GIT_WORK_TREE=*) return 0 ;;
               *=*) i=$((i + 1)); continue ;;
               -*) return 0 ;;
               *) break ;;
@@ -833,6 +838,14 @@ guard_reload_git_workflow_for_command() {
       while [ "$command_index" -lt "$token_count" ]; do
         token="${command_tokens[$command_index]}"
         if [[ "$token" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+          case "$token" in
+            GIT_DIR=*|GIT_WORK_TREE=*)
+              seen_target=1
+              all_trunk_direct=0
+              command_index="$token_count"
+              break
+              ;;
+          esac
           command_index=$((command_index + 1))
           continue
         fi
@@ -859,6 +872,12 @@ guard_reload_git_workflow_for_command() {
                 -u|--unset|-S|--split-string) command_index=$((command_index + 2)) ;;
                 --unset=*|--split-string=*) command_index=$((command_index + 1)) ;;
                 --help|--version|-*) command_index="$token_count"; break ;;
+                GIT_DIR=*|GIT_WORK_TREE=*)
+                  seen_target=1
+                  all_trunk_direct=0
+                  command_index="$token_count"
+                  break
+                  ;;
                 *=*) command_index=$((command_index + 1)) ;;
                 *) break ;;
               esac
