@@ -227,6 +227,16 @@ assert_deny "不正な環境変数値は config にfallbackせず緩和しない
 run_bash_guard "$COMMIT_GUARD" 'git commit -m test' ''
 assert_deny "空の環境変数値も config にfallbackせず緩和しない"
 
+set_config 'GIT_WORKFLOW="worktree-pr"'
+run_bash_guard "$COMMIT_GUARD" 'git checkout main'
+assert_silent_allow "worktree-pr でも protected branch への通常switchは許可する"
+
+run_bash_guard "$COMMIT_GUARD" 'git checkout main -- README.md'
+assert_silent_allow "protected revision からの pathspec restore は許可する"
+
+run_bash_guard "$COMMIT_GUARD" 'git checkout main README.md'
+assert_deny "-- のない ambiguous checkout は従来どおりdenyする"
+
 set_config ''
 run_bash_guard "$COMMIT_GUARD" 'git commit -m test'
 assert_deny "未設定は既存の main direct commit 防御を維持する"
@@ -427,6 +437,12 @@ assert_deny "git global option 後の commit でも --no-verify を critical den
 
 run_bash_guard "$COMMIT_GUARD" 'git --no-lazy-fetch commit -m test --no-verify' trunk-direct warn
 assert_deny "no-value global option 後の commit でも critical check を維持する"
+
+run_bash_guard "$COMMIT_GUARD" 'git commit -m "fix (parser)" --no-verify' trunk-direct warn
+assert_deny "double-quote 内の literal parentheses 後も --no-verify をcritical denyする"
+
+run_bash_guard "$COMMIT_GUARD" 'git commit -m "fix (parser)"' trunk-direct warn
+assert_silent_allow "double-quote 内の literal parentheses は message data として保持する"
 
 run_bash_guard "$COMMIT_GUARD" 'git --no-optional-locks push origin main --force' trunk-direct warn
 assert_deny "no-value global option 後の push でも critical check を維持する"

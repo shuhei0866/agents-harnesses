@@ -956,7 +956,8 @@ guard_strip_heredoc_bodies() {
 # --- 引用符を意識したセグメント分割 ---
 # コマンドを「コマンド先頭位置の判定ができる単位」に分割する。引用符の外にある
 # ; & | ( ) ` を改行に置き換え、引用符の中では実行され得ない区切り（; & |）を
-# 空白に潰す。二重引用符内の ( ) ` はコマンド置換として実行され得るため分割する。
+# 空白に潰す。二重引用符内は `$(` と対応する `)`、backtick だけを
+# コマンド置換として分割し、literal な括弧は引数データとして保持する。
 # backslash + 改行の行継続は先に結合する。
 #
 # mode:
@@ -970,7 +971,7 @@ guard_split_segments() {
   local text="$1" mode="${2:-full}"
   text="${text//\\$'\n'/ }"
   printf '%s\n' "$text" | awk -v mode="$mode" '
-    BEGIN { SQ = sprintf("%c", 39); q = ""; out = ""; prev = "" }
+    BEGIN { SQ = sprintf("%c", 39); q = ""; out = ""; prev = ""; cmdsub = 0 }
     function flush() {
       print out
       out = ""
@@ -990,8 +991,14 @@ guard_split_segments() {
           if (c == q && !(q == "\"" && prev == "\\")) {
             q = ""
             out = out c
-          } else if (q == "\"" && (c == "(" || c == ")" || c == "`")) {
-            flush()           # 二重引用符内でも $( ) や ` は実行される
+          } else if (q == "\"" && c == "(" && prev == "$") {
+            flush()
+            cmdsub++          # `$(` の開始だけを実行境界として扱う
+          } else if (q == "\"" && c == ")" && cmdsub > 0) {
+            flush()
+            cmdsub--
+          } else if (q == "\"" && c == "`" && prev != "\\") {
+            flush()           # backtick command substitution
           } else if (c == ";" || c == "&" || c == "|") {
             out = out " "    # 引用符内の区切り文字は実行されない
           } else {

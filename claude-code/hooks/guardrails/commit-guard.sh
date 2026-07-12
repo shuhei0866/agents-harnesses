@@ -51,7 +51,7 @@ _commit_guard_record_advisory() {
 }
 
 _commit_guard_is_protected_switch() {
-  local i="$1" count="${#_COMMIT_GUARD_TOKENS[@]}"
+  local operation="$1" i="$2" count="${#_COMMIT_GUARD_TOKENS[@]}"
   if [ "$i" -ge "$count" ]; then
     return 1
   fi
@@ -59,7 +59,13 @@ _commit_guard_is_protected_switch() {
     main|master|develop) ;;
     *) return 1 ;;
   esac
-  [ $((i + 1)) -eq "$count" ]
+  if [ $((i + 1)) -eq "$count" ]; then
+    return 0
+  fi
+  # `git checkout <revision> -- <pathspec>` はbranch switchではなく復元操作。
+  [ "$operation" = "checkout" ] \
+    && [ "${_COMMIT_GUARD_TOKENS[$((i + 1))]}" = "--" ] \
+    && [ $((i + 2)) -lt "$count" ]
 }
 
 _commit_guard_merge_is_hotfix() {
@@ -392,7 +398,7 @@ _commit_guard_find_git_index() {
 _commit_guard_check_universal_critical() {
   local stripped="" segments="" segment="" token="" count=0 i=0 subcommand="" git_index=""
   local base_dir="" active_dir="" git_dir="" path=""
-  local ambiguous_context=0 context_unknown=0 k=0 detail="" action="" unknown_global=0 cd_index=-1 first_base=""
+  local ambiguous_context=0 context_unknown=0 k=0 detail="" action="" cd_index=-1
 
   if [ -n "$HOOK_CWD" ]; then
     base_dir=$(_guard_resolve_directory "$(pwd -P)" "$HOOK_CWD" 2>/dev/null || echo "")
@@ -478,7 +484,6 @@ _commit_guard_check_universal_critical() {
 
     # common policy resolver と同じ global option 分類で target/subcommand を得る。
     subcommand=""
-    unknown_global=0
     while [ "$i" -lt "$count" ]; do
       token="${_COMMIT_GUARD_TOKENS[$i]}"
       guard_classify_git_global_token "$token"
@@ -513,7 +518,6 @@ _commit_guard_check_universal_critical() {
         unknown)
           # 将来の global option が危険 subcommand を隠しても fail-open しない。
           context_unknown=1
-          unknown_global=1
           i=$((i + 1))
           while [ "$i" -lt "$count" ]; do
             token="${_COMMIT_GUARD_TOKENS[$i]}"
@@ -545,7 +549,7 @@ _commit_guard_check_universal_critical() {
         ;;
       checkout|switch)
         detail=0
-        if _commit_guard_is_protected_switch "$i"; then
+        if _commit_guard_is_protected_switch "$subcommand" "$i"; then
           detail=1
         fi
         _commit_guard_record_advisory "$subcommand" "$git_dir" "$context_unknown" "$detail"
