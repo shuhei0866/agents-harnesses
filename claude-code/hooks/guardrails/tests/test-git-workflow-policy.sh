@@ -601,6 +601,14 @@ assert_deny "origin のみ指定した implicit main force push を critical den
 run_bash_guard "$COMMIT_GUARD" 'git push --force-with-lease' trunk-direct warn
 assert_deny "implicit main force-with-lease を critical deny する"
 
+git -C "$REPO" switch -q -c feature/force-all
+run_bash_guard "$COMMIT_GUARD" 'git push --force --all origin' trunk-direct warn
+assert_deny "feature branch 上でも --force --all は main を含むため critical deny する"
+
+run_bash_guard "$COMMIT_GUARD" 'git push --branches --force origin' trunk-direct warn
+assert_deny "--branches alias の force push も critical deny する"
+git -C "$REPO" switch -q main
+
 run_bash_guard "$COMMIT_GUARD" 'git push origin main --no-verify' trunk-direct warn
 assert_deny "push の --no-verify も critical deny する"
 
@@ -676,11 +684,17 @@ assert_deny "trunk-direct でも API direct merge を deny する"
 run_bash_guard "$GH_GUARD" '"/opt/homebrew/bin/gh" api repos/o/r/pulls/42/merge -X PUT' trunk-direct warn
 assert_deny "quoted gh executable の API direct merge も deny する"
 
+run_bash_guard "$GH_GUARD" "env -S 'gh api repos/o/r/pulls/42/merge -X PUT'" trunk-direct warn
+assert_deny "env -S payload 内の gh API direct merge も deny する"
+
 run_bash_guard "$GH_GUARD" 'gh api repos/o/r/pulls/42/reviews -f event=APPROVE' trunk-direct warn
 assert_deny "trunk-direct でも API direct approve を deny する"
 
 run_bash_guard "$GH_GUARD" '"curl" -X POST https://api.github.com/repos/o/r/pulls/42/reviews -d event=APPROVE' trunk-direct warn
 assert_deny "quoted curl executable の API direct approve も deny する"
+
+run_bash_guard "$GH_GUARD" 'env "--split-string=curl -X POST https://api.github.com/repos/o/r/pulls/42/reviews -d event=APPROVE"' trunk-direct warn
+assert_deny "env --split-string= payload 内の curl API direct approve も deny する"
 
 run_bash_guard "$GH_GUARD" 'gh pr merge 42' worktree-pr
 assert_deny "worktree-pr は main 向け gh pr merge 防御を維持する"

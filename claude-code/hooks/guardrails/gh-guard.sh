@@ -59,7 +59,7 @@ _gh_guard_api_client() {
     tokens=()
     while IFS= read -r token; do
       tokens[${#tokens[@]}]="$token"
-    done < <(guard_shell_tokens "$segment")
+    done < <(guard_shell_tokens_expanding_env_split "$segment")
     count=${#tokens[@]}
     i=0
     while [ "$i" -lt "$count" ]; do

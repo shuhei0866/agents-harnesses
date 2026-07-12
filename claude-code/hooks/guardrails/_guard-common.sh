@@ -310,6 +310,114 @@ guard_shell_tokens() {
   '
 }
 
+# env -S/--split-string の static payload を argv と同様に展開して token 化する。
+# command/sudo wrapper と nested env を扱い、動的 payload の policy 判定自体は
+# guard_command_context_is_ambiguous が fail closed にする。
+guard_shell_tokens_expanding_env_split() {
+  local segment="$1" token="" base="" payload=""
+  local i=0 count=0 option_index=-1 suffix_index=-1 k=0
+  local -a tokens=() expanded=()
+
+  while IFS= read -r token; do
+    tokens[${#tokens[@]}]="$token"
+  done < <(guard_shell_tokens "$segment")
+
+  while :; do
+    count=${#tokens[@]}
+    option_index=-1
+    suffix_index=-1
+    payload=""
+    i=0
+
+    while [ "$i" -lt "$count" ]; do
+      token="${tokens[$i]}"
+      if [[ "$token" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+        i=$((i + 1))
+        continue
+      fi
+      base="${token##*/}"
+      case "$base" in
+        command)
+          i=$((i + 1))
+          while [ "$i" -lt "$count" ]; do
+            token="${tokens[$i]}"
+            case "$token" in
+              --) i=$((i + 1)); break ;;
+              -p) i=$((i + 1)) ;;
+              -*) i="$count"; break ;;
+              *) break ;;
+            esac
+          done
+          ;;
+        sudo)
+          i=$((i + 1))
+          while [ "$i" -lt "$count" ]; do
+            token="${tokens[$i]}"
+            case "$token" in
+              --) i=$((i + 1)); break ;;
+              -u|-g|-h|-p|-C|-D|-T|-r|-t|-U|--user|--group|--host|--prompt|--chdir|--command-timeout|--role|--type|--other-user) i=$((i + 2)) ;;
+              --*=*|-*) i=$((i + 1)) ;;
+              *=*) i=$((i + 1)) ;;
+              *) break ;;
+            esac
+          done
+          ;;
+        env)
+          i=$((i + 1))
+          while [ "$i" -lt "$count" ]; do
+            token="${tokens[$i]}"
+            case "$token" in
+              -S|--split-string)
+                if [ $((i + 1)) -lt "$count" ]; then
+                  option_index="$i"
+                  payload="${tokens[$((i + 1))]}"
+                  suffix_index=$((i + 2))
+                fi
+                break
+                ;;
+              --split-string=*)
+                option_index="$i"
+                payload="${token#*=}"
+                suffix_index=$((i + 1))
+                break
+                ;;
+              -u|--unset|-C|--chdir) i=$((i + 2)) ;;
+              --) i=$((i + 1)); break ;;
+              --unset=*|--chdir=*|*=*|-*) i=$((i + 1)) ;;
+              *) break ;;
+            esac
+          done
+          break
+          ;;
+        *) break ;;
+      esac
+    done
+
+    [ "$option_index" -ge 0 ] || break
+    expanded=()
+    k=0
+    while [ "$k" -lt "$option_index" ]; do
+      expanded[${#expanded[@]}]="${tokens[$k]}"
+      k=$((k + 1))
+    done
+    while IFS= read -r token; do
+      expanded[${#expanded[@]}]="$token"
+    done < <(guard_shell_tokens "$payload")
+    k="$suffix_index"
+    while [ "$k" -lt "$count" ]; do
+      expanded[${#expanded[@]}]="${tokens[$k]}"
+      k=$((k + 1))
+    done
+    tokens=("${expanded[@]}")
+  done
+
+  if [ "${#tokens[@]}" -gt 0 ]; then
+    for token in "${tokens[@]}"; do
+      printf '%s\n' "$token"
+    done
+  fi
+}
+
 # shell segment が cwd を変更する cd invocation なら cd token の index を返す。
 # quoted/concatenated builtin 名と `builtin -- cd` / `command -p -- cd` を扱い、
 # `command -v/-V cd` の query mode は実行扱いにしない。
