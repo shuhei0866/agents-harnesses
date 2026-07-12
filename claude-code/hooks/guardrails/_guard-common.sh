@@ -576,6 +576,44 @@ guard_extract_gh_repo_selector() {
   return 1
 }
 
+# single quote 内の literal を除き、実行可能な `$()` / backtick があれば 0。
+guard_has_executable_command_substitution() {
+  local text="$1"
+  text="${text//\\$'\n'/ }"
+  printf '%s\n' "$text" | awk '
+    BEGIN { SQ = sprintf("%c", 39); q = ""; found = 0 }
+    function escaped(s, pos,    j, count) {
+      count = 0
+      for (j = pos - 1; j >= 1 && substr(s, j, 1) == "\\"; j--) count++
+      return (count % 2) == 1
+    }
+    {
+      line = $0
+      for (i = 1; i <= length(line); i++) {
+        c = substr(line, i, 1)
+        nextc = (i < length(line)) ? substr(line, i + 1, 1) : ""
+        if (q == SQ) {
+          if (c == SQ) q = ""
+          continue
+        }
+        if (c == SQ && q == "") {
+          q = SQ
+        } else if (c == "\"" && !escaped(line, i)) {
+          if (q == "\"") q = ""
+          else if (q == "") q = "\""
+        } else if (c == "$" && nextc == "(" && !escaped(line, i)) {
+          found = 1
+          exit
+        } else if (c == "`" && !escaped(line, i)) {
+          found = 1
+          exit
+        }
+      }
+    }
+    END { exit found ? 0 : 1 }
+  '
+}
+
 # cd の効果範囲を逐次 segment として安全に追えない shell 構造なら 0 を返す。
 guard_command_context_is_ambiguous() {
   local command="$1" stripped="" structure="" segments="" segment="" token="" base=""
@@ -583,9 +621,9 @@ guard_command_context_is_ambiguous() {
   local -a tokens=()
   stripped=$(guard_strip_heredoc_bodies "$command")
 
-  case "$stripped" in
-    *'$('*|*'`'*) return 0 ;;
-  esac
+  if guard_has_executable_command_substitution "$stripped"; then
+    return 0
+  fi
 
   structure=$(guard_sanitize_command "$stripped")
   case "$structure" in
@@ -688,7 +726,7 @@ guard_command_context_is_ambiguous() {
 guard_reload_git_workflow_for_command() {
   local command="$1" hook_cwd="${2:-}" base_dir="" active_dir=""
   local stripped="" segments="" segment="" path="" target_dir="" workflow="" token=""
-  local seen_target=0 all_trunk_direct=1 i=0 token_count=0 command_index=0 command_base="" first_base="" cd_index=-1
+  local seen_target=0 all_trunk_direct=1 i=0 token_count=0 command_index=0 command_base="" cd_index=-1
   local -a command_tokens=()
 
   if [ "${_GUARD_GIT_WORKFLOW_ENV_IS_SET:-0}" = "1" ]; then
@@ -734,15 +772,56 @@ guard_reload_git_workflow_for_command() {
     fi
 
     command_index=0
-    first_base="${command_tokens[0]##*/}"
-    command_base="$first_base"
+    command_base="${command_tokens[0]##*/}"
     cd_index=$(guard_cd_command_index "$segment" 2>/dev/null || echo -1)
     if [ "$cd_index" -ge 0 ]; then
       command_index="$cd_index"
       command_base="cd"
-    elif [ "$first_base" = "command" ] && [ "$token_count" -gt 1 ]; then
-      command_index=1
-      command_base="${command_tokens[1]##*/}"
+    else
+      # cwd を変えない静的 wrapper と leading assignment を読み飛ばし、
+      # config-based workflow でも実際の git/gh command を解決する。
+      while [ "$command_index" -lt "$token_count" ]; do
+        token="${command_tokens[$command_index]}"
+        if [[ "$token" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+          command_index=$((command_index + 1))
+          continue
+        fi
+        command_base="${token##*/}"
+        case "$command_base" in
+          command)
+            command_index=$((command_index + 1))
+            while [ "$command_index" -lt "$token_count" ]; do
+              token="${command_tokens[$command_index]}"
+              case "$token" in
+                --) command_index=$((command_index + 1)); break ;;
+                -p) command_index=$((command_index + 1)) ;;
+                -v|-V|-*) command_index="$token_count"; break ;;
+                *) break ;;
+              esac
+            done
+            ;;
+          env)
+            command_index=$((command_index + 1))
+            while [ "$command_index" -lt "$token_count" ]; do
+              token="${command_tokens[$command_index]}"
+              case "$token" in
+                --) command_index=$((command_index + 1)); break ;;
+                -u|--unset|-S|--split-string) command_index=$((command_index + 2)) ;;
+                --unset=*|--split-string=*) command_index=$((command_index + 1)) ;;
+                --help|--version|-*) command_index="$token_count"; break ;;
+                *=*) command_index=$((command_index + 1)) ;;
+                *) break ;;
+              esac
+            done
+            ;;
+          *) break ;;
+        esac
+      done
+      if [ "$command_index" -lt "$token_count" ]; then
+        command_base="${command_tokens[$command_index]##*/}"
+      else
+        command_base=""
+      fi
     fi
 
     case "$command_base" in

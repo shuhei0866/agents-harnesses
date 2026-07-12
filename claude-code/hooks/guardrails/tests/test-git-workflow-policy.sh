@@ -213,6 +213,18 @@ set_config 'GIT_WORKFLOW="trunk-direct"'
 run_bash_guard "$COMMIT_GUARD" 'git commit -m test'
 assert_silent_allow "harness.config の trunk-direct を読み main direct commit を許可する"
 
+run_bash_guard "$COMMIT_GUARD" "git commit -m 'document \$(foo)'"
+assert_silent_allow "single-quote 内の literal command substitution は workflow を曖昧化しない"
+
+run_bash_guard "$COMMIT_GUARD" "git commit -m 'document \`foo\`'"
+assert_silent_allow "single-quote 内の literal backtick は workflow を曖昧化しない"
+
+run_bash_guard "$COMMIT_GUARD" 'env GIT_AUTHOR_NAME=bot git commit -m test'
+assert_silent_allow "env assignment wrapper 後の git は config の trunk-direct を使う"
+
+run_bash_guard "$COMMIT_GUARD" 'env -u HOME GIT_AUTHOR_NAME=bot git commit -m test'
+assert_silent_allow "env option と assignment wrapper 後の git も trunk-direct を使う"
+
 set_config 'GIT_WORKFLOW="worktree-pr"'
 run_bash_guard "$COMMIT_GUARD" 'git commit -m test' trunk-direct
 assert_silent_allow "環境変数 trunk-direct が config worktree-pr より優先される"
