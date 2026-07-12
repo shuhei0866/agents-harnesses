@@ -365,6 +365,16 @@ run_bash_guard "$GH_GUARD" 'gh pr merge 42' __UNSET__ deny __UNSET__ __UNSET__ o
 assert_deny "ambient GH_REPO も explicit repo として fail closed"
 assert_gh_log_contains "ambient GH_REPO を merge lookup に引き渡す" "--repo other/repo --json baseRefName"
 
+set_config 'GIT_WORKFLOW="worktree-pr"'
+run_bash_guard "$GH_GUARD" 'env -u GH_REPO gh pr merge 42' __UNSET__ deny __UNSET__ __UNSET__ other/develop
+assert_deny "env -u GH_REPO 後は ambient selector を使わず local main merge を deny"
+assert_gh_log_not_contains "unset 済み GH_REPO を lookup に引き渡さない" "--repo other/develop"
+
+run_bash_guard "$GH_GUARD" 'env -i gh pr merge 42' __UNSET__ deny __UNSET__ __UNSET__ other/develop
+assert_deny "env -i 後も ambient selector を使わず local main merge を deny"
+assert_gh_log_not_contains "clear 済み environment の GH_REPO を lookup に引き渡さない" "--repo other/develop"
+set_config 'GIT_WORKFLOW="trunk-direct"'
+
 run_bash_guard "$GH_GUARD" 'gh -Rother/repo pr merge 42'
 assert_deny "gh root位置の attached -R でも merge を検出する"
 assert_gh_log_contains "root位置の selector を merge lookup に引き渡す" "--repo other/repo --json baseRefName"

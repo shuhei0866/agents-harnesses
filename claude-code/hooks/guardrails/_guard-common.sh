@@ -474,6 +474,7 @@ guard_extract_gh_pr_segment() {
 guard_extract_gh_repo_selector() {
   local command="$1" expected_subcommand="${2:-}" stripped="" segments="" segment="" token="" base=""
   local i=0 count=0 gh_index=-1 found=0 repo_selector="" matched_segment=""
+  local env_options=0 expect_env_unset=0
   local -a tokens=()
 
   if [ -n "${GH_REPO:-}" ]; then
@@ -511,16 +512,65 @@ guard_extract_gh_repo_selector() {
       continue
     fi
 
-    # command-local GH_REPO assignment も explicit selector と同じく扱う。
+    # command-local GH_REPO assignment は explicit selector と同じく扱う。
+    # ただし env -u GH_REPO / env -i は実行時の ambient selector を消すため、
+    # prefix を左から順に解釈して状態を反映する。
     i=0
     while [ "$i" -lt "$gh_index" ]; do
       token="${tokens[$i]}"
-      case "$token" in
-        GH_REPO=*)
-          found=1
-          repo_selector="${token#GH_REPO=}"
-          ;;
-      esac
+      if [ "$expect_env_unset" -eq 1 ]; then
+        if [ "$token" = "GH_REPO" ]; then
+          found=0
+          repo_selector=""
+        fi
+        expect_env_unset=0
+        i=$((i + 1))
+        continue
+      fi
+
+      base="${token##*/}"
+      if [ "$base" = "env" ]; then
+        env_options=1
+        i=$((i + 1))
+        continue
+      fi
+
+      if [ "$env_options" -eq 1 ]; then
+        case "$token" in
+          -i|--ignore-environment|-)
+            found=0
+            repo_selector=""
+            ;;
+          -u|--unset)
+            expect_env_unset=1
+            ;;
+          --unset=GH_REPO|-uGH_REPO)
+            found=0
+            repo_selector=""
+            ;;
+          --unset=*|-u?*)
+            ;;
+          GH_REPO=*)
+            found=1
+            repo_selector="${token#GH_REPO=}"
+            ;;
+          --)
+            env_options=0
+            ;;
+          *=*|-*)
+            ;;
+          *)
+            env_options=0
+            ;;
+        esac
+      else
+        case "$token" in
+          GH_REPO=*)
+            found=1
+            repo_selector="${token#GH_REPO=}"
+            ;;
+        esac
+      fi
       i=$((i + 1))
     done
 
