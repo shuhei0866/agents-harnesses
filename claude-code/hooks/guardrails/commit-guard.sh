@@ -36,6 +36,58 @@ COMMAND_FOR_MATCH=$(echo "$COMMAND" | sed -E "s/\"[^\"]*\"/_Q_/g; s/'[^']*'/_Q_/
 # quote-aware token 列を使い、quoted option を検出しつつ message/option value は誤検出しない。
 
 _COMMIT_GUARD_TOKENS=()
+_COMMIT_GUARD_ADVISORY_OPS=()
+_COMMIT_GUARD_ADVISORY_DIRS=()
+_COMMIT_GUARD_ADVISORY_UNKNOWN=()
+_COMMIT_GUARD_ADVISORY_DETAILS=()
+
+_commit_guard_record_advisory() {
+  local op="$1" git_dir="$2" context_unknown="$3" detail="${4:-}"
+  local index="${#_COMMIT_GUARD_ADVISORY_OPS[@]}"
+  _COMMIT_GUARD_ADVISORY_OPS[$index]="$op"
+  _COMMIT_GUARD_ADVISORY_DIRS[$index]="$git_dir"
+  _COMMIT_GUARD_ADVISORY_UNKNOWN[$index]="$context_unknown"
+  _COMMIT_GUARD_ADVISORY_DETAILS[$index]="$detail"
+}
+
+_commit_guard_is_protected_switch() {
+  local i="$1" count="${#_COMMIT_GUARD_TOKENS[@]}"
+  if [ "$i" -ge "$count" ]; then
+    return 1
+  fi
+  case "${_COMMIT_GUARD_TOKENS[$i]}" in
+    main|master|develop) ;;
+    *) return 1 ;;
+  esac
+  [ $((i + 1)) -eq "$count" ]
+}
+
+_commit_guard_merge_is_hotfix() {
+  local i="$1" count="${#_COMMIT_GUARD_TOKENS[@]}" token="" option_mode=1 saw_revision=0
+  while [ "$i" -lt "$count" ]; do
+    token="${_COMMIT_GUARD_TOKENS[$i]}"
+    if [ "$option_mode" -eq 1 ]; then
+      case "$token" in
+        --) option_mode=0; i=$((i + 1)); continue ;;
+        -m|--message|-s|--strategy|-X|--strategy-option|-F|--file|--cleanup|--into-name)
+          i=$((i + 2))
+          continue
+          ;;
+        -m?*|-s?*|-X?*|-F?*|--message=*|--strategy=*|--strategy-option=*|--file=*|--cleanup=*|--into-name=*|-*)
+          i=$((i + 1))
+          continue
+          ;;
+      esac
+    fi
+    saw_revision=1
+    case "$token" in
+      hotfix/*|refs/heads/hotfix/*) ;;
+      *) return 1 ;;
+    esac
+    i=$((i + 1))
+  done
+  [ "$saw_revision" -eq 1 ]
+}
 
 _commit_guard_check_commit_args() {
   local i="$1" count="${#_COMMIT_GUARD_TOKENS[@]}" token="" cluster="" ch=""
@@ -168,7 +220,11 @@ _commit_guard_check_push_args() {
   fi
 
   if [ "$force" -eq 1 ] && [ "${#positional[@]}" -le "$ref_start" ]; then
-    current_branch=$(git -C "$git_dir" branch --show-current 2>/dev/null || echo "")
+    if [ -n "$git_dir" ]; then
+      current_branch=$(git -C "$git_dir" branch --show-current 2>/dev/null || echo "")
+    else
+      current_branch=""
+    fi
     if [ -z "$current_branch" ] || [ "$current_branch" = "main" ] || [ "$current_branch" = "master" ]; then
       guard_respond "critical" "コミット衛生ガード" "main/master への force push はブロックされています。"
     fi
@@ -336,7 +392,7 @@ _commit_guard_find_git_index() {
 _commit_guard_check_universal_critical() {
   local stripped="" segments="" segment="" token="" count=0 i=0 subcommand="" git_index=""
   local base_dir="" active_dir="" git_dir="" path=""
-  local ambiguous_context=0 context_unknown=0 k=0
+  local ambiguous_context=0 context_unknown=0 k=0 detail="" action="" unknown_global=0 cd_index=-1 first_base=""
 
   if [ -n "$HOOK_CWD" ]; then
     base_dir=$(_guard_resolve_directory "$(pwd -P)" "$HOOK_CWD" 2>/dev/null || echo "")
@@ -365,8 +421,16 @@ _commit_guard_check_universal_critical() {
       continue
     fi
 
-    if [ "${_COMMIT_GUARD_TOKENS[0]}" = "cd" ]; then
-      i=1
+    cd_index=$(guard_cd_command_index "$segment" 2>/dev/null || echo -1)
+    if [ "$cd_index" -ge 0 ]; then
+      i=$((cd_index + 1))
+      while [ "$i" -lt "$count" ]; do
+        token="${_COMMIT_GUARD_TOKENS[$i]}"
+        case "$token" in
+          -L|-P|-e|-@) i=$((i + 1)) ;;
+          *) break ;;
+        esac
+      done
       if [ "$i" -lt "$count" ] && [ "${_COMMIT_GUARD_TOKENS[$i]}" = "--" ]; then
         i=$((i + 1))
       fi
@@ -412,11 +476,14 @@ _commit_guard_check_universal_critical() {
       k=$((k + 1))
     done
 
-    # git global options（-C/-c は値を1つ消費）を読み飛ばして subcommand を得る。
+    # common policy resolver と同じ global option 分類で target/subcommand を得る。
+    subcommand=""
+    unknown_global=0
     while [ "$i" -lt "$count" ]; do
       token="${_COMMIT_GUARD_TOKENS[$i]}"
-      case "$token" in
-        -C)
+      guard_classify_git_global_token "$token"
+      case "$GUARD_GIT_GLOBAL_KIND" in
+        cwd-value)
           if [ $((i + 1)) -lt "$count" ]; then
             git_dir=$(_guard_resolve_directory "$git_dir" "${_COMMIT_GUARD_TOKENS[$((i + 1))]}" 2>/dev/null || echo "")
           else
@@ -424,28 +491,80 @@ _commit_guard_check_universal_critical() {
           fi
           i=$((i + 2))
           ;;
-        --git-dir|--work-tree)
+        cwd-attached)
+          git_dir=$(_guard_resolve_directory "$git_dir" "$GUARD_GIT_GLOBAL_VALUE" 2>/dev/null || echo "")
+          i=$((i + 1))
+          ;;
+        context-value)
           context_unknown=1
           i=$((i + 2))
           ;;
-        -c|--namespace|--config-env) i=$((i + 2)) ;;
-        --git-dir=*|--work-tree=*)
+        context-attached)
           context_unknown=1
           i=$((i + 1))
           ;;
-        --namespace=*|--config-env=*|--bare|--no-pager|--paginate|--literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs) i=$((i + 1)) ;;
-        *) break ;;
+        value) i=$((i + 2)) ;;
+        flag) i=$((i + 1)) ;;
+        subcommand)
+          subcommand="$GUARD_GIT_GLOBAL_VALUE"
+          i=$((i + 1))
+          break
+          ;;
+        unknown)
+          # 将来の global option が危険 subcommand を隠しても fail-open しない。
+          context_unknown=1
+          unknown_global=1
+          i=$((i + 1))
+          while [ "$i" -lt "$count" ]; do
+            token="${_COMMIT_GUARD_TOKENS[$i]}"
+            case "$token" in
+              commit|push|branch|checkout|switch|merge|stash)
+                subcommand="$token"
+                i=$((i + 1))
+                break
+                ;;
+            esac
+            i=$((i + 1))
+          done
+          break
+          ;;
       esac
     done
-    if [ "$i" -ge "$count" ]; then
+    if [ -z "$subcommand" ]; then
       continue
     fi
 
-    subcommand="${_COMMIT_GUARD_TOKENS[$i]}"
-    i=$((i + 1))
     if [ "$context_unknown" -eq 1 ]; then
       git_dir=""
     fi
+
+    detail=""
+    case "$subcommand" in
+      commit)
+        _commit_guard_record_advisory "commit" "$git_dir" "$context_unknown"
+        ;;
+      checkout|switch)
+        detail=0
+        if _commit_guard_is_protected_switch "$i"; then
+          detail=1
+        fi
+        _commit_guard_record_advisory "$subcommand" "$git_dir" "$context_unknown" "$detail"
+        ;;
+      merge)
+        detail=0
+        if _commit_guard_merge_is_hotfix "$i"; then
+          detail=1
+        fi
+        _commit_guard_record_advisory "merge" "$git_dir" "$context_unknown" "$detail"
+        ;;
+      stash)
+        action="${_COMMIT_GUARD_TOKENS[$i]:-}"
+        case "$action" in
+          pop|apply) _commit_guard_record_advisory "stash-$action" "$git_dir" "$context_unknown" ;;
+        esac
+        ;;
+    esac
+
     case "$subcommand" in
       commit) _commit_guard_check_commit_args "$i" ;;
       push)   _commit_guard_check_push_args "$i" "$git_dir" ;;
@@ -456,85 +575,52 @@ _commit_guard_check_universal_critical() {
 
 _commit_guard_check_universal_critical
 
-# --- チェック 0: メインワークツリーでの git commit (保護ブランチ直接コミット防止) ---
-if echo "$COMMAND_FOR_MATCH" | grep -qE 'git\s+(-C\s+\S+\s+)?commit\b' && ! guard_is_trunk_direct; then
-  GIT_C_PATH=$(echo "$COMMAND" | sed -nE 's/.*git[[:space:]]+-C[[:space:]]+"([^"]+)".*/\1/p')
-  if [ -z "$GIT_C_PATH" ]; then
-    GIT_C_PATH=$(echo "$COMMAND" | sed -nE "s/.*git[[:space:]]+-C[[:space:]]+'([^']+)'.*/\1/p")
-  fi
-  if [ -z "$GIT_C_PATH" ]; then
-    GIT_C_PATH=$(echo "$COMMAND" | sed -nE 's/.*git[[:space:]]+-C[[:space:]]+([^ "'"'"']+).*/\1/p')
-  fi
+# --- workflow advisory: parser が記録した各 git invocation を target repo 単位で判定 ---
+if ! guard_is_trunk_direct; then
+  ADVISORY_INDEX=0
+  while [ "$ADVISORY_INDEX" -lt "${#_COMMIT_GUARD_ADVISORY_OPS[@]}" ]; do
+    ADVISORY_OP="${_COMMIT_GUARD_ADVISORY_OPS[$ADVISORY_INDEX]}"
+    ADVISORY_DIR="${_COMMIT_GUARD_ADVISORY_DIRS[$ADVISORY_INDEX]}"
+    ADVISORY_UNKNOWN="${_COMMIT_GUARD_ADVISORY_UNKNOWN[$ADVISORY_INDEX]}"
+    ADVISORY_DETAIL="${_COMMIT_GUARD_ADVISORY_DETAILS[$ADVISORY_INDEX]}"
 
-  BEFORE_GIT=$(echo "$COMMAND" | sed -nE 's/(.*)(git[[:space:]]+(-C[[:space:]]+[^ ]+[[:space:]]+)?commit\b.*)/\1/p')
-  CD_PATH=$(echo "$BEFORE_GIT" | sed -nE 's/.*cd[[:space:]]+"([^"]+)".*/\1/p')
-  if [ -z "$CD_PATH" ]; then
-    CD_PATH=$(echo "$BEFORE_GIT" | sed -nE "s/.*cd[[:space:]]+'([^']+)'.*/\1/p")
-  fi
-  if [ -z "$CD_PATH" ]; then
-    CD_PATH=$(echo "$BEFORE_GIT" | sed -nE 's/.*cd[[:space:]]+([^ "&;|'"'"']+).*/\1/p')
-  fi
-
-  if [ -n "$GIT_C_PATH" ]; then
-    GIT_COMMON_DIR=$(git -C "$GIT_C_PATH" rev-parse --git-common-dir 2>/dev/null || echo "")
-    GIT_DIR=$(git -C "$GIT_C_PATH" rev-parse --git-dir 2>/dev/null || echo "")
-    BRANCH=$(git -C "$GIT_C_PATH" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-  elif [ -n "$CD_PATH" ] && [ -d "$CD_PATH" ]; then
-    GIT_COMMON_DIR=$(git -C "$CD_PATH" rev-parse --git-common-dir 2>/dev/null || echo "")
-    GIT_DIR=$(git -C "$CD_PATH" rev-parse --git-dir 2>/dev/null || echo "")
-    BRANCH=$(git -C "$CD_PATH" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-  else
-    GIT_COMMON_DIR=$(git rev-parse --git-common-dir 2>/dev/null || echo "")
-    GIT_DIR=$(git rev-parse --git-dir 2>/dev/null || echo "")
-    BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-  fi
-
-  if [ "$GIT_DIR" = "$GIT_COMMON_DIR" ] || [ "$GIT_DIR" = ".git" ]; then
-    if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ] || [ "$BRANCH" = "develop" ]; then
-      guard_respond "advisory" "コミット衛生ガード" "メインワークツリーの ${BRANCH} ブランチでの直接コミットはブロックされています。ブランチを作成して PR 経由でマージしてください。.claude/ の変更も含め、ワークツリーまたは別ブランチで作業してください。"
-    fi
-  fi
-fi
-
-# --- チェック 3: メインワークツリーでの git checkout (ブランチ切り替え) ---
-if echo "$COMMAND_FOR_MATCH" | grep -qE 'git\s+checkout\s|git\s+switch\s'; then
-  GIT_COMMON_DIR=$(git rev-parse --git-common-dir 2>/dev/null || echo "")
-  GIT_DIR=$(git rev-parse --git-dir 2>/dev/null || echo "")
-
-  if { [ "$GIT_DIR" = "$GIT_COMMON_DIR" ] || [ "$GIT_DIR" = ".git" ]; } && ! guard_is_trunk_direct; then
-    ALLOW_PROTECTED_SWITCH=0
-    if echo "$COMMAND_FOR_MATCH" | grep -qE 'git\s+(checkout|switch)\s+(develop|main|master)(\s|$|&|;)'; then
-      if ! echo "$COMMAND_FOR_MATCH" | grep -qE 'git\s+(checkout|switch)\s+(develop|main|master)\s+--'; then
-        ALLOW_PROTECTED_SWITCH=1
-      fi
-    fi
-    if [ "$ALLOW_PROTECTED_SWITCH" -ne 1 ]; then
-      guard_respond "advisory" "コミット衛生ガード" "メインワークツリーでの git checkout/switch はブロックされています。\`git worktree add\` でワークツリーを作成してください。未コミットの作業が消失するリスクがあります。（develop/main への切り替えは許可されています）"
-    fi
-  fi
-fi
-
-# --- チェック 4: main ブランチへの直接マージ防止（hotfix/* 除く） ---
-if echo "$COMMAND_FOR_MATCH" | grep -qE 'git\s+(-C\s+\S+\s+)?merge\s' && ! guard_is_trunk_direct; then
-  if ! echo "$COMMAND_FOR_MATCH" | grep -qE 'git\s+(-C\s+\S+\s+)?merge\s.*hotfix/'; then
-    GIT_C_PATH=$(echo "$COMMAND" | sed -nE 's/.*git[[:space:]]+-C[[:space:]]+"([^"]+)".*/\1/p')
-    if [ -z "$GIT_C_PATH" ]; then
-      GIT_C_PATH=$(echo "$COMMAND" | sed -nE "s/.*git[[:space:]]+-C[[:space:]]+'([^']+)'.*/\1/p")
-    fi
-    if [ -z "$GIT_C_PATH" ]; then
-      GIT_C_PATH=$(echo "$COMMAND" | sed -nE 's/.*git[[:space:]]+-C[[:space:]]+([^ "'"'"']+).*/\1/p')
+    if [ "$ADVISORY_UNKNOWN" -eq 1 ] || [ -z "$ADVISORY_DIR" ]; then
+      guard_respond "advisory" "コミット衛生ガード" "${ADVISORY_OP} の対象リポジトリを一意に確認できなかったため、安全のためブロックしました。"
     fi
 
-    if [ -n "$GIT_C_PATH" ]; then
-      CURRENT_BRANCH=$(git -C "$GIT_C_PATH" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-    else
-      CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    GIT_COMMON_DIR=$(git -C "$ADVISORY_DIR" rev-parse --git-common-dir 2>/dev/null || echo "")
+    GIT_DIR=$(git -C "$ADVISORY_DIR" rev-parse --git-dir 2>/dev/null || echo "")
+    BRANCH=$(git -C "$ADVISORY_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    if [ -z "$GIT_DIR" ] || [ -z "$GIT_COMMON_DIR" ]; then
+      guard_respond "advisory" "コミット衛生ガード" "${ADVISORY_OP} の対象リポジトリを確認できなかったため、安全のためブロックしました。"
     fi
 
-    if [ "$CURRENT_BRANCH" = "main" ] || [ "$CURRENT_BRANCH" = "master" ]; then
-      guard_respond "advisory" "ブランチ戦略ガード" "main への直接マージはブロックされています。develop 経由でマージしてください。hotfix の場合は hotfix/* ブランチを使用してください。"
-    fi
-  fi
+    case "$ADVISORY_OP" in
+      commit)
+        if { [ "$GIT_DIR" = "$GIT_COMMON_DIR" ] || [ "$GIT_DIR" = ".git" ]; } \
+           && { [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ] || [ "$BRANCH" = "develop" ]; }; then
+          guard_respond "advisory" "コミット衛生ガード" "メインワークツリーの ${BRANCH} ブランチでの直接コミットはブロックされています。ブランチを作成して PR 経由でマージしてください。.claude/ の変更も含め、ワークツリーまたは別ブランチで作業してください。"
+        fi
+        ;;
+      checkout|switch)
+        if { [ "$GIT_DIR" = "$GIT_COMMON_DIR" ] || [ "$GIT_DIR" = ".git" ]; } \
+           && [ "$ADVISORY_DETAIL" -ne 1 ]; then
+          guard_respond "advisory" "コミット衛生ガード" "メインワークツリーでの git checkout/switch はブロックされています。\`git worktree add\` でワークツリーを作成してください。未コミットの作業が消失するリスクがあります。（develop/main への切り替えは許可されています）"
+        fi
+        ;;
+      merge)
+        if [ "$ADVISORY_DETAIL" -ne 1 ] && { [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; }; then
+          guard_respond "advisory" "ブランチ戦略ガード" "main への直接マージはブロックされています。develop 経由でマージしてください。hotfix の場合は hotfix/* ブランチを使用してください。"
+        fi
+        ;;
+      stash-pop|stash-apply)
+        if [ "$GIT_DIR" = "$GIT_COMMON_DIR" ] || [ "$GIT_DIR" = ".git" ]; then
+          guard_respond "advisory" "コミット衛生ガード" "メインワークツリーでの git stash pop/apply はブロックされています。ワークツリー内で作業してください。"
+        fi
+        ;;
+    esac
+    ADVISORY_INDEX=$((ADVISORY_INDEX + 1))
+  done
 fi
 
 # --- チェック 4b: gh pr merge で main 向け PR のマージ防止（hotfix/* 除く） ---
@@ -557,16 +643,6 @@ if echo "$COMMAND_FOR_MATCH" | grep -qE '(^|&&|\|\||[;|])\s*gh\s+pr\s+merge' && 
         guard_respond "advisory" "ブランチ戦略ガード" "${HEAD_BRANCH} → ${BASE_BRANCH} への PR マージはブロックされています。develop を経由してマージしてください。hotfix の場合は hotfix/* ブランチを使用してください。"
       fi
     fi
-  fi
-fi
-
-# --- チェック 6: メインワークツリーでの git stash pop/apply ---
-if echo "$COMMAND_FOR_MATCH" | grep -qE 'git\s+stash\s+(pop|apply)'; then
-  GIT_COMMON_DIR=$(git rev-parse --git-common-dir 2>/dev/null || echo "")
-  GIT_DIR=$(git rev-parse --git-dir 2>/dev/null || echo "")
-
-  if { [ "$GIT_DIR" = "$GIT_COMMON_DIR" ] || [ "$GIT_DIR" = ".git" ]; } && ! guard_is_trunk_direct; then
-    guard_respond "advisory" "コミット衛生ガード" "メインワークツリーでの git stash pop/apply はブロックされています。ワークツリー内で作業してください。"
   fi
 fi
 

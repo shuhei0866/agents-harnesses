@@ -139,6 +139,12 @@ PHANTOM=$'echo \'see <<EOF usage\'\nrm -rf /etc'
 run_guard "$PHANTOM"
 assert_deny "引用符内の <<EOF 言及を偽 opener と誤認して後続の rm -rf /etc を見逃さない"
 
+run_guard 'echo __AH_GUARD_CRITICAL_BEGIN_7F3A__; rm -rf "/etc/nginx"'
+assert_deny "fixed begin marker を入力されても quote 付き critical path を deny する"
+
+run_guard 'echo __AH_GUARD_CRITICAL_END_7F3A__; rm -rf "/etc/nginx"'
+assert_deny "fixed end marker を入力されても quote 付き critical path を deny する"
+
 echo ""
 echo "=== destructive-guard: advisory（デフォルト GUARD_LEVEL=warn では警告のみ）==="
 

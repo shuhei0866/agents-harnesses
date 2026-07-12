@@ -310,9 +310,277 @@ guard_shell_tokens() {
   '
 }
 
+# shell segment が cwd を変更する cd invocation なら cd token の index を返す。
+# quoted/concatenated builtin 名と `builtin -- cd` / `command -p -- cd` を扱い、
+# `command -v/-V cd` の query mode は実行扱いにしない。
+guard_cd_command_index() {
+  local segment="$1" token="" base="" i=0 count=0
+  local -a tokens=()
+  while IFS= read -r token; do
+    tokens[${#tokens[@]}]="$token"
+  done < <(guard_shell_tokens "$segment")
+  count=${#tokens[@]}
+  [ "$count" -gt 0 ] || return 1
+
+  base="${tokens[0]##*/}"
+  if [ "$base" = "cd" ]; then
+    printf '0\n'
+    return 0
+  fi
+
+  if [ "$base" = "builtin" ]; then
+    i=1
+    if [ "$i" -lt "$count" ] && [ "${tokens[$i]}" = "--" ]; then
+      i=$((i + 1))
+    fi
+    if [ "$i" -lt "$count" ] && [ "${tokens[$i]##*/}" = "cd" ]; then
+      printf '%s\n' "$i"
+      return 0
+    fi
+    return 1
+  fi
+
+  if [ "$base" = "command" ]; then
+    i=1
+    while [ "$i" -lt "$count" ]; do
+      token="${tokens[$i]}"
+      case "$token" in
+        --) i=$((i + 1)); break ;;
+        -p) i=$((i + 1)) ;;
+        -*v*|-*V*) return 1 ;;
+        -*) return 1 ;;
+        *) break ;;
+      esac
+    done
+    if [ "$i" -lt "$count" ] && [ "${tokens[$i]##*/}" = "cd" ]; then
+      printf '%s\n' "$i"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# git global option の解釈を policy resolver と各 guard で共有する。
+# 呼び出し後に GUARD_GIT_GLOBAL_KIND / VALUE を参照する。
+guard_classify_git_global_token() {
+  local token="$1"
+  GUARD_GIT_GLOBAL_KIND=""
+  GUARD_GIT_GLOBAL_VALUE=""
+
+  case "$token" in
+    -C)
+      GUARD_GIT_GLOBAL_KIND="cwd-value"
+      ;;
+    -C?*)
+      # Git の実装差を安全側に扱い、attached form も target として解釈する。
+      GUARD_GIT_GLOBAL_KIND="cwd-attached"
+      GUARD_GIT_GLOBAL_VALUE="${token#-C}"
+      ;;
+    -c|--namespace|--config-env)
+      GUARD_GIT_GLOBAL_KIND="value"
+      ;;
+    -c?*|--namespace=*|--config-env=*)
+      GUARD_GIT_GLOBAL_KIND="flag"
+      ;;
+    --git-dir|--work-tree)
+      GUARD_GIT_GLOBAL_KIND="context-value"
+      ;;
+    --git-dir=*|--work-tree=*)
+      GUARD_GIT_GLOBAL_KIND="context-attached"
+      ;;
+    --bare|-p|-P|--paginate|--no-pager|--no-replace-objects|--literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs|--no-optional-locks|--no-lazy-fetch|--no-advice|--exec-path=*|--super-prefix=*|--attr-source=*|--list-cmds=*)
+      GUARD_GIT_GLOBAL_KIND="flag"
+      ;;
+    -*)
+      GUARD_GIT_GLOBAL_KIND="unknown"
+      ;;
+    *)
+      GUARD_GIT_GLOBAL_KIND="subcommand"
+      GUARD_GIT_GLOBAL_VALUE="$token"
+      ;;
+  esac
+}
+
+# 指定した gh pr subcommand を実行する shell segment を1つ返す。
+# gh root flag は gh の直後・pr の後・subcommand の後のどこでも許容されるため、
+# regex ではなく token 列の最初の非 option command/group を追う。
+guard_extract_gh_pr_segment() {
+  local command="$1" expected_subcommand="$2" stripped="" segments="" segment=""
+  local token="" base="" i=0 count=0 gh_index=-1 state=0 found=0
+  local -a tokens=()
+
+  stripped=$(guard_strip_heredoc_bodies "$command")
+  segments=$(guard_split_segments "$stripped")
+  while IFS= read -r segment; do
+    tokens=()
+    while IFS= read -r token; do
+      tokens[${#tokens[@]}]="$token"
+    done < <(guard_shell_tokens "$segment")
+    count=${#tokens[@]}
+    gh_index=-1
+    i=0
+    while [ "$i" -lt "$count" ]; do
+      base="${tokens[$i]##*/}"
+      if [ "$base" = "gh" ]; then
+        gh_index="$i"
+        break
+      fi
+      i=$((i + 1))
+    done
+    if [ "$gh_index" -lt 0 ]; then
+      continue
+    fi
+
+    state=0
+    i=$((gh_index + 1))
+    while [ "$i" -lt "$count" ]; do
+      token="${tokens[$i]}"
+      case "$token" in
+        --repo|-R|--hostname)
+          i=$((i + 2))
+          continue
+          ;;
+        --repo=*|-R=*|-R?*|--hostname=*|--help|-h|--version)
+          i=$((i + 1))
+          continue
+          ;;
+        -*)
+          i=$((i + 1))
+          continue
+          ;;
+      esac
+
+      if [ "$state" -eq 0 ]; then
+        if [ "$token" != "pr" ]; then
+          break
+        fi
+        state=1
+      else
+        if [ "$token" = "$expected_subcommand" ]; then
+          printf '%s\n' "$segment"
+          found=1
+          break
+        fi
+        break
+      fi
+      i=$((i + 1))
+    done
+  done <<< "$segments"
+  [ "$found" -eq 1 ]
+}
+
+# gh command の explicit repository selector を quote-aware に抽出する。
+# 対応形: --repo value / --repo=value / -R value / -R=value / -Rvalue
+guard_extract_gh_repo_selector() {
+  local command="$1" expected_subcommand="${2:-}" stripped="" segments="" segment="" token="" base=""
+  local i=0 count=0 gh_index=-1 found=0 repo_selector="" matched_segment=""
+  local -a tokens=()
+
+  if [ -n "${GH_REPO:-}" ]; then
+    found=1
+    repo_selector="$GH_REPO"
+  fi
+
+  stripped=$(guard_strip_heredoc_bodies "$command")
+  if [ -n "$expected_subcommand" ]; then
+    matched_segment=$(guard_extract_gh_pr_segment "$stripped" "$expected_subcommand" 2>/dev/null || echo "")
+    if [ -z "$matched_segment" ]; then
+      return 1
+    fi
+    segments="$matched_segment"
+  else
+    segments=$(guard_split_segments "$stripped")
+  fi
+  while IFS= read -r segment; do
+    tokens=()
+    while IFS= read -r token; do
+      tokens[${#tokens[@]}]="$token"
+    done < <(guard_shell_tokens "$segment")
+    count=${#tokens[@]}
+    gh_index=-1
+    i=0
+    while [ "$i" -lt "$count" ]; do
+      base="${tokens[$i]##*/}"
+      if [ "$base" = "gh" ]; then
+        gh_index="$i"
+        break
+      fi
+      i=$((i + 1))
+    done
+    if [ "$gh_index" -lt 0 ]; then
+      continue
+    fi
+
+    # command-local GH_REPO assignment も explicit selector と同じく扱う。
+    i=0
+    while [ "$i" -lt "$gh_index" ]; do
+      token="${tokens[$i]}"
+      case "$token" in
+        GH_REPO=*)
+          found=1
+          repo_selector="${token#GH_REPO=}"
+          ;;
+      esac
+      i=$((i + 1))
+    done
+
+    i=$((gh_index + 1))
+    while [ "$i" -lt "$count" ]; do
+      token="${tokens[$i]}"
+      case "$token" in
+        --)
+          break
+          ;;
+        --body|--body-file|-b|-F|--subject|-t|--match-head-commit|--author|-A|--author-email)
+          i=$((i + 2))
+          continue
+          ;;
+        --body=*|--body-file=*|-b=*|-F=*|-F?*|--subject=*|-t=*|--match-head-commit=*|--author=*|-A=*|-A?*|--author-email=*)
+          i=$((i + 1))
+          continue
+          ;;
+        --repo|-R)
+          found=1
+          if [ $((i + 1)) -lt "$count" ]; then
+            repo_selector="${tokens[$((i + 1))]}"
+          fi
+          i=$((i + 2))
+          continue
+          ;;
+        --repo=*)
+          found=1
+          repo_selector="${token#--repo=}"
+          i=$((i + 1))
+          continue
+          ;;
+        -R=*)
+          found=1
+          repo_selector="${token#-R=}"
+          i=$((i + 1))
+          continue
+          ;;
+        -R?*)
+          found=1
+          repo_selector="${token#-R}"
+          i=$((i + 1))
+          continue
+          ;;
+      esac
+      i=$((i + 1))
+    done
+    if [ "$found" -eq 1 ]; then
+      printf '%s\n' "$repo_selector"
+      return 0
+    fi
+  done <<< "$segments"
+  return 1
+}
+
 # cd の効果範囲を逐次 segment として安全に追えない shell 構造なら 0 を返す。
 guard_command_context_is_ambiguous() {
-  local command="$1" stripped="" structure=""
+  local command="$1" stripped="" structure="" segments="" segment="" token="" base=""
+  local i=0 count=0
+  local -a tokens=()
   stripped=$(guard_strip_heredoc_bodies "$command")
 
   case "$stripped" in
@@ -327,6 +595,88 @@ guard_command_context_is_ambiguous() {
   case "$structure" in
     *"&"*) return 0 ;;
   esac
+
+  # directory stack と cwd-changing wrapper は全 guard で同じ target を安全に
+  # 再現しにくいため、workflow を緩和せず fail closed にする。
+  segments=$(guard_split_segments "$stripped")
+  while IFS= read -r segment; do
+    tokens=()
+    while IFS= read -r token; do
+      tokens[${#tokens[@]}]="$token"
+    done < <(guard_shell_tokens "$segment")
+    count=${#tokens[@]}
+    i=0
+    # 引数や message 内の単語ではなく、実際に実行される command position だけを
+    # 追う。leading assignment と静的 wrapper は順に読み飛ばす。
+    while [ "$i" -lt "$count" ]; do
+      token="${tokens[$i]}"
+      if [[ "$token" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+        i=$((i + 1))
+        continue
+      fi
+
+      base="${tokens[$i]##*/}"
+      case "$base" in
+        pushd|popd) return 0 ;;
+        command)
+          i=$((i + 1))
+          while [ "$i" -lt "$count" ]; do
+            token="${tokens[$i]}"
+            case "$token" in
+              --) i=$((i + 1)); break ;;
+              -p) i=$((i + 1)) ;;
+              -v|-V) i="$count"; break ;;
+              -*) return 0 ;;
+              *) break ;;
+            esac
+          done
+          ;;
+        builtin)
+          i=$((i + 1))
+          if [ "$i" -lt "$count" ] && [ "${tokens[$i]}" = "--" ]; then
+            i=$((i + 1))
+          fi
+          ;;
+        env)
+          i=$((i + 1))
+          while [ "$i" -lt "$count" ]; do
+            token="${tokens[$i]}"
+            case "$token" in
+              -C|--chdir|-C?*|--chdir=*) return 0 ;;
+              -u|--unset|-S|--split-string) i=$((i + 2)); continue ;;
+              --unset=*|--split-string=*) i=$((i + 1)); continue ;;
+              --help|--version) i="$count"; break ;;
+              --) i=$((i + 1)); break ;;
+              *=*) i=$((i + 1)); continue ;;
+              -*) return 0 ;;
+              *) break ;;
+            esac
+          done
+          ;;
+        sudo)
+          i=$((i + 1))
+          while [ "$i" -lt "$count" ]; do
+            token="${tokens[$i]}"
+            case "$token" in
+              -D|--chdir|-D?*|--chdir=*) return 0 ;;
+              -u|-g|-h|-p|-C|-T|-r|-t|-U|--user|--group|--host|--prompt|--command-timeout|--role|--type|--other-user)
+                i=$((i + 2))
+                continue
+                ;;
+              --*=*) i=$((i + 1)); continue ;;
+              -A|-b|-E|-e|-H|-K|-k|-n|-P|-S|-V|-v) i=$((i + 1)); continue ;;
+              --) i=$((i + 1)); break ;;
+              *=*) i=$((i + 1)); continue ;;
+              -*) return 0 ;;
+              *) break ;;
+            esac
+          done
+          ;;
+        eval|source|.) return 0 ;;
+        *) break ;;
+      esac
+    done
+  done <<< "$segments"
   return 1
 }
 
@@ -337,8 +687,9 @@ guard_command_context_is_ambiguous() {
 # - --repo / -R は local config に確実に対応付けられないため fail closed
 guard_reload_git_workflow_for_command() {
   local command="$1" hook_cwd="${2:-}" base_dir="" active_dir=""
-  local stripped="" segments="" segment="" rest="" path="" target_dir="" workflow=""
-  local seen_target=0 all_trunk_direct=1 command_for_match=""
+  local stripped="" segments="" segment="" path="" target_dir="" workflow="" token=""
+  local seen_target=0 all_trunk_direct=1 i=0 token_count=0 command_index=0 command_base="" first_base="" cd_index=-1
+  local -a command_tokens=()
 
   if [ "${_GUARD_GIT_WORKFLOW_ENV_IS_SET:-0}" = "1" ]; then
     GIT_WORKFLOW="$_GUARD_GIT_WORKFLOW_ENV_VALUE"
@@ -373,36 +724,88 @@ guard_reload_git_workflow_for_command() {
       continue
     fi
 
-    case "$segment" in
-      cd[[:space:]]*)
-        rest="${segment#cd}"
-        path=$(_guard_first_shell_arg "$rest" 2>/dev/null || echo "")
+    command_tokens=()
+    while IFS= read -r token; do
+      command_tokens[${#command_tokens[@]}]="$token"
+    done < <(guard_shell_tokens "$segment")
+    token_count=${#command_tokens[@]}
+    if [ "$token_count" -eq 0 ]; then
+      continue
+    fi
+
+    command_index=0
+    first_base="${command_tokens[0]##*/}"
+    command_base="$first_base"
+    cd_index=$(guard_cd_command_index "$segment" 2>/dev/null || echo -1)
+    if [ "$cd_index" -ge 0 ]; then
+      command_index="$cd_index"
+      command_base="cd"
+    elif [ "$first_base" = "command" ] && [ "$token_count" -gt 1 ]; then
+      command_index=1
+      command_base="${command_tokens[1]##*/}"
+    fi
+
+    case "$command_base" in
+      cd)
+        i=$((command_index + 1))
+        while [ "$i" -lt "$token_count" ]; do
+          token="${command_tokens[$i]}"
+          case "$token" in
+            --) i=$((i + 1)); break ;;
+            -L|-P|-e|-@) i=$((i + 1)) ;;
+            *) break ;;
+          esac
+        done
+        path="${command_tokens[$i]:-}"
         active_dir=$(_guard_resolve_directory "$active_dir" "$path" 2>/dev/null || echo "")
         if [ -z "$active_dir" ]; then
           all_trunk_direct=0
         fi
         ;;
-      git[[:space:]]*)
+      git)
         seen_target=1
         target_dir="$active_dir"
-        rest="${segment#git}"
-        rest=$(printf '%s\n' "$rest" | sed -E 's/^[[:space:]]+//')
-        case "$rest" in
-          -C[[:space:]]*)
-            rest="${rest#-C}"
-            path=$(_guard_first_shell_arg "$rest" 2>/dev/null || echo "")
-            target_dir=$(_guard_resolve_directory "$target_dir" "$path" 2>/dev/null || echo "")
-            ;;
-        esac
+        i=$((command_index + 1))
+        while [ "$i" -lt "$token_count" ]; do
+          token="${command_tokens[$i]}"
+          guard_classify_git_global_token "$token"
+          case "$GUARD_GIT_GLOBAL_KIND" in
+            cwd-value)
+              if [ $((i + 1)) -lt "$token_count" ]; then
+                target_dir=$(_guard_resolve_directory "$target_dir" "${command_tokens[$((i + 1))]}" 2>/dev/null || echo "")
+              else
+                target_dir=""
+              fi
+              i=$((i + 2))
+              ;;
+            cwd-attached)
+              target_dir=$(_guard_resolve_directory "$target_dir" "$GUARD_GIT_GLOBAL_VALUE" 2>/dev/null || echo "")
+              i=$((i + 1))
+              ;;
+            value)
+              i=$((i + 2))
+              ;;
+            flag)
+              i=$((i + 1))
+              ;;
+            context-value|context-attached|unknown)
+              target_dir=""
+              all_trunk_direct=0
+              break
+              ;;
+            subcommand)
+              break
+              ;;
+          esac
+        done
         workflow=$(_guard_git_workflow_from_dir "$target_dir")
         if [ "$workflow" != "trunk-direct" ]; then
           all_trunk_direct=0
         fi
         ;;
-      gh[[:space:]]*)
+      gh)
         seen_target=1
-        command_for_match=$(guard_sanitize_command "$segment")
-        if echo "$command_for_match" | grep -qE '(^|[[:space:]])(--repo|-R)(=|[[:space:]])'; then
+        if guard_extract_gh_repo_selector "$segment" >/dev/null; then
           all_trunk_direct=0
         else
           workflow=$(_guard_git_workflow_from_dir "$active_dir")
@@ -412,13 +815,17 @@ guard_reload_git_workflow_for_command() {
         fi
         ;;
       *)
-        # command prefix や未対応構文に git/gh が含まれる場合、別 repo を見落として
-        # 緩和しないよう target 不明として扱う。
-        command_for_match=$(guard_sanitize_command "$segment")
-        if echo "$command_for_match" | grep -qE '(^|[[:space:]])(git|gh)[[:space:]]'; then
-          seen_target=1
-          all_trunk_direct=0
-        fi
+        # 未対応 prefix に git/gh が含まれる場合は target 不明として fail closed。
+        i=0
+        while [ "$i" -lt "$token_count" ]; do
+          command_base="${command_tokens[$i]##*/}"
+          if [ "$command_base" = "git" ] || [ "$command_base" = "gh" ]; then
+            seen_target=1
+            all_trunk_direct=0
+            break
+          fi
+          i=$((i + 1))
+        done
         ;;
     esac
   done <<< "$segments"
@@ -563,13 +970,20 @@ guard_split_segments() {
   local text="$1" mode="${2:-full}"
   text="${text//\\$'\n'/ }"
   printf '%s\n' "$text" | awk -v mode="$mode" '
-    BEGIN { SQ = sprintf("%c", 39) }
+    BEGIN { SQ = sprintf("%c", 39); q = ""; out = ""; prev = "" }
+    function flush() {
+      print out
+      out = ""
+      prev = ""
+    }
     {
+      if (NR > 1) {
+        if (q != "") out = out " "
+        else flush()
+        prev = ""
+      }
       line = $0
       n = length(line)
-      out = ""
-      q = ""
-      prev = ""
       for (i = 1; i <= n; i++) {
         c = substr(line, i, 1)
         if (q != "") {
@@ -577,7 +991,7 @@ guard_split_segments() {
             q = ""
             out = out c
           } else if (q == "\"" && (c == "(" || c == ")" || c == "`")) {
-            out = out "\n"   # 二重引用符内でも $( ) や ` は実行される
+            flush()           # 二重引用符内でも $( ) や ` は実行される
           } else if (c == ";" || c == "&" || c == "|") {
             out = out " "    # 引用符内の区切り文字は実行されない
           } else {
@@ -588,18 +1002,18 @@ guard_split_segments() {
             q = c
             out = out c
           } else if (c == ";" || c == "(" || c == ")" || c == "`" || c == "&") {
-            out = out "\n"
+            flush()
           } else if (c == "|") {
             if (mode == "pipeline") out = out c
-            else out = out "\n"
+            else flush()
           } else {
             out = out c
           }
         }
         prev = c
       }
-      print out
     }
+    END { flush() }
   '
 }
 

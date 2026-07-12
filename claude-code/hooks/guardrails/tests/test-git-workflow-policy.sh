@@ -37,7 +37,21 @@ git -C "$REPO_C" branch -M main
 # commit-guard / gh-guard / merged-pr-push-guard が必要とする gh 応答を1つの mock で返す。
 cat > "$TMPDIR_TEST/bin/gh" <<'MOCK'
 #!/bin/bash
+[ -n "${MOCK_GH_LOG:-}" ] && printf '%s\n' "$*" >> "$MOCK_GH_LOG"
+if [[ "$*" == *"--json baseRefName"* && -n "${MOCK_GH_DEVELOP_CWD:-}" && "$PWD" == "$MOCK_GH_DEVELOP_CWD" ]]; then
+  printf 'develop\n'
+  exit 0
+fi
 case "$*" in
+  *"--repo foo/bar"*"--json baseRefName"*)
+    printf 'develop\n'
+    ;;
+  "pr view develop "*"--json baseRefName"*)
+    printf 'develop\n'
+    ;;
+  *"--repo safe/develop"*"--json baseRefName"*)
+    printf 'develop\n'
+    ;;
   *"--json state,number,url"*)
     printf '{"state":"MERGED","number":12,"url":"https://example.com/pull/12"}\n'
     ;;
@@ -46,6 +60,9 @@ case "$*" in
     ;;
   *"--json baseRefName"*)
     printf 'main\n'
+    ;;
+  *"--json author"*)
+    printf 'author\n'
     ;;
   "api user"*)
     printf 'reviewer\n'
@@ -72,8 +89,10 @@ STATUS=0
 
 run_guard_json() {
   local guard="$1" input="$2" workflow="$3" level="$4" force_deny="$5"
+  local cloud="${6-__UNSET__}" gh_repo="${7-__UNSET__}"
   local errf="$TMPDIR_TEST/stderr"
   local -a env_args
+  : > "$TMPDIR_TEST/gh.log"
   env_args=(
     env
     -u GIT_WORKFLOW
@@ -81,15 +100,24 @@ run_guard_json() {
     -u GUARD_LEVEL
     -u GUARD_FORCE_DENY
     -u CLAUDE_CLOUD
+    -u GH_REPO
     "CLAUDE_PROJECT_DIR=$REPO"
     "GUARD_LEVEL=$level"
     "PATH=$TMPDIR_TEST/bin:$PATH"
+    "MOCK_GH_LOG=$TMPDIR_TEST/gh.log"
+    "MOCK_GH_DEVELOP_CWD=$REPO_C"
   )
   if [ "$workflow" != "__UNSET__" ]; then
     env_args+=("GIT_WORKFLOW=$workflow")
   fi
   if [ "$force_deny" != "__UNSET__" ]; then
     env_args+=("GUARD_FORCE_DENY=$force_deny")
+  fi
+  if [ "$cloud" != "__UNSET__" ]; then
+    env_args+=("CLAUDE_CLOUD=$cloud")
+  fi
+  if [ "$gh_repo" != "__UNSET__" ]; then
+    env_args+=("GH_REPO=$gh_repo")
   fi
 
   OUT=$(cd "$REPO" && printf '%s\n' "$input" | "${env_args[@]}" /bin/bash "$guard" 2>"$errf")
@@ -98,10 +126,10 @@ run_guard_json() {
 }
 
 run_bash_guard() {
-  local guard="$1" cmd="$2" workflow="${3-__UNSET__}" level="${4:-deny}" force_deny="${5:-__UNSET__}"
+  local guard="$1" cmd="$2" workflow="${3-__UNSET__}" level="${4:-deny}" force_deny="${5:-__UNSET__}" cloud="${6-__UNSET__}" gh_repo="${7-__UNSET__}"
   local input
   input=$(jq -n --arg c "$cmd" --arg cwd "$REPO" '{tool_input:{command:$c},cwd:$cwd}')
-  run_guard_json "$guard" "$input" "$workflow" "$level" "$force_deny"
+  run_guard_json "$guard" "$input" "$workflow" "$level" "$force_deny" "$cloud" "$gh_repo"
 }
 
 run_bash_guard_with_cwd() {
@@ -155,6 +183,30 @@ assert_contains() {
   fi
 }
 
+assert_gh_log_contains() {
+  local desc="$1" needle="$2"
+  if grep -q -- "$needle" "$TMPDIR_TEST/gh.log"; then
+    echo "  PASS: $desc"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL: $desc"
+    echo "    expected gh log to contain: $needle / log: $(cat "$TMPDIR_TEST/gh.log" 2>/dev/null || echo '（無し）')"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_gh_log_not_contains() {
+  local desc="$1" needle="$2"
+  if ! grep -q -- "$needle" "$TMPDIR_TEST/gh.log"; then
+    echo "  PASS: $desc"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL: $desc"
+    echo "    expected gh log not to contain: $needle / log: $(cat "$TMPDIR_TEST/gh.log" 2>/dev/null || echo '（無し）')"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
 echo "=== GIT_WORKFLOW: load order and validation ==="
 
 set_config 'GIT_WORKFLOW="trunk-direct"'
@@ -198,6 +250,53 @@ assert_deny "git -C の unquoted absolute target は target repo の worktree-pr
 run_bash_guard "$COMMIT_GUARD" "git -C \"$REPO_B\" commit -m test"
 assert_deny "git -C の quoted absolute target は target repo の worktree-pr を使う"
 
+run_bash_guard "$COMMIT_GUARD" "git -c user.name=test -C \"$REPO_B\" commit -m test"
+assert_deny "別の git global option 後の -C も target repo の worktree-pr を使う"
+
+run_bash_guard "$COMMIT_GUARD" "git -P -C \"$REPO_B\" commit -m test"
+assert_deny "pager global option 後の -C でも direct commit advisory を維持する"
+
+git -C "$REPO" switch -q -c feature/quoted-cd-context
+run_bash_guard "$COMMIT_GUARD" "'cd' \"$REPO_B\" && git commit -m test"
+assert_deny "quoted cd builtin でも target repo の worktree-pr を使う"
+
+run_bash_guard "$COMMIT_GUARD" "c''d \"$REPO_B\" && git commit -m test"
+assert_deny "quote-concatenated cd builtin でも target repo policy を使う"
+
+run_bash_guard "$COMMIT_GUARD" "builtin cd \"$REPO_B\" && git commit -m test"
+assert_deny "builtin cd prefix でも target repo policy を使う"
+
+run_bash_guard "$COMMIT_GUARD" "command cd \"$REPO_B\" && git commit -m test"
+assert_deny "command cd prefix でも target repo policy を使う"
+
+run_bash_guard "$COMMIT_GUARD" "command -p cd \"$REPO_B\" && git commit -m test"
+assert_deny "command -p cd prefix でも target repo policy を使う"
+
+run_bash_guard "$COMMIT_GUARD" "command -- cd \"$REPO_B\" && git commit -m test"
+assert_deny "command -- cd prefix でも target repo policy を使う"
+
+run_bash_guard "$COMMIT_GUARD" "builtin -- cd \"$REPO_B\" && git commit -m test"
+assert_deny "builtin -- cd prefix でも target repo policy を使う"
+
+run_bash_guard "$COMMIT_GUARD" "pushd \"$REPO_B\" >/dev/null && git commit -m test"
+assert_deny "pushd による untracked cwd change は fail closed する"
+git -C "$REPO" switch -q main
+
+run_bash_guard "$COMMIT_GUARD" 'git commit -m pushd'
+assert_silent_allow "commit message の pushd は cwd change と誤認しない"
+
+run_bash_guard "$COMMIT_GUARD" 'echo pushd && git commit -m test'
+assert_silent_allow "通常commandの引数にある pushd は cwd change と誤認しない"
+
+run_bash_guard "$COMMIT_GUARD" "git --no-replace-objects -C \"$REPO_B\" checkout feature/policy"
+assert_deny "global option 後の -C でも checkout advisory を target repo に適用する"
+
+run_bash_guard "$COMMIT_GUARD" "git -p -C \"$REPO_B\" merge feature/policy"
+assert_deny "global option 後の -C でも merge advisory を target repo に適用する"
+
+run_bash_guard "$COMMIT_GUARD" "git -C \"$REPO_B\" stash apply"
+assert_deny "git -C でも stash advisory を target repo に適用する"
+
 run_bash_guard "$COMMIT_GUARD" "cd $REPO_C && git commit -m test"
 assert_deny "cd の unquoted target は target repo の worktree-pr を使う"
 
@@ -236,6 +335,69 @@ set_config_c 'GIT_WORKFLOW="worktree-pr"'
 run_bash_guard "$GH_GUARD" 'gh pr merge 42 --repo other/repo'
 assert_deny "明示 --repo を local config に対応付けられなければ fail closed"
 
+run_bash_guard "$GH_GUARD" 'gh pr merge 42 -Rother/repo'
+assert_deny "attached -Rowner/repo も explicit repo として fail closed"
+assert_gh_log_contains "get_pr_base は attached -R の repo を --repo で引き渡す" "--repo other/repo --json baseRefName"
+
+run_bash_guard "$GH_GUARD" 'gh pr merge 42' __UNSET__ deny __UNSET__ __UNSET__ other/repo
+assert_deny "ambient GH_REPO も explicit repo として fail closed"
+assert_gh_log_contains "ambient GH_REPO を merge lookup に引き渡す" "--repo other/repo --json baseRefName"
+
+run_bash_guard "$GH_GUARD" 'gh -Rother/repo pr merge 42'
+assert_deny "gh root位置の attached -R でも merge を検出する"
+assert_gh_log_contains "root位置の selector を merge lookup に引き渡す" "--repo other/repo --json baseRefName"
+
+run_bash_guard "$GH_GUARD" 'gh --repo other/repo pr review 42 --approve'
+assert_deny "gh root位置の separated --repo でも review を検出する"
+
+run_bash_guard "$GH_GUARD" 'gh pr -R=other/repo merge 42'
+assert_deny "pr と subcommand 間の equals -R でも merge を検出する"
+
+run_bash_guard "$GH_GUARD" '"gh" pr merge 42 -Rother/repo'
+assert_deny "quoted gh executable でも merge を検出する"
+
+run_bash_guard "$GH_GUARD" 'gh pr merge -Rother/repo'
+assert_deny "PR番号省略時も explicit repo の main merge を deny する"
+assert_gh_log_contains "PR番号省略時も repo selector を lookup に引き渡す" "--repo other/repo --json baseRefName"
+
+run_bash_guard "$GH_GUARD" 'gh pr view 7 -Rsafe/develop && gh pr merge 42 -Rother/repo'
+assert_deny "別 gh segment の selector を merge lookup に流用しない"
+assert_gh_log_contains "merge segment 自身の selector を lookup に使う" "--repo other/repo --json baseRefName"
+
+run_bash_guard "$GH_GUARD" 'gh pr merge 1 -Rsafe/develop && gh pr merge 2 -Rother/repo'
+assert_deny "複数 merge segment をすべて評価して後続 main target を見逃さない"
+
+run_bash_guard "$GH_GUARD" 'gh pr merge -A develop 42 -Rother/repo'
+assert_deny "merge option の author-email 値を PR target と誤認しない"
+assert_gh_log_contains "author-email 後の実 PR target を lookup に使う" "pr view 42 --repo other/repo"
+
+run_bash_guard "$GH_GUARD" 'gh pr merge -- -Rfoo/bar' worktree-pr
+assert_deny "-- 後の -R-prefixed branch を repo selector と誤認しない"
+assert_gh_log_contains "-- 後の token を PR target として lookup する" "pr view -Rfoo/bar --json baseRefName"
+assert_gh_log_not_contains "-- 後の token を --repo に変換しない" "--repo foo/bar"
+
+run_bash_guard "$GH_GUARD" "cd \"$REPO_C\" && gh pr view 1; cd \"$REPO_B\" && gh pr merge 42"
+assert_deny "各 gh segment に対応する cd context で target branch を評価する"
+
+run_bash_guard_with_cwd "$GH_GUARD" "env -C \"$REPO_B\" gh pr merge 42" "$REPO_C"
+assert_deny "env -C 経由の gh target context は fail closed する"
+
+run_bash_guard "$GH_GUARD" 'GH_REPO=other/repo gh pr merge 42'
+assert_deny "command-local GH_REPO の main target を deny する"
+assert_gh_log_contains "GH_REPO を lookup の repo selector に引き渡す" "--repo other/repo --json baseRefName"
+
+run_bash_guard "$GH_GUARD" 'gh pr review 42 --approve -F -Rdecoy/repo'
+assert_silent_allow "-F の値を repo selector と誤認せず trunk-direct を維持する"
+assert_gh_log_not_contains "body-file 値を --repo に変換しない" "--repo decoy/repo"
+
+run_bash_guard "$GH_GUARD" $'gh pr review 42 --approve --body "hello\nworld" -Rother/repo'
+assert_deny "multiline quoted body 後の real repo selector を見逃さない"
+assert_gh_log_contains "multiline body 後の selector を lookup に引き渡す" "--repo other/repo --json baseRefName"
+
+run_bash_guard "$GH_GUARD" 'gh pr review 42 --approve -Rother/repo' worktree-pr deny __UNSET__ 1
+assert_deny "cloud review の attached -Rowner/repo も main approve を deny"
+assert_gh_log_contains "is_proxy_approve は attached -R の repo を --repo で引き渡す" "--repo other/repo --json author"
+
 run_bash_guard "$COMMIT_GUARD" "git -C \"$REPO_B\" commit -m test" trunk-direct
 assert_silent_allow "明示した環境変数 trunk-direct は command target config より優先する"
 
@@ -259,6 +421,30 @@ assert_contains "worktree-pr でも --no-verify 専用理由で deny する" "--
 
 run_bash_guard "$COMMIT_GUARD" 'git commit -m test && git push origin main --force' worktree-pr warn
 assert_deny "worktree advisory より先に main force push を critical deny する"
+
+run_bash_guard "$COMMIT_GUARD" 'git -P commit -m test --no-verify' trunk-direct warn
+assert_deny "git global option 後の commit でも --no-verify を critical deny する"
+
+run_bash_guard "$COMMIT_GUARD" 'git --no-lazy-fetch commit -m test --no-verify' trunk-direct warn
+assert_deny "no-value global option 後の commit でも critical check を維持する"
+
+run_bash_guard "$COMMIT_GUARD" 'git --no-optional-locks push origin main --force' trunk-direct warn
+assert_deny "no-value global option 後の push でも critical check を維持する"
+
+run_bash_guard "$COMMIT_GUARD" 'git --no-advice branch -D develop' trunk-direct warn
+assert_deny "no-value global option 後の branch でも critical check を維持する"
+
+run_bash_guard "$COMMIT_GUARD" 'git --exec-path=/tmp commit -m test --no-verify' trunk-direct warn
+assert_deny "attached-value global option 後も critical check を維持する"
+
+run_bash_guard "$COMMIT_GUARD" 'git --future-global commit -m test --no-verify' trunk-direct warn
+assert_deny "未知の global option 後も危険 subcommand を fail closed する"
+
+run_bash_guard "$COMMIT_GUARD" $'git commit -m "hello\nworld" --no-verify' trunk-direct warn
+assert_deny "multiline commit message 後の --no-verify も critical deny する"
+
+run_bash_guard "$COMMIT_GUARD" 'git merge feature/policy -m hotfix/bypass' worktree-pr
+assert_deny "merge message の hotfix/ を actual hotfix revision と誤認しない"
 
 run_bash_guard "$COMMIT_GUARD" 'git checkout feature/policy && git branch -D develop' worktree-pr warn
 assert_deny "worktree advisory より先に develop 削除を critical deny する"
@@ -422,8 +608,14 @@ assert_silent_allow "main 向け gh pr merge workflow check を許可する"
 run_bash_guard "$GH_GUARD" 'gh api repos/o/r/pulls/42/merge -X PUT' trunk-direct warn
 assert_deny "trunk-direct でも API direct merge を deny する"
 
+run_bash_guard "$GH_GUARD" '"/opt/homebrew/bin/gh" api repos/o/r/pulls/42/merge -X PUT' trunk-direct warn
+assert_deny "quoted gh executable の API direct merge も deny する"
+
 run_bash_guard "$GH_GUARD" 'gh api repos/o/r/pulls/42/reviews -f event=APPROVE' trunk-direct warn
 assert_deny "trunk-direct でも API direct approve を deny する"
+
+run_bash_guard "$GH_GUARD" '"curl" -X POST https://api.github.com/repos/o/r/pulls/42/reviews -d event=APPROVE' trunk-direct warn
+assert_deny "quoted curl executable の API direct approve も deny する"
 
 run_bash_guard "$GH_GUARD" 'gh pr merge 42' worktree-pr
 assert_deny "worktree-pr は main 向け gh pr merge 防御を維持する"
@@ -439,6 +631,9 @@ echo "=== worktree policy and universal guards ==="
 
 run_write_guard trunk-direct
 assert_silent_allow "trunk-direct は main worktree edit を許可する"
+
+run_write_guard trunk-direct warn worktree-guard
+assert_deny "trunk-direct でも GUARD_FORCE_DENY=worktree-guard を優先する"
 
 run_write_guard worktree-pr warn worktree-guard
 assert_deny "worktree-pr + GUARD_FORCE_DENY は main worktree edit を deny する"

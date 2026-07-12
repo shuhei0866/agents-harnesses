@@ -39,22 +39,25 @@ SAFE_CMD=$(guard_sanitize_command "$STRIPPED_CMD")
 # ごと除去する。これにより rm -rf "/etc" は検出しつつ、echo 'rm -rf "/etc"' や
 # rm -rf '\"/etc\"' のように quote 自体がパス名の一部である場合は除外できる。
 # "$HOME" は展開されるため保護するが、"~" と '$HOME' は展開されないため保護しない。
-CRITICAL_BEGIN_MARKER='__AH_GUARD_CRITICAL_BEGIN_7F3A__'
-CRITICAL_END_MARKER='__AH_GUARD_CRITICAL_END_7F3A__'
-if [[ "$STRIPPED_CMD" == *"$CRITICAL_BEGIN_MARKER"* || "$STRIPPED_CMD" == *"$CRITICAL_END_MARKER"* ]]; then
-  # 入力と marker が衝突する場合は quote 保護を fail-open し、既存の sanitized 判定に戻す。
-  CRITICAL_CMD="$SAFE_CMD"
-else
-  PROTECTED_CMD=$(printf '%s\n' "$STRIPPED_CMD" | sed -E \
-    -e 's#"(/(etc|var|usr)(/[^\"]*)?|/)"#__AH_GUARD_CRITICAL_BEGIN_7F3A__\1__AH_GUARD_CRITICAL_END_7F3A__#g' \
-    -e "s#'(/(etc|var|usr)(/[^']*)?|/)'#__AH_GUARD_CRITICAL_BEGIN_7F3A__\\1__AH_GUARD_CRITICAL_END_7F3A__#g" \
-    -e 's#"\$HOME/?"#__AH_GUARD_CRITICAL_BEGIN_7F3A__$HOME__AH_GUARD_CRITICAL_END_7F3A__#g' \
-    -e 's#/"(etc|var|usr)"#/__AH_GUARD_CRITICAL_BEGIN_7F3A__\1__AH_GUARD_CRITICAL_END_7F3A__#g' \
-    -e "s#/'(etc|var|usr)'#/__AH_GUARD_CRITICAL_BEGIN_7F3A__\\1__AH_GUARD_CRITICAL_END_7F3A__#g")
-  CRITICAL_CMD=$(guard_sanitize_command "$PROTECTED_CMD")
-  CRITICAL_CMD="${CRITICAL_CMD//${CRITICAL_BEGIN_MARKER}/}"
-  CRITICAL_CMD="${CRITICAL_CMD//${CRITICAL_END_MARKER}/}"
-fi
+MARKER_NONCE="$$"
+MARKER_NONCE="${MARKER_NONCE}_${RANDOM}_${#STRIPPED_CMD}"
+CRITICAL_BEGIN_MARKER="__AH_GUARD_CRITICAL_BEGIN_${MARKER_NONCE}__"
+CRITICAL_END_MARKER="__AH_GUARD_CRITICAL_END_${MARKER_NONCE}__"
+while [[ "$STRIPPED_CMD" == *"$CRITICAL_BEGIN_MARKER"* || "$STRIPPED_CMD" == *"$CRITICAL_END_MARKER"* ]]; do
+  MARKER_NONCE="${MARKER_NONCE}_X"
+  CRITICAL_BEGIN_MARKER="__AH_GUARD_CRITICAL_BEGIN_${MARKER_NONCE}__"
+  CRITICAL_END_MARKER="__AH_GUARD_CRITICAL_END_${MARKER_NONCE}__"
+done
+
+PROTECTED_CMD=$(printf '%s\n' "$STRIPPED_CMD" | sed -E \
+  -e "s#\"(/(etc|var|usr)(/[^\"]*)?|/)\"#${CRITICAL_BEGIN_MARKER}\\1${CRITICAL_END_MARKER}#g" \
+  -e "s#'(/(etc|var|usr)(/[^']*)?|/)'#${CRITICAL_BEGIN_MARKER}\\1${CRITICAL_END_MARKER}#g" \
+  -e 's#"\$HOME/?"#'"${CRITICAL_BEGIN_MARKER}"'$HOME'"${CRITICAL_END_MARKER}"'#g' \
+  -e "s#/\"(etc|var|usr)\"#/${CRITICAL_BEGIN_MARKER}\\1${CRITICAL_END_MARKER}#g" \
+  -e "s#/'(etc|var|usr)'#/${CRITICAL_BEGIN_MARKER}\\1${CRITICAL_END_MARKER}#g")
+CRITICAL_CMD=$(guard_sanitize_command "$PROTECTED_CMD")
+CRITICAL_CMD="${CRITICAL_CMD//${CRITICAL_BEGIN_MARKER}/}"
+CRITICAL_CMD="${CRITICAL_CMD//${CRITICAL_END_MARKER}/}"
 
 # --- rm -rf /（ルート・ホーム・重要ディレクトリ）: ブロック ---
 # 注: \b は / や ~ の直後では一致しない（非単語文字同士に語境界が立たない）ため、

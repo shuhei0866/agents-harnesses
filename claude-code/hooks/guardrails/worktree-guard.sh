@@ -56,8 +56,8 @@ GUARD_COMMON="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_guard-common.sh
 source "$GUARD_COMMON"
 
 # trunk-direct はメインワークツリーでの Edit/Write を明示的に許可する。
-# 未設定・worktree-pr・不正値は guard_is_trunk_direct が false となり従来どおり判定する。
-if guard_is_trunk_direct; then
+# ただし GUARD_FORCE_DENY=worktree-guard は policy より優先して通常の deny 判定へ進む。
+if guard_is_trunk_direct && ! _is_force_deny; then
   exit 0
 fi
 
