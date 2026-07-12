@@ -299,6 +299,10 @@ HOME="$TMPDIR_TEST" run_bash_guard "$COMMIT_GUARD" "git -C __GUARD_LITERAL_TILDE
 assert_deny "literal path から tilde metadata を偽装できない"
 run_bash_guard "$COMMIT_GUARD" "if false; then cd \"$REPO_B\"; fi; git commit -m test"
 assert_deny "未実行の conditional cd から trunk-direct policy を後続 commit に漏らさない"
+git -C "$REPO" switch -qc feature/conditional-cwd
+run_bash_guard "$COMMIT_GUARD" "if cd \"$REPO_B\"; then git commit -m test; fi"
+assert_deny "conditional cd 後の commit target を元 feature branch と誤認しない"
+git -C "$REPO" switch -q main
 run_bash_guard "$COMMIT_GUARD" $'if false\nthen\n  cd '"\"$REPO_B\""$'\nfi\ngit commit -m test'
 assert_deny "改行された conditional cd からも trunk-direct policy を漏らさない"
 run_bash_guard "$COMMIT_GUARD" $'if true\nthen\n  if false\n  then\n    cd '"\"$REPO_B\""$'\n  fi\nfi\ngit commit -m test'
@@ -474,6 +478,9 @@ assert_gh_log_not_contains "-- 後の token を --repo に変換しない" "--re
 
 run_bash_guard "$GH_GUARD" "cd \"$REPO_C\" && gh pr view 1; cd \"$REPO_B\" && gh pr merge 42"
 assert_deny "各 gh segment に対応する cd context で target branch を評価する"
+
+run_bash_guard_with_cwd "$GH_GUARD" "if cd \"$REPO_B\"; then gh pr merge 42; fi" "$REPO_C"
+assert_deny "conditional cd 後の gh repo context は fail closed する"
 
 run_bash_guard_with_cwd "$GH_GUARD" "env -C \"$REPO_B\" gh pr merge 42" "$REPO_C"
 assert_deny "env -C 経由の gh target context は fail closed する"

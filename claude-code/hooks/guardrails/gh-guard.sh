@@ -120,8 +120,8 @@ _gh_guard_record_pr_invocation() {
 
 _gh_guard_collect_pr_invocations() {
   local base_dir="" active_dir="" stripped="" segments="" segment="" token="" path=""
-  local context_unknown=0 i=0 count=0 cd_index=-1
-  local -a tokens=()
+  local context_unknown=0 i=0 count=0 cd_index=-1 tilde_literal=0
+  local -a tokens=() tilde_literals=()
 
   if [ -n "$HOOK_CWD" ]; then
     base_dir=$(_guard_resolve_directory "$(pwd -P)" "$HOOK_CWD" 2>/dev/null || echo "")
@@ -136,14 +136,20 @@ _gh_guard_collect_pr_invocations() {
   fi
 
   stripped=$(guard_strip_heredoc_bodies "$COMMAND")
+  if guard_has_control_flow_cwd_change "$stripped"; then
+    context_unknown=1
+    active_dir=""
+  fi
   segments=$(guard_split_segments "$stripped")
   while IFS= read -r segment; do
     segment=$(printf '%s\n' "$segment" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
     [ -n "$segment" ] || continue
     tokens=()
-    while IFS= read -r token; do
+    tilde_literals=()
+    while IFS=$'\034' read -r tilde_literal token; do
       tokens[${#tokens[@]}]="$token"
-    done < <(guard_shell_tokens_expanding_env_split "$segment")
+      tilde_literals[${#tilde_literals[@]}]="$tilde_literal"
+    done < <(guard_shell_tokens_expanding_env_split "$segment" tilde-meta)
     count=${#tokens[@]}
     [ "$count" -gt 0 ] || continue
 
@@ -162,7 +168,7 @@ _gh_guard_collect_pr_invocations() {
       fi
       if [ "$i" -lt "$count" ]; then
         path="${tokens[$i]}"
-        active_dir=$(_guard_resolve_directory "$active_dir" "$path" 2>/dev/null || echo "")
+        active_dir=$(_guard_resolve_directory "$active_dir" "$path" "${tilde_literals[$i]:-0}" 2>/dev/null || echo "")
       else
         active_dir=""
       fi

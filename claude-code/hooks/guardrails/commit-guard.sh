@@ -442,6 +442,10 @@ _commit_guard_check_universal_critical() {
   fi
 
   stripped=$(guard_strip_heredoc_bodies "$COMMAND")
+  if guard_has_control_flow_cwd_change "$stripped"; then
+    ambiguous_context=1
+    active_dir=""
+  fi
   segments=$(guard_split_segments "$stripped")
   case "$stripped" in
     *'$('*|*'`'*)

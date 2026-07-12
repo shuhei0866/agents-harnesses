@@ -532,6 +532,29 @@ guard_cd_command_index() {
   return 1
 }
 
+# Static command text containing both shell control flow and a cwd-changing cd
+# cannot be assigned a single repository safely by the downstream collectors.
+guard_has_control_flow_cwd_change() {
+  local command="$1" segments="" segment="" token="" base="" saw_control=0
+  segments=$(guard_split_segments "$command")
+  while IFS= read -r segment; do
+    while IFS= read -r token; do
+      base="${token##*/}"
+      case "$base" in
+        if|then|elif|else|while|until|for|select|do|case|in)
+          saw_control=1
+          ;;
+        cd)
+          if [ "$saw_control" -eq 1 ]; then
+            return 0
+          fi
+          ;;
+      esac
+    done < <(guard_shell_tokens "$segment")
+  done <<< "$segments"
+  return 1
+}
+
 # git global option の解釈を policy resolver と各 guard で共有する。
 # 呼び出し後に GUARD_GIT_GLOBAL_KIND / VALUE を参照する。
 guard_classify_git_global_token() {
