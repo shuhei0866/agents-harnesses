@@ -17,13 +17,14 @@ TMPDIR_TEST="$(cd "$TMPDIR_TEST" && pwd -P)"
 REPO="$TMPDIR_TEST/repo"
 REPO_B="$TMPDIR_TEST/repo b"
 REPO_C="$TMPDIR_TEST/repo-c"
+REPO_NO_CONFIG="$TMPDIR_TEST/repo-no-config"
 
 cleanup() {
   rm -rf "$TMPDIR_TEST"
 }
 trap cleanup EXIT
 
-mkdir -p "$REPO/.claude" "$REPO/src" "$REPO_B/.claude" "$REPO_B/src" "$REPO_C/.claude" "$REPO_C/src" "$TMPDIR_TEST/bin"
+mkdir -p "$REPO/.claude" "$REPO/src" "$REPO_B/.claude" "$REPO_B/src" "$REPO_C/.claude" "$REPO_C/src" "$REPO_NO_CONFIG/src" "$TMPDIR_TEST/bin"
 git init -q "$REPO"
 git -C "$REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
 git -C "$REPO" branch -M main
@@ -33,6 +34,9 @@ git -C "$REPO_B" branch -M main
 git init -q "$REPO_C"
 git -C "$REPO_C" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
 git -C "$REPO_C" branch -M main
+git init -q "$REPO_NO_CONFIG"
+git -C "$REPO_NO_CONFIG" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+git -C "$REPO_NO_CONFIG" branch -M main
 
 # commit-guard / gh-guard / merged-pr-push-guard が必要とする gh 応答を1つの mock で返す。
 cat > "$TMPDIR_TEST/bin/gh" <<'MOCK'
@@ -146,6 +150,12 @@ run_write_guard() {
   run_guard_json "$WORKTREE_GUARD" "$input" "$workflow" "$level" "$force_deny"
 }
 
+run_write_guard_without_target_config() {
+  local input
+  input=$(jq -n --arg p "$REPO_NO_CONFIG/src/app.txt" '{tool_input:{file_path:$p}}')
+  run_guard_json "$WORKTREE_GUARD" "$input" __UNSET__ "" __UNSET__
+}
+
 assert_deny() {
   local desc="$1"
   if [ "$STATUS" -eq 0 ] && [ -z "$ERR" ] \
@@ -167,6 +177,19 @@ assert_silent_allow() {
   else
     echo "  FAIL: $desc"
     echo "    expected: silent allow / status: $STATUS / stderr: ${ERR:-無し} / output: ${OUT:-（出力なし）}"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_warn_allow() {
+  local desc="$1"
+  if [ "$STATUS" -eq 0 ] && [ -z "$ERR" ] \
+     && echo "$OUT" | jq -e '.hookSpecificOutput.permissionDecision == "allow" and (.hookSpecificOutput.additionalContext | contains("WARNING:"))' >/dev/null 2>&1; then
+    echo "  PASS: $desc"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL: $desc"
+    echo "    expected: warning allow / status: $STATUS / stderr: ${ERR:-無し} / output: ${OUT:-（出力なし）}"
     FAIL=$((FAIL + 1))
   fi
 }
@@ -208,6 +231,31 @@ assert_gh_log_not_contains() {
 }
 
 echo "=== GIT_WORKFLOW: load order and validation ==="
+
+echo ""
+echo "=== config lookup stays anchored to the target repository ==="
+
+set_config 'GUARD_FORCE_DENY="worktree-guard"'
+run_write_guard_without_target_config
+assert_warn_allow "config のない対象 repo は hook cwd の GUARD_FORCE_DENY を継承しない"
+
+set_config 'GUARD_LEVEL="deny"'
+run_write_guard_without_target_config
+assert_warn_allow "config のない対象 repo は hook cwd の GUARD_LEVEL を継承しない"
+
+set_config 'GUARD_SKIP="worktree-guard"'
+run_write_guard_without_target_config
+assert_warn_allow "config のない対象 repo は hook cwd の GUARD_SKIP を継承しない"
+
+set_config 'GIT_WORKFLOW="trunk-direct"'
+run_write_guard_without_target_config
+assert_warn_allow "config のない対象 repo は hook cwd の GIT_WORKFLOW を継承しない"
+
+rm -f "$REPO/.claude/harness.config"
+printf '%s\n' 'GUARD_FORCE_DENY="worktree-guard"' > "$REPO/.claude/vdd.config"
+run_write_guard_without_target_config
+assert_warn_allow "legacy vdd.config も hook cwd から対象 repo へ漏れない"
+rm -f "$REPO/.claude/vdd.config"
 
 set_config 'GIT_WORKFLOW="trunk-direct"'
 run_bash_guard "$COMMIT_GUARD" 'git commit -m test'
