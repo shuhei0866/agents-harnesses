@@ -29,29 +29,29 @@ fi
 # --- 設定ファイルの探索 ---
 # 優先順位: harness.config > vdd.config（後方互換）
 _find_config_file() {
-  local config_file=""
+  local config_file="" project_root=""
+
+  # CLAUDE_PROJECT_DIR が明示されている場合は、その repo だけを探索対象にする。
+  # config が無くても hook プロセスの cwd へはフォールバックしない。
+  if [ -n "${CLAUDE_PROJECT_DIR:-}" ]; then
+    project_root=$(git -C "$CLAUDE_PROJECT_DIR" rev-parse --show-toplevel 2>/dev/null || echo "")
+  else
+    project_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+  fi
 
   # harness.config を優先探索
   if [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -f "$CLAUDE_PROJECT_DIR/.claude/harness.config" ]; then
     config_file="$CLAUDE_PROJECT_DIR/.claude/harness.config"
-  else
-    local project_root
-    project_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
-    if [ -n "$project_root" ] && [ -f "$project_root/.claude/harness.config" ]; then
-      config_file="$project_root/.claude/harness.config"
-    fi
+  elif [ -n "$project_root" ] && [ -f "$project_root/.claude/harness.config" ]; then
+    config_file="$project_root/.claude/harness.config"
   fi
 
   # harness.config が見つからなければ vdd.config にフォールバック（後方互換）
   if [ -z "$config_file" ]; then
     if [ -n "${CLAUDE_PROJECT_DIR:-}" ] && [ -f "$CLAUDE_PROJECT_DIR/.claude/vdd.config" ]; then
       config_file="$CLAUDE_PROJECT_DIR/.claude/vdd.config"
-    else
-      local project_root
-      project_root=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
-      if [ -n "$project_root" ] && [ -f "$project_root/.claude/vdd.config" ]; then
-        config_file="$project_root/.claude/vdd.config"
-      fi
+    elif [ -n "$project_root" ] && [ -f "$project_root/.claude/vdd.config" ]; then
+      config_file="$project_root/.claude/vdd.config"
     fi
   fi
 
