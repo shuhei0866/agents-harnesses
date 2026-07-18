@@ -631,14 +631,14 @@ if ! guard_is_trunk_direct; then
     ADVISORY_DETAIL="${_COMMIT_GUARD_ADVISORY_DETAILS[$ADVISORY_INDEX]}"
 
     if [ "$ADVISORY_UNKNOWN" -eq 1 ] || [ -z "$ADVISORY_DIR" ]; then
-      guard_respond "advisory" "コミット衛生ガード" "${ADVISORY_OP} の対象リポジトリを一意に確認できなかったため、安全のためブロックしました。"
+      guard_respond "advisory" "コミット衛生ガード" "${ADVISORY_OP} の対象リポジトリを一意に確認できませんでした。コマンドの作業ディレクトリまたは \`git -C <path>\` で対象リポジトリを明示してください。"
     fi
 
     GIT_COMMON_DIR=$(git -C "$ADVISORY_DIR" rev-parse --git-common-dir 2>/dev/null || echo "")
     GIT_DIR=$(git -C "$ADVISORY_DIR" rev-parse --git-dir 2>/dev/null || echo "")
     BRANCH=$(git -C "$ADVISORY_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
     if [ -z "$GIT_DIR" ] || [ -z "$GIT_COMMON_DIR" ]; then
-      guard_respond "advisory" "コミット衛生ガード" "${ADVISORY_OP} の対象リポジトリを確認できなかったため、安全のためブロックしました。"
+      guard_respond "advisory" "コミット衛生ガード" "${ADVISORY_OP} の対象リポジトリを確認できませんでした。コマンドの作業ディレクトリまたは \`git -C <path>\` で対象リポジトリを明示してください。"
     fi
 
     case "$ADVISORY_OP" in

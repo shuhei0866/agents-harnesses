@@ -17,6 +17,7 @@ TMPDIR_TEST="$(cd "$TMPDIR_TEST" && pwd -P)"
 REPO="$TMPDIR_TEST/repo"
 REPO_B="$TMPDIR_TEST/repo b"
 REPO_C="$TMPDIR_TEST/repo-c"
+NON_REPO="$TMPDIR_TEST/not-a-repository"
 REPO_NO_CONFIG="$TMPDIR_TEST/repo-no-config"
 
 cleanup() {
@@ -24,7 +25,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$REPO/.claude" "$REPO/src" "$REPO_B/.claude" "$REPO_B/src" "$REPO_C/.claude" "$REPO_C/src" "$REPO_NO_CONFIG/src" "$TMPDIR_TEST/bin"
+mkdir -p "$REPO/.claude" "$REPO/src" "$REPO_B/.claude" "$REPO_B/src" "$REPO_C/.claude" "$REPO_C/src" "$NON_REPO" "$REPO_NO_CONFIG/src" "$TMPDIR_TEST/bin"
 git init -q "$REPO"
 git -C "$REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
 git -C "$REPO" branch -M main
@@ -206,6 +207,18 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local desc="$1" needle="$2"
+  if ! echo "$OUT" | grep -q -- "$needle"; then
+    echo "  PASS: $desc"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL: $desc"
+    echo "    expected not to contain: $needle / output: ${OUT:-（出力なし）}"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
 assert_gh_log_contains() {
   local desc="$1" needle="$2"
   if grep -q -- "$needle" "$TMPDIR_TEST/gh.log"; then
@@ -256,6 +269,27 @@ printf '%s\n' 'GUARD_FORCE_DENY="worktree-guard"' > "$REPO/.claude/vdd.config"
 run_write_guard_without_target_config
 assert_warn_allow "legacy vdd.config も hook cwd から対象 repo へ漏れない"
 rm -f "$REPO/.claude/vdd.config"
+
+echo ""
+echo "=== unresolved repository advisories describe the actual decision ==="
+
+run_bash_guard "$COMMIT_GUARD" 'GIT_DIR=/tmp/example.git git commit -m test' worktree-pr warn
+assert_warn_allow "曖昧な commit target は warn 設定で警告して許可する"
+assert_contains "曖昧な target は対象 repo の明示を促す" "対象リポジトリを明示してください"
+assert_not_contains "warn 応答は commit をブロックしたと誤表示しない" "ブロックしました"
+
+run_bash_guard "$COMMIT_GUARD" 'GIT_DIR=/tmp/example.git git commit -m test' worktree-pr deny
+assert_deny "曖昧な commit target は deny 設定では拒否する"
+assert_not_contains "deny 応答も固定の誤解を招く文言を使わない" "ブロックしました"
+
+run_bash_guard "$COMMIT_GUARD" "git -C \"$NON_REPO\" commit -m test" worktree-pr warn
+assert_warn_allow "非 Git directory は warn 設定で警告して許可する"
+assert_contains "非 Git directory でも対象 repo の明示を促す" "対象リポジトリを明示してください"
+assert_not_contains "非 Git directory の warn 応答も block と誤表示しない" "ブロックしました"
+
+run_bash_guard "$COMMIT_GUARD" "git -C \"$NON_REPO\" commit -m test" worktree-pr deny
+assert_deny "非 Git directory は deny 設定では拒否する"
+assert_not_contains "非 Git directory の deny 応答も中立文言を使う" "ブロックしました"
 
 set_config 'GIT_WORKFLOW="trunk-direct"'
 run_bash_guard "$COMMIT_GUARD" 'git commit -m test'
