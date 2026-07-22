@@ -1,0 +1,13 @@
+{
+  "hook_event_name": "Stop",
+  "session_id": "claude-session-123",
+  "transcript_path": "/Users/alice/.claude/projects/acme/session.jsonl",
+  "cwd": "/Users/alice/work/acme-api",
+  "permission_mode": "default",
+  "stop_hook_active": false,
+  "last_assistant_message": "ASSISTANT_CANARY_72f1b9",
+  "prompt": "PROMPT_CANARY_5a82d4",
+  "code": "CODE_CANARY_e193c7",
+  "output": "OUTPUT_CANARY_b647aa",
+  "unknown": "UNKNOWN_CANARY_c04f2e"
+}

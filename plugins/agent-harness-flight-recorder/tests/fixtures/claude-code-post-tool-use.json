@@ -1,0 +1,20 @@
+{
+  "session_id": "claude-session-789",
+  "transcript_path": "/Users/alice/.claude/projects/acme/session.jsonl",
+  "cwd": "/Users/alice/work/acme-api",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "printf CODE_CANARY_e193c7",
+    "description": "PROMPT_CANARY_5a82d4"
+  },
+  "tool_response": {
+    "output": "OUTPUT_CANARY_b647aa",
+    "success": true
+  },
+  "tool_use_id": "toolu_01ABC123",
+  "duration_ms": 12,
+  "unknown": "UNKNOWN_CANARY_c04f2e",
+  "assistant": "ASSISTANT_CANARY_72f1b9"
+}
