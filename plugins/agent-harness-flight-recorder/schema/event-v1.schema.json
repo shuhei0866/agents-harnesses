@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/shuhei0866/agents-harnesses/plugins/agent-harness-flight-recorder/schema/event-v1.schema.json",
+  "title": "Agent Harness Flight Recorder Event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "recorded_at",
+    "harness",
+    "source_event",
+    "event_kind",
+    "session_id_hash",
+    "turn_id_hash",
+    "workspace_id",
+    "model",
+    "permission_mode",
+    "tool",
+    "metrics",
+    "outcome"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "event_id": { "type": "string", "format": "uuid" },
+    "recorded_at": { "type": "string", "format": "date-time" },
+    "harness": { "enum": ["claude-code", "codex"] },
+    "source_event": { "type": "string" },
+    "event_kind": {
+      "enum": [
+        "session.started",
+        "turn.prompted",
+        "tool.completed",
+        "turn.completed",
+        "hook.observed"
+      ]
+    },
+    "session_id_hash": { "$ref": "#/$defs/hashOrNull" },
+    "turn_id_hash": { "$ref": "#/$defs/hashOrNull" },
+    "workspace_id": { "$ref": "#/$defs/hashOrNull" },
+    "model": { "$ref": "#/$defs/stringOrNull" },
+    "permission_mode": { "$ref": "#/$defs/stringOrNull" },
+    "tool": { "$ref": "#/$defs/stringOrNull" },
+    "metrics": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "duration_ms": { "$ref": "#/$defs/nonNegativeNumber" },
+            "duration_api_ms": { "$ref": "#/$defs/nonNegativeNumber" },
+            "tool_duration_ms": { "$ref": "#/$defs/nonNegativeNumber" },
+            "num_turns": { "$ref": "#/$defs/nonNegativeNumber" },
+            "input_tokens": { "$ref": "#/$defs/nonNegativeNumber" },
+            "output_tokens": { "$ref": "#/$defs/nonNegativeNumber" },
+            "cache_creation_input_tokens": { "$ref": "#/$defs/nonNegativeNumber" },
+            "cache_read_input_tokens": { "$ref": "#/$defs/nonNegativeNumber" },
+            "total_cost_usd": { "$ref": "#/$defs/nonNegativeNumber" }
+          }
+        }
+      ]
+    },
+    "outcome": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "status": { "enum": ["success", "failure", "unknown"] },
+            "exit_code": { "type": ["integer", "null"] }
+          }
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "hashOrNull": {
+      "oneOf": [
+        { "type": "null" },
+        { "type": "string", "pattern": "^sha256:[0-9a-f]{24}$" }
+      ]
+    },
+    "stringOrNull": { "type": ["string", "null"] },
+    "nonNegativeNumber": { "type": "number", "minimum": 0 }
+  }
+}
