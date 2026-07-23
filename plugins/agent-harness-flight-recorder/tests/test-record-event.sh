@@ -214,7 +214,7 @@ test_concurrent_append() {
 test_optional_fields_default_to_null() {
   echo "test_optional_fields_default_to_null:"
   local log="$TMPDIR_TEST/optional.jsonl" out="$TMPDIR_TEST/optional.out" err="$TMPDIR_TEST/optional.err" input="$TMPDIR_TEST/optional-input.json" status
-  printf '%s' '{"hook_event_name":"Stop","session_id":"minimal-session-123","turn_id":"minimal-turn-456","cwd":"/Users/alice/work/minimal"}' > "$input"
+  printf '%s' '{"hook_event_name":"Stop","session_id":"minimal-session-123","turn_id":"minimal-turn-456","cwd":"/workspaces/minimal"}' > "$input"
   run_record claude-code "$input" "$log" "$out" "$err"
   status=$?
   assert_success "optionalフィールド欠落時も記録できる" "$status"
@@ -244,7 +244,7 @@ with open(key_path, "rb") as stream:
 assert len(key) == 32
 assert stat.S_IMODE(__import__("os").stat(key_path).st_mode) == 0o600
 assert rows[0]["workspace_id"] == rows[1]["workspace_id"]
-plain = "sha256:" + hashlib.sha256(b"/Users/alice/work/acme-api").hexdigest()[:24]
+plain = "sha256:" + hashlib.sha256(b"/workspaces/acme-api").hexdigest()[:24]
 assert rows[0]["workspace_id"] != plain
 PY
   then

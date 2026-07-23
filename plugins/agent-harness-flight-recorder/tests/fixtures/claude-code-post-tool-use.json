@@ -1,7 +1,7 @@
 {
   "session_id": "claude-session-789",
-  "transcript_path": "/Users/alice/.claude/projects/acme/session.jsonl",
-  "cwd": "/Users/alice/work/acme-api",
+  "transcript_path": "/state/claude/projects/acme/session.jsonl",
+  "cwd": "/workspaces/acme-api",
   "permission_mode": "default",
   "hook_event_name": "PostToolUse",
   "tool_name": "Bash",

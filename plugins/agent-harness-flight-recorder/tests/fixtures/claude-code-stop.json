@@ -1,8 +1,8 @@
 {
   "hook_event_name": "Stop",
   "session_id": "claude-session-123",
-  "transcript_path": "/Users/alice/.claude/projects/acme/session.jsonl",
-  "cwd": "/Users/alice/work/acme-api",
+  "transcript_path": "/state/claude/projects/acme/session.jsonl",
+  "cwd": "/workspaces/acme-api",
   "permission_mode": "default",
   "stop_hook_active": false,
   "last_assistant_message": "ASSISTANT_CANARY_72f1b9",
