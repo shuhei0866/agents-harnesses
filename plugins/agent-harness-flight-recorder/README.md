@@ -6,6 +6,10 @@ This first slice only observes work. It does not route models, score developers,
 upload data, or call an evaluator model. The purpose is to create a trustworthy
 `work episode` event stream before adding recommendations.
 
+The accepted product architecture and release boundaries are documented in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The reasons behind the major
+choices are preserved in [`docs/DECISIONS.md`](docs/DECISIONS.md).
+
 ## What it records
 
 The shared hook configuration observes four lifecycle events:
