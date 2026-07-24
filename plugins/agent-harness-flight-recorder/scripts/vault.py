@@ -32,6 +32,16 @@ CONFIG_PATHS = {
     "correlation_key_envelope": str(ENVELOPE_PATH),
     "device_identity": str(DEVICE_IDENTITY_PATH),
 }
+CONFIG_FIELDS = {
+    "schema_version",
+    "vault_id",
+    "remote",
+    "devices",
+    "recovery_recipients",
+    "recipient_state_hmac",
+    "paths",
+    "git_sync_allowlist",
+}
 GIT_SYNC_ALLOWLIST = [
     ".gitignore",
     CONFIG_NAME,
@@ -247,7 +257,11 @@ def load_config(root: Path) -> dict[str, object]:
         config = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise VaultError("vault configuration is invalid") from error
-    if not isinstance(config, dict) or config.get("schema_version") != 1:
+    if (
+        not isinstance(config, dict)
+        or set(config) != CONFIG_FIELDS
+        or config.get("schema_version") != 1
+    ):
         raise VaultError("unsupported vault configuration")
     try:
         uuid.UUID(config["vault_id"])
@@ -724,6 +738,7 @@ def parser() -> argparse.ArgumentParser:
     join = device_commands.add_parser("join")
     join.add_argument("--identity", required=True)
     commands.add_parser("rotate")
+    commands.add_parser("sync")
     return top
 
 
@@ -736,14 +751,19 @@ def main() -> int:
         add_device(root, args.recipient, args.identity)
     elif args.command == "device" and args.device_command == "join":
         join_device(root, args.identity)
-    elif args.command == "rotate":
+    elif args.command in ("rotate", "sync"):
         # The shell wrapper executes this file as __main__. Register that module
         # under its import name so chunk_rotation shares this VaultError class
         # instead of loading a second copy that the CLI exception handler misses.
         sys.modules.setdefault("vault", sys.modules[__name__])
-        from chunk_rotation import rotate
+        if args.command == "rotate":
+            from chunk_rotation import rotate
 
-        rotate(root)
+            rotate(root)
+        else:
+            from sync import sync
+
+            sync(root)
     return 0
 
 

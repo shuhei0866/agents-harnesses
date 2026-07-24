@@ -154,6 +154,32 @@ inbox, retry queue, quarantine, keys, device identities, indexes, and temporary
 files remain local-only. The recovery private key must never be placed inside
 the Vault.
 
+Synchronize the Vault through its configured private Git remote:
+
+```bash
+scripts/flight-recorder sync
+```
+
+`sync` rotates pending events, initializes the Vault root as a dedicated Git
+working tree when needed, commits only the explicit allowlist, pulls with
+rebase, imports unseen encrypted chunks into the local-only cache, and pushes
+to `main`. It uses the `git` CLI and the remote in `vault.json`; it does not use
+GitHub-specific APIs.
+
+Every candidate chunk is decrypted and its path, Chunk v1 header, Vault/device
+IDs, date, Event v1 records, count, and content digest are verified before it
+can enter a local commit or import cache. Existing imports record the Git blob
+OID so replacing an immutable ciphertext at the same path is rejected. A
+failed pull, import, or push keeps the encrypted artifact, local commit, and
+`queue/pending-sync.json` for a later retry. Network work never holds the
+hook's inbox lock, so recording remains fail-open and independent of sync.
+
+For a second device, clone the private repository into that device's state
+directory, run `device join`, then run `sync`. Pre-enrolling the device
+recipient before older chunks are created lets its adopted identity decrypt
+those chunks; otherwise retain access to the recovery identity when historical
+import is required.
+
 ## Local development
 
 Claude Code can load the plugin directly for one session:
@@ -177,6 +203,8 @@ bash plugins/agent-harness-flight-recorder/tests/test-vault-init.sh
 bash plugins/agent-harness-flight-recorder/tests/test-vault-init-age-e2e.sh
 bash plugins/agent-harness-flight-recorder/tests/test-chunk-rotation.sh
 bash plugins/agent-harness-flight-recorder/tests/test-chunk-rotation-age-e2e.sh
+bash plugins/agent-harness-flight-recorder/tests/test-git-sync.sh
+bash plugins/agent-harness-flight-recorder/tests/test-git-sync-age-e2e.sh
 ```
 
 The tests exercise official-shape fixtures for both harnesses, privacy canaries,
