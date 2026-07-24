@@ -104,3 +104,37 @@ Accepted decisions remain recorded when later superseded.
 - Consequence: purge must preview scope, require explicit confirmation, and
   document that external caches or uncontrolled clones cannot be guaranteed to
   disappear.
+
+## D-20260724-11: Keep recovery ownership outside the Vault
+
+- Status: accepted
+- Decision: `init` requires an externally created offline recovery recipient
+  and never creates or stores its private identity.
+- Reason: a recovery secret synchronized with the data it protects would not
+  provide an independent recovery boundary.
+- Consequence: setup has one explicit manual step, and losing both every
+  enrolled device identity and the offline recovery identity makes the
+  correlation key unrecoverable.
+
+## D-20260724-12: Preserve a local plaintext correlation key
+
+- Status: accepted
+- Decision: retain the 32-byte correlation key locally as user-only
+  `hash.key`, while synchronizing only its age-encrypted envelope.
+- Reason: lifecycle hooks need cheap, fail-open HMAC correlation without
+  invoking an external decryptor on every event.
+- Consequence: `.gitignore` and the sync allowlist both exclude `hash.key`;
+  local endpoint security remains part of the trust boundary.
+
+## D-20260724-13: Authenticate the recipient registry
+
+- Status: accepted
+- Decision: assign every enrolled device a random ID and authenticate the
+  device/recovery recipient registry with an HMAC derived from the Vault
+  correlation key.
+- Reason: public Git metadata can be edited independently of the encrypted
+  envelope; blindly trusting an added recipient would turn an authorized
+  device into a key-distribution confused deputy.
+- Consequence: recipient changes require successful envelope decryption before
+  metadata is accepted, and a new device uses `device join` to create its local
+  identity, device ID, and `hash.key`.

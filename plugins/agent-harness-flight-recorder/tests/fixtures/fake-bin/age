@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Small age CLI test double with recipient authorization semantics."""
+
+import base64
+import hashlib
+import json
+import os
+import pathlib
+import sys
+
+
+BECH32_DATA = "023456789acdefghjklmnpqrstuvwxyz"
+
+
+def recipient_for_identity(path: str) -> str:
+    lines = pathlib.Path(path).read_text(encoding="utf-8").splitlines()
+    secret = next((line for line in lines if line.startswith("AGE-SECRET-KEY-1")), None)
+    if secret is None:
+        raise SystemExit("fake age: invalid identity")
+    digest = hashlib.sha256(secret.encode("utf-8")).digest()
+    body = "".join(BECH32_DATA[byte % len(BECH32_DATA)] for byte in digest)
+    return "age1" + (body * 2)[:58]
+
+
+def option_values(args: list[str], short: str, long: str) -> list[str]:
+    values = []
+    index = 0
+    while index < len(args):
+        if args[index] in (short, long):
+            values.append(args[index + 1])
+            index += 2
+        else:
+            index += 1
+    return values
+
+
+args = sys.argv[1:]
+decrypting = "-d" in args or "--decrypt" in args
+output_values = option_values(args, "-o", "--output")
+output_path = output_values[-1] if output_values else None
+
+if decrypting:
+    identities = option_values(args, "-i", "--identity")
+    positional = [
+        value
+        for index, value in enumerate(args)
+        if not value.startswith("-")
+        and (index == 0 or args[index - 1] not in ("-i", "--identity", "-o", "--output"))
+    ]
+    payload = pathlib.Path(positional[-1]).read_bytes() if positional else sys.stdin.buffer.read()
+    envelope = json.loads(payload.decode("utf-8"))
+    authorized = any(
+        recipient_for_identity(identity) in envelope["recipients"] for identity in identities
+    )
+    if not authorized:
+        raise SystemExit("fake age: no identity matched a recipient")
+    plaintext = base64.b64decode(envelope["payload"])
+    if output_path:
+        pathlib.Path(output_path).write_bytes(plaintext)
+    else:
+        sys.stdout.buffer.write(plaintext)
+    raise SystemExit(0)
+
+if os.environ.get("FAKE_AGE_ENCRYPT_FAIL"):
+    raise SystemExit("fake age: injected encryption failure")
+
+recipients = option_values(args, "-r", "--recipient")
+if not recipients:
+    raise SystemExit("fake age: at least one recipient is required")
+plaintext = sys.stdin.buffer.read()
+envelope = json.dumps(
+    {
+        "format": "fake-age-v1",
+        "recipients": recipients,
+        "payload": base64.b64encode(plaintext).decode("ascii"),
+    },
+    sort_keys=True,
+).encode("utf-8")
+if output_path:
+    pathlib.Path(output_path).write_bytes(envelope)
+else:
+    sys.stdout.buffer.write(envelope)

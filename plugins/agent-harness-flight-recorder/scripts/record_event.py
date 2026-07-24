@@ -93,6 +93,9 @@ def destination() -> str | None:
     explicit = os.environ.get("AGENT_FLIGHT_RECORDER_PATH")
     if explicit:
         return explicit
+    vault_root = os.environ.get("FLIGHT_RECORDER_STATE_DIR")
+    if vault_root:
+        return os.path.join(vault_root, "events.jsonl")
     state_home = os.environ.get("XDG_STATE_HOME")
     if not state_home:
         home = os.environ.get("HOME")
@@ -130,17 +133,25 @@ def correlation_key(event_path: str) -> bytes | None:
     parent = os.path.dirname(os.path.abspath(key_path))
     os.makedirs(parent, mode=0o700, exist_ok=True)
     created = False
+    safe_flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(
+        os, "O_NOFOLLOW", 0
+    )
     try:
-        descriptor = os.open(key_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        descriptor = os.open(key_path, safe_flags | os.O_CREAT | os.O_EXCL, 0o600)
         created = True
     except FileExistsError:
-        descriptor = os.open(key_path, os.O_RDWR)
+        descriptor = os.open(key_path, safe_flags)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         os.fchmod(descriptor, 0o600)
-        existing = os.read(descriptor, 32)
+        existing = os.read(descriptor, 33)
         if len(existing) == 32:
             return existing
+        # Never replace an existing malformed key: it may be the local half of
+        # an encrypted Vault whose envelope would then diverge. Recording stays
+        # fail-open without correlated identifiers until the user repairs it.
+        if not created:
+            return None
         key = secrets.token_bytes(32)
         os.lseek(descriptor, 0, os.SEEK_SET)
         os.ftruncate(descriptor, 0)

@@ -82,6 +82,63 @@ can instead be supplied through `AGENT_FLIGHT_RECORDER_HASH_KEY`.
 New directories and files are created with user-only permissions where the
 platform honors POSIX modes.
 
+## Initialize an encrypted Vault
+
+Install [`age`](https://github.com/FiloSottile/age), then create an offline
+recovery identity outside the Vault and keep that private file backed up:
+
+```bash
+age-keygen -o /secure/offline-recovery.agekey
+age-keygen -y /secure/offline-recovery.agekey
+```
+
+Pass only the printed public recipient to the initializer:
+
+```bash
+scripts/flight-recorder init \
+  --remote git@github.com:you/private-flight-recorder.git \
+  --recovery-recipient age1...
+```
+
+`init` is local-only: it records the future private Git remote but does not
+connect to or clone it. The Vault defaults to the same state directory as the
+hook recorder and can be overridden with `FLIGHT_RECORDER_STATE_DIR`.
+
+The initializer creates a device-specific age identity, a random Vault and
+device ID, and one 32-byte correlation key. The key remains available locally
+as the recorder's user-only `hash.key` and is also encrypted to both the device
+and recovery recipients in `keys/correlation-key.age`. Each enrolled device is
+recorded as a random device ID plus its public recipient. That recipient
+registry is authenticated with the correlation key before any re-encryption.
+
+To pre-enroll another device's already-generated public recipient from an
+authorized device:
+
+```bash
+scripts/flight-recorder device add --recipient age1...
+```
+
+On a new device, first obtain the Git-synchronized `.gitignore`, `vault.json`,
+and `keys/correlation-key.age`, then bootstrap its local-only identity and
+`hash.key`:
+
+```bash
+scripts/flight-recorder device join \
+  --identity /secure/offline-recovery.agekey
+```
+
+`device join` preserves the Vault ID, generates a new random device ID and age
+identity, adds its recipient to the same envelope, and materializes the same
+correlation key for the local recorder. If `--identity` is a pre-enrolled
+device identity, `join` adopts that identity and its existing device ID instead
+of creating a duplicate. Otherwise, use a recovery identity to create a new
+device registration.
+
+Only `.gitignore`, `vault.json`, and the encrypted key envelope are initial
+Git-sync candidates. Plaintext events and keys, device identities, indexes,
+and temporary files are local-only. The recovery private key must never be
+placed inside the Vault.
+
 ## Local development
 
 Claude Code can load the plugin directly for one session:
@@ -101,8 +158,11 @@ Run the contract tests:
 
 ```bash
 bash plugins/agent-harness-flight-recorder/tests/test-record-event.sh
+bash plugins/agent-harness-flight-recorder/tests/test-vault-init.sh
+bash plugins/agent-harness-flight-recorder/tests/test-vault-init-age-e2e.sh
 ```
 
 The tests exercise official-shape fixtures for both harnesses, privacy canaries,
 fail-open behavior, optional fields, shared auto-detection, and 50 concurrent
-writers. The stable event contract is in `schema/event-v1.schema.json`.
+writers. The stable event and Vault contracts are in `schema/event-v1.schema.json`
+and `schema/vault-v1.schema.json`.
