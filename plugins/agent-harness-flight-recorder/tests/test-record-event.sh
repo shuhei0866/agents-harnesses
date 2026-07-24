@@ -303,6 +303,25 @@ test_vault_state_override() {
   fi
 }
 
+test_relative_vault_state_fails_open() {
+  echo "test_relative_vault_state_fails_open:"
+  local sandbox="$TMPDIR_TEST/relative-vault-state"
+  local out="$TMPDIR_TEST/relative-vault.out" err="$TMPDIR_TEST/relative-vault.err"
+  local status
+  mkdir -p "$sandbox"
+  (
+    cd "$sandbox" || exit 1
+    FLIGHT_RECORDER_STATE_DIR="relative-vault" \
+      "$RECORDER" --harness claude-code \
+      <"$FIXTURES/claude-code-stop.json" >"$out" 2>"$err"
+  )
+  status=$?
+  assert_success "相対Vault overrideでもhookはfail-openする" "$status"
+  assert_file_absent_or_empty \
+    "相対cwd依存のVaultへeventを書かない" \
+    "$sandbox/relative-vault/events.jsonl"
+}
+
 test_malformed_vault_key_is_not_replaced() {
   echo "test_malformed_vault_key_is_not_replaced:"
   local vault="$TMPDIR_TEST/malformed-vault-key"
@@ -353,6 +372,7 @@ test_concurrent_append
 test_optional_fields_default_to_null
 test_hmac_correlation_key
 test_vault_state_override
+test_relative_vault_state_fails_open
 test_malformed_vault_key_is_not_replaced
 test_oversized_input_fail_open
 

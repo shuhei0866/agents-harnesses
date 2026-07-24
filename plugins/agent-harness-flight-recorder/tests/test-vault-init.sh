@@ -46,6 +46,16 @@ assert_failure() {
   fi
 }
 
+stat_mode() {
+  python3 - "$1" <<'PY'
+import os
+import stat
+import sys
+
+print(f"{stat.S_IMODE(os.stat(sys.argv[1]).st_mode):03o}")
+PY
+}
+
 make_identity() {
   PATH="$FAKE_BIN:$PATH" age-keygen -o "$1" >/dev/null 2>&1
 }
@@ -143,9 +153,9 @@ test_init_and_recovery_contract() {
   assert_same_plaintext "deviceとrecoveryが同じ32-byte相関鍵を復号できる" \
     "$state/keys/correlation-key.age" "$state/keys/device.agekey" "$recovery"
 
-  if [[ "$(stat -f '%Lp' "$state/keys/device.agekey")" == "600" \
-    && "$(stat -f '%Lp' "$state/hash.key")" == "600" \
-    && "$(stat -f '%Lp' "$state")" == "700" ]]; then
+  if [[ "$(stat_mode "$state/keys/device.agekey")" == "600" \
+    && "$(stat_mode "$state/hash.key")" == "600" \
+    && "$(stat_mode "$state")" == "700" ]]; then
     pass "ローカル秘密ファイルとstate rootを最小権限にする"
   else
     fail "ローカル秘密ファイルとstate rootを最小権限にする"
@@ -233,7 +243,7 @@ test_init_adopts_existing_recorder_key() {
   assert_success "既存recorderの32-byte相関鍵を採用できる" "$status"
   [[ "$status" -eq 0 ]] || return
   if [[ "$(cat "$state/hash.key")" == "0123456789abcdef0123456789abcdef" \
-    && "$(stat -f '%Lp' "$state/hash.key")" == "600" ]]; then
+    && "$(stat_mode "$state/hash.key")" == "600" ]]; then
     pass "既存相関鍵を変更せずpermissionだけを0600へ強化する"
   else
     fail "既存相関鍵を変更せずpermissionだけを0600へ強化する"
@@ -311,6 +321,28 @@ test_rejects_invalid_recipient() {
     pass "不正recipientでvault内容を作らない"
   else
     fail "不正recipientでvault内容を作らない"
+  fi
+}
+
+test_rejects_relative_state_root() {
+  echo "test_rejects_relative_state_root:"
+  local sandbox="$TMPDIR_TEST/relative-state"
+  local recovery="$TMPDIR_TEST/relative-state-recovery.agekey" status
+  mkdir -p "$sandbox"
+  make_identity "$recovery"
+  (
+    cd "$sandbox" || exit 1
+    PATH="$FAKE_BIN:$PATH" FLIGHT_RECORDER_STATE_DIR="relative-vault" \
+      "$CLI" init \
+      --remote "git@github.com:example/private-flight-recorder.git" \
+      --recovery-recipient "$(recipient_of "$recovery")" >/dev/null 2>&1
+  )
+  status=$?
+  assert_failure "相対FLIGHT_RECORDER_STATE_DIRを拒否する" "$status"
+  if [[ ! -e "$sandbox/relative-vault" ]]; then
+    pass "cwd依存の分岐Vaultを作らない"
+  else
+    fail "cwd依存の分岐Vaultを作らない"
   fi
 }
 
@@ -580,10 +612,14 @@ test_git_eligibility_boundary() {
     fail "事前のvault初期化に成功する"
     return
   }
+  mkdir -p "$state/chunks/device-a/2026/07/24"
+  printf '%s\n' '{"plaintext":"must-not-sync"}' \
+    >"$state/chunks/device-a/2026/07/24/chunk.jsonl"
   git -C "$state" init -q
   if git -C "$state" check-ignore -q hash.key \
     && git -C "$state" check-ignore -q keys/device.agekey \
-    && git -C "$state" check-ignore -q events.jsonl; then
+    && git -C "$state" check-ignore -q events.jsonl \
+    && git -C "$state" check-ignore -q chunks/device-a/2026/07/24/chunk.jsonl; then
     pass "平文鍵・device秘密鍵・イベントログをGit対象外にする"
   else
     fail "平文鍵・device秘密鍵・イベントログをGit対象外にする"
@@ -616,6 +652,7 @@ test_init_adopts_existing_recorder_key
 test_init_rolls_back_on_dependency_failure
 test_init_recovers_interrupted_commit
 test_rejects_invalid_recipient
+test_rejects_relative_state_root
 test_rejects_symlinked_keys_directory
 test_concurrent_init_is_consistent
 test_device_add_and_recovery_rotation

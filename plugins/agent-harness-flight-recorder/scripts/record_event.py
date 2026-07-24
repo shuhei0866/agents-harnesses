@@ -95,7 +95,10 @@ def destination() -> str | None:
         return explicit
     vault_root = os.environ.get("FLIGHT_RECORDER_STATE_DIR")
     if vault_root:
-        return os.path.join(vault_root, "events.jsonl")
+        normalized_root = os.path.expanduser(vault_root)
+        if not os.path.isabs(normalized_root):
+            return None
+        return os.path.join(normalized_root, "events.jsonl")
     state_home = os.environ.get("XDG_STATE_HOME")
     if not state_home:
         home = os.environ.get("HOME")

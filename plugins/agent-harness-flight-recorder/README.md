@@ -82,6 +82,10 @@ can instead be supplied through `AGENT_FLIGHT_RECORDER_HASH_KEY`.
 New directories and files are created with user-only permissions where the
 platform honors POSIX modes.
 
+`FLIGHT_RECORDER_STATE_DIR` must be absolute (a leading `~` is expanded).
+Relative overrides are rejected by the CLI and ignored fail-open by hooks so a
+workspace-dependent current directory cannot split one logical Vault.
+
 ## Initialize an encrypted Vault
 
 Install [`age`](https://github.com/FiloSottile/age), then create an offline

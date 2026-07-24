@@ -38,12 +38,10 @@ GITIGNORE = """# Local-only Flight Recorder state
 /events.jsonl
 /keys/*.agekey
 /inbox/
+/chunks/
 /index/
 /cache/
 /tmp/
-/chunks/*.json
-/chunks/*.jsonl
-/chunks/*.tmp
 /.init-in-progress
 /*.lock
 /*.tmp
@@ -57,7 +55,10 @@ class VaultError(RuntimeError):
 def state_root() -> Path:
     override = os.environ.get("FLIGHT_RECORDER_STATE_DIR")
     if override:
-        return Path(override).expanduser().absolute()
+        path = Path(override).expanduser()
+        if not path.is_absolute():
+            raise VaultError("FLIGHT_RECORDER_STATE_DIR must be absolute")
+        return path
     state_home = os.environ.get("XDG_STATE_HOME")
     if state_home:
         return (
