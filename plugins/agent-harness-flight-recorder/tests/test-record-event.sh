@@ -135,6 +135,39 @@ test_auto_harness_detection() {
   fi
 }
 
+test_lifecycle_event_mappings() {
+  echo "test_lifecycle_event_mappings:"
+  local log="$TMPDIR_TEST/lifecycle.jsonl" out="$TMPDIR_TEST/lifecycle.out" err="$TMPDIR_TEST/lifecycle.err"
+  run_record claude-code "$FIXTURES/claude-code-session-start.json" "$log" "$out" "$err"
+  run_record claude-code "$FIXTURES/claude-code-user-prompt-submit.json" "$log" "$out" "$err"
+  run_record claude-code "$FIXTURES/claude-code-post-tool-use.json" "$log" "$out" "$err"
+  run_record claude-code "$FIXTURES/claude-code-stop.json" "$log" "$out" "$err"
+  if python3 - "$log" <<'PY' 2>/dev/null
+import json
+import pathlib
+import sys
+
+rows = [
+    json.loads(line)
+    for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+]
+assert [(row["source_event"], row["event_kind"]) for row in rows] == [
+    ("SessionStart", "session.started"),
+    ("UserPromptSubmit", "turn.prompted"),
+    ("PostToolUse", "tool.completed"),
+    ("Stop", "turn.completed"),
+]
+assert "PROMPT_CANARY_5a82d4" not in pathlib.Path(sys.argv[1]).read_text(
+    encoding="utf-8"
+)
+PY
+  then
+    pass "全lifecycle hookをprivacy-safeなevent kindへ正規化する"
+  else
+    fail "全lifecycle hookをprivacy-safeなevent kindへ正規化する"
+  fi
+}
+
 test_privacy_allowlist() {
   echo "test_privacy_allowlist:"
   local log="$TMPDIR_TEST/privacy.jsonl" out="$TMPDIR_TEST/privacy.out" err="$TMPDIR_TEST/privacy.err" status
@@ -268,6 +301,7 @@ echo "=== agent-harness-flight-recorder tests ==="
 test_claude_code_schema
 test_codex_same_schema
 test_auto_harness_detection
+test_lifecycle_event_mappings
 test_privacy_allowlist
 test_empty_json_fail_open
 test_malformed_json_fail_open

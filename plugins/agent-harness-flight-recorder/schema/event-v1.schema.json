@@ -25,7 +25,9 @@
     "event_id": { "type": "string", "format": "uuid" },
     "recorded_at": { "type": "string", "format": "date-time" },
     "harness": { "enum": ["claude-code", "codex"] },
-    "source_event": { "type": "string" },
+    "source_event": {
+      "enum": ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "unknown"]
+    },
     "event_kind": {
       "enum": [
         "session.started",
@@ -82,7 +84,7 @@
         { "type": "string", "pattern": "^sha256:[0-9a-f]{24}$" }
       ]
     },
-    "stringOrNull": { "type": ["string", "null"] },
+    "stringOrNull": { "type": ["string", "null"], "maxLength": 256 },
     "nonNegativeNumber": { "type": "number", "minimum": 0 }
   }
 }

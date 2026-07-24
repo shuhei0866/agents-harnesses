@@ -111,6 +111,14 @@ def write_all(descriptor: int, data: bytes) -> None:
         view = view[written:]
 
 
+def fsync_directory(path: str) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def correlation_key(event_path: str) -> bytes | None:
     override = os.environ.get("AGENT_FLIGHT_RECORDER_HASH_KEY")
     if override:
@@ -121,7 +129,12 @@ def correlation_key(event_path: str) -> bytes | None:
         key_path = os.path.join(os.path.dirname(os.path.abspath(event_path)), "hash.key")
     parent = os.path.dirname(os.path.abspath(key_path))
     os.makedirs(parent, mode=0o700, exist_ok=True)
-    descriptor = os.open(key_path, os.O_CREAT | os.O_RDWR, 0o600)
+    created = False
+    try:
+        descriptor = os.open(key_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        created = True
+    except FileExistsError:
+        descriptor = os.open(key_path, os.O_RDWR)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         os.fchmod(descriptor, 0o600)
@@ -132,9 +145,12 @@ def correlation_key(event_path: str) -> bytes | None:
         os.lseek(descriptor, 0, os.SEEK_SET)
         os.ftruncate(descriptor, 0)
         write_all(descriptor, key)
+        os.fsync(descriptor)
         return key
     finally:
         os.close(descriptor)
+        if created:
+            fsync_directory(parent)
 
 
 def normalize(
@@ -177,12 +193,22 @@ def append_event(path: str, event: dict[str, Any]) -> None:
     line = (json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
         "utf-8"
     )
-    descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    created = False
+    try:
+        descriptor = os.open(
+            path, os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+        )
+        created = True
+    except FileExistsError:
+        descriptor = os.open(path, os.O_APPEND | os.O_WRONLY)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         write_all(descriptor, line)
+        os.fsync(descriptor)
     finally:
         os.close(descriptor)
+        if created:
+            fsync_directory(parent)
 
 
 def main() -> None:

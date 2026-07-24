@@ -93,7 +93,9 @@ claude --plugin-dir /absolute/path/to/plugins/agent-harness-flight-recorder
 Codex loads this plugin from a configured marketplace. For hook development
 without publishing a marketplace, use the same `hooks/hooks.json` definition
 and replace `${CLAUDE_PLUGIN_ROOT}` with the plugin's absolute path in a local
-`~/.codex/hooks.json` or trusted project `.codex/hooks.json`.
+`~/.codex/hooks.json` or trusted project `.codex/hooks.json`. Also replace
+`--harness auto` with `--harness codex`; `auto` relies on the plugin-provided
+`PLUGIN_ROOT` signal and cannot identify a manually copied Codex hook reliably.
 
 Run the contract tests:
 

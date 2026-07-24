@@ -1,0 +1,8 @@
+{
+  "hook_event_name": "UserPromptSubmit",
+  "session_id": "claude-session-prompt-123",
+  "transcript_path": "/state/claude/projects/acme/session.jsonl",
+  "cwd": "/workspaces/acme-api",
+  "permission_mode": "default",
+  "prompt": "PROMPT_CANARY_5a82d4"
+}
