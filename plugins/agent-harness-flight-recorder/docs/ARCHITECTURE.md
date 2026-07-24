@@ -135,9 +135,25 @@ re-encrypting or overwriting it. A conflicting artifact fails closed while
 retaining the plaintext pending source. Import decrypts unseen chunks and
 rebuilds derived state idempotently.
 
-Manual Git synchronization is a later command layered on top of this format. It
-may stage only the explicit Vault allowlist; rotation itself does not invoke
-Git or the network beyond the local `age` process.
+Manual Git synchronization is layered on top of this format:
+
+```text
+flight-recorder sync
+  1. rotate local pending events
+  2. validate and commit only the explicit Vault allowlist
+  3. record local pending-sync intent
+  4. pull --rebase from the configured private remote
+  5. re-authenticate Vault metadata and validate tracked chunks
+  6. idempotently import unseen chunks into local-only derived state
+  7. push without force and clear pending state only after success
+```
+
+The private remote is an untrusted transport. A tracked chunk is decrypted and
+its path, header, Vault/device IDs, date, Event v1 records, count, and content
+digest are verified before commit or import. Import receipts retain the Git
+blob OID so a ciphertext replacement at an immutable path fails closed.
+Rotation itself does not invoke Git or the network beyond the local `age`
+process.
 
 The next release runs the same operation once per day through `launchd` on macOS
 and a `systemd` timer on Linux. Failures use backoff and remain invisible during

@@ -150,3 +150,17 @@ Accepted decisions remain recorded when later superseded.
 - Consequence: retry reuses a matching existing artifact, refuses a conflicting
   artifact without overwriting it, and removes plaintext pending state only
   after successful publication.
+
+## D-20260725-15: Treat the private Git remote as untrusted transport
+
+- Status: accepted
+- Decision: synchronize with the provider-neutral `git` CLI, stage only the
+  explicit Vault allowlist, and decrypt and validate every unseen or changed
+  chunk before commit or local import.
+- Reason: a private remote and a `.jsonl.age` suffix do not prove that a blob is
+  encrypted, belongs to this Vault, or still represents the immutable chunk
+  previously imported.
+- Consequence: sync verifies Git entry modes, recipient metadata HMAC, chunk
+  path/header/schema/content digest, and the imported Git blob OID. Network or
+  validation failures retain the local encrypted artifact, commit, and
+  Git-ignored pending-sync state without blocking harness hooks.
