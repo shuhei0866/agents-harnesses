@@ -14,10 +14,12 @@ BECH32_DATA = "023456789acdefghjklmnpqrstuvwxyz"
 
 def recipient_for_identity(path: str) -> str:
     lines = pathlib.Path(path).read_text(encoding="utf-8").splitlines()
-    secret = next((line for line in lines if line.startswith("AGE-SECRET-KEY-1")), None)
-    if secret is None:
+    identity_line = next(
+        (line for line in lines if line.startswith("FAKE-AGE-IDENTITY-1-")), None
+    )
+    if identity_line is None:
         raise SystemExit("fake age: invalid identity")
-    digest = hashlib.sha256(secret.encode("utf-8")).digest()
+    digest = hashlib.sha256(identity_line.encode("utf-8")).digest()
     body = "".join(BECH32_DATA[byte % len(BECH32_DATA)] for byte in digest)
     return "age1" + (body * 2)[:58]
 
