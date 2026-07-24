@@ -1,0 +1,11 @@
+{
+  "hook_event_name": "Stop",
+  "session_id": "codex-session-123",
+  "turn_id": "codex-turn-456",
+  "transcript_path": "/state/codex/sessions/acme/session.jsonl",
+  "cwd": "/workspaces/acme-api",
+  "model": "gpt-5-codex",
+  "permission_mode": "on-request",
+  "stop_hook_active": false,
+  "last_assistant_message": "Codex completed the turn"
+}

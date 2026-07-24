@@ -1,0 +1,19 @@
+{
+  "name": "agent-harness-flight-recorder",
+  "version": "0.1.0",
+  "description": "Privacy-first local work-episode telemetry for Codex and Claude Code lifecycle hooks.",
+  "author": {
+    "name": "agents-harnesses contributors"
+  },
+  "interface": {
+    "displayName": "Agent Harness Flight Recorder",
+    "shortDescription": "Record privacy-safe agent work events locally.",
+    "longDescription": "Observe Codex and Claude Code lifecycle events through one privacy-first schema without storing raw prompts, code, command input, tool output, transcripts, or workspace paths.",
+    "developerName": "agents-harnesses contributors",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": [
+      "Summarize my local agent flight-recorder events without exposing raw work content."
+    ]
+  }
+}
