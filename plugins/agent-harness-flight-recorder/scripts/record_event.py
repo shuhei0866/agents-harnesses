@@ -12,6 +12,7 @@ import json
 import math
 import os
 import secrets
+import stat
 import sys
 import uuid
 from typing import Any
@@ -98,14 +99,16 @@ def destination() -> str | None:
         normalized_root = os.path.expanduser(vault_root)
         if not os.path.isabs(normalized_root):
             return None
-        return os.path.join(normalized_root, "events.jsonl")
+        return os.path.join(normalized_root, "inbox", "events.jsonl")
     state_home = os.environ.get("XDG_STATE_HOME")
     if not state_home:
         home = os.environ.get("HOME")
         if not home:
             return None
         state_home = os.path.join(home, ".local", "state")
-    return os.path.join(state_home, "agent-harness-flight-recorder", "events.jsonl")
+    return os.path.join(
+        state_home, "agent-harness-flight-recorder", "inbox", "events.jsonl"
+    )
 
 
 def write_all(descriptor: int, data: bytes) -> None:
@@ -132,7 +135,20 @@ def correlation_key(event_path: str) -> bytes | None:
 
     key_path = os.environ.get("AGENT_FLIGHT_RECORDER_KEY_PATH")
     if not key_path:
-        key_path = os.path.join(os.path.dirname(os.path.abspath(event_path)), "hash.key")
+        vault_root = os.environ.get("FLIGHT_RECORDER_STATE_DIR")
+        if vault_root:
+            key_path = os.path.join(vault_root, "hash.key")
+        elif not os.environ.get("AGENT_FLIGHT_RECORDER_PATH"):
+            # The managed XDG/HOME destination is <vault>/inbox/events.jsonl,
+            # while the Vault-wide key intentionally remains at <vault>/hash.key.
+            key_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(event_path))),
+                "hash.key",
+            )
+        else:
+            key_path = os.path.join(
+                os.path.dirname(os.path.abspath(event_path)), "hash.key"
+            )
     parent = os.path.dirname(os.path.abspath(key_path))
     os.makedirs(parent, mode=0o700, exist_ok=True)
     created = False
@@ -202,27 +218,65 @@ def resolve_harness(requested: str) -> str:
 
 
 def append_event(path: str, event: dict[str, Any]) -> None:
-    parent = os.path.dirname(os.path.abspath(path))
+    absolute_path = os.path.abspath(path)
+    parent = os.path.dirname(absolute_path)
+    data_name = os.path.basename(absolute_path)
     os.makedirs(parent, mode=0o700, exist_ok=True)
     line = (json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
         "utf-8"
     )
-    created = False
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    parent_descriptor = os.open(parent, directory_flags)
+    lock_flags = os.O_CREAT | os.O_RDWR
+    lock_flags |= getattr(os, "O_CLOEXEC", 0)
+    lock_flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(
-            path, os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+        lock_descriptor = os.open(
+            "events.lock", lock_flags, 0o600, dir_fd=parent_descriptor
         )
-        created = True
-    except FileExistsError:
-        descriptor = os.open(path, os.O_APPEND | os.O_WRONLY)
+    except BaseException:
+        os.close(parent_descriptor)
+        raise
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        write_all(descriptor, line)
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+        lock_metadata = os.fstat(lock_descriptor)
+        if (
+            not stat.S_ISREG(lock_metadata.st_mode)
+            or lock_metadata.st_nlink != 1
+            or lock_metadata.st_uid != os.geteuid()
+        ):
+            raise OSError("unsafe event lock")
+        os.fchmod(lock_descriptor, 0o600)
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        data_flags = os.O_APPEND | os.O_WRONLY
+        data_flags |= getattr(os, "O_CLOEXEC", 0)
+        data_flags |= getattr(os, "O_NOFOLLOW", 0)
+        created = False
+        try:
+            descriptor = os.open(
+                data_name,
+                data_flags | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+            created = True
+        except FileExistsError:
+            descriptor = os.open(data_name, data_flags, dir_fd=parent_descriptor)
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+                raise OSError("unsafe event file")
+            os.fchmod(descriptor, 0o600)
+            write_all(descriptor, line)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
         if created:
-            fsync_directory(parent)
+            os.fsync(parent_descriptor)
+    finally:
+        os.close(lock_descriptor)
+        os.close(parent_descriptor)
 
 
 def main() -> None:

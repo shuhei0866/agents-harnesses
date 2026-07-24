@@ -295,7 +295,7 @@ test_vault_state_override() {
     AGENT_FLIGHT_RECORDER_NOW="2026-07-21T00:00:00Z" \
     "$RECORDER" --harness claude-code \
     <"$FIXTURES/claude-code-stop.json" >"$out" 2>"$err"
-  if [[ -s "$vault/events.jsonl" \
+  if [[ -s "$vault/inbox/events.jsonl" \
     && "$(wc -c <"$vault/hash.key" | tr -d ' ')" == "32" ]]; then
     pass "Vault override配下へeventと相関鍵をまとめて保存する"
   else
@@ -319,7 +319,25 @@ test_relative_vault_state_fails_open() {
   assert_success "相対Vault overrideでもhookはfail-openする" "$status"
   assert_file_absent_or_empty \
     "相対cwd依存のVaultへeventを書かない" \
-    "$sandbox/relative-vault/events.jsonl"
+    "$sandbox/relative-vault/inbox/events.jsonl"
+}
+
+test_default_state_keeps_key_at_vault_root() {
+  echo "test_default_state_keeps_key_at_vault_root:"
+  local state_home="$TMPDIR_TEST/default-state"
+  local vault="$state_home/agent-harness-flight-recorder"
+  local out="$TMPDIR_TEST/default-state.out" err="$TMPDIR_TEST/default-state.err"
+  XDG_STATE_HOME="$state_home" \
+    AGENT_FLIGHT_RECORDER_NOW="2026-07-21T00:00:00Z" \
+    "$RECORDER" --harness claude-code \
+    <"$FIXTURES/claude-code-stop.json" >"$out" 2>"$err"
+  if [[ -s "$vault/inbox/events.jsonl" \
+    && "$(wc -c <"$vault/hash.key" | tr -d ' ')" == "32" \
+    && ! -e "$vault/inbox/hash.key" ]]; then
+    pass "managed defaultはeventをinbox、相関鍵をVault rootへ保存する"
+  else
+    fail "managed defaultはeventをinbox、相関鍵をVault rootへ保存する"
+  fi
 }
 
 test_malformed_vault_key_is_not_replaced() {
@@ -340,7 +358,7 @@ test_malformed_vault_key_is_not_replaced() {
   else
     fail "Vault envelopeと分岐し得る既存鍵を上書きしない"
   fi
-  if json_check "$vault/events.jsonl" \
+  if json_check "$vault/inbox/events.jsonl" \
     "v['session_id_hash'] is None and v['turn_id_hash'] is None and v['workspace_id'] is None" \
     2>/dev/null; then
     pass "鍵修復まで相関IDだけを省略してeventを保持する"
@@ -373,6 +391,7 @@ test_optional_fields_default_to_null
 test_hmac_correlation_key
 test_vault_state_override
 test_relative_vault_state_fails_open
+test_default_state_keeps_key_at_vault_root
 test_malformed_vault_key_is_not_replaced
 test_oversized_input_fail_open
 

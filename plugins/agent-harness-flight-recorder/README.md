@@ -66,7 +66,7 @@ supported macOS/Linux development environments.
 Default:
 
 ```text
-${XDG_STATE_HOME:-$HOME/.local/state}/agent-harness-flight-recorder/events.jsonl
+${XDG_STATE_HOME:-$HOME/.local/state}/agent-harness-flight-recorder/inbox/events.jsonl
 ```
 
 Override the file for testing or local policy:
@@ -75,9 +75,10 @@ Override the file for testing or local policy:
 export AGENT_FLIGHT_RECORDER_PATH=/path/to/events.jsonl
 ```
 
-The correlation key defaults to `hash.key` beside that file. Its path can be
-overridden with `AGENT_FLIGHT_RECORDER_KEY_PATH`; an externally managed secret
-can instead be supplied through `AGENT_FLIGHT_RECORDER_HASH_KEY`.
+For an explicit event path, the correlation key defaults to `hash.key` beside
+that file. In a Vault it remains at the Vault root. Its path can be overridden
+with `AGENT_FLIGHT_RECORDER_KEY_PATH`; an externally managed secret can instead
+be supplied through `AGENT_FLIGHT_RECORDER_HASH_KEY`.
 
 New directories and files are created with user-only permissions where the
 platform honors POSIX modes.
@@ -138,10 +139,20 @@ device identity, `join` adopts that identity and its existing device ID instead
 of creating a duplicate. Otherwise, use a recovery identity to create a new
 device registration.
 
-Only `.gitignore`, `vault.json`, and the encrypted key envelope are initial
-Git-sync candidates. Plaintext events and keys, device identities, indexes,
-and temporary files are local-only. The recovery private key must never be
-placed inside the Vault.
+Rotate complete inbox records into an immutable encrypted chunk:
+
+```bash
+scripts/flight-recorder rotate
+```
+
+Rotation detaches the live inbox under a short-lived stable lock, validates
+each event, quarantines invalid bytes locally, and encrypts the canonical chunk
+to every enrolled device and recovery recipient. Only
+`devices/<device-id>/<YYYY>/<MM>/<DD>/<digest>.jsonl.age`, `.gitignore`,
+`vault.json`, and the encrypted key envelope are Git-sync candidates. Plaintext
+inbox, retry queue, quarantine, keys, device identities, indexes, and temporary
+files remain local-only. The recovery private key must never be placed inside
+the Vault.
 
 ## Local development
 
@@ -164,9 +175,11 @@ Run the contract tests:
 bash plugins/agent-harness-flight-recorder/tests/test-record-event.sh
 bash plugins/agent-harness-flight-recorder/tests/test-vault-init.sh
 bash plugins/agent-harness-flight-recorder/tests/test-vault-init-age-e2e.sh
+bash plugins/agent-harness-flight-recorder/tests/test-chunk-rotation.sh
+bash plugins/agent-harness-flight-recorder/tests/test-chunk-rotation-age-e2e.sh
 ```
 
 The tests exercise official-shape fixtures for both harnesses, privacy canaries,
 fail-open behavior, optional fields, shared auto-detection, and 50 concurrent
-writers. The stable event and Vault contracts are in `schema/event-v1.schema.json`
-and `schema/vault-v1.schema.json`.
+writers. The stable contracts are in `schema/event-v1.schema.json`,
+`schema/vault-v1.schema.json`, and `schema/chunk-v1.schema.json`.
