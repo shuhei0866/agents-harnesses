@@ -32,7 +32,7 @@ Claude Code / Codex
 privacy allowlist + canonical Event v1
         |
         v
-local append-only events.jsonl
+local append-only inbox/events.jsonl
         |
         | rotate
         v
@@ -56,25 +56,28 @@ The exact platform state directory is configurable. A representative vault is:
 
 ```text
 vault/
-├── config.json
+├── vault.json
 ├── inbox/
+│   ├── events.lock
 │   └── events.jsonl
-├── chunks/
-│   └── <device-id>/YYYY/MM/DD/<chunk-id>.jsonl
-├── encrypted/
-│   └── <device-id>/YYYY/MM/DD/<chunk-id>.jsonl.age
+├── queue/
+│   └── <rotation-id>.jsonl.pending
+├── quarantine/
+│   └── <rotation-id>.jsonl
+├── devices/
+│   └── <device-id>/YYYY/MM/DD/<digest>.jsonl.age
 ├── index/
 │   └── vault.sqlite
 ├── keys/
 │   ├── device.agekey
 │   └── correlation-key.age
-└── queue/
-    └── pending-sync.json
+└── hash.key
 ```
 
-Only encrypted immutable chunks and non-sensitive format metadata are eligible
-for the private Git repository. The device secret key, plaintext inbox, decoded
-chunks, and SQLite index remain local.
+Only encrypted immutable chunks, `vault.json`, `.gitignore`, and the encrypted
+correlation-key envelope are eligible for the private Git repository. The
+device secret key, plaintext inbox and retry queue, quarantine, `hash.key`,
+decoded chunks, and SQLite index remain local.
 
 The Git layout avoids shared mutable files:
 
@@ -106,22 +109,35 @@ private keys are never copied through the Git repository.
 
 ## Rotation and manual synchronization
 
-The first release exposes explicit synchronization:
+The first release separates local rotation from synchronization:
 
 ```text
-flight-recorder sync
-  1. lock the local inbox
-  2. rotate complete events into a unique immutable chunk
-  3. validate the chunk schema
-  4. encrypt the chunk to enrolled age recipients
-  5. commit only the encrypted device-scoped file
-  6. pull --rebase and push
-  7. retain failed work in the local retry queue
+flight-recorder rotate
+  1. verify the authenticated recipient registry
+  2. take the stable inbox lock
+  3. atomically rename each complete event generation into the retry queue
+  4. release the inbox lock before validation and encryption
+  5. quarantine invalid lines and preserve valid Event v1 records in order
+  6. derive a content ID from the Vault, device, and canonical event bytes
+  7. encrypt the Chunk v1 JSONL to every enrolled age recipient
+  8. publish one immutable device-scoped `.jsonl.age` file
+  9. delete plaintext retry state only after successful publication
 ```
 
-Chunks are content-addressed or randomly identified and are never edited after
-publication. Import decrypts unseen chunks and rebuilds derived state
-idempotently.
+The hook and rotate command acquire the same stable `inbox/events.lock` before
+opening the live data file, preventing stale-inode writes during rename. The
+lock is not held during validation or age encryption, so a slow or failed
+rotation does not block normal event capture.
+
+Chunks are content-addressed and never edited after publication. A retry that
+finds the same path decrypts and compares the existing artifact instead of
+re-encrypting or overwriting it. A conflicting artifact fails closed while
+retaining the plaintext pending source. Import decrypts unseen chunks and
+rebuilds derived state idempotently.
+
+Manual Git synchronization is a later command layered on top of this format. It
+may stage only the explicit Vault allowlist; rotation itself does not invoke
+Git or the network beyond the local `age` process.
 
 The next release runs the same operation once per day through `launchd` on macOS
 and a `systemd` timer on Linux. Failures use backoff and remain invisible during

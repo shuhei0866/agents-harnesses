@@ -13,6 +13,10 @@ Thumbs.db
 loops/logs/
 *.log
 
+# Python
+__pycache__/
+*.py[cod]
+
 # Local sensitive patterns (user-specific, never commit)
 .sensitive-patterns.local
 

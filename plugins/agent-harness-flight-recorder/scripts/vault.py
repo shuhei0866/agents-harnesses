@@ -32,8 +32,32 @@ CONFIG_PATHS = {
     "correlation_key_envelope": str(ENVELOPE_PATH),
     "device_identity": str(DEVICE_IDENTITY_PATH),
 }
-GIT_SYNC_ALLOWLIST = [".gitignore", CONFIG_NAME, str(ENVELOPE_PATH)]
+GIT_SYNC_ALLOWLIST = [
+    ".gitignore",
+    CONFIG_NAME,
+    str(ENVELOPE_PATH),
+    "devices/**/*.jsonl.age",
+]
+LEGACY_GIT_SYNC_ALLOWLIST = [".gitignore", CONFIG_NAME, str(ENVELOPE_PATH)]
 GITIGNORE = """# Local-only Flight Recorder state
+/hash.key
+/events.jsonl
+/keys/*.agekey
+/inbox/
+/queue/
+/quarantine/
+/devices/**/*
+!/devices/**/
+!/devices/**/*.jsonl.age
+/chunks/
+/index/
+/cache/
+/tmp/
+/.init-in-progress
+/*.lock
+/*.tmp
+"""
+LEGACY_GITIGNORE = """# Local-only Flight Recorder state
 /hash.key
 /events.jsonl
 /keys/*.agekey
@@ -265,7 +289,10 @@ def load_config(root: Path) -> dict[str, object]:
         raise VaultError("vault recipients must be unique")
     if config.get("paths") != CONFIG_PATHS:
         raise VaultError("vault paths are invalid")
-    if config.get("git_sync_allowlist") != GIT_SYNC_ALLOWLIST:
+    if config.get("git_sync_allowlist") not in (
+        GIT_SYNC_ALLOWLIST,
+        LEGACY_GIT_SYNC_ALLOWLIST,
+    ):
         raise VaultError("vault Git allowlist is invalid")
     mac = config.get("recipient_state_hmac")
     if not isinstance(mac, str) or not re.fullmatch(r"[0-9a-f]{64}", mac):
@@ -362,10 +389,21 @@ def init_vault_locked(root: Path, remote: str, recovery: str) -> None:
         unexpected = [
             item
             for item in root.iterdir()
-            if item.name not in {"events.jsonl", "hash.key"}
+            if item.name not in {"events.jsonl", "hash.key", "inbox"}
         ]
         if unexpected:
             raise VaultError("refusing to initialize a non-empty vault directory")
+        inbox = root / "inbox"
+        if inbox.exists():
+            if inbox.is_symlink() or not inbox.is_dir():
+                raise VaultError("existing recorder inbox is unsafe")
+            if any(
+                item.name not in {"events.jsonl", "events.lock"}
+                or item.is_symlink()
+                or not item.is_file()
+                for item in inbox.iterdir()
+            ):
+                raise VaultError("existing recorder inbox is unsafe")
         existing_key = root / HASH_KEY_PATH
         if existing_key.exists() and (
             existing_key.is_symlink()
@@ -685,6 +723,7 @@ def parser() -> argparse.ArgumentParser:
     add.add_argument("--identity")
     join = device_commands.add_parser("join")
     join.add_argument("--identity", required=True)
+    commands.add_parser("rotate")
     return top
 
 
@@ -697,6 +736,14 @@ def main() -> int:
         add_device(root, args.recipient, args.identity)
     elif args.command == "device" and args.device_command == "join":
         join_device(root, args.identity)
+    elif args.command == "rotate":
+        # The shell wrapper executes this file as __main__. Register that module
+        # under its import name so chunk_rotation shares this VaultError class
+        # instead of loading a second copy that the CLI exception handler misses.
+        sys.modules.setdefault("vault", sys.modules[__name__])
+        from chunk_rotation import rotate
+
+        rotate(root)
     return 0
 
 

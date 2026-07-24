@@ -7,6 +7,7 @@ import json
 import os
 import pathlib
 import sys
+import time
 
 
 BECH32_DATA = "023456789acdefghjklmnpqrstuvwxyz"
@@ -65,6 +66,16 @@ if decrypting:
 
 if os.environ.get("FAKE_AGE_ENCRYPT_FAIL"):
     raise SystemExit("fake age: injected encryption failure")
+
+marker = os.environ.get("FAKE_AGE_ENCRYPT_MARKER")
+release = os.environ.get("FAKE_AGE_ENCRYPT_RELEASE")
+if marker and release:
+    pathlib.Path(marker).touch()
+    deadline = time.monotonic() + 10
+    while not pathlib.Path(release).exists():
+        if time.monotonic() >= deadline:
+            raise SystemExit("fake age: timed out waiting for encryption release")
+        time.sleep(0.01)
 
 recipients = option_values(args, "-r", "--recipient")
 if not recipients:

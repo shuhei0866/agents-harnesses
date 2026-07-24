@@ -138,3 +138,15 @@ Accepted decisions remain recorded when later superseded.
 - Consequence: recipient changes require successful envelope decryption before
   metadata is accepted, and a new device uses `device join` to create its local
   identity, device ID, and `hash.key`.
+
+## D-20260724-14: Content-address encrypted chunks with durable local retry
+
+- Status: accepted
+- Decision: derive each chunk ID from the Vault ID, producing device ID, and
+  ordered canonical Event v1 bytes; keep atomically detached plaintext input in
+  a Git-ignored queue until one immutable age artifact is verified as published.
+- Reason: age encryption is probabilistic, so ciphertext identity cannot make
+  interrupted retries converge. The canonical plaintext evidence can.
+- Consequence: retry reuses a matching existing artifact, refuses a conflicting
+  artifact without overwriting it, and removes plaintext pending state only
+  after successful publication.

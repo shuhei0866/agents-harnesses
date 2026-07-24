@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent Harness Flight Recorder Chunk Header v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "record_type",
+    "schema_version",
+    "event_schema_version",
+    "chunk_id",
+    "vault_id",
+    "device_id",
+    "created_at",
+    "event_count"
+  ],
+  "properties": {
+    "record_type": { "const": "chunk_header" },
+    "schema_version": { "const": 1 },
+    "event_schema_version": { "const": 1 },
+    "chunk_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "vault_id": { "type": "string", "format": "uuid" },
+    "device_id": { "type": "string", "format": "uuid" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "event_count": { "type": "integer", "minimum": 1 }
+  }
+}
