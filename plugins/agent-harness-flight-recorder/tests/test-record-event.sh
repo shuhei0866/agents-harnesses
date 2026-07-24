@@ -287,6 +287,68 @@ PY
   fi
 }
 
+test_vault_state_override() {
+  echo "test_vault_state_override:"
+  local vault="$TMPDIR_TEST/vault-override"
+  local out="$TMPDIR_TEST/vault-override.out" err="$TMPDIR_TEST/vault-override.err"
+  FLIGHT_RECORDER_STATE_DIR="$vault" \
+    AGENT_FLIGHT_RECORDER_NOW="2026-07-21T00:00:00Z" \
+    "$RECORDER" --harness claude-code \
+    <"$FIXTURES/claude-code-stop.json" >"$out" 2>"$err"
+  if [[ -s "$vault/events.jsonl" \
+    && "$(wc -c <"$vault/hash.key" | tr -d ' ')" == "32" ]]; then
+    pass "Vault override配下へeventと相関鍵をまとめて保存する"
+  else
+    fail "Vault override配下へeventと相関鍵をまとめて保存する"
+  fi
+}
+
+test_relative_vault_state_fails_open() {
+  echo "test_relative_vault_state_fails_open:"
+  local sandbox="$TMPDIR_TEST/relative-vault-state"
+  local out="$TMPDIR_TEST/relative-vault.out" err="$TMPDIR_TEST/relative-vault.err"
+  local status
+  mkdir -p "$sandbox"
+  (
+    cd "$sandbox" || exit 1
+    FLIGHT_RECORDER_STATE_DIR="relative-vault" \
+      "$RECORDER" --harness claude-code \
+      <"$FIXTURES/claude-code-stop.json" >"$out" 2>"$err"
+  )
+  status=$?
+  assert_success "相対Vault overrideでもhookはfail-openする" "$status"
+  assert_file_absent_or_empty \
+    "相対cwd依存のVaultへeventを書かない" \
+    "$sandbox/relative-vault/events.jsonl"
+}
+
+test_malformed_vault_key_is_not_replaced() {
+  echo "test_malformed_vault_key_is_not_replaced:"
+  local vault="$TMPDIR_TEST/malformed-vault-key"
+  local out="$TMPDIR_TEST/malformed-vault-key.out"
+  local err="$TMPDIR_TEST/malformed-vault-key.err" status
+  mkdir -p "$vault"
+  printf '%s' "do-not-replace" >"$vault/hash.key"
+  FLIGHT_RECORDER_STATE_DIR="$vault" \
+    AGENT_FLIGHT_RECORDER_NOW="2026-07-21T00:00:00Z" \
+    "$RECORDER" --harness claude-code \
+    <"$FIXTURES/claude-code-stop.json" >"$out" 2>"$err"
+  status=$?
+  assert_success "壊れた既存相関鍵でもhookをfail-openする" "$status"
+  if [[ "$(cat "$vault/hash.key")" == "do-not-replace" ]]; then
+    pass "Vault envelopeと分岐し得る既存鍵を上書きしない"
+  else
+    fail "Vault envelopeと分岐し得る既存鍵を上書きしない"
+  fi
+  if json_check "$vault/events.jsonl" \
+    "v['session_id_hash'] is None and v['turn_id_hash'] is None and v['workspace_id'] is None" \
+    2>/dev/null; then
+    pass "鍵修復まで相関IDだけを省略してeventを保持する"
+  else
+    fail "鍵修復まで相関IDだけを省略してeventを保持する"
+  fi
+}
+
 test_oversized_input_fail_open() {
   echo "test_oversized_input_fail_open:"
   local log="$TMPDIR_TEST/oversized.jsonl" out="$TMPDIR_TEST/oversized.out" err="$TMPDIR_TEST/oversized.err" input="$TMPDIR_TEST/oversized-input.json" status
@@ -309,6 +371,9 @@ test_storage_failure_fail_open
 test_concurrent_append
 test_optional_fields_default_to_null
 test_hmac_correlation_key
+test_vault_state_override
+test_relative_vault_state_fails_open
+test_malformed_vault_key_is_not_replaced
 test_oversized_input_fail_open
 
 echo ""

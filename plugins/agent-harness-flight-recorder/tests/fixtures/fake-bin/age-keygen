@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""Dependency-free age-keygen test double.
+
+The identity format is intentionally fake. Tests exercise the flight-recorder's
+CLI/process contract while a real-age smoke test remains free to use age itself.
+"""
+
+import hashlib
+import os
+import pathlib
+import sys
+import uuid
+
+
+BECH32_DATA = "023456789acdefghjklmnpqrstuvwxyz"
+
+
+def recipient(identity_line: str) -> str:
+    digest = hashlib.sha256(identity_line.encode("utf-8")).digest()
+    body = "".join(BECH32_DATA[byte % len(BECH32_DATA)] for byte in digest)
+    return "age1" + (body * 2)[:58]
+
+
+def read_identity(path: str) -> str:
+    for line in pathlib.Path(path).read_text(encoding="utf-8").splitlines():
+        if line.startswith("FAKE-AGE-IDENTITY-1-"):
+            return line
+    raise SystemExit("fake age-keygen: identity missing")
+
+
+args = sys.argv[1:]
+if args[:1] in (["-y"], ["--y"]):
+    print(recipient(read_identity(args[1])))
+    raise SystemExit(0)
+
+if os.environ.get("FAKE_AGE_KEYGEN_FAIL"):
+    raise SystemExit("fake age-keygen: injected failure")
+
+try:
+    output_index = args.index("-o") + 1
+except ValueError:
+    try:
+        output_index = args.index("--output") + 1
+    except ValueError:
+        raise SystemExit("fake age-keygen: -o is required")
+
+output = pathlib.Path(args[output_index])
+if output.exists():
+    raise SystemExit("fake age-keygen: refusing to overwrite identity")
+
+identity_line = "FAKE-AGE-IDENTITY-1-" + uuid.uuid4().hex
+public = recipient(identity_line)
+output.parent.mkdir(parents=True, exist_ok=True)
+fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w", encoding="utf-8") as stream:
+    stream.write(f"# public key: {public}\n{identity_line}\n")
+print(f"Public key: {public}", file=sys.stderr)

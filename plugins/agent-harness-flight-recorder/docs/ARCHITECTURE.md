@@ -98,7 +98,11 @@ The correlation key creates stable pseudonymous identifiers across devices.
 Raw workspace, session, and turn identifiers are not synchronized.
 
 Adding a device means adding its age recipient and re-encrypting the small vault
-key envelope. Device private keys are never copied through the Git repository.
+key envelope. On the new device, `device join` generates a local identity and
+device ID, decrypts the envelope through an already authorized identity, and
+materializes the shared correlation key as a local-only `hash.key`. The
+recipient registry is authenticated with that key before re-encryption. Device
+private keys are never copied through the Git repository.
 
 ## Rotation and manual synchronization
 

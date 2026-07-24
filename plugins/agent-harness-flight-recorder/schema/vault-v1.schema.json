@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-harness-flight-recorder.dev/schema/vault-v1.schema.json",
+  "title": "Agent Harness Flight Recorder Vault",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "vault_id",
+    "remote",
+    "devices",
+    "recovery_recipients",
+    "recipient_state_hmac",
+    "paths",
+    "git_sync_allowlist"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "vault_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "remote": {
+      "type": "string",
+      "minLength": 1
+    },
+    "devices": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "device_id",
+          "recipient"
+        ],
+        "properties": {
+          "device_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "recipient": {
+            "type": "string",
+            "pattern": "^age1[023456789acdefghjklmnpqrstuvwxyz]{20,}$"
+          }
+        }
+      }
+    },
+    "recovery_recipients": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^age1[023456789acdefghjklmnpqrstuvwxyz]{20,}$"
+      }
+    },
+    "recipient_state_hmac": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "paths": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "correlation_key_envelope",
+        "device_identity"
+      ],
+      "properties": {
+        "correlation_key_envelope": {
+          "const": "keys/correlation-key.age"
+        },
+        "device_identity": {
+          "const": "keys/device.agekey"
+        }
+      }
+    },
+    "git_sync_allowlist": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}
