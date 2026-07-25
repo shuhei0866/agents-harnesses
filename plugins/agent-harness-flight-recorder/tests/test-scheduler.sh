@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Daily scheduler contract tests (external dependencies: git and python3).
+# Scheduler and durable retry contract tests (git and python3 required).
 # launchctl/systemctl are always supplied by fixtures; these tests never touch
 # the host scheduler.
 set -uo pipefail
@@ -55,6 +55,12 @@ run_cli() {
     FLIGHT_RECORDER_SCHEDULER_CALL_LOG="$call_log" \
     FLIGHT_RECORDER_SCHEDULER_MANAGER_STATE="$call_log.manager" \
     "$CLI" "$@"
+}
+
+run_cli_at() {
+  local now="$1"
+  shift
+  AGENT_FLIGHT_RECORDER_TEST_NOW="$now" run_cli "$@"
 }
 
 init_vault() {
@@ -115,9 +121,8 @@ assert value["ProgramArguments"] == [str(cli), "scheduler", "run"]
 assert value["EnvironmentVariables"]["FLIGHT_RECORDER_STATE_DIR"] == str(state)
 assert value["EnvironmentVariables"]["PATH"]
 assert value["RunAtLoad"] is True
-calendar = value["StartCalendarInterval"]
-assert calendar["Hour"] in range(24)
-assert calendar["Minute"] in range(60)
+assert value["StartInterval"] == 300
+assert "StartCalendarInterval" not in value
 assert cli.is_absolute()
 assert state.is_absolute()
 PY
@@ -249,7 +254,7 @@ assert service["Service"]["ExecStart"] == (
 environment = service["Service"]["Environment"]
 assert f'"FLIGHT_RECORDER_STATE_DIR={state}"' in environment
 assert "PATH=" in environment
-assert timer["Timer"]["OnCalendar"] == "daily"
+assert timer["Timer"]["OnCalendar"] == "*:0/5"
 assert timer["Timer"]["Persistent"].lower() == "true"
 assert timer["Install"]["WantedBy"] == "timers.target"
 assert cli.is_absolute()
@@ -454,6 +459,164 @@ PY
   else
     fail "offline失敗はscheduler statusへerrorとして残る"
   fi
+
+  local before_state before_pending
+  before_state="$(git hash-object "$state/scheduler/state.json")"
+  before_pending="$(git hash-object "$state/queue/pending-sync.json")"
+  if run_cli macos "$state" "$home" "$config_home" "$call_log" \
+      scheduler run >/dev/null 2>&1 \
+    && [[ "$before_state" == "$(git hash-object "$state/scheduler/state.json")" ]] \
+    && [[ "$before_pending" == "$(git hash-object "$state/queue/pending-sync.json")" ]]; then
+    pass "別processの早期起動もdurable retry gateでremote再試行を抑止する"
+  else
+    fail "別processの早期起動もdurable retry gateでremote再試行を抑止する"
+  fi
+
+  rm -f "$remote/hooks/pre-receive"
+  if run_cli macos "$state" "$home" "$config_home" "$call_log" \
+      sync >/dev/null 2>&1 \
+    && [[ ! -e "$state/queue/pending-sync.json" ]] \
+    && python3 - "$state/scheduler/state.json" <<'PY' 2>/dev/null
+import json
+import pathlib
+import sys
+
+state = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert state["schema_version"] == 2
+assert state["last_success_at"]
+assert state["failure_class"] is None
+assert state["diagnostic_code"] is None
+assert state["next_action_code"] is None
+assert state["next_retry_at"] is None
+assert state["consecutive_failure_count"] == 0
+PY
+  then
+    pass "明示syncはbackoffを迂回してpendingとhealthを回復する"
+  else
+    fail "明示syncはbackoffを迂回してpendingとhealthを回復する"
+  fi
+}
+
+test_permanent_configuration_failure_is_suppressed() {
+  echo "test_permanent_configuration_failure_is_suppressed:"
+  local base="$TEST_ROOT/permanent"
+  local state="$base/vault" home="$base/home" config_home="$base/config"
+  local remote="$base/remote.git" other="$base/other.git"
+  local recovery="$base/recovery.agekey" call_log="$base/calls.log"
+  local status_json="$base/status.json"
+  mkdir -p "$base" "$home" "$config_home"
+  : >"$call_log"
+  init_remote "$remote"
+  init_remote "$other"
+  init_vault macos "$state" "$home" "$config_home" "$call_log" \
+    "$remote" "$recovery" >/dev/null 2>&1 || {
+    fail "permanent failure fixture Vaultを初期化できる"
+    return
+  }
+  run_cli_at "2026-07-24T00:00:00Z" \
+    macos "$state" "$home" "$config_home" "$call_log" \
+    sync >/dev/null 2>&1 || {
+    fail "permanent failure fixture Git repositoryを初期化できる"
+    return
+  }
+  git -C "$state" remote set-url origin "$other"
+  local first_status=0
+  run_cli_at "2026-07-26T00:00:00Z" \
+    macos "$state" "$home" "$config_home" "$call_log" \
+    scheduler run >/dev/null 2>&1 || first_status=$?
+  local before_state
+  before_state="$(git hash-object "$state/scheduler/state.json" 2>/dev/null)"
+  run_cli_at "2026-07-27T00:00:00Z" \
+    macos "$state" "$home" "$config_home" "$call_log" \
+    scheduler run >/dev/null 2>&1
+  run_cli macos "$state" "$home" "$config_home" "$call_log" \
+    status --json >"$status_json" 2>/dev/null
+  if [[ "$first_status" -eq 0 ]] \
+    && [[ "$before_state" == "$(git hash-object "$state/scheduler/state.json")" ]] \
+    && python3 - "$state/scheduler/state.json" "$status_json" \
+      "$other" <<'PY' 2>/dev/null
+import json
+import pathlib
+import sys
+
+state_path, status_path, secret_path = sys.argv[1:]
+state = json.loads(pathlib.Path(state_path).read_text())
+status = json.loads(pathlib.Path(status_path).read_text())
+published = (
+    pathlib.Path(status_path).read_text()
+    + pathlib.Path(state_path).read_text()
+)
+assert state["failure_class"] == "permanent"
+assert state["diagnostic_code"] == "origin_mismatch"
+assert state["next_action_code"] == "repair_configuration"
+assert state["next_retry_at"] is None
+assert state["consecutive_failure_count"] == 1
+assert status["sync"]["state"] == "error"
+assert status["overall"] == "attention"
+assert secret_path not in published
+PY
+  then
+    pass "origin不一致はsafeなpermanent診断として保存し自動再試行しない"
+  else
+    fail "origin不一致はsafeなpermanent診断として保存し自動再試行しない"
+  fi
+}
+
+test_manual_failure_reclassifies_retry_health() {
+  echo "test_manual_failure_reclassifies_retry_health:"
+  local base="$TEST_ROOT/manual-reclassify"
+  local state="$base/vault" home="$base/home" config_home="$base/config"
+  local remote="$base/remote.git" offline="$base/remote.offline"
+  local other="$base/other.git" recovery="$base/recovery.agekey"
+  local call_log="$base/calls.log" status_json="$base/status.json"
+  mkdir -p "$base" "$home" "$config_home"
+  : >"$call_log"
+  init_remote "$remote"
+  init_remote "$other"
+  init_vault macos "$state" "$home" "$config_home" "$call_log" \
+    "$remote" "$recovery" >/dev/null 2>&1
+  run_cli_at "2026-07-24T00:00:00Z" \
+    macos "$state" "$home" "$config_home" "$call_log" \
+    sync >/dev/null 2>&1
+  git -C "$state" remote set-url origin "$other"
+  run_cli_at "2026-07-26T00:00:00Z" \
+    macos "$state" "$home" "$config_home" "$call_log" \
+    scheduler run >/dev/null 2>&1
+  git -C "$state" remote set-url origin "$remote"
+  mv "$remote" "$offline"
+  local manual_status=0
+  run_cli_at "2026-07-27T00:00:00Z" \
+    macos "$state" "$home" "$config_home" "$call_log" \
+    sync >/dev/null 2>"$base/manual.err" || manual_status=$?
+  run_cli macos "$state" "$home" "$config_home" "$call_log" \
+    status --json >"$status_json" 2>/dev/null
+  if [[ "$manual_status" -ne 0 ]] \
+    && python3 - "$state/scheduler/state.json" "$status_json" \
+      "$base/manual.err" "$offline" <<'PY' 2>/dev/null
+import json
+import pathlib
+import sys
+
+state_path, status_path, error_path, secret_path = sys.argv[1:]
+state = json.loads(pathlib.Path(state_path).read_text())
+published = (
+    pathlib.Path(state_path).read_text()
+    + pathlib.Path(status_path).read_text()
+    + pathlib.Path(error_path).read_text()
+)
+assert state["failure_class"] == "transient"
+assert state["diagnostic_code"] == "remote_unavailable"
+assert state["next_action_code"] == "retry_automatically"
+assert state["next_retry_at"] is not None
+assert state["consecutive_failure_count"] == 2
+assert secret_path not in published
+PY
+  then
+    pass "明示sync失敗も古いpermanent healthをtransientへ更新する"
+  else
+    fail "明示sync失敗も古いpermanent healthをtransientへ更新する"
+  fi
+  mv "$offline" "$remote"
 }
 
 test_manager_namespace_collision_contract() {
@@ -665,13 +828,15 @@ PY
   fi
 }
 
-echo "=== Flight Recorder Daily Scheduler Tests ==="
+echo "=== Flight Recorder Scheduler Tests ==="
 test_macos_install_contract
 test_macos_uninstall_and_collision_contract
 test_linux_install_contract
 test_linux_uninstall_and_collision_contract
 test_scheduler_run_reuses_sync_core_and_lock
 test_offline_run_is_fail_open_and_visible_in_status
+test_permanent_configuration_failure_is_suppressed
+test_manual_failure_reclassifies_retry_health
 test_manager_namespace_collision_contract
 test_manifest_provenance_contract
 test_install_transaction_contract

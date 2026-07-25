@@ -1,4 +1,4 @@
-"""Install and run a daily user-level Flight Recorder sync scheduler."""
+"""Install and run the user-level Flight Recorder sync retry policy."""
 
 from __future__ import annotations
 
@@ -17,12 +17,18 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from chunk_rotation import atomic_replace, canonical_json, safe_subdirectory
+from chunk_rotation import (
+    atomic_replace,
+    canonical_json,
+    local_device,
+    safe_subdirectory,
+)
 from sync import load_pending, sync
 from vault import (
     VaultError,
     ensure_managed_gitignore,
     ensure_safe_existing_root,
+    load_config,
 )
 
 
@@ -34,6 +40,30 @@ RUNTIME_PATH = (
     "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 )
 COMMAND_TIMEOUT_SECONDS = 30
+WAKE_INTERVAL_SECONDS = 300
+HEALTHY_INTERVAL_SECONDS = 86400
+RETRY_BASE_SECONDS = 300
+RETRY_CAP_SECONDS = 86400
+MAX_FAILURE_COUNT = 1_000_000
+FAILURE_CLASSES = {"transient", "permanent"}
+DIAGNOSTIC_CODES = {
+    "remote_unavailable",
+    "origin_mismatch",
+    "rebase_conflict",
+    "local_integrity_invalid",
+}
+NEXT_ACTION_CODES = {"retry_automatically", "repair_configuration"}
+STATE_V2_FIELDS = {
+    "schema_version",
+    "last_attempt_at",
+    "last_success_at",
+    "last_error_category",
+    "failure_class",
+    "diagnostic_code",
+    "next_action_code",
+    "consecutive_failure_count",
+    "next_retry_at",
+}
 
 
 def platform_name() -> str:
@@ -162,7 +192,7 @@ def _expected(root: Path, platform: str) -> dict[Path, bytes]:
                 "FLIGHT_RECORDER_STATE_DIR": str(root),
                 "PATH": runtime_path,
             },
-            "StartCalendarInterval": {"Hour": 3, "Minute": 0},
+            "StartInterval": WAKE_INTERVAL_SECONDS,
             "RunAtLoad": True,
             "ProcessType": "Background",
         }
@@ -171,7 +201,7 @@ def _expected(root: Path, platform: str) -> dict[Path, bytes]:
         }
     service = (
         "[Unit]\n"
-        "Description=Daily Agent Harness Flight Recorder sync\n\n"
+        "Description=Agent Harness Flight Recorder sync\n\n"
         "[Service]\n"
         "Type=oneshot\n"
         f"Environment={_systemd_quote(f'FLIGHT_RECORDER_STATE_DIR={root}')} "
@@ -180,9 +210,9 @@ def _expected(root: Path, platform: str) -> dict[Path, bytes]:
     ).encode()
     timer = (
         "[Unit]\n"
-        "Description=Run Agent Harness Flight Recorder sync daily\n\n"
+        "Description=Wake Agent Harness Flight Recorder sync policy\n\n"
         "[Timer]\n"
-        "OnCalendar=daily\n"
+        "OnCalendar=*:0/5\n"
         "Persistent=true\n\n"
         "[Install]\n"
         "WantedBy=timers.target\n"
@@ -570,6 +600,10 @@ def _install(root: Path) -> None:
             _command(
                 ["systemctl", "--user", "enable", "--now", f"{UNIT}.timer"]
             )
+            if loaded_before and configuration_changed:
+                _command(
+                    ["systemctl", "--user", "restart", f"{UNIT}.timer"]
+                )
         _write_manifest(
             root,
             _manifest_value(
@@ -638,6 +672,9 @@ def _install(root: Path) -> None:
                             "--now",
                             f"{UNIT}.timer",
                         ]
+                    )
+                    _command(
+                        ["systemctl", "--user", "restart", f"{UNIT}.timer"]
                     )
             except VaultError:
                 pass
@@ -712,13 +749,161 @@ def uninstall(root: Path) -> None:
         _uninstall(root)
 
 
-def _time() -> str:
+def _format_time(value: dt.datetime) -> str:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise VaultError("scheduler timestamp is invalid")
     return (
-        dt.datetime.now(dt.timezone.utc)
+        value.astimezone(dt.timezone.utc)
         .replace(microsecond=0)
         .isoformat()
         .replace("+00:00", "Z")
     )
+
+
+def _parse_time(value: str) -> dt.datetime:
+    if not isinstance(value, str):
+        raise VaultError("scheduler timestamp is invalid")
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise VaultError("scheduler timestamp is invalid") from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise VaultError("scheduler timestamp is invalid")
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def _now() -> dt.datetime:
+    override = os.environ.get("AGENT_FLIGHT_RECORDER_TEST_NOW")
+    if override is not None:
+        if os.environ.get("FLIGHT_RECORDER_SCHEDULER_PLATFORM") is None:
+            raise VaultError("scheduler time override is test-only")
+        return _parse_time(override).replace(microsecond=0)
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+
+
+def retry_delay_seconds(seed: str, failure_count: int) -> int:
+    if (
+        not isinstance(seed, str)
+        or not seed
+        or isinstance(failure_count, bool)
+        or not isinstance(failure_count, int)
+        or failure_count < 1
+    ):
+        raise ValueError("retry policy input is invalid")
+    exponent = min(failure_count - 1, 63)
+    nominal = min(RETRY_CAP_SECONDS, RETRY_BASE_SECONDS * (2**exponent))
+    lower = nominal // 2
+    span = nominal - lower
+    digest = hashlib.sha256(
+        f"{seed}:{failure_count}".encode("utf-8")
+    ).digest()
+    return lower + int.from_bytes(digest[:8], "big") % (span + 1)
+
+
+def _state_after_failure(
+    previous: dict[str, Any] | None,
+    *,
+    now: dt.datetime,
+    failure_class: str,
+    diagnostic_code: str,
+    next_action_code: str,
+    retry_seed: str,
+) -> dict[str, Any]:
+    if (
+        failure_class not in FAILURE_CLASSES
+        or diagnostic_code not in DIAGNOSTIC_CODES
+        or next_action_code not in NEXT_ACTION_CODES
+    ):
+        raise VaultError("scheduler failure classification is invalid")
+    previous_count = (
+        previous.get("consecutive_failure_count", 0) if previous else 0
+    )
+    if (
+        isinstance(previous_count, bool)
+        or not isinstance(previous_count, int)
+        or previous_count < 0
+        or previous_count >= MAX_FAILURE_COUNT
+    ):
+        raise VaultError("scheduler state is invalid")
+    count = previous_count + 1
+    next_retry = None
+    if failure_class == "transient":
+        delay = retry_delay_seconds(retry_seed, count)
+        next_retry = _format_time(now + dt.timedelta(seconds=delay))
+    category = (
+        "remote"
+        if diagnostic_code == "remote_unavailable"
+        else "rebase"
+        if diagnostic_code == "rebase_conflict"
+        else "integrity"
+    )
+    return {
+        "schema_version": 2,
+        "last_attempt_at": _format_time(now),
+        "last_success_at": (
+            previous.get("last_success_at") if previous else None
+        ),
+        "last_error_category": category,
+        "failure_class": failure_class,
+        "diagnostic_code": diagnostic_code,
+        "next_action_code": next_action_code,
+        "consecutive_failure_count": count,
+        "next_retry_at": next_retry,
+    }
+
+
+def _state_after_success(
+    previous: dict[str, Any] | None, *, now: dt.datetime
+) -> dict[str, Any]:
+    timestamp = _format_time(now)
+    return {
+        "schema_version": 2,
+        "last_attempt_at": timestamp,
+        "last_success_at": timestamp,
+        "last_error_category": None,
+        "failure_class": None,
+        "diagnostic_code": None,
+        "next_action_code": None,
+        "consecutive_failure_count": 0,
+        "next_retry_at": None,
+    }
+
+
+def _retry_due(state: dict[str, Any], now: dt.datetime) -> bool:
+    failure_class = state.get("failure_class")
+    if failure_class == "permanent":
+        return False
+    if failure_class != "transient":
+        return True
+    next_retry = state.get("next_retry_at")
+    return next_retry is None or now >= _parse_time(next_retry)
+
+
+def _scheduler_due(
+    state: dict[str, Any] | None, now: dt.datetime
+) -> bool:
+    if state is None:
+        return True
+    if state.get("failure_class") is not None:
+        return _retry_due(state, now)
+    last_success = state.get("last_success_at")
+    if last_success is None:
+        return True
+    return now >= _parse_time(last_success) + dt.timedelta(
+        seconds=HEALTHY_INTERVAL_SECONDS
+    )
+
+
+def _retry_seed(root: Path) -> str:
+    try:
+        config = load_config(root)
+        device_id, _ = local_device(config, root)
+        vault_id = config.get("vault_id")
+        if isinstance(vault_id, str):
+            return f"{vault_id}:{device_id}"
+    except VaultError:
+        pass
+    return hashlib.sha256(str(root).encode("utf-8")).hexdigest()
 
 
 def _write_state(root: Path, value: dict[str, Any]) -> None:
@@ -750,39 +935,155 @@ def _load_state(root: Path) -> dict[str, Any] | None:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise VaultError("scheduler state is invalid") from error
-    if (
-        not isinstance(value, dict)
-        or value.get("schema_version") != 1
-        or set(value)
-        != {
+    if not isinstance(value, dict):
+        raise VaultError("scheduler state is invalid")
+    if value.get("schema_version") == 1:
+        if set(value) != {
             "schema_version",
             "last_attempt_at",
             "last_success_at",
             "last_error_category",
-        }
-        or any(
+        } or any(
             field is not None and not isinstance(field, str)
             for field in (
                 value.get("last_attempt_at"),
                 value.get("last_success_at"),
                 value.get("last_error_category"),
             )
-        )
+        ):
+            raise VaultError("scheduler state is invalid")
+        for field in ("last_attempt_at", "last_success_at"):
+            timestamp = value.get(field)
+            if timestamp is not None:
+                _parse_time(timestamp)
+        category = value.get("last_error_category")
+        if category not in (None, "remote", "rebase", "integrity", "sync"):
+            raise VaultError("scheduler state is invalid")
+        transient = category in ("remote", "rebase")
+        return {
+            "schema_version": 2,
+            "last_attempt_at": value.get("last_attempt_at"),
+            "last_success_at": value.get("last_success_at"),
+            "last_error_category": (
+                "remote"
+                if transient
+                else "integrity"
+                if category is not None
+                else None
+            ),
+            "failure_class": (
+                "transient"
+                if transient
+                else "permanent"
+                if category is not None
+                else None
+            ),
+            "diagnostic_code": (
+                "remote_unavailable"
+                if transient
+                else "local_integrity_invalid"
+                if category is not None
+                else None
+            ),
+            "next_action_code": (
+                "retry_automatically"
+                if transient
+                else "repair_configuration"
+                if category is not None
+                else None
+            ),
+            "consecutive_failure_count": 1 if category is not None else 0,
+            "next_retry_at": None,
+        }
+    if value.get("schema_version") != 2 or set(value) != STATE_V2_FIELDS:
+        raise VaultError("scheduler state is invalid")
+    for field in (
+        "last_attempt_at",
+        "last_success_at",
+        "last_error_category",
+        "failure_class",
+        "diagnostic_code",
+        "next_action_code",
+        "next_retry_at",
+    ):
+        if value.get(field) is not None and not isinstance(value[field], str):
+            raise VaultError("scheduler state is invalid")
+    for field in ("last_attempt_at", "last_success_at", "next_retry_at"):
+        if value.get(field) is not None:
+            _parse_time(value[field])
+    count = value.get("consecutive_failure_count")
+    if (
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or count < 0
+        or count > MAX_FAILURE_COUNT
     ):
         raise VaultError("scheduler state is invalid")
+    failure_class = value.get("failure_class")
+    diagnostic = value.get("diagnostic_code")
+    action = value.get("next_action_code")
+    retry = value.get("next_retry_at")
+    category = value.get("last_error_category")
+    if category not in (None, "remote", "rebase", "integrity"):
+        raise VaultError("scheduler state is invalid")
+    if failure_class is None:
+        if (
+            diagnostic is not None
+            or action is not None
+            or retry is not None
+            or count != 0
+            or value.get("last_error_category") is not None
+        ):
+            raise VaultError("scheduler state is invalid")
+    elif (
+        failure_class not in FAILURE_CLASSES
+        or diagnostic not in DIAGNOSTIC_CODES
+        or action not in NEXT_ACTION_CODES
+        or count < 1
+    ):
+        raise VaultError("scheduler state is invalid")
+    elif failure_class == "transient" and (
+        diagnostic != "remote_unavailable"
+        or action != "retry_automatically"
+        or category != "remote"
+    ):
+        raise VaultError("scheduler state is invalid")
+    elif failure_class == "permanent" and (
+        retry is not None or action != "repair_configuration"
+    ):
+        raise VaultError("scheduler state is invalid")
+    elif failure_class == "permanent":
+        expected_category = (
+            "rebase" if diagnostic == "rebase_conflict" else "integrity"
+        )
+        if category != expected_category:
+            raise VaultError("scheduler state is invalid")
+    if failure_class is not None and value.get("last_attempt_at") is None:
+        raise VaultError("scheduler state is invalid")
+    if retry is not None:
+        attempt_time = _parse_time(value["last_attempt_at"])
+        retry_time = _parse_time(retry)
+        if (
+            retry_time < attempt_time
+            or retry_time
+            > attempt_time + dt.timedelta(seconds=RETRY_CAP_SECONDS)
+        ):
+            raise VaultError("scheduler state is invalid")
     return value
 
 
-def run(root: Path) -> None:
-    ensure_safe_existing_root(root)
-    ensure_managed_gitignore(root)
+@contextlib.contextmanager
+def _run_lock(root: Path, *, blocking: bool) -> Any:
     directory = safe_subdirectory(root, "scheduler")
     lock_path = directory / "run.lock"
     if lock_path.is_symlink():
         raise VaultError("scheduler run lock is unsafe")
-    descriptor = os.open(
-        lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600
-    )
+    try:
+        descriptor = os.open(
+            lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600
+        )
+    except OSError as error:
+        raise VaultError("scheduler run lock is unavailable") from error
     try:
         metadata = os.fstat(descriptor)
         if (
@@ -793,46 +1094,97 @@ def run(root: Path) -> None:
         ):
             raise VaultError("scheduler run lock is unsafe")
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            operation = fcntl.LOCK_EX
+            if not blocking:
+                operation |= fcntl.LOCK_NB
+            fcntl.flock(descriptor, operation)
         except BlockingIOError:
+            yield False
             return
-        previous = _load_state(root)
-        attempt = _time()
-        state = {
-            "schema_version": 1,
-            "last_attempt_at": attempt,
-            "last_success_at": (
-                previous.get("last_success_at") if previous else None
-            ),
-            "last_error_category": None,
-        }
-        _write_state(root, state)
-        try:
-            sync(root)
-        except VaultError:
-            try:
-                pending = load_pending(root)
-            except VaultError:
-                pending = None
-            category = (
-                pending.get("last_error_category")
-                if pending is not None
-                else "integrity"
-            )
-            if category == "rebase":
-                # R1 sync cannot yet distinguish an offline pull from a true
-                # rebase conflict. At the scheduler surface it is a remote
-                # failure; IAM-114 introduces durable retry classification.
-                category = "remote"
-            state["last_error_category"] = (
-                category if isinstance(category, str) else "sync"
-            )
-            _write_state(root, state)
-            return
-        state["last_success_at"] = _time()
-        _write_state(root, state)
+        except OSError as error:
+            raise VaultError("scheduler run lock is unavailable") from error
+        yield True
     finally:
         os.close(descriptor)
+
+
+def _failure_state(
+    root: Path,
+    previous: dict[str, Any] | None,
+    *,
+    now: dt.datetime,
+    error: VaultError,
+) -> dict[str, Any]:
+    try:
+        pending = load_pending(root)
+    except VaultError:
+        pending = None
+    pending_category = pending.get("last_error_category") if pending else None
+    failure_class = getattr(error, "failure_class", None)
+    diagnostic_code = getattr(error, "diagnostic_code", None)
+    next_action_code = getattr(error, "next_action_code", None)
+    if (
+        failure_class not in FAILURE_CLASSES
+        or diagnostic_code not in DIAGNOSTIC_CODES
+        or next_action_code not in NEXT_ACTION_CODES
+    ):
+        if pending_category in ("remote", "rebase"):
+            failure_class = "transient"
+            diagnostic_code = "remote_unavailable"
+            next_action_code = "retry_automatically"
+        else:
+            failure_class = "permanent"
+            diagnostic_code = "local_integrity_invalid"
+            next_action_code = "repair_configuration"
+    return _state_after_failure(
+        previous,
+        now=now,
+        failure_class=failure_class,
+        diagnostic_code=diagnostic_code,
+        next_action_code=next_action_code,
+        retry_seed=_retry_seed(root),
+    )
+
+
+def run(root: Path) -> None:
+    ensure_safe_existing_root(root)
+    ensure_managed_gitignore(root)
+    with _run_lock(root, blocking=False) as acquired:
+        if not acquired:
+            return
+        previous = _load_state(root)
+        now = _now()
+        if not _scheduler_due(previous, now):
+            return
+        try:
+            sync(root)
+        except VaultError as error:
+            _write_state(
+                root,
+                _failure_state(root, previous, now=now, error=error),
+            )
+            return
+        _write_state(root, _state_after_success(previous, now=now))
+
+
+def manual_sync(root: Path) -> None:
+    """Run an explicit sync outside backoff and reconcile either outcome."""
+    ensure_safe_existing_root(root)
+    ensure_managed_gitignore(root)
+    with _run_lock(root, blocking=True) as acquired:
+        if not acquired:  # pragma: no cover - blocking acquisition cannot skip.
+            raise VaultError("scheduler run lock is unavailable")
+        previous = _load_state(root)
+        now = _now()
+        try:
+            sync(root)
+        except VaultError as error:
+            _write_state(
+                root,
+                _failure_state(root, previous, now=now, error=error),
+            )
+            raise
+        _write_state(root, _state_after_success(previous, now=now))
 
 
 def status(root: Path) -> dict[str, Any]:
@@ -887,6 +1239,21 @@ def status(root: Path) -> dict[str, Any]:
                 state.get("last_success_at") if state else None
             ),
             "last_error_category": error,
+            "failure_class": (
+                state.get("failure_class") if state else None
+            ),
+            "diagnostic_code": (
+                state.get("diagnostic_code") if state else None
+            ),
+            "next_action_code": (
+                state.get("next_action_code") if state else None
+            ),
+            "consecutive_failure_count": (
+                state.get("consecutive_failure_count") if state else 0
+            ),
+            "next_retry_at": (
+                state.get("next_retry_at") if state else None
+            ),
         }
     except VaultError:
         return {
@@ -896,4 +1263,9 @@ def status(root: Path) -> dict[str, Any]:
             "last_attempt_at": None,
             "last_success_at": None,
             "last_error_category": None,
+            "failure_class": None,
+            "diagnostic_code": None,
+            "next_action_code": None,
+            "consecutive_failure_count": None,
+            "next_retry_at": None,
         }

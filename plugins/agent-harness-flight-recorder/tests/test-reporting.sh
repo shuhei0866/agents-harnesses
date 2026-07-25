@@ -165,7 +165,7 @@ import sys
 
 value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 human = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
-assert value["schema_version"] == 2
+assert value["schema_version"] == 3
 assert value["command"] == "status"
 assert set(value) == {
     "schema_version", "command", "overall", "vault", "sync", "index", "queue",
@@ -174,6 +174,12 @@ assert set(value) == {
 assert value["vault"]["state"] == "initialized"
 assert value["sync"]["state"] == "idle"
 assert value["sync"]["pending"] is False
+assert value["sync"]["pending_chunk_count"] == 0
+assert value["sync"]["failure_class"] is None
+assert value["sync"]["diagnostic_code"] is None
+assert value["sync"]["next_action_code"] is None
+assert value["sync"]["next_retry_at"] is None
+assert value["sync"]["consecutive_failure_count"] == 0
 assert value["index"]["state"] == "ready"
 assert value["index"]["source_event_count"] == 3
 assert value["index"]["episode_count"] == 2
@@ -200,8 +206,19 @@ pathlib.Path(sys.argv[1]).write_text(json.dumps({
     "schema_version": 1,
     "phase": "pull_pending",
     "attempt_count": 2,
+    "artifact_paths": [
+        "devices/00000000-0000-4000-8000-000000000001/"
+        "2026/07/25/" + "a" * 64 + ".jsonl.age",
+        "devices/00000000-0000-4000-8000-000000000001/"
+        "2026/07/25/" + "b" * 64 + ".jsonl.age",
+    ],
 }), encoding="utf-8")
 PY
+  mkdir -m 700 -p "$STATE/scheduler"
+  printf '%s\n' \
+    '{"consecutive_failure_count":2,"diagnostic_code":"remote_unavailable","failure_class":"transient","last_attempt_at":"2026-07-25T00:00:00Z","last_error_category":"remote","last_success_at":null,"next_action_code":"retry_automatically","next_retry_at":"2026-07-25T00:10:00Z","schema_version":2}' \
+    >"$STATE/scheduler/state.json"
+  chmod 600 "$STATE/scheduler/state.json"
   if run_cli status --json >"$json_output" 2>"$TEST_ROOT/status-pending.err" \
     && python3 - "$json_output" <<'PY'
 import json
@@ -213,7 +230,13 @@ assert value["sync"]["state"] == "pending"
 assert value["sync"]["pending"] is True
 assert value["sync"]["pending_phase"] == "pull_pending"
 assert value["sync"]["attempt_count"] == 2
+assert value["sync"]["pending_chunk_count"] == 2
 assert value["sync"]["last_success_at"] is None
+assert value["sync"]["failure_class"] == "transient"
+assert value["sync"]["diagnostic_code"] == "remote_unavailable"
+assert value["sync"]["next_action_code"] == "retry_automatically"
+assert value["sync"]["next_retry_at"] == "2026-07-25T00:10:00Z"
+assert value["sync"]["consecutive_failure_count"] == 2
 assert value["queue"]["pending_count"] == 1
 assert value["overall"] == "attention"
 PY

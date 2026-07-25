@@ -51,7 +51,7 @@ from retention_state import load_forgotten
 
 
 OUTPUT_VERSION = 1
-STATUS_OUTPUT_VERSION = 2
+STATUS_OUTPUT_VERSION = 3
 DEFAULT_POLICY_VERSION = "default-v1"
 EPISODE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 DURATION_RE = re.compile(r"^([1-9][0-9]*)([smhdw])$")
@@ -635,6 +635,7 @@ def _vault_health(root: Path) -> dict[str, Any]:
 def status(root: Path) -> dict[str, Any]:
     ensure_safe_existing_root(root)
     components: dict[str, dict[str, Any]] = {}
+    scheduler_component: dict[str, Any] | None = None
     try:
         components["vault"] = _vault_health(root)
     except VaultError:
@@ -652,6 +653,7 @@ def status(root: Path) -> dict[str, Any]:
             chunks = []
         phase = pending.get("phase") if pending else None
         attempts = pending.get("attempt_count") if pending else None
+        artifact_paths = pending.get("artifact_paths", []) if pending else []
         if phase is not None and not isinstance(phase, str):
             raise VaultError("pending sync state is invalid")
         if attempts is not None and (
@@ -660,14 +662,37 @@ def status(root: Path) -> dict[str, Any]:
             or attempts < 0
         ):
             raise VaultError("pending sync state is invalid")
+        if not isinstance(artifact_paths, list) or any(
+            not isinstance(item, str) or not CHUNK_PATH_RE.fullmatch(item)
+            for item in artifact_paths
+        ):
+            raise VaultError("pending sync state is invalid")
+        from scheduler import status as scheduler_status
+
+        scheduler_component = scheduler_status(root)
+        failure_class = scheduler_component.get("failure_class")
+        sync_state = (
+            "pending"
+            if pending is not None
+            else "error"
+            if failure_class is not None
+            else "idle"
+        )
         components["sync"] = {
-            "state": "pending" if pending is not None else "idle",
+            "state": sync_state,
             "pending": pending is not None,
             "pending_phase": phase,
             "attempt_count": attempts,
+            "pending_chunk_count": len(set(artifact_paths)),
             "imported_chunk_count": len(chunks),
-            # No pending marker proves only local idleness, not remote success.
-            "last_success_at": None,
+            "last_success_at": scheduler_component.get("last_success_at"),
+            "failure_class": failure_class,
+            "diagnostic_code": scheduler_component.get("diagnostic_code"),
+            "next_action_code": scheduler_component.get("next_action_code"),
+            "next_retry_at": scheduler_component.get("next_retry_at"),
+            "consecutive_failure_count": scheduler_component.get(
+                "consecutive_failure_count"
+            ),
         }
     except VaultError:
         components["sync"] = {"state": "invalid", "pending": None}
@@ -743,9 +768,11 @@ def status(root: Path) -> dict[str, Any]:
         components["queue"] = {"state": "invalid", "pending_count": None}
 
     try:
-        from scheduler import status as scheduler_status
+        if scheduler_component is None:
+            from scheduler import status as scheduler_status
 
-        components["scheduler"] = scheduler_status(root)
+            scheduler_component = scheduler_status(root)
+        components["scheduler"] = scheduler_component
     except VaultError:
         components["scheduler"] = {
             "state": "invalid",
@@ -754,6 +781,11 @@ def status(root: Path) -> dict[str, Any]:
             "last_attempt_at": None,
             "last_success_at": None,
             "last_error_category": None,
+            "failure_class": None,
+            "diagnostic_code": None,
+            "next_action_code": None,
+            "consecutive_failure_count": None,
+            "next_retry_at": None,
         }
 
     states = [component["state"] for component in components.values()]
@@ -784,7 +816,10 @@ def render_status(value: dict[str, Any]) -> str:
             f"Vault: {value['vault']['state']}",
             (
                 f"Sync: {value['sync']['state']} "
-                f"(pending: {value['sync'].get('pending')})"
+                f"(pending: {value['sync'].get('pending')}, "
+                f"cause: {value['sync'].get('diagnostic_code')}, "
+                f"next: {value['sync'].get('next_action_code')}, "
+                f"retry: {value['sync'].get('next_retry_at')})"
             ),
             (
                 f"Index: {value['index']['state']} "
