@@ -763,6 +763,23 @@ def parser() -> argparse.ArgumentParser:
         "--policy", "--policy-file", dest="policy", type=Path
     )
     inspect.add_argument("--json", action="store_true")
+    forget = commands.add_parser("forget")
+    forget.add_argument("episode_id")
+    forget_policy = forget.add_mutually_exclusive_group()
+    forget_policy.add_argument("--policy-version")
+    forget_policy.add_argument(
+        "--policy", "--policy-file", dest="policy", type=Path
+    )
+    forget.add_argument("--json", action="store_true")
+    purge = commands.add_parser("purge")
+    purge.add_argument("episode_id")
+    purge_policy = purge.add_mutually_exclusive_group()
+    purge_policy.add_argument("--policy-version")
+    purge_policy.add_argument(
+        "--policy", "--policy-file", dest="policy", type=Path
+    )
+    purge.add_argument("--apply", action="store_true")
+    purge.add_argument("--json", action="store_true")
     return top
 
 
@@ -783,6 +800,8 @@ def main() -> int:
         "status",
         "report",
         "inspect",
+        "forget",
+        "purge",
     ):
         # The shell wrapper executes this file as __main__. Register that module
         # under its import name so chunk_rotation shares this VaultError class
@@ -804,7 +823,7 @@ def main() -> int:
             from evidence_index import rebuild_relationship_views
 
             rebuild_relationship_views(root, args.policy)
-        else:
+        elif args.command in ("status", "report", "inspect"):
             from reporting import (
                 emit,
                 inspect_episode,
@@ -831,6 +850,32 @@ def main() -> int:
                     args.policy,
                 )
                 emit(value, as_json=args.json, human=render_inspect(value))
+        else:
+            from reporting import emit
+            from retention import (
+                forget,
+                purge,
+                render_forget,
+                render_purge,
+            )
+
+            if args.command == "forget":
+                value = forget(
+                    root,
+                    args.episode_id,
+                    args.policy_version,
+                    args.policy,
+                )
+                emit(value, as_json=args.json, human=render_forget(value))
+            else:
+                value = purge(
+                    root,
+                    args.episode_id,
+                    args.policy_version,
+                    args.policy,
+                    apply=args.apply,
+                )
+                emit(value, as_json=args.json, human=render_purge(value))
     return 0
 
 

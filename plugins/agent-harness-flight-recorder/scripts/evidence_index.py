@@ -754,21 +754,25 @@ def rebuild_incremental(root: Path, chunks: list[Chunk]) -> tuple[int, int]:
     return added_chunks, added_events
 
 
+def rebuild_index_locked(root: Path, *, incremental: bool) -> None:
+    index = safe_index_directory(root)
+    collect_stale_temporaries(index)
+    chunks = load_chunks(root)
+    if incremental:
+        added_chunks, added_events = rebuild_incremental(root, chunks)
+        mode = "incremental"
+    else:
+        added_chunks, added_events = rebuild_full(root, chunks)
+        mode = "full"
+    print(
+        f"rebuild-index: mode={mode} "
+        f"chunks={added_chunks} events={added_events}"
+    )
+
+
 def rebuild_index(root: Path, *, incremental: bool) -> None:
     with vault_lock(root):
-        index = safe_index_directory(root)
-        collect_stale_temporaries(index)
-        chunks = load_chunks(root)
-        if incremental:
-            added_chunks, added_events = rebuild_incremental(root, chunks)
-            mode = "incremental"
-        else:
-            added_chunks, added_events = rebuild_full(root, chunks)
-            mode = "full"
-        print(
-            f"rebuild-index: mode={mode} "
-            f"chunks={added_chunks} events={added_events}"
-        )
+        rebuild_index_locked(root, incremental=incremental)
 
 
 def rebuild_relationship_views(root: Path, policy_path: Path | None) -> None:
