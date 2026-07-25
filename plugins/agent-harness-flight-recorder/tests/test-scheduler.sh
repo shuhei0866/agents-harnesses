@@ -159,14 +159,29 @@ test_macos_uninstall_and_collision_contract() {
   local agents="$home/Library/LaunchAgents"
   local managed="$agents/io.agent-harness.flight-recorder.sync.plist"
   local unrelated="$agents/com.example.user-owned.plist"
+  local status_json="$base/uninstalled-status.json"
   if run_cli macos "$state" "$home" "$config_home" "$call_log" \
+      scheduler run >/dev/null 2>&1 \
+    && run_cli macos "$state" "$home" "$config_home" "$call_log" \
       scheduler uninstall >/dev/null 2>&1 \
     && [[ ! -e "$managed" && "$(cat "$unrelated")" == "user-owned-launch-agent" ]] \
     && grep -q $'launchctl\t.*bootstrap' "$call_log" \
-    && grep -q $'launchctl\t.*bootout' "$call_log"; then
-    pass "launchd uninstallはmanaged plistだけを解除・削除する"
+    && grep -q $'launchctl\t.*bootout' "$call_log" \
+    && run_cli macos "$state" "$home" "$config_home" "$call_log" \
+      status --json >"$status_json" 2>/dev/null \
+    && python3 - "$status_json" <<'PY' 2>/dev/null
+import json
+import pathlib
+import sys
+
+scheduler = json.loads(pathlib.Path(sys.argv[1]).read_text())["scheduler"]
+assert scheduler["configured"] is False
+assert scheduler["state"] == "unconfigured"
+PY
+  then
+    pass "launchd uninstall後は過去のrun stateよりunconfiguredを優先する"
   else
-    fail "launchd uninstallはmanaged plistだけを解除・削除する"
+    fail "launchd uninstall後は過去のrun stateよりunconfiguredを優先する"
   fi
 
   printf '%s\n' 'colliding-user-config' >"$managed"
@@ -348,6 +363,11 @@ test_offline_run_is_fail_open_and_visible_in_status() {
   init_vault macos "$state" "$home" "$config_home" "$call_log" \
     "$remote" "$recovery" >/dev/null 2>&1 || {
     fail "offline fixture Vaultを初期化できる"
+    return
+  }
+  run_cli macos "$state" "$home" "$config_home" "$call_log" \
+    scheduler install >/dev/null 2>&1 || {
+    fail "offline fixture schedulerをinstallできる"
     return
   }
   record_event "$state" "2026-07-25T08:00:00Z"

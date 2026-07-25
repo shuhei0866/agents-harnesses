@@ -856,13 +856,13 @@ def status(root: Path) -> dict[str, Any]:
         state = _load_state(root)
         error = state.get("last_error_category") if state else None
         health = (
-            "error"
+            "unconfigured"
+            if not configured
+            else "error"
             if error is not None
             else "healthy"
             if state and state.get("last_success_at")
             else "idle"
-            if configured
-            else "unconfigured"
         )
         return {
             "state": health,
