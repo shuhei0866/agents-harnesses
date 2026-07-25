@@ -227,6 +227,8 @@ def validate_event(value: object) -> dict[str, Any]:
         if outcome is not None:
             if "status" not in outcome:
                 raise ValueError("Event v3 outcome must include status")
+            if "exit_code" in outcome and outcome["exit_code"] is None:
+                raise ValueError("Event v3 exit_code cannot be null")
             exit_code = outcome.get("exit_code")
             if exit_code is not None and not 0 <= exit_code <= 255:
                 raise ValueError("invalid allowlisted exit_code")

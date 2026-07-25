@@ -226,9 +226,14 @@ import sys
 
 path = pathlib.Path(sys.argv[1])
 event = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+null_exit = dict(event)
+null_exit["event_id"] = "6b094c18-61bc-48ce-b46b-b27ff6e6e09d"
+null_exit["recorded_at"] = "2026-07-24T10:59:59Z"
+null_exit["outcome"] = {"status": "success", "exit_code": None}
 event["event_id"] = "6b094c18-61bc-48ce-b46b-b27ff6e6e09e"
 event["recorded_at"] = "20260724T110000+0000"
 with path.open("a", encoding="utf-8") as stream:
+    stream.write(json.dumps(null_exit, separators=(",", ":")) + "\n")
     stream.write(json.dumps(event, separators=(",", ":")) + "\n")
     event["schema_version"] = 2
     event["event_id"] = "6b094c18-61bc-48ce-b46b-b27ff6e6e09f"
@@ -266,8 +271,9 @@ rows = [
     json.loads(line)
     for line in pathlib.Path(sys.argv[2]).read_text(encoding="utf-8").splitlines()
 ]
-assert len(rows) == 5
+assert len(rows) == 6
 raw = [base64.b64decode(row["raw_base64"]) for row in rows]
+assert any(b'"exit_code":null' in item for item in raw)
 assert any(b"20260724T110000+0000" in item for item in raw)
 assert any(b"changed_file_fingerprints" in item for item in raw)
 assert b'{"not":"complete"' in raw

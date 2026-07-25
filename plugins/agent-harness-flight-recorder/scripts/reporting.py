@@ -424,7 +424,6 @@ def _episode_card(
         else:
             outcome_counts["not_recorded"] += 1
     event_ids = [event["event_id"] for event in events]
-    placeholders = ",".join("?" for _ in event_ids)
     deterministic_evidence = []
     for (
         evidence_id,
@@ -435,12 +434,14 @@ def _episode_card(
         state,
         value_json,
     ) in connection.execute(
-        "SELECT evidence_id, source_event_id, collector_version, "
-        "collected_at, evidence_type, state, value_json "
-        "FROM deterministic_evidence "
-        f"WHERE source_event_id IN ({placeholders}) "
-        "ORDER BY collected_at, source_event_id, evidence_type, evidence_id",
-        event_ids,
+        "SELECT d.evidence_id, d.source_event_id, d.collector_version, "
+        "d.collected_at, d.evidence_type, d.state, d.value_json "
+        "FROM deterministic_evidence AS d "
+        "JOIN episode_members AS m ON m.event_id = d.source_event_id "
+        "WHERE m.policy_version = ? AND m.episode_id = ? "
+        "ORDER BY d.collected_at, d.source_event_id, d.evidence_type, "
+        "d.evidence_id",
+        (policy["policy_version"], episode_id),
     ):
         try:
             evidence_value = (
@@ -1052,6 +1053,8 @@ def render_inspect(value: dict[str, Any]) -> str:
         ),
         "Supporting relationship edges:",
     ]
+    if not card["deterministic_evidence"]:
+        lines.insert(lines.index("Supporting relationship edges:"), "  none")
     if value["supporting_edges"]:
         for edge in value["supporting_edges"]:
             lines.extend(

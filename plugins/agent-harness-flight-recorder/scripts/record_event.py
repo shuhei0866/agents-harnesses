@@ -53,7 +53,6 @@ OPERATION_KINDS = {
     "pull_request",
 }
 SHELL_TOOLS = {"bash", "shell"}
-SHELL_CONTROL_TOKENS = {"&&", "||", ";", "|", "&"}
 
 
 def safe_string(value: Any) -> str | None:
@@ -338,12 +337,13 @@ def _command_operation(command: object) -> str | None:
         tokens = shlex.split(text, posix=True)
     except ValueError:
         return None
-    if not tokens or any(token in SHELL_CONTROL_TOKENS for token in tokens):
+    if not tokens:
         return None
     executable = os.path.basename(tokens[0]).lower()
-    arguments = [token.lower() for token in tokens[1:]]
+    raw_arguments = tokens[1:]
+    arguments = [token.lower() for token in raw_arguments]
     command_tokens = [executable, *arguments]
-    if "--help" in arguments or "--version" in arguments:
+    if any(token in {"--help", "-h", "--version", "-V"} for token in raw_arguments):
         return None
 
     if command_tokens[:2] == ["git", "commit"] and "--dry-run" not in arguments:
@@ -571,7 +571,8 @@ def normalize(
     source = safe_string(payload.get("hook_event_name"))
     known_source = source if source in EVENT_KINDS else "unknown"
     event = {
-        "schema_version": 1,
+        # New writes are Event v3. Event v1/v2 remain reader/chunk compatible.
+        "schema_version": 3,
         "event_id": str(uuid.uuid4()),
         "recorded_at": recorded_at(),
         "harness": harness,
@@ -586,8 +587,6 @@ def normalize(
         "metrics": metrics_from(payload),
         "outcome": outcome_from(payload),
     }
-    # New writes are Event v3. Event v1/v2 remain reader/chunk compatible.
-    event["schema_version"] = 3
     event["relationship_context"] = relationship_context(payload, key)
     event["operation_kind"] = operation_from(payload)
     return event

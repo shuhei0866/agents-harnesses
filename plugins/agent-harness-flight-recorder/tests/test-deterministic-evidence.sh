@@ -89,6 +89,12 @@ payloads = [
     {
         "hook_event_name": "PostToolUse",
         "tool_name": "Bash",
+        "tool_input": {"command": "pytest -h"},
+        "tool_response": {"success": True},
+    },
+    {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
         "tool_input": {"command": f"printf {canary} && pytest"},
         "tool_response": {"success": True},
     },
@@ -114,10 +120,10 @@ path = pathlib.Path(sys.argv[1])
 text = path.read_text(encoding="utf-8")
 assert "PRIVATE_CANARY_iam115" not in text
 events = [json.loads(line) for line in text.splitlines()]
-assert len(events) == 7
+assert len(events) == 8
 assert {event["schema_version"] for event in events} == {3}
 assert [event["operation_kind"] for event in events] == [
-    "test", "build", "lint", "git_commit", "pull_request", "pull_request", None
+    "test", "build", "lint", "git_commit", "pull_request", "pull_request", None, None
 ]
 assert events[0]["outcome"] == {"status": "success", "exit_code": 0}
 assert events[1]["outcome"] == {"status": "failure", "exit_code": 2}
@@ -126,6 +132,7 @@ assert events[3]["outcome"] == {"status": "success"}
 assert events[4]["outcome"] == {"status": "success"}
 assert events[5]["outcome"] == {"status": "success"}
 assert events[6]["outcome"] == {"status": "success"}
+assert events[7]["outcome"] == {"status": "success"}
 assert all("tool_input" not in event and "tool_response" not in event for event in events)
 PY
   then
@@ -147,6 +154,7 @@ build_vault_fixture() {
     --recovery-recipient "$(recipient_of "$recovery")" >/dev/null 2>&1
   mkdir -p "$state/inbox"
   python3 - "$state/inbox/events.jsonl" <<'PY'
+import datetime as dt
 import json
 import pathlib
 import sys
@@ -183,10 +191,17 @@ def event(event_id, recorded_at, operation, metrics, outcome):
     }
 
 
+now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+
+
+def timestamp(seconds):
+    return (now - dt.timedelta(seconds=seconds)).isoformat().replace("+00:00", "Z")
+
+
 events = [
     event(
         "40000000-0000-4000-8000-000000000001",
-        "2026-07-25T08:00:00Z",
+        timestamp(20),
         "test",
         {
             "duration_ms": 1200,
@@ -199,14 +214,14 @@ events = [
     ),
     event(
         "40000000-0000-4000-8000-000000000002",
-        "2026-07-25T08:00:10Z",
+        timestamp(10),
         "build",
         {"duration_ms": 200},
         {"status": "failure", "exit_code": 2},
     ),
     event(
         "40000000-0000-4000-8000-000000000003",
-        "2026-07-25T08:00:20Z",
+        timestamp(0),
         "lint",
         None,
         None,
