@@ -847,9 +847,9 @@ def main() -> int:
 
             rotate(root)
         elif args.command == "sync":
-            from sync import sync
+            from scheduler import manual_sync
 
-            sync(root)
+            manual_sync(root)
         elif args.command == "rebuild-index":
             from evidence_index import rebuild_index
 

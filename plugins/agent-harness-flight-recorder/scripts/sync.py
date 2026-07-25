@@ -59,6 +59,43 @@ PENDING_PATH = Path("queue/pending-sync.json")
 RECEIPT_PATH = Path("index/imported-chunks.json")
 
 
+class SyncFailure(VaultError):
+    """A secret-free classification for background retry decisions."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_class: str,
+        diagnostic_code: str,
+        next_action_code: str,
+    ) -> None:
+        super().__init__(message)
+        self.failure_class = failure_class
+        self.diagnostic_code = diagnostic_code
+        self.next_action_code = next_action_code
+
+
+def transient_remote_failure() -> SyncFailure:
+    return SyncFailure(
+        "remote synchronization is unavailable",
+        failure_class="transient",
+        diagnostic_code="remote_unavailable",
+        next_action_code="retry_automatically",
+    )
+
+
+def permanent_sync_failure(
+    diagnostic_code: str = "local_integrity_invalid",
+) -> SyncFailure:
+    return SyncFailure(
+        "synchronization requires local repair",
+        failure_class="permanent",
+        diagnostic_code=diagnostic_code,
+        next_action_code="repair_configuration",
+    )
+
+
 def git(
     root: Path,
     arguments: list[str],
@@ -109,7 +146,7 @@ def ensure_repository(root: Path, remote: str) -> None:
     if origin.returncode == 2:
         git(root, ["remote", "add", "origin", remote])
     elif text_output(origin).strip() != remote:
-        raise VaultError("Git origin does not match the Vault remote")
+        raise permanent_sync_failure("origin_mismatch")
     push_urls = [
         value
         for value in text_output(
@@ -118,7 +155,7 @@ def ensure_repository(root: Path, remote: str) -> None:
         if value
     ]
     if push_urls != [remote]:
-        raise VaultError("Git origin push URL does not match the Vault remote")
+        raise permanent_sync_failure("origin_mismatch")
 
 
 def tracked_paths(root: Path) -> list[str]:
@@ -300,13 +337,18 @@ def pull_rebase(root: Path) -> None:
     if remote_has_main(root):
         try:
             git(root, ["pull", "--rebase", "-q", "origin", "main"])
-        except VaultError:
+        except VaultError as error:
             git_dir = root / ".git"
-            if (git_dir / "rebase-merge").exists() or (
+            conflict = (git_dir / "rebase-merge").exists() or (
                 git_dir / "rebase-apply"
-            ).exists():
-                git(root, ["rebase", "--abort"])
-            raise
+            ).exists()
+            if conflict:
+                try:
+                    git(root, ["rebase", "--abort"])
+                except VaultError:
+                    pass
+                raise permanent_sync_failure("rebase_conflict") from error
+            raise transient_remote_failure() from error
 
 
 def verify_after_pull(root: Path, expected_remote: str) -> dict[str, object]:
@@ -567,7 +609,7 @@ def sync_locked(root: Path) -> None:
         validate_candidate_chunks(root)
         stage_allowlist(root)
         committed = commit_if_needed(root)
-    except VaultError:
+    except VaultError as error:
         if pending.exists():
             write_pending(
                 root,
@@ -577,7 +619,9 @@ def sync_locked(root: Path) -> None:
                 error_category="integrity",
                 increment_attempt=True,
             )
-        raise
+        if isinstance(error, SyncFailure):
+            raise
+        raise permanent_sync_failure() from error
     artifact_paths = changed_artifact_paths(root) if committed else []
     # Record intent before every network operation, including a no-change pull.
     # This makes remote/auth failures observable without involving the hook.
@@ -590,7 +634,7 @@ def sync_locked(root: Path) -> None:
     )
     try:
         pull_rebase(root)
-    except VaultError:
+    except VaultError as error:
         if pending.exists():
             write_pending(
                 root,
@@ -600,12 +644,14 @@ def sync_locked(root: Path) -> None:
                 error_category="rebase",
                 increment_attempt=True,
             )
-        raise
+        if isinstance(error, SyncFailure):
+            raise
+        raise transient_remote_failure() from error
     try:
         strict_preflight(root)
         verify_after_pull(root, remote)
         import_chunks(root)
-    except VaultError:
+    except VaultError as error:
         if pending.exists():
             write_pending(
                 root,
@@ -615,7 +661,9 @@ def sync_locked(root: Path) -> None:
                 error_category="integrity",
                 increment_attempt=True,
             )
-        raise
+        if isinstance(error, SyncFailure):
+            raise
+        raise permanent_sync_failure() from error
     if pending.exists():
         write_pending(
             root,
@@ -626,7 +674,7 @@ def sync_locked(root: Path) -> None:
         )
     try:
         push(root)
-    except VaultError:
+    except VaultError as error:
         if pending.exists():
             write_pending(
                 root,
@@ -636,7 +684,9 @@ def sync_locked(root: Path) -> None:
                 error_category="remote",
                 increment_attempt=True,
             )
-        raise
+        if isinstance(error, SyncFailure):
+            raise
+        raise transient_remote_failure() from error
     clear_pending(root)
 
 

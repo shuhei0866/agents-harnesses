@@ -37,11 +37,19 @@ Accepted decisions remain recorded when later superseded.
 
 - Status: accepted
 - Decision: validate synchronization through an explicit command in R1, then
-  move quickly to daily OS scheduling with a durable retry queue in R1.1.
+  move quickly to a five-minute OS wake policy with a durable retry queue in
+  R1.1; healthy synchronization remains limited to once per 24 hours.
 - Reason: invisible operation is a core product property, but Git, encryption,
   and recovery semantics need an observable bootstrap path first.
 - Consequence: background failures never block a harness and surface only in
   explicit health status unless a future policy says otherwise.
+- Retry policy: wake every five minutes, gate healthy synchronization to once
+  per 24 hours, and persist deterministic equal-jitter exponential backoff
+  between five minutes and 24 hours for transient remote failures. Permanent
+  locally provable failures require repair or an explicit manual sync.
+- Privacy boundary: persist and report only finite failure/action codes; never
+  retain raw Git stderr, remote URLs, filesystem paths, or credentials in
+  retry health.
 
 ## D-20260722-05: Use device-scoped immutable Git paths
 

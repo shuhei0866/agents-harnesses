@@ -195,15 +195,23 @@ their owner-held policy files. R1 does not migrate evidence rows in place.
 An unsupported schema is recovered through a full rebuild from canonical
 chunks, leaving encrypted evidence and decoded inputs untouched.
 
-R1.1 runs the same operation once per day through `launchd` on macOS and a
-`systemd --user` timer on Linux. `RunAtLoad` and `Persistent=true` recover
-missed runs after login or wake. A separate non-blocking scheduler lock
-collapses concurrent starts before they enter the existing serialized sync
-core. Background failure never changes a harness hook's exit status and is
-visible through `flight-recorder status`. Handled sync failures exit zero to
-avoid an OS-manager retry storm; unsafe scheduler setup, local state, or
-integrity failures exit non-zero and fail closed. Durable bounded retry and
-backoff are the next R1.1 layer.
+R1.1 wakes a local policy every five minutes through `launchd` on macOS and a
+`systemd --user` timer on Linux. `RunAtLoad` and the user timer recover after
+login or wake. A healthy policy enters the serialized sync core at most once
+per 24 hours. Transient remote failures use deterministic equal-jitter
+exponential backoff from five minutes to a 24-hour cap; the next deadline and
+failure count are stored atomically in `scheduler/state.json`. A separate
+non-blocking scheduler lock collapses concurrent starts, and the persisted
+deadline gates new processes after restart.
+
+Background failure never changes a harness hook's exit status. Remote
+operation failures are retried, while locally provable origin mismatch,
+rebase conflict, and integrity failures are suppressed until repair. Status
+publishes only finite diagnostic and next-action codes, never Git stderr,
+remote URLs, paths, or credentials. Handled sync failures and early wakeups
+exit zero; unsafe scheduler setup, locks, or tampered local state exit non-zero
+and fail closed. Explicit manual sync bypasses the automatic deadline and
+reconciles both successful and failed outcomes under the same scheduler lock.
 
 Scheduler ownership is fail-closed. A `0600` local install manifest records the
 platform, manager identifiers, target paths, content hashes, and transaction
@@ -321,8 +329,8 @@ owner controls; the CLI must state this limitation clearly.
 
 ### R1.1: Unconscious Sync
 
-- daily `launchd` and `systemd` scheduling;
-- durable retry queue, backoff, and sync-health reporting.
+- unconscious `launchd` and `systemd` scheduling;
+- durable retry queue, bounded jittered backoff, and secret-free sync health.
 
 ### R1.2: Evaluation
 
