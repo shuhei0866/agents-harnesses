@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from chunk_rotation import atomic_replace, canonical_json
+from background_evaluation import (
+    remove_episode_attempts,
+    restore_attempts,
+    run_lock as auto_evaluation_lock,
+)
 from evidence_index import DATABASE_PATH, rebuild_index_locked
 from evaluation import evaluation_record_snapshots
 from reporting import (
@@ -295,62 +300,72 @@ def purge(
     scope = _scope(root, episode_id, selected, trusted)
     if not apply:
         return scope
-    with vault_lock(root):
-        # Reauthenticate and resolve scope under the same exclusive lock used
-        # for mutation so a sync/rebuild cannot make the preview stale.
-        scope = _scope(
-            root, episode_id, selected, trusted, locked=True
-        )
-        paths = [item["source_path"] for item in scope["chunks"]]
-        _validate_remote_namespace(root)
-        # Validate every local input before history or derivative mutation.
-        _remove_local_derivatives(root, scope, apply=False)
-        original_forgotten = load_forgotten(root)
-        pending_path = root / PENDING_PATH
-        original_pending = (
-            pending_path.read_bytes() if pending_path.exists() else None
-        )
-        evaluation_snapshots = evaluation_record_snapshots(
-            root, selected, episode_id
-        )
-        _rewrite_history(root, paths)
-        _remove_local_derivatives(root, scope)
-        rebuild_index_locked(root, incremental=False)
-        forgotten = set(original_forgotten)
-        forgotten.discard((selected, episode_id))
-        store_forgotten(root, forgotten)
-        removed_evaluations: list[tuple[Path, bytes]] = []
-        try:
-            for evaluation_path, evaluation_bytes in evaluation_snapshots:
-                evaluation_path.unlink()
-                removed_evaluations.append(
-                    (evaluation_path, evaluation_bytes)
-                )
-        except OSError as error:
-            for evaluation_path, evaluation_bytes in removed_evaluations:
-                atomic_replace(evaluation_path, evaluation_bytes)
-            raise VaultError("evaluation storage is unsafe") from error
-        try:
-            # Keep refs/original until the remote accepts the rewrite. A push
-            # rejection restores the local Vault to a retryable pre-purge state.
-            _run_git(root, ["push", "--force", "origin", "HEAD:main"])
-        except VaultError:
-            _restore_history(root)
-            import_chunks(root)
-            rebuild_index_locked(root, incremental=False)
-            store_forgotten(root, original_forgotten)
-            if original_pending is None:
+    # Lock order is shared with configure/run: auto-evaluation first, then the
+    # Vault. Purge cannot expose a stale episode to an already-running evaluator.
+    with auto_evaluation_lock(root, blocking=True):
+        with vault_lock(root):
+            # Reauthenticate and resolve scope under the same exclusive lock
+            # used for mutation so a sync/rebuild cannot make the preview stale.
+            scope = _scope(
+                root, episode_id, selected, trusted, locked=True
+            )
+            paths = [item["source_path"] for item in scope["chunks"]]
+            _validate_remote_namespace(root)
+            # Validate every local input before history or derivative mutation.
+            _remove_local_derivatives(root, scope, apply=False)
+            original_forgotten = load_forgotten(root)
+            pending_path = root / PENDING_PATH
+            original_pending = (
+                pending_path.read_bytes() if pending_path.exists() else None
+            )
+            evaluation_snapshots = evaluation_record_snapshots(
+                root, selected, episode_id
+            )
+            attempt_snapshot = remove_episode_attempts(root, episode_id)
+            attempt_committed = False
+            try:
+                _rewrite_history(root, paths)
+                _remove_local_derivatives(root, scope)
+                rebuild_index_locked(root, incremental=False)
+                forgotten = set(original_forgotten)
+                forgotten.discard((selected, episode_id))
+                store_forgotten(root, forgotten)
+                removed_evaluations: list[tuple[Path, bytes]] = []
                 try:
-                    pending_path.unlink()
-                except FileNotFoundError:
-                    pass
-            else:
-                atomic_replace(pending_path, original_pending)
-            for evaluation_path, evaluation_bytes in evaluation_snapshots:
-                atomic_replace(evaluation_path, evaluation_bytes)
-            _cleanup_original_history(root)
-            raise
-        _cleanup_original_history(root)
+                    for evaluation_path, evaluation_bytes in evaluation_snapshots:
+                        evaluation_path.unlink()
+                        removed_evaluations.append(
+                            (evaluation_path, evaluation_bytes)
+                        )
+                except OSError as error:
+                    for evaluation_path, evaluation_bytes in removed_evaluations:
+                        atomic_replace(evaluation_path, evaluation_bytes)
+                    raise VaultError("evaluation storage is unsafe") from error
+                try:
+                    # Keep refs/original until the remote accepts the rewrite.
+                    # A rejection restores the Vault to a retryable state.
+                    _run_git(root, ["push", "--force", "origin", "HEAD:main"])
+                except VaultError:
+                    _restore_history(root)
+                    import_chunks(root)
+                    rebuild_index_locked(root, incremental=False)
+                    store_forgotten(root, original_forgotten)
+                    if original_pending is None:
+                        try:
+                            pending_path.unlink()
+                        except FileNotFoundError:
+                            pass
+                    else:
+                        atomic_replace(pending_path, original_pending)
+                    for evaluation_path, evaluation_bytes in evaluation_snapshots:
+                        atomic_replace(evaluation_path, evaluation_bytes)
+                    _cleanup_original_history(root)
+                    raise
+                _cleanup_original_history(root)
+                attempt_committed = True
+            finally:
+                if not attempt_committed:
+                    restore_attempts(root, attempt_snapshot)
     scope["apply"] = True
     return scope
 

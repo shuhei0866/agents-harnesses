@@ -76,6 +76,11 @@ GITIGNORE = PRE_EVALUATION_GITIGNORE.replace(
     "/scheduler/\n", "/scheduler/\n/evaluations/\n"
 )
 assert "/evaluations/\n" in GITIGNORE
+PRE_AUTO_EVALUATION_GITIGNORE = GITIGNORE
+GITIGNORE = PRE_AUTO_EVALUATION_GITIGNORE.replace(
+    "/evaluations/\n", "/evaluations/\n/auto-evaluation/\n"
+)
+assert "/auto-evaluation/\n" in GITIGNORE
 LEGACY_GITIGNORE = """# Local-only Flight Recorder state
 /hash.key
 /events.jsonl
@@ -360,6 +365,7 @@ def ensure_managed_gitignore(root: Path) -> None:
         LEGACY_GITIGNORE,
         PRE_SCHEDULER_GITIGNORE,
         PRE_EVALUATION_GITIGNORE,
+        PRE_AUTO_EVALUATION_GITIGNORE,
     ):
         atomic_replace(path, GITIGNORE.encode("utf-8"))
     elif contents != GITIGNORE:
@@ -814,6 +820,32 @@ def parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--artifact-preview-token")
     evaluate.add_argument("--timeout", type=int, default=60)
     evaluate.add_argument("--json", action="store_true")
+    automatic = commands.add_parser("auto-evaluation")
+    automatic_commands = automatic.add_subparsers(
+        dest="auto_evaluation_command", required=True
+    )
+    automatic_configure = automatic_commands.add_parser("configure")
+    automatic_configure.add_argument("--evaluator", required=True)
+    automatic_configure.add_argument("--model", required=True)
+    automatic_policy = automatic_configure.add_mutually_exclusive_group(
+        required=True
+    )
+    automatic_policy.add_argument("--policy-version")
+    automatic_policy.add_argument(
+        "--policy", "--policy-file", dest="policy", type=Path
+    )
+    automatic_configure.add_argument(
+        "--uncertainty-score-below", type=int, required=True
+    )
+    automatic_configure.add_argument(
+        "--max-evaluations-per-run", type=int, required=True
+    )
+    automatic_configure.add_argument(
+        "--max-cost-microusd-per-run", type=int, required=True
+    )
+    automatic_configure.add_argument("--json", action="store_true")
+    automatic_run = automatic_commands.add_parser("run")
+    automatic_run.add_argument("--json", action="store_true")
     forget = commands.add_parser("forget")
     forget.add_argument("episode_id")
     forget_policy = forget.add_mutually_exclusive_group()
@@ -859,6 +891,7 @@ def main() -> int:
         "report",
         "inspect",
         "evaluate",
+        "auto-evaluation",
         "forget",
         "purge",
         "scheduler",
@@ -928,6 +961,33 @@ def main() -> int:
                 args.timeout,
             )
             emit(value, as_json=args.json, human=render_evaluate(value))
+        elif args.command == "auto-evaluation":
+            from background_evaluation import configure, run as run_automatic
+            from reporting import emit
+
+            if args.auto_evaluation_command == "configure":
+                value = configure(
+                    root,
+                    args.evaluator,
+                    args.model,
+                    args.policy_version,
+                    args.policy,
+                    args.uncertainty_score_below,
+                    args.max_evaluations_per_run,
+                    args.max_cost_microusd_per_run,
+                )
+                human = "Automatic evaluation configured.\n"
+            else:
+                value = run_automatic(root)
+                human = (
+                    "Automatic evaluation completed: "
+                    f"{value['evaluated_count']} evaluated.\n"
+                )
+            emit(
+                value,
+                as_json=args.json,
+                human=human,
+            )
         elif args.command in ("forget", "purge"):
             from reporting import emit
             from retention import (

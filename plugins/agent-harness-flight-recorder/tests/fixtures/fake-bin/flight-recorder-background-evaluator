@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import sys
+import time
+
+
+request = json.load(sys.stdin)
+capture = os.environ.get("FLIGHT_RECORDER_TEST_EVALUATOR_CAPTURE")
+if capture:
+    pathlib.Path(capture).write_text(
+        json.dumps(request, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+counter = os.environ.get("FLIGHT_RECORDER_TEST_EVALUATOR_COUNT")
+if counter:
+    path = pathlib.Path(counter)
+    count = int(path.read_text(encoding="utf-8")) if path.exists() else 0
+    path.write_text(str(count + 1), encoding="utf-8")
+if os.environ.get("FLIGHT_RECORDER_TEST_EVALUATOR_FAIL") == "1":
+    raise SystemExit(7)
+ready = os.environ.get("FLIGHT_RECORDER_TEST_EVALUATOR_READY")
+release = os.environ.get("FLIGHT_RECORDER_TEST_EVALUATOR_RELEASE")
+if ready and release:
+    pathlib.Path(ready).touch()
+    for _ in range(3000):
+        if pathlib.Path(release).exists():
+            break
+        time.sleep(0.01)
+    else:
+        raise SystemExit(8)
+
+evidence_ids = sorted(
+    fact["evidence_id"] for fact in request["episode"]["deterministic_evidence"]
+)
+configured_cost = int(
+    os.environ.get("FLIGHT_RECORDER_TEST_EVALUATOR_COST", "12000")
+)
+remaining_cost = request.get("remaining_cost_microusd")
+measured_cost = (
+    min(configured_cost, remaining_cost)
+    if isinstance(remaining_cost, int)
+    else configured_cost
+)
+response = {
+        "schema_version": (
+            1
+            if os.environ.get("FLIGHT_RECORDER_TEST_EVALUATOR_V1") == "1"
+            else 2
+        ),
+        "conclusion": "successful",
+        "confidence": "high",
+        "evidence_ids": evidence_ids,
+        "criteria": {
+            "goal_achievement": "supported",
+            "quality": "supported",
+            "efficiency": "unknown",
+        },
+}
+if os.environ.get("FLIGHT_RECORDER_TEST_EVALUATOR_NO_COST") != "1":
+    response["measured_cost_microusd"] = measured_cost
+json.dump(response, sys.stdout, sort_keys=True, separators=(",", ":"))

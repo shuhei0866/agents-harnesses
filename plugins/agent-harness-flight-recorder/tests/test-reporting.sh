@@ -474,6 +474,15 @@ stored = records[0].read_text(encoding="utf-8")
 assert "PRIVATE_ARTIFACT_BODY_iam116" not in stored
 assert request["metadata_only"] is True
 assert request["artifacts"] == []
+assert request["schema_version"] == 1
+assert set(request) == {
+    "schema_version", "rubric", "model", "metadata_only",
+    "episode", "artifacts",
+}
+assert evaluation["schema_version"] == 1
+assert evaluation["evaluator_protocol_version"] == 1
+assert "trigger" not in evaluation
+assert "measured_cost_microusd" not in evaluation
 assert "source_event_ids" not in request["episode"]
 assert "models" not in request["episode"]
 assert "INJECTED" not in json.dumps(request)

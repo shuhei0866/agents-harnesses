@@ -169,6 +169,41 @@ evaluation_count() {
   find "$1/evaluations" -type f -name '*.json' | wc -l | tr -d ' '
 }
 
+write_attempt_ledger() {
+  local state="$1" target_episode="$2" unrelated_episode="$3"
+  mkdir -p "$state/auto-evaluation"
+  chmod 700 "$state/auto-evaluation"
+  python3 - "$state/auto-evaluation/attempts.json" \
+    "$target_episode" "$unrelated_episode" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+attempts = [
+    {
+        "fingerprint": "sha256:" + "1" * 64,
+        "episode_id": sys.argv[2],
+        "state": "pending",
+    },
+    {
+        "fingerprint": "sha256:" + "2" * 64,
+        "episode_id": sys.argv[3],
+        "state": "failed",
+    },
+]
+value = {
+    "schema_version": 2,
+    "attempts": sorted(attempts, key=lambda item: item["fingerprint"]),
+}
+path.write_text(
+    json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+path.chmod(0o600)
+PY
+}
+
 test_forget_preserves_source_and_survives_rebuild() {
   echo "test_forget_preserves_source_and_survives_rebuild:"
   local base="$TEST_ROOT/forget"
@@ -279,13 +314,18 @@ test_purge_apply_removes_target_history_and_keeps_unrelated_chunk() {
   local base="$TEST_ROOT/purge-apply"
   local state="$base/vault"
   local remote="$base/remote.git" db="$state/index/vault.sqlite"
-  local episode target_path unrelated_path target_cache unrelated_cache
+  local episode unrelated_episode target_path unrelated_path
+  local target_cache unrelated_cache
   local history_objects="$base/remote-history-objects.txt"
   init_fixture "$base" || {
     fail "purge apply fixtureを作成できる"
     return
   }
   episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+  unrelated_episode="$(
+    db_value_for_event "$db" "$UNRELATED_EVENT" episode_id
+  )"
+  write_attempt_ledger "$state" "$episode" "$unrelated_episode"
   target_path="$(db_value_for_event "$db" "$TARGET_EVENT" source_path)"
   unrelated_path="$(db_value_for_event "$db" "$UNRELATED_EVENT" source_path)"
   target_cache="$(db_value_for_event "$db" "$TARGET_EVENT" cache_path)"
@@ -304,7 +344,11 @@ test_purge_apply_removes_target_history_and_keeps_unrelated_chunk() {
     && "$(evaluation_count "$state")" == "0" ]] \
     && ! grep -Fq " $target_path" "$history_objects" \
     && grep -Fq " $unrelated_path" "$history_objects" \
-    && python3 - "$db" "$TARGET_EVENT" "$UNRELATED_EVENT" <<'PY'
+    && python3 - "$db" "$TARGET_EVENT" "$UNRELATED_EVENT" \
+      "$state/auto-evaluation/attempts.json" \
+      "$episode" "$unrelated_episode" <<'PY'
+import json
+import pathlib
 import sqlite3
 import sys
 
@@ -317,11 +361,15 @@ unrelated = connection.execute(
 ).fetchone()[0]
 assert target == 0
 assert unrelated == 1
+items = json.loads(pathlib.Path(sys.argv[4]).read_text())["attempts"]
+episodes = {item["episode_id"] for item in items}
+assert sys.argv[5] not in episodes
+assert episodes == {sys.argv[6]}
 PY
   then
-    pass "purgeは対象chunk・local evaluationを除去しunrelated chunkを保持する"
+    pass "purgeは対象chunk・evaluation・attemptを除去しunrelated状態を保持する"
   else
-    fail "purgeは対象chunk・local evaluationを除去しunrelated chunkを保持する"
+    fail "purgeは対象chunk・evaluation・attemptを除去しunrelated状態を保持する"
   fi
 }
 
@@ -330,13 +378,17 @@ test_purge_push_rejection_restores_retryable_local_state() {
   local base="$TEST_ROOT/purge-push-rejection"
   local state="$base/vault"
   local remote="$base/remote.git" db="$state/index/vault.sqlite"
-  local episode target_path target_cache
-  local before_head before_remote before_source before_files
+  local episode unrelated_episode target_path target_cache
+  local before_head before_remote before_source before_files before_attempts
   init_fixture "$base" || {
     fail "push rejection fixtureを作成できる"
     return
   }
   episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+  unrelated_episode="$(
+    db_value_for_event "$db" "$UNRELATED_EVENT" episode_id
+  )"
+  write_attempt_ledger "$state" "$episode" "$unrelated_episode"
   run_cli "$state" evaluate "$episode" \
     --evaluator flight-recorder-evaluator \
     --model evaluator-test-model --json >/dev/null 2>&1 || {
@@ -349,6 +401,9 @@ test_purge_push_rejection_restores_retryable_local_state() {
   before_remote="$(git --git-dir="$remote" rev-parse main)"
   before_source="$(source_snapshot "$db")"
   before_files="$(evidence_file_snapshot "$state")"
+  before_attempts="$(
+    shasum -a 256 "$state/auto-evaluation/attempts.json"
+  )"
 
   git --git-dir="$remote" config receive.denyNonFastForwards true
   if run_cli "$state" purge "$episode" --apply \
@@ -361,6 +416,9 @@ test_purge_push_rejection_restores_retryable_local_state() {
     || "$before_remote" != "$(git --git-dir="$remote" rev-parse main)" \
     || "$before_source" != "$(source_snapshot "$db")" \
     || "$before_files" != "$(evidence_file_snapshot "$state")" \
+    || "$before_attempts" != "$(
+      shasum -a 256 "$state/auto-evaluation/attempts.json"
+    )" \
     || ! -f "$state/$target_path" \
     || ! -f "$state/$target_cache" ]] \
     || grep -q "Traceback" "$base/rejected.err" \
@@ -377,10 +435,59 @@ test_purge_push_rejection_restores_retryable_local_state() {
       && ! -e "$state/$target_cache" \
       && "$(evaluation_count "$state")" == "0" ]] \
     && ! git --git-dir="$remote" cat-file -e \
-      "main:$target_path" 2>/dev/null; then
-    pass "push拒否後はlocal stateを復元し同じpurgeを安全に再試行できる"
+      "main:$target_path" 2>/dev/null \
+    && python3 - "$state/auto-evaluation/attempts.json" \
+      "$episode" "$unrelated_episode" <<'PY'
+import json
+import pathlib
+import sys
+
+items = json.loads(pathlib.Path(sys.argv[1]).read_text())["attempts"]
+episodes = {item["episode_id"] for item in items}
+assert sys.argv[2] not in episodes
+assert episodes == {sys.argv[3]}
+PY
+  then
+    pass "push拒否時はattemptも復元し再試行成功時だけ対象を除く"
   else
-    fail "push拒否後はlocal stateを復元し同じpurgeを安全に再試行できる"
+    fail "push拒否時はattemptも復元し再試行成功時だけ対象を除く"
+  fi
+}
+
+test_invalid_attempt_ledger_blocks_purge_before_rewrite() {
+  echo "test_invalid_attempt_ledger_blocks_purge_before_rewrite:"
+  local base="$TEST_ROOT/purge-invalid-attempts"
+  local state="$base/vault"
+  local remote="$base/remote.git" db="$state/index/vault.sqlite"
+  local episode target_path before_head before_remote before_source before_files
+  init_fixture "$base" || {
+    fail "invalid attempt ledger fixtureを作成できる"
+    return
+  }
+  episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+  target_path="$(db_value_for_event "$db" "$TARGET_EVENT" source_path)"
+  mkdir -p "$state/auto-evaluation"
+  chmod 700 "$state/auto-evaluation"
+  printf '%s\n' '{"schema_version":2,"attempts":"broken"}' \
+    >"$state/auto-evaluation/attempts.json"
+  chmod 600 "$state/auto-evaluation/attempts.json"
+  before_head="$(git -C "$state" rev-parse HEAD)"
+  before_remote="$(git --git-dir="$remote" rev-parse main)"
+  before_source="$(source_snapshot "$db")"
+  before_files="$(evidence_file_snapshot "$state")"
+
+  if run_cli "$state" purge "$episode" --apply \
+    >"$base/invalid.out" 2>"$base/invalid.err"; then
+    fail "invalid attempt ledgerを持つpurgeを拒否する"
+  elif [[ "$before_head" == "$(git -C "$state" rev-parse HEAD)" \
+    && "$before_remote" == "$(git --git-dir="$remote" rev-parse main)" \
+    && "$before_source" == "$(source_snapshot "$db")" \
+    && "$before_files" == "$(evidence_file_snapshot "$state")" \
+    && -f "$state/$target_path" ]] \
+    && ! grep -q "Traceback" "$base/invalid.err"; then
+    pass "invalid attempt ledgerを履歴rewrite前に拒否する"
+  else
+    fail "invalid attempt ledgerを履歴rewrite前に拒否する"
   fi
 }
 
@@ -390,6 +497,7 @@ test_dangling_forget_marker_fails_closed
 test_purge_dry_run_previews_scope_without_rewriting_history
 test_purge_apply_removes_target_history_and_keeps_unrelated_chunk
 test_purge_push_rejection_restores_retryable_local_state
+test_invalid_attempt_ledger_blocks_purge_before_rewrite
 echo
 echo "Results: $PASS passed, $FAIL failed"
 [[ "$FAIL" -eq 0 ]]
