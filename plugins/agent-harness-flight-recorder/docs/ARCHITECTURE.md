@@ -200,8 +200,10 @@ R1.1 runs the same operation once per day through `launchd` on macOS and a
 missed runs after login or wake. A separate non-blocking scheduler lock
 collapses concurrent starts before they enter the existing serialized sync
 core. Background failure never changes a harness hook's exit status and is
-visible through `flight-recorder status`; durable bounded retry and backoff are
-the next R1.1 layer.
+visible through `flight-recorder status`. Handled sync failures exit zero to
+avoid an OS-manager retry storm; unsafe scheduler setup, local state, or
+integrity failures exit non-zero and fail closed. Durable bounded retry and
+backoff are the next R1.1 layer.
 
 Scheduler ownership is fail-closed. A `0600` local install manifest records the
 platform, manager identifiers, target paths, content hashes, and transaction

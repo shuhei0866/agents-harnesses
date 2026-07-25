@@ -33,6 +33,7 @@ MANIFEST_PATH = Path("scheduler/install.json")
 RUNTIME_PATH = (
     "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 )
+COMMAND_TIMEOUT_SECONDS = 30
 
 
 def platform_name() -> str:
@@ -224,9 +225,12 @@ def _run_command(
             check=False,
             shell=False,
             text=True,
+            timeout=COMMAND_TIMEOUT_SECONDS,
         )
     except FileNotFoundError as error:
         raise VaultError("required scheduler command is unavailable") from error
+    except subprocess.TimeoutExpired as error:
+        raise VaultError("scheduler command timed out") from error
     if result.returncode not in allowed:
         raise VaultError("scheduler command failed")
     return result
@@ -689,7 +693,7 @@ def _uninstall(root: Path) -> None:
                 path.unlink()
             except FileNotFoundError:
                 pass
-        (root / MANIFEST_PATH).unlink()
+        (root / MANIFEST_PATH).unlink(missing_ok=True)
         if platform == "linux":
             _command(["systemctl", "--user", "daemon-reload"])
     except OSError as error:
@@ -756,6 +760,14 @@ def _load_state(root: Path) -> dict[str, Any] | None:
             "last_success_at",
             "last_error_category",
         }
+        or any(
+            field is not None and not isinstance(field, str)
+            for field in (
+                value.get("last_attempt_at"),
+                value.get("last_success_at"),
+                value.get("last_error_category"),
+            )
+        )
     ):
         raise VaultError("scheduler state is invalid")
     return value

@@ -10,7 +10,14 @@ set -eu
 } >>"$FLIGHT_RECORDER_SCHEDULER_CALL_LOG"
 
 if [ "${2:-}" = "show" ]; then
-  identifier="${5:-}"
+  identifier=""
+  for argument in "$@"; do
+    case "$argument" in
+      -*) ;;
+      show) ;;
+      *) identifier="$argument" ;;
+    esac
+  done
   fragment=""
   if [ -f "$FLIGHT_RECORDER_SCHEDULER_MANAGER_STATE" ]; then
     fragment=$(awk -F '	' -v name="$identifier" \
@@ -25,14 +32,28 @@ if [ "${2:-}" = "show" ]; then
 fi
 
 case "${2:-}" in
-  enable)
+  daemon-reload)
     units="${XDG_CONFIG_HOME}/systemd/user"
-    {
-      printf 'agent-harness-flight-recorder-sync.service\t%s\n' \
-        "$units/agent-harness-flight-recorder-sync.service"
-      printf 'agent-harness-flight-recorder-sync.timer\t%s\n' \
-        "$units/agent-harness-flight-recorder-sync.timer"
-    } >"$FLIGHT_RECORDER_SCHEDULER_MANAGER_STATE"
+    : >"$FLIGHT_RECORDER_SCHEDULER_MANAGER_STATE"
+    for identifier in \
+      agent-harness-flight-recorder-sync.service \
+      agent-harness-flight-recorder-sync.timer; do
+      if [ -f "$units/$identifier" ]; then
+        printf '%s\t%s\n' "$identifier" "$units/$identifier" \
+          >>"$FLIGHT_RECORDER_SCHEDULER_MANAGER_STATE"
+      fi
+    done
+    ;;
+  enable)
+    requested=""
+    for argument in "$@"; do
+      case "$argument" in
+        -*) ;;
+        enable) ;;
+        *) requested="$argument" ;;
+      esac
+    done
+    [ "$requested" = "agent-harness-flight-recorder-sync.timer" ]
     ;;
   disable)
     : >"$FLIGHT_RECORDER_SCHEDULER_MANAGER_STATE"

@@ -70,6 +70,7 @@ PRE_SCHEDULER_GITIGNORE = """# Local-only Flight Recorder state
 GITIGNORE = PRE_SCHEDULER_GITIGNORE.replace(
     "/tmp/\n", "/tmp/\n/scheduler/\n"
 )
+assert "/scheduler/\n" in GITIGNORE
 LEGACY_GITIGNORE = """# Local-only Flight Recorder state
 /hash.key
 /events.jsonl
@@ -917,11 +918,13 @@ def main() -> int:
                 install(root)
             elif args.scheduler_command == "uninstall":
                 uninstall(root)
-            else:
-                # Background execution records failures in scheduler status and
-                # deliberately exits zero so OS managers do not create a retry
-                # storm. IAM-114 adds durable bounded retry.
+            elif args.scheduler_command == "run":
+                # Handled sync failures are recorded in scheduler status and
+                # deliberately exit zero so OS managers do not create a retry
+                # storm. Unsafe setup or integrity failures still fail closed.
                 run(root)
+            else:
+                raise VaultError("unsupported scheduler command")
     return 0
 
 

@@ -228,11 +228,13 @@ test_linux_install_contract() {
       "$PLUGIN_DIR/scripts" <<'PY' 2>/dev/null
 import configparser
 import pathlib
+import subprocess
 import sys
 
 service_path, timer_path, cli, state, scripts = map(pathlib.Path, sys.argv[1:])
 sys.path.insert(0, str(scripts))
-from scheduler import _systemd_exec_quote, _systemd_quote
+import scheduler as scheduler_module
+from scheduler import _run_command, _systemd_exec_quote, _systemd_quote
 
 service = configparser.ConfigParser(interpolation=None)
 service.optionxform = str
@@ -241,7 +243,9 @@ timer = configparser.ConfigParser(interpolation=None)
 timer.optionxform = str
 timer.read(timer_path, encoding="utf-8")
 assert service["Service"]["Type"] == "oneshot"
-assert service["Service"]["ExecStart"] == f"{cli} scheduler run"
+assert service["Service"]["ExecStart"] == (
+    f"{_systemd_exec_quote(str(cli))} scheduler run"
+)
 environment = service["Service"]["Environment"]
 assert f'"FLIGHT_RECORDER_STATE_DIR={state}"' in environment
 assert "PATH=" in environment
@@ -257,6 +261,21 @@ assert "$${HOME}" in escaped_exec
 assert "percent%%" in escaped_exec
 assert '\\"' in escaped_exec
 assert _systemd_quote("VALUE=${HOME}") == "VALUE=${HOME}"
+
+original_run = scheduler_module.subprocess.run
+def raise_timeout(*arguments, **options):
+    assert options["timeout"] == scheduler_module.COMMAND_TIMEOUT_SECONDS
+    raise subprocess.TimeoutExpired(arguments[0], options["timeout"])
+try:
+    scheduler_module.subprocess.run = raise_timeout
+    try:
+        _run_command(["systemctl", "--user", "show", "fixture"])
+    except scheduler_module.VaultError as error:
+        assert "timed out" in str(error)
+    else:
+        raise AssertionError("scheduler command timeout must fail closed")
+finally:
+    scheduler_module.subprocess.run = original_run
 PY
   then
     pass "systemd user unitは絶対pathとlogin/sleep後missed runを安全に設定する"
@@ -395,7 +414,12 @@ test_offline_run_is_fail_open_and_visible_in_status() {
 
   record_event "$state" "2026-07-25T08:01:00Z" &
   local recorder_pid=$!
-  sleep 0.5
+  local recorder_attempts=0
+  while kill -0 "$recorder_pid" 2>/dev/null \
+    && [[ "$recorder_attempts" -lt 500 ]]; do
+    sleep 0.01
+    recorder_attempts=$((recorder_attempts + 1))
+  done
   if ! kill -0 "$recorder_pid" 2>/dev/null \
     && [[ "$(wc -l <"$state/inbox/events.jsonl" | tr -d ' ')" == "1" ]]; then
     pass "offline sync待機中もharness hookをblockしない"

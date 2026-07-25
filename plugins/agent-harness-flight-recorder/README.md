@@ -200,10 +200,12 @@ published by normal or broad Git staging.
 
 The scheduler calls `flight-recorder scheduler run`, which takes a
 non-blocking scheduler lock and then invokes the same `sync()` implementation
-as the manual command. Concurrent starts are harmless. Background network
-failures are recorded in `flight-recorder status` and return success to the OS
-scheduler so it does not create an unbounded retry storm; durable bounded retry
-is added by the next R1.1 step.
+as the manual command. Concurrent starts are harmless. Handled failures from
+the sync core, including background network failures, are recorded in
+`flight-recorder status` and return success to the OS scheduler so it does not
+create an unbounded retry storm. Unsafe roots, local configuration, locks, or
+other setup/integrity failures still exit non-zero and fail closed. Durable
+bounded retry is added by the next R1.1 step.
 
 For a second device, clone the private repository into that device's state
 directory, run `device join`, then run `sync`. Pre-enrolling the device
