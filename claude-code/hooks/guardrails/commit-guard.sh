@@ -24,6 +24,10 @@ if [ -z "${COMMAND:-}" ]; then
   exit 0
 fi
 
+# 純関数（heredoc 除去・セグメント分割・正規化）の結果をここで 1 回だけ確定させる。
+# メインシェルで呼ぶ必要がある（$(...) の中で設定した変数は親へ戻らないため）。
+guard_prime_command_cache "$COMMAND"
+
 # hook 起動元ではなく、command が実際に操作する repo の workflow policy を使う。
 HOOK_CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
 guard_reload_git_workflow_for_command "$COMMAND" "$HOOK_CWD"
