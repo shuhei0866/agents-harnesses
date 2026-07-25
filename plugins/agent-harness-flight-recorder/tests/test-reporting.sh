@@ -495,6 +495,23 @@ test_invalid_queries_fail_cleanly() {
     fail "invalid durationはstdoutやtracebackを出さずstrictに拒否する"
   fi
 
+  if PYTHONPATH="$PLUGIN_DIR/scripts" python3 - <<'PY' 2>/dev/null
+from reporting import _measurement
+from vault import VaultError
+
+for invalid in (True, "12", None, {}):
+    try:
+        _measurement([{"metrics": {"duration_ms": invalid}}], "duration_ms")
+    except VaultError:
+        continue
+    raise AssertionError(f"accepted invalid metric: {invalid!r}")
+PY
+  then
+    pass "non-numeric metric aggregateはVaultErrorへ閉じ込める"
+  else
+    fail "non-numeric metric aggregateはVaultErrorへ閉じ込める"
+  fi
+
   status=0
   : >"$TEST_ROOT/error.out"
   : >"$TEST_ROOT/error.err"

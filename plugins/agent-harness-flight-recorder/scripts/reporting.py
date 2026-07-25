@@ -262,9 +262,14 @@ def _measurement(
         value: int | float | None = None
     else:
         state = "complete" if known == total else "partial"
+        if any(
+            isinstance(item, bool) or not isinstance(item, (int, float))
+            for item in values
+        ):
+            raise VaultError("recorded metric aggregate is invalid")
         try:
             value = math.fsum(values)
-        except (OverflowError, ValueError) as error:
+        except (OverflowError, TypeError, ValueError) as error:
             raise VaultError("recorded metric aggregate is invalid") from error
         if not math.isfinite(value):
             raise VaultError("recorded metric aggregate is invalid")

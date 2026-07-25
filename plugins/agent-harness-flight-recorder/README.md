@@ -236,11 +236,12 @@ scripts/flight-recorder inspect sha256:<episode-digest>
 
 Add `--json` to any command for a canonical, single-document JSON response that
 Claude Code, Codex, or another local tool can consume. `report` and `inspect`
-use `default-v1` unless `--policy-version <version>` is explicit. Reports
-include episodes whose last recorded event is inside the requested UTC window;
-durations accept a positive integer followed by `s`, `m`, `h`, `d`, or `w`.
-Custom views require their owner-held policy file through `--policy`; selecting
-a custom version stored only in the derived database is rejected.
+use `default-v1`; `--policy-version default-v1` states that default explicitly.
+Reports include episodes whose last recorded event is inside the requested UTC
+window; durations accept a positive integer followed by `s`, `m`, `h`, `d`, or
+`w`. Custom views require their owner-held policy file through `--policy`, which
+also supplies the version; selecting a custom version stored only in the
+derived database is rejected.
 
 Before displaying a card, the CLI reauthenticates the receipt/cache projection
 against the SQLite source rows and deterministically rederives the requested
