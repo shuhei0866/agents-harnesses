@@ -58,6 +58,22 @@ _find_config_file() {
   echo "$config_file"
 }
 
+# --- 設定ファイルの解決は source 時の 1 回だけにする ---
+# _find_config_file は repo ルートの特定に git rev-parse を使う。以前は読み取り側
+# 4 箇所がそれぞれ独立に呼んでいたため、guard 1 本の起動につき rev-parse が 4 回
+# 走っていた。guard は 11 本あるので Bash 1 コマンドあたり 44 回になり、1 回 27.5ms
+# として約 1.2 秒を「毎回同じ答え」を得るために使っていた。
+#
+# 遅延キャッシュにしない理由: 読み取り側の呼び出しは全て $(...) の中にあり、
+# subshell で設定した変数は親シェルへ戻らないため、関数内で memo しても次の呼び出し
+# からは見えない。source は親シェルで走るので、ここで確定させた値だけが後続の
+# subshell から参照できる。
+#
+# hook プロセスは途中で cd せず CLAUDE_PROJECT_DIR も固定なので、source 時の値と
+# 呼び出し時の値は一致する。引数でディレクトリを受け取る _guard_git_workflow_from_dir
+# は対象が呼び出しごとに変わるため、この共有値は使わず従来どおり自分で解決する。
+_GUARD_CONFIG_FILE=$(_find_config_file)
+
 # --- GUARD_LEVEL のロード ---
 # 優先順位: 環境変数 GUARD_LEVEL > harness.config > デフォルト (warn)
 _load_guard_level() {
@@ -67,7 +83,7 @@ _load_guard_level() {
   fi
 
   local config_file
-  config_file=$(_find_config_file)
+  config_file="${_GUARD_CONFIG_FILE:-}"
 
   if [ -n "$config_file" ]; then
     local level
@@ -95,7 +111,7 @@ _load_guard_skip() {
   fi
 
   local config_file
-  config_file=$(_find_config_file)
+  config_file="${_GUARD_CONFIG_FILE:-}"
 
   if [ -n "$config_file" ]; then
     GUARD_SKIP_LIST=$(grep -E '^GUARD_SKIP=' "$config_file" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '"'"'" | tr -d '[:space:]')
@@ -150,7 +166,7 @@ _load_guard_force_deny() {
   fi
 
   local config_file
-  config_file=$(_find_config_file)
+  config_file="${_GUARD_CONFIG_FILE:-}"
 
   if [ -n "$config_file" ]; then
     GUARD_FORCE_DENY_LIST=$(grep -E '^GUARD_FORCE_DENY=' "$config_file" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '"'"'" | tr -d '[:space:]')
@@ -183,7 +199,7 @@ _load_git_workflow() {
   GIT_WORKFLOW=""
 
   local config_file
-  config_file=$(_find_config_file)
+  config_file="${_GUARD_CONFIG_FILE:-}"
 
   if [ -n "$config_file" ]; then
     GIT_WORKFLOW=$(_guard_read_config_value "$config_file" GIT_WORKFLOW)
@@ -1264,6 +1280,10 @@ _is_force_deny() {
 #   echo "$SANITIZED" | grep -qE 'terraform\s+apply' && ...
 guard_sanitize_command() {
   local cmd="$1"
+  if [ "${_GUARD_MEMO_PRIMED:-}" = "1" ] && [ "$cmd" = "$_GUARD_MEMO_STRIPPED" ]; then
+    printf '%s\n' "$_GUARD_MEMO_SANITIZED"
+    return
+  fi
   echo "$cmd" \
     | sed -E "s/\"[^\"]*\"/_Q_/g; s/'[^']*'/_Q_/g" \
     | sed -E 's/\$\([^)]*\)/_SUBST_/g' \
@@ -1290,6 +1310,10 @@ guard_sanitize_command() {
 #   STRIPPED=$(guard_strip_heredoc_bodies "$COMMAND")
 guard_strip_heredoc_bodies() {
   local cmd="$1"
+  if [ "${_GUARD_MEMO_PRIMED:-}" = "1" ] && [ "$cmd" = "$_GUARD_MEMO_RAW" ]; then
+    printf '%s\n' "$_GUARD_MEMO_STRIPPED"
+    return
+  fi
   printf '%s\n' "$cmd" | awk '
     # pos の位置が引用符の内側かを判定する。$( ) の内側では引用符文脈が
     # リセットされる（"--body \"$(cat <<EOF ...)\"" の heredoc は引用外）ため、
@@ -1368,6 +1392,12 @@ guard_strip_heredoc_bodies() {
 #   PIPE_SEGS=$(guard_split_segments "$STRIPPED" pipeline)
 guard_split_segments() {
   local text="$1" mode="${2:-full}"
+  if [ "${_GUARD_MEMO_PRIMED:-}" = "1" ] && [ "$text" = "$_GUARD_MEMO_STRIPPED" ]; then
+    case "$mode" in
+      full) printf '%s\n' "$_GUARD_MEMO_SEG_FULL"; return ;;
+      pipeline) printf '%s\n' "$_GUARD_MEMO_SEG_PIPELINE"; return ;;
+    esac
+  fi
   text="${text//\\$'\n'/ }"
   printf '%s\n' "$text" | awk -v mode="$mode" '
     BEGIN { SQ = sprintf("%c", 39); q = ""; out = ""; prev = ""; cmdsub = 0 }
@@ -1580,6 +1610,37 @@ _check_branch_context() {
       exit 0
     fi
   fi
+}
+
+# --- コマンド派生形の事前計算 ---
+# guard_strip_heredoc_bodies / guard_split_segments / guard_sanitize_command は
+# 引数だけで結果が決まる純関数だが、同じ引数で何度も呼ばれている。echo hi のような
+# 無害なコマンド 1 つに対して、gh-guard は 13 回・commit-guard は 11 回これらを呼び、
+# うち 18 回は完全な重複だった。1 回ごとに awk か sed のプロセスが起きる。
+#
+# 関数内で memo できない理由: 呼び出しは全て $(...) の中にあり、subshell で設定した
+# 変数は親シェルへ戻らない。そこで guard 側がメインシェルでこの関数を 1 回呼び、
+# 派生形を global に確定させる。以降の subshell はそれを継承して読むだけで済む。
+#
+# 安全性: 各関数は引数が prime したものと一致したときだけ global を返し、一致しなければ
+# 従来どおり計算する。キャッシュミスは元の経路にそのまま落ちるので、最悪でも速く
+# ならないだけで、誤った値を返す経路は生まれない。
+#
+# 対象を 3 関数に絞った理由: guard_shell_tokens 系はプロセス置換 < <(...) で呼ばれて
+# 出力バイト列そのものが意味を持ち、guard_has_executable_command_substitution は
+# stdout ではなく終了ステータスで判定される。いずれも $(...) 前提のこの方式には
+# 乗らないため、除外して従来どおり計算させる。
+guard_prime_command_cache() {
+  local command="$1"
+
+  # prime 中は自分自身がキャッシュを読まないよう、最後まで PRIMED を立てない
+  _GUARD_MEMO_PRIMED=""
+  _GUARD_MEMO_RAW="$command"
+  _GUARD_MEMO_STRIPPED=$(guard_strip_heredoc_bodies "$command")
+  _GUARD_MEMO_SEG_FULL=$(guard_split_segments "$_GUARD_MEMO_STRIPPED" full)
+  _GUARD_MEMO_SEG_PIPELINE=$(guard_split_segments "$_GUARD_MEMO_STRIPPED" pipeline)
+  _GUARD_MEMO_SANITIZED=$(guard_sanitize_command "$_GUARD_MEMO_STRIPPED")
+  _GUARD_MEMO_PRIMED=1
 }
 
 # 初期化: source された時点で設定をロード
