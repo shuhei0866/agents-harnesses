@@ -180,6 +180,28 @@ recipient before older chunks are created lets its adopted identity decrypt
 those chunks; otherwise retain access to the recovery identity when historical
 import is required.
 
+Build the local SQLite evidence index from validated imported chunks:
+
+```bash
+scripts/flight-recorder rebuild-index
+```
+
+This performs a deterministic full rebuild into a temporary database, verifies
+foreign keys and SQLite integrity, then atomically publishes
+`index/vault.sqlite`. A corrupt or unsupported existing database is replaced
+only after the new index is complete. To add only unseen chunks to a current
+schema-v1 database, use:
+
+```bash
+scripts/flight-recorder rebuild-index --incremental
+```
+
+Incremental import is transactional and idempotent. Existing chunk, event, and
+provenance rows must match their immutable source exactly; a conflict rolls
+back without changing the encrypted artifacts, decoded cache, or import
+receipt. The SQLite database is derived local state, has user-only permissions,
+and remains outside the Git sync allowlist.
+
 ## Local development
 
 Claude Code can load the plugin directly for one session:
@@ -205,6 +227,7 @@ bash plugins/agent-harness-flight-recorder/tests/test-chunk-rotation.sh
 bash plugins/agent-harness-flight-recorder/tests/test-chunk-rotation-age-e2e.sh
 bash plugins/agent-harness-flight-recorder/tests/test-git-sync.sh
 bash plugins/agent-harness-flight-recorder/tests/test-git-sync-age-e2e.sh
+bash plugins/agent-harness-flight-recorder/tests/test-evidence-index.sh
 ```
 
 The tests exercise official-shape fixtures for both harnesses, privacy canaries,

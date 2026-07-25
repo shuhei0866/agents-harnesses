@@ -164,3 +164,17 @@ Accepted decisions remain recorded when later superseded.
   path/header/schema/content digest, and the imported Git blob OID. Network or
   validation failures retain the local encrypted artifact, commit, and
   Git-ignored pending-sync state without blocking harness hooks.
+
+## D-20260725-16: Rebuild SQLite instead of migrating evidence in place
+
+- Status: accepted
+- Decision: treat `index/vault.sqlite` as a deterministic local projection.
+  Full rebuilds publish a separately constructed current-schema database
+  atomically; incremental imports accept only the exact current schema.
+- Reason: immutable chunks and their validated import provenance are the source
+  of truth. In-place evidence migration adds recovery risk without preserving
+  information that cannot already be reconstructed.
+- Consequence: schema metadata explicitly separates source projections from
+  policy-versioned derived state. Unsupported or corrupt databases are
+  recovered through full rebuild, and any failure leaves encrypted chunks,
+  decoded cache, receipts, and the previous valid database unchanged.

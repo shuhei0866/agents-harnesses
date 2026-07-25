@@ -155,6 +155,39 @@ blob OID so a ciphertext replacement at an immutable path fails closed.
 Rotation itself does not invoke Git or the network beyond the local `age`
 process.
 
+## Rebuildable evidence index
+
+The SQLite index is a deterministic projection of receipt-selected canonical
+Chunk v1 cache files. It is never a source of truth:
+
+```text
+encrypted immutable chunk (source evidence)
+        |
+        | validated by sync
+        v
+import receipt + canonical decoded cache
+        |
+        | rebuild-index
+        v
+index/vault.sqlite (derived, local-only, replaceable)
+```
+
+Schema v1 separates immutable source projections from recomputable state:
+
+- `source_chunks` records chunk identity, source path, Git blob OID, producer,
+  event count, and canonical plaintext digest;
+- `source_events` stores ordered Event v1 projections and their canonical JSON;
+- `import_provenance` records the receipt and cache path used for each chunk;
+- `derived_state` is namespaced and policy-versioned for later episode views.
+
+`rebuild-index` constructs a fresh user-only temporary database, validates
+foreign keys and SQLite integrity, fsyncs it, and atomically replaces the
+previous index. `--incremental` accepts only the exact current schema and adds
+unseen chunks in a transaction; known identical chunks are no-ops and
+immutable conflicts fail closed. R1 does not migrate evidence rows in place.
+An unsupported schema is recovered through a full rebuild from canonical
+chunks, leaving encrypted evidence and decoded inputs untouched.
+
 The next release runs the same operation once per day through `launchd` on macOS
 and a `systemd` timer on Linux. Failures use backoff and remain invisible during
 normal harness operation; prolonged failures are visible through
