@@ -739,6 +739,8 @@ def parser() -> argparse.ArgumentParser:
     join.add_argument("--identity", required=True)
     commands.add_parser("rotate")
     commands.add_parser("sync")
+    rebuild = commands.add_parser("rebuild-index")
+    rebuild.add_argument("--incremental", action="store_true")
     return top
 
 
@@ -751,7 +753,7 @@ def main() -> int:
         add_device(root, args.recipient, args.identity)
     elif args.command == "device" and args.device_command == "join":
         join_device(root, args.identity)
-    elif args.command in ("rotate", "sync"):
+    elif args.command in ("rotate", "sync", "rebuild-index"):
         # The shell wrapper executes this file as __main__. Register that module
         # under its import name so chunk_rotation shares this VaultError class
         # instead of loading a second copy that the CLI exception handler misses.
@@ -760,10 +762,14 @@ def main() -> int:
             from chunk_rotation import rotate
 
             rotate(root)
-        else:
+        elif args.command == "sync":
             from sync import sync
 
             sync(root)
+        else:
+            from evidence_index import rebuild_index
+
+            rebuild_index(root, incremental=args.incremental)
     return 0
 
 
