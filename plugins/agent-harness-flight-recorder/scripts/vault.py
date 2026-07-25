@@ -745,6 +745,24 @@ def parser() -> argparse.ArgumentParser:
     relationships.add_argument(
         "--policy", "--policy-file", dest="policy", type=Path
     )
+    status = commands.add_parser("status")
+    status.add_argument("--json", action="store_true")
+    report = commands.add_parser("report")
+    report.add_argument("--last", required=True)
+    report_policy = report.add_mutually_exclusive_group()
+    report_policy.add_argument("--policy-version")
+    report_policy.add_argument(
+        "--policy", "--policy-file", dest="policy", type=Path
+    )
+    report.add_argument("--json", action="store_true")
+    inspect = commands.add_parser("inspect")
+    inspect.add_argument("episode_id")
+    inspect_policy = inspect.add_mutually_exclusive_group()
+    inspect_policy.add_argument("--policy-version")
+    inspect_policy.add_argument(
+        "--policy", "--policy-file", dest="policy", type=Path
+    )
+    inspect.add_argument("--json", action="store_true")
     return top
 
 
@@ -757,7 +775,15 @@ def main() -> int:
         add_device(root, args.recipient, args.identity)
     elif args.command == "device" and args.device_command == "join":
         join_device(root, args.identity)
-    elif args.command in ("rotate", "sync", "rebuild-index", "rebuild-relationships"):
+    elif args.command in (
+        "rotate",
+        "sync",
+        "rebuild-index",
+        "rebuild-relationships",
+        "status",
+        "report",
+        "inspect",
+    ):
         # The shell wrapper executes this file as __main__. Register that module
         # under its import name so chunk_rotation shares this VaultError class
         # instead of loading a second copy that the CLI exception handler misses.
@@ -774,10 +800,37 @@ def main() -> int:
             from evidence_index import rebuild_index
 
             rebuild_index(root, incremental=args.incremental)
-        else:
+        elif args.command == "rebuild-relationships":
             from evidence_index import rebuild_relationship_views
 
             rebuild_relationship_views(root, args.policy)
+        else:
+            from reporting import (
+                emit,
+                inspect_episode,
+                render_inspect,
+                render_report,
+                render_status,
+                report,
+                status,
+            )
+
+            if args.command == "status":
+                value = status(root)
+                emit(value, as_json=args.json, human=render_status(value))
+            elif args.command == "report":
+                value = report(
+                    root, args.last, args.policy_version, args.policy
+                )
+                emit(value, as_json=args.json, human=render_report(value))
+            else:
+                value = inspect_episode(
+                    root,
+                    args.episode_id,
+                    args.policy_version,
+                    args.policy,
+                )
+                emit(value, as_json=args.json, human=render_inspect(value))
     return 0
 
 
