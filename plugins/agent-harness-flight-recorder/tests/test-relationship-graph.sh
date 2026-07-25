@@ -8,7 +8,6 @@ PLUGIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CLI="$PLUGIN_DIR/scripts/flight-recorder"
 RECORDER="$PLUGIN_DIR/scripts/record-event"
 FAKE_BIN="$SCRIPT_DIR/fixtures/fake-bin"
-V1_FIXTURE="$SCRIPT_DIR/fixtures/claude-code-stop.json"
 TEST_ROOT="$(mktemp -d)"
 PASS=0
 FAIL=0
@@ -636,6 +635,22 @@ test_relationship_rebuild_is_deterministic_idempotent_and_source_immutable() {
     return
   fi
 
+  chmod 0644 "$db"
+  if run_cli "$state" rebuild-relationships >/dev/null 2>&1 \
+    && python3 - "$db" <<'PY'
+import pathlib
+import stat
+import sys
+
+assert stat.S_IMODE(pathlib.Path(sys.argv[1]).stat().st_mode) == 0o600
+PY
+  then
+    pass "relationship再計算後にevidence indexをowner-onlyへ戻す"
+  else
+    fail "relationship再計算後にevidence indexをowner-onlyへ戻す"
+    return
+  fi
+
   python3 - "$db" <<'PY'
 import sqlite3
 import sys
@@ -879,7 +894,7 @@ test_full_rebuild_restores_graph_without_privacy_leak() {
   fi
   after="$(default_graph_snapshot "$db" 2>/dev/null)"
   if [[ "$before" == "$after" ]] \
-    && ! rg -a -q \
+    && ! grep -a -r -E -q \
       "RAW_RELATIONSHIP_CANARY_79b7|RAW_BRANCH_CANARY_80c8|/private/workspace|private/second.py" \
       "$state"; then
     pass "full rebuildは同じgraphを復元しraw task/branch/pathを保存しない"

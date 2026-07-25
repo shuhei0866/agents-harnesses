@@ -796,6 +796,7 @@ def rebuild_relationship_views(root: Path, policy_path: Path | None) -> None:
             raise VaultError("relationship rebuild failed") from error
         finally:
             connection.close()
+        os.chmod(root / DATABASE_PATH, 0o600)
         print(
             "rebuild-relationships: "
             f"policy={policy['policy_version']} edges={edges} episodes={episodes}"

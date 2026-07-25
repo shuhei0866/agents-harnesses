@@ -230,6 +230,17 @@ event["event_id"] = "6b094c18-61bc-48ce-b46b-b27ff6e6e09e"
 event["recorded_at"] = "20260724T110000+0000"
 with path.open("a", encoding="utf-8") as stream:
     stream.write(json.dumps(event, separators=(",", ":")) + "\n")
+    event["schema_version"] = 2
+    event["event_id"] = "6b094c18-61bc-48ce-b46b-b27ff6e6e09f"
+    event["recorded_at"] = "2026-07-24T11:00:01Z"
+    event["relationship_context"] = {
+        "task_id_hash": None,
+        "task_source": None,
+        "branch_or_worktree_id": None,
+        "changed_file_fingerprints": [{}, "sha256:" + "0" * 24],
+        "changed_files_state": "complete",
+    }
+    stream.write(json.dumps(event, separators=(",", ":")) + "\n")
 PY
   printf '%s\n' '{"not":"complete"' >>"$state/inbox/events.jsonl"
   printf '%s\n' '{"schema_version":99}' >>"$state/inbox/events.jsonl"
@@ -255,9 +266,10 @@ rows = [
     json.loads(line)
     for line in pathlib.Path(sys.argv[2]).read_text(encoding="utf-8").splitlines()
 ]
-assert len(rows) == 4
+assert len(rows) == 5
 raw = [base64.b64decode(row["raw_base64"]) for row in rows]
 assert any(b"20260724T110000+0000" in item for item in raw)
+assert any(b"changed_file_fingerprints" in item for item in raw)
 assert b'{"not":"complete"' in raw
 assert b'{"schema_version":99}' in raw
 assert b'{"partial":' in raw

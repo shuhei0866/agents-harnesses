@@ -185,12 +185,12 @@ def validate_event(value: object) -> dict[str, Any]:
         if (
             not isinstance(fingerprints, list)
             or len(fingerprints) > 128
-            or fingerprints != sorted(set(fingerprints))
             or any(
                 not isinstance(item, str)
                 or not re.fullmatch(r"sha256:[0-9a-f]{24}", item)
                 for item in fingerprints
             )
+            or fingerprints != sorted(set(fingerprints))
         ):
             raise ValueError("invalid changed_file_fingerprints")
         state = context["changed_files_state"]
