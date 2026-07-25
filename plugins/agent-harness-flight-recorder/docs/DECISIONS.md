@@ -231,3 +231,22 @@ Accepted decisions remain recorded when later superseded.
   operation without a trustworthy outcome remains `missing`, distinct from
   `failure`. Card reads rederive and authenticate evidence rows, and an older
   local SQLite schema requires a full rebuild from the immutable chunks.
+
+## D-20260725-20: Bound delayed evaluation with an executable protocol
+
+- Status: accepted
+- Decision: run an owner-selected episode through a local, versioned evaluator
+  executable. Default to metadata-only input; require a scope-preview round
+  trip before reading additional artifacts. Persist only finite rubric output,
+  evaluator/model/timestamp provenance, evidence IDs, and artifact hashes.
+- Reason: Claude Code and Codex need different invocation adapters, while the
+  privacy and replay contract must remain provider-neutral. Free-form model
+  output can repeat private source content and therefore cannot be a safe
+  stored result.
+- Consequence: evaluator adapters receive transient JSON on stdin and return a
+  strict finite JSON object. Artifact access requires a keyed preview receipt;
+  the executable identity is pinned by SHA-256 and runs with bounded output in
+  a minimal environment. Evaluation records are atomic local state excluded
+  from Vault Git in R1.2 and are part of purge rollback. A timeout, process
+  failure, invalid response, changed evidence set, or unsafe artifact leaves
+  existing episodes and evidence untouched.

@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import sys
+
+
+request = json.load(sys.stdin)
+capture = os.environ.get("FLIGHT_RECORDER_TEST_EVALUATOR_CAPTURE")
+if capture:
+    pathlib.Path(capture).write_text(
+        json.dumps(request, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+if os.environ.get("FLIGHT_RECORDER_TEST_EVALUATOR_FAIL") == "1":
+    raise SystemExit(7)
+if os.environ.get("FLIGHT_RECORDER_TEST_EVALUATOR_OVERSIZE") == "1":
+    sys.stdout.write("x" * (65 * 1024))
+    raise SystemExit(0)
+
+evidence_ids = sorted(
+    fact["evidence_id"] for fact in request["episode"]["deterministic_evidence"]
+)
+json.dump(
+    {
+        "schema_version": 1,
+        "conclusion": "successful",
+        "confidence": "high",
+        "evidence_ids": evidence_ids,
+        "criteria": {
+            "goal_achievement": "supported",
+            "quality": "supported",
+            "efficiency": "unknown",
+        },
+    },
+    sys.stdout,
+    sort_keys=True,
+    separators=(",", ":"),
+)

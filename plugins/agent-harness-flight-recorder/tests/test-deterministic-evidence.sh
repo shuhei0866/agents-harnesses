@@ -334,9 +334,9 @@ import sys
 
 report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 inspect = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
-assert report["schema_version"] == 2
+assert report["schema_version"] == 3
 card = inspect["card"]
-assert card["schema_version"] == 2
+assert card["schema_version"] == 3
 facts = card["deterministic_evidence"]
 assert len(facts) == 11, facts
 assert all(set(fact) == {

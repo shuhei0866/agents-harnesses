@@ -263,14 +263,31 @@ Evaluation is layered by cost and privacy:
 
 1. Deterministic evidence: test, build, lint, exit status, commit, pull request,
    retry count, duration, token use, and measured cost when available.
-2. On-demand delayed evaluation: the owner selects an episode and explicitly
-   permits any additional artifact scope required by a model.
+2. On-demand delayed evaluation: the owner selects an episode, invokes a local
+   versioned evaluator adapter, and explicitly permits any additional artifact
+   scope required by a model.
 3. Background evaluation: a later release evaluates uncertain episodes from
    metadata by default. Artifact access remains an explicit workspace policy.
 
 Stored evaluation provenance includes the rubric version, evaluator and model,
 timestamp, evidence identifiers, artifact hashes, conclusions, and confidence.
 Artifact bodies and evaluator input transcripts are not persisted by default.
+R1.2 stores only finite judgments and criterion states, never free-form model
+text. Records are atomic, user-only, content-addressed local files excluded
+from Vault Git; the input fingerprint makes identical
+rubric/model/evidence/executable scopes comparable and idempotent when
+evaluated at the same timestamp. Card output is version 3 so strict consumers
+can distinguish the separate model-judgment field.
+
+Additional artifact access is a two-step protocol. The first invocation
+authenticates the episode and returns canonical paths plus byte sizes without
+reading content or starting the evaluator. It also returns a keyed receipt
+bound to file identity and metadata. Only a second invocation with explicit
+permission and that still-valid receipt reads bounded UTF-8 content. The
+evaluator executable is pinned by SHA-256 and runs from an empty temporary
+directory with a minimal environment and an OS-enforced stdout limit. Failure,
+timeout, invalid JSON, an out-of-rubric response, or changed evidence creates
+no evaluation record and does not mutate episode evidence.
 
 The deterministic collector is deliberately narrower than a shell parser.
 Event v3 recognizes only finite operation kinds from simple allowlisted tool
@@ -288,13 +305,14 @@ The first interface is a stable CLI that agent harnesses can also invoke:
 flight-recorder status
 flight-recorder report --last 7d
 flight-recorder inspect <episode-id>
+flight-recorder evaluate <episode-id> --evaluator ADAPTER --model MODEL
 ```
 
 The primary output is an Episode Evidence Card containing task type, model,
 duration, measured cost, deterministic outcomes, retry count, confidence, and
 supporting evidence. A dashboard is not required for the first value test.
 
-All three commands accept `--json` and build their human and machine output
+All four commands accept `--json` and build their human and machine output
 from the same versioned domain object. `report` uses an explicit positive
 duration and includes an episode when its last recorded event is inside the UTC
 window. `report` and `inspect` default to `default-v1`; another coexisting view
@@ -323,11 +341,13 @@ only as locally `idle`, never as proof of a successful remote sync.
 Privacy-safe encrypted events are retained until the owner deletes them. Normal
 analysis deletion is a tombstone-like `forget` operation in derived state.
 
-`purge` removes matching local data and rewrites the dedicated private data
-repository so encrypted chunks are removed from Git history. It is explicit,
-destructive, and must show the affected scope before applying. Remote-provider
-caches and independent clones mean purge is best-effort beyond repositories the
-owner controls; the CLI must state this limitation clearly.
+`purge` removes matching local data, including evaluation records, and rewrites
+the dedicated private data repository so encrypted chunks are removed from Git
+history. A rejected force-push restores the evaluation records with the other
+retryable local state. It is explicit, destructive, and must show the affected
+scope before applying. Remote-provider caches and independent clones mean
+purge is best-effort beyond repositories the owner controls; the CLI must state
+this limitation clearly.
 
 ## Release boundaries
 
@@ -347,7 +367,8 @@ owner controls; the CLI must state this limitation clearly.
 ### R1.2: Evaluation
 
 - deterministic evidence collectors;
-- on-demand delayed model evaluation with provenance;
+- explicit `evaluate` with metadata-only default, finite model judgments,
+  provenance, and artifact scope preview;
 - metadata-only background evaluation for uncertain episodes.
 
 ### Later

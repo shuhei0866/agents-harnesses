@@ -71,6 +71,11 @@ GITIGNORE = PRE_SCHEDULER_GITIGNORE.replace(
     "/tmp/\n", "/tmp/\n/scheduler/\n"
 )
 assert "/scheduler/\n" in GITIGNORE
+PRE_EVALUATION_GITIGNORE = GITIGNORE
+GITIGNORE = PRE_EVALUATION_GITIGNORE.replace(
+    "/scheduler/\n", "/scheduler/\n/evaluations/\n"
+)
+assert "/evaluations/\n" in GITIGNORE
 LEGACY_GITIGNORE = """# Local-only Flight Recorder state
 /hash.key
 /events.jsonl
@@ -351,7 +356,11 @@ def ensure_managed_gitignore(root: Path) -> None:
         contents = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
         raise VaultError("vault Git ignore file is unsafe") from error
-    if contents in (LEGACY_GITIGNORE, PRE_SCHEDULER_GITIGNORE):
+    if contents in (
+        LEGACY_GITIGNORE,
+        PRE_SCHEDULER_GITIGNORE,
+        PRE_EVALUATION_GITIGNORE,
+    ):
         atomic_replace(path, GITIGNORE.encode("utf-8"))
     elif contents != GITIGNORE:
         raise VaultError("vault Git ignore file is not managed by this version")
@@ -790,6 +799,21 @@ def parser() -> argparse.ArgumentParser:
         "--policy", "--policy-file", dest="policy", type=Path
     )
     inspect.add_argument("--json", action="store_true")
+    evaluate = commands.add_parser("evaluate")
+    evaluate.add_argument("episode_id")
+    evaluate_policy = evaluate.add_mutually_exclusive_group()
+    evaluate_policy.add_argument("--policy-version")
+    evaluate_policy.add_argument(
+        "--policy", "--policy-file", dest="policy", type=Path
+    )
+    evaluate.add_argument("--rubric", type=Path)
+    evaluate.add_argument("--evaluator")
+    evaluate.add_argument("--model")
+    evaluate.add_argument("--artifact", action="append", type=Path, default=[])
+    evaluate.add_argument("--allow-artifact-content", action="store_true")
+    evaluate.add_argument("--artifact-preview-token")
+    evaluate.add_argument("--timeout", type=int, default=60)
+    evaluate.add_argument("--json", action="store_true")
     forget = commands.add_parser("forget")
     forget.add_argument("episode_id")
     forget_policy = forget.add_mutually_exclusive_group()
@@ -834,6 +858,7 @@ def main() -> int:
         "status",
         "report",
         "inspect",
+        "evaluate",
         "forget",
         "purge",
         "scheduler",
@@ -885,6 +910,24 @@ def main() -> int:
                     args.policy,
                 )
                 emit(value, as_json=args.json, human=render_inspect(value))
+        elif args.command == "evaluate":
+            from evaluation import evaluate, render_evaluate
+            from reporting import emit
+
+            value = evaluate(
+                root,
+                args.episode_id,
+                args.policy_version,
+                args.policy,
+                args.rubric,
+                args.evaluator,
+                args.model,
+                args.artifact,
+                args.allow_artifact_content,
+                args.artifact_preview_token,
+                args.timeout,
+            )
+            emit(value, as_json=args.json, human=render_evaluate(value))
         elif args.command in ("forget", "purge"):
             from reporting import emit
             from retention import (
