@@ -188,7 +188,7 @@ assert set(header) == {
 }
 assert header["record_type"] == "chunk_header"
 assert header["schema_version"] == 1
-assert header["event_schema_version"] == 1
+assert header["event_schema_version"] == 2
 assert header["event_count"] == 2 == len(events)
 assert header["vault_id"] == config["vault_id"]
 assert header["created_at"] == events[0]["recorded_at"]

@@ -29,7 +29,7 @@ Claude Code / Codex
         |
         | lifecycle hooks
         v
-privacy allowlist + canonical Event v1
+privacy allowlist + canonical Event v1/v2
         |
         v
 local append-only inbox/events.jsonl
@@ -117,7 +117,7 @@ flight-recorder rotate
   2. take the stable inbox lock
   3. atomically rename each complete event generation into the retry queue
   4. release the inbox lock before validation and encryption
-  5. quarantine invalid lines and preserve valid Event v1 records in order
+  5. quarantine invalid lines and preserve valid Event v1/v2 records in order
   6. derive a content ID from the Vault, device, and canonical event bytes
   7. encrypt the Chunk v1 JSONL to every enrolled age recipient
   8. publish one immutable device-scoped `.jsonl.age` file
@@ -149,7 +149,8 @@ flight-recorder sync
 ```
 
 The private remote is an untrusted transport. A tracked chunk is decrypted and
-its path, header, Vault/device IDs, date, Event v1 records, count, and content
+its path, header, Vault/device IDs, date, homogeneous Event v1 or v2 records,
+count, and content
 digest are verified before commit or import. Import receipts retain the Git
 blob OID so a ciphertext replacement at an immutable path fails closed.
 Rotation itself does not invoke Git or the network beyond the local `age`
@@ -172,19 +173,25 @@ import receipt + canonical decoded cache
 index/vault.sqlite (derived, local-only, replaceable)
 ```
 
-Schema v1 separates immutable source projections from recomputable state:
+Schema v2 separates immutable source projections from recomputable state:
 
 - `source_chunks` records chunk identity, source path, Git blob OID, producer,
   event count, and canonical plaintext digest;
-- `source_events` stores ordered Event v1 projections and their canonical JSON;
+- `source_events` stores ordered Event v1/v2 projections, canonical JSON, and
+  nullable Event v2 relationship-context projections;
 - `import_provenance` records the receipt and cache path used for each chunk;
-- `derived_state` is namespaced and policy-versioned for later episode views.
+- `derived_state` is namespaced and policy-versioned;
+- `relationship_policies`, `relationship_edges`, `episodes`, and
+  `episode_members` contain recomputable versioned relationship views.
 
 `rebuild-index` constructs a fresh user-only temporary database, validates
 foreign keys and SQLite integrity, fsyncs it, and atomically replaces the
 previous index. `--incremental` accepts only the exact current schema and adds
 unseen chunks in a transaction; known identical chunks are no-ops and
-immutable conflicts fail closed. R1 does not migrate evidence rows in place.
+immutable conflicts fail closed. Incremental rebuild authenticates and
+recomputes every stored policy version in that same transaction. Full rebuild
+restores only the bundled default view; custom views must be reapplied from
+their owner-held policy files. R1 does not migrate evidence rows in place.
 An unsupported schema is recovered through a full rebuild from canonical
 chunks, leaving encrypted evidence and decoded inputs untouched.
 
@@ -213,8 +220,13 @@ Initial deterministic features include:
 - allowlisted changed-file fingerprints;
 - contradictory explicit task identifiers.
 
-A versioned policy converts these edges into a derived episode view. Weight and
-threshold changes create a new view without rewriting source events.
+A versioned integer-only policy converts these edges into a derived episode
+view. Explicit contradictory task IDs are a hard veto, including during
+component union, so an unknown-task event cannot bridge contradictory tasks.
+Every event belongs to a view, including singleton episodes. Weight and
+threshold changes create a coexisting view without rewriting source events.
+`rebuild-relationships` replaces only the requested policy version in one
+transaction.
 
 ## Evaluation
 

@@ -93,7 +93,8 @@ run_record() {
     "$RECORDER" --harness "$harness" < "$fixture" > "$stdout_file" 2> "$stderr_file"
 }
 
-canonical_keys='["event_id", "event_kind", "harness", "metrics", "model", "outcome", "permission_mode", "recorded_at", "schema_version", "session_id_hash", "source_event", "tool", "turn_id_hash", "workspace_id"]'
+canonical_keys='["event_id", "event_kind", "harness", "metrics", "model", "outcome", "permission_mode", "recorded_at", "relationship_context", "schema_version", "session_id_hash", "source_event", "tool", "turn_id_hash", "workspace_id"]'
+missing_relationship_context="{'task_id_hash': None, 'task_source': None, 'branch_or_worktree_id': None, 'changed_file_fingerprints': [], 'changed_files_state': 'missing'}"
 
 test_claude_code_schema() {
   echo "test_claude_code_schema:"
@@ -101,10 +102,10 @@ test_claude_code_schema() {
   run_record claude-code "$FIXTURES/claude-code-stop.json" "$log" "$out" "$err"
   status=$?
   assert_success "Claude Codeイベントを記録できる" "$status"
-  if json_check "$log" "sorted(v.keys()) == $canonical_keys and v['harness'] == 'claude-code' and v['source_event'] == 'Stop' and v['recorded_at'] == '2026-07-21T00:00:00Z'" 2>/dev/null; then
-    pass "canonical schemaへ正規化する"
+  if json_check "$log" "sorted(v.keys()) == $canonical_keys and v['schema_version'] == 2 and v['harness'] == 'claude-code' and v['source_event'] == 'Stop' and v['recorded_at'] == '2026-07-21T00:00:00Z' and v['relationship_context'] == $missing_relationship_context" 2>/dev/null; then
+    pass "missing relationship stateを明示したcanonical Event v2へ正規化する"
   else
-    fail "canonical schemaへ正規化する"
+    fail "missing relationship stateを明示したcanonical Event v2へ正規化する"
   fi
 }
 
@@ -114,10 +115,10 @@ test_codex_same_schema() {
   run_record codex "$FIXTURES/codex-turn-complete.json" "$log" "$out" "$err"
   status=$?
   assert_success "Codexイベントを記録できる" "$status"
-  if json_check "$log" "sorted(v.keys()) == $canonical_keys and v['harness'] == 'codex' and v['source_event'] == 'Stop' and v['recorded_at'] == '2026-07-21T00:00:00Z'" 2>/dev/null; then
-    pass "Claude Codeと同一のcanonical schemaへ正規化する"
+  if json_check "$log" "sorted(v.keys()) == $canonical_keys and v['schema_version'] == 2 and v['harness'] == 'codex' and v['source_event'] == 'Stop' and v['recorded_at'] == '2026-07-21T00:00:00Z' and v['relationship_context'] == $missing_relationship_context" 2>/dev/null; then
+    pass "Claude Codeと同一のcanonical Event v2へ正規化する"
   else
-    fail "Claude Codeと同一のcanonical schemaへ正規化する"
+    fail "Claude Codeと同一のcanonical Event v2へ正規化する"
   fi
 }
 
@@ -181,9 +182,17 @@ import sys
 text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
 canaries = ("PROMPT_CANARY_5a82d4", "ASSISTANT_CANARY_72f1b9", "CODE_CANARY_e193c7", "OUTPUT_CANARY_b647aa", "UNKNOWN_CANARY_c04f2e")
 assert not any(canary in text for canary in canaries)
+assert "/workspaces/acme-api" not in text
 event = __import__("json").loads(text)
 assert event["tool"] == "Bash"
 assert event["metrics"] == {"duration_ms": 12}
+assert set(event["relationship_context"]) == {
+    "task_id_hash",
+    "task_source",
+    "branch_or_worktree_id",
+    "changed_file_fingerprints",
+    "changed_files_state",
+}
 PY
   then
     pass "本文を捨て、許可済みtoolメタデータだけを保存する"
@@ -265,6 +274,7 @@ test_hmac_correlation_key() {
   run_record claude-code "$FIXTURES/claude-code-stop.json" "$log" "$out" "$err"
   if python3 - "$log" "$key" <<'PY' 2>/dev/null
 import hashlib
+import hmac
 import json
 import stat
 import sys
@@ -277,6 +287,10 @@ with open(key_path, "rb") as stream:
 assert len(key) == 32
 assert stat.S_IMODE(__import__("os").stat(key_path).st_mode) == 0o600
 assert rows[0]["workspace_id"] == rows[1]["workspace_id"]
+expected = "sha256:" + hmac.new(
+    key, b"/workspaces/acme-api", hashlib.sha256
+).hexdigest()[:24]
+assert rows[0]["workspace_id"] == expected
 plain = "sha256:" + hashlib.sha256(b"/workspaces/acme-api").hexdigest()[:24]
 assert rows[0]["workspace_id"] != plain
 PY

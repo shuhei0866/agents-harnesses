@@ -36,6 +36,8 @@ Stored:
 - a fixed allowlist of numeric duration, token, and cost metrics
 - random event ID and timestamp
 - truncated HMAC-SHA-256 identifiers for session, turn, and workspace correlation
+- domain-separated HMAC identifiers for tasks, branches/worktrees, and up to
+  128 allowlisted changed-file paths, with explicit missing/truncated state
 
 Never stored by default:
 
@@ -43,6 +45,7 @@ Never stored by default:
 - commands, code, file contents, or tool output
 - transcript contents or transcript paths
 - raw session IDs, turn IDs, or workspace paths
+- raw task IDs, branch/worktree names, or changed-file paths
 - unknown future hook fields
 
 The HMAC key is generated locally beside the event log with user-only
@@ -167,7 +170,8 @@ to `main`. It uses the `git` CLI and the remote in `vault.json`; it does not use
 GitHub-specific APIs.
 
 Every candidate chunk is decrypted and its path, Chunk v1 header, Vault/device
-IDs, date, Event v1 records, count, and content digest are verified before it
+IDs, date, homogeneous Event v1 or v2 records, count, and content digest are
+verified before it
 can enter a local commit or import cache. Existing imports record the Git blob
 OID so replacing an immutable ciphertext at the same path is rejected. A
 failed pull, import, or push keeps the encrypted artifact, local commit, and
@@ -180,7 +184,8 @@ recipient before older chunks are created lets its adopted identity decrypt
 those chunks; otherwise retain access to the recovery identity when historical
 import is required.
 
-Build the local SQLite evidence index from validated imported chunks:
+Build the local SQLite evidence index and bundled `default-v1` relationship
+view from validated imported chunks:
 
 ```bash
 scripts/flight-recorder rebuild-index
@@ -189,8 +194,10 @@ scripts/flight-recorder rebuild-index
 This performs a deterministic full rebuild into a temporary database, verifies
 foreign keys and SQLite integrity, then atomically publishes
 `index/vault.sqlite`. A corrupt or unsupported existing database is replaced
-only after the new index is complete. To add only unseen chunks to a current
-schema-v1 database, use:
+only after the new index is complete. Full rebuild restores the bundled
+`default-v1` relationship view; custom views are derived local state and must
+be reapplied from their owner-held policy files. To add only unseen chunks to
+a current schema-v2 database, use:
 
 ```bash
 scripts/flight-recorder rebuild-index --incremental
@@ -199,8 +206,25 @@ scripts/flight-recorder rebuild-index --incremental
 Incremental import is transactional and idempotent. Existing chunk, event, and
 provenance rows must match their immutable source exactly; a conflict rolls
 back without changing the encrypted artifacts, decoded cache, or import
-receipt. The SQLite database is derived local state, has user-only permissions,
-and remains outside the Git sync allowlist.
+receipt. Every canonical stored policy version is rebuilt in the same
+transaction, so custom views remain current; an invalid or conflicting stored
+policy rolls back the entire import. The SQLite database is derived local
+state, has user-only permissions, and remains outside the Git sync allowlist.
+
+Event v2 adds privacy-safe relationship context: domain-separated HMACs for
+explicit tasks and branches/worktrees plus a bounded set of changed-file
+fingerprints. Raw identifiers and paths are discarded. Mixed Event v1/v2
+inboxes are rotated into homogeneous Chunk v1 files.
+
+Recompute one versioned relationship view without changing source evidence:
+
+```bash
+scripts/flight-recorder rebuild-relationships
+scripts/flight-recorder rebuild-relationships --policy /path/to/policy.json
+```
+
+Policies use integer weights and thresholds. Different versions coexist, and
+an invalid policy or failed rebuild leaves every existing view unchanged.
 
 ## Local development
 
@@ -228,9 +252,11 @@ bash plugins/agent-harness-flight-recorder/tests/test-chunk-rotation-age-e2e.sh
 bash plugins/agent-harness-flight-recorder/tests/test-git-sync.sh
 bash plugins/agent-harness-flight-recorder/tests/test-git-sync-age-e2e.sh
 bash plugins/agent-harness-flight-recorder/tests/test-evidence-index.sh
+bash plugins/agent-harness-flight-recorder/tests/test-relationship-graph.sh
 ```
 
 The tests exercise official-shape fixtures for both harnesses, privacy canaries,
 fail-open behavior, optional fields, shared auto-detection, and 50 concurrent
 writers. The stable contracts are in `schema/event-v1.schema.json`,
-`schema/vault-v1.schema.json`, and `schema/chunk-v1.schema.json`.
+`schema/event-v2.schema.json`, `schema/vault-v1.schema.json`, and
+`schema/chunk-v1.schema.json`.

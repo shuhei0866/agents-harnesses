@@ -11,9 +11,13 @@ import hmac
 import json
 import math
 import os
+import re
 import secrets
+import selectors
 import stat
+import subprocess
 import sys
+import time
 import uuid
 from typing import Any
 
@@ -52,6 +56,241 @@ def hash_identifier(value: Any, key: bytes | None) -> str | None:
         return None
     digest = hmac.new(key, text.encode("utf-8"), hashlib.sha256).hexdigest()
     return f"sha256:{digest[:24]}"
+
+
+def hash_relationship_identifier(
+    value: Any, key: bytes | None, domain: str
+) -> str | None:
+    text = safe_string(value)
+    if text is None or key is None:
+        return None
+    digest = hmac.new(
+        key,
+        b"agent-harness-flight-recorder/relationship-v1\0"
+        + domain.encode("ascii")
+        + b"\0"
+        + text.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"sha256:{digest[:24]}"
+
+
+MAX_CHANGED_FILES = 128
+MAX_GIT_OUTPUT_BYTES = 64 * 1024
+GIT_TIMEOUT_SECONDS = 0.075
+CHANGED_FILE_SUFFIXES = {
+    ".c", ".cc", ".cpp", ".css", ".go", ".h", ".hpp", ".html", ".java",
+    ".js", ".json", ".jsx", ".kt", ".md", ".mjs", ".py", ".rb", ".rs",
+    ".sh", ".sql", ".swift", ".toml", ".ts", ".tsx", ".yaml", ".yml",
+}
+SECRET_PATH_PARTS = {
+    ".git", ".env", ".ssh", "__pycache__", "build", "coverage", "dist",
+    "keys", "node_modules", "secrets", "target", "vendor",
+}
+ISSUE_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9])([A-Z][A-Z0-9]{1,9}-[1-9][0-9]{0,8})(?![A-Za-z0-9])"
+)
+
+
+def allowlisted_changed_path(value: object) -> str | None:
+    path = safe_string(value)
+    if (
+        path is None
+        or path.startswith(("/", "\\"))
+        or any(ord(character) < 32 for character in path)
+    ):
+        return None
+    normalized = path.replace("\\", "/")
+    parts = normalized.split("/")
+    if (
+        len(parts) > 32
+        or any(
+            not part
+            or part in (".", "..")
+            or part.startswith(".")
+            or part.lower() in SECRET_PATH_PARTS
+            for part in parts
+        )
+    ):
+        return None
+    suffix = os.path.splitext(normalized)[1].lower()
+    if suffix not in CHANGED_FILE_SUFFIXES and parts[-1] not in (
+        "Dockerfile", "Makefile"
+    ):
+        return None
+    return normalized
+
+
+def _run_git_bounded(
+    path: str, arguments: list[str], deadline: float
+) -> tuple[int, bytes] | None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+            "LC_ALL": "C",
+        }
+    )
+    process = subprocess.Popen(
+        ["git", "-C", path, *arguments],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        shell=False,
+        env=environment,
+    )
+    assert process.stdout is not None
+    descriptor = process.stdout.fileno()
+    os.set_blocking(descriptor, False)
+    selector = selectors.DefaultSelector()
+    selector.register(descriptor, selectors.EVENT_READ)
+    output = bytearray()
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                process.wait()
+                return None
+            ready = selector.select(remaining)
+            if not ready:
+                process.kill()
+                process.wait()
+                return None
+            chunk = os.read(
+                descriptor,
+                min(8192, MAX_GIT_OUTPUT_BYTES + 1 - len(output)),
+            )
+            if chunk:
+                output.extend(chunk)
+                if len(output) > MAX_GIT_OUTPUT_BYTES:
+                    process.kill()
+                    process.wait()
+                    return None
+                continue
+            return process.wait(), bytes(output)
+    finally:
+        selector.close()
+        process.stdout.close()
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
+def _git_relationship_metadata(cwd: object) -> tuple[str | None, list[str], str]:
+    """Collect bounded repository metadata without ever making recording fail."""
+    path = safe_string(cwd)
+    if path is None or not os.path.isabs(path):
+        return None, [], "missing"
+    try:
+        result = _run_git_bounded(
+            path,
+            [
+                "status", "--porcelain=v1", "-z", "--branch",
+                "--untracked-files=all", "--no-renames",
+            ],
+            time.monotonic() + GIT_TIMEOUT_SECONDS * 2,
+        )
+        if result is None or result[0] != 0:
+            return None, [], "missing"
+        items = result[1].decode("utf-8").split("\0")
+        branch_value = None
+        if items and items[0].startswith("## "):
+            branch_text = items.pop(0)[3:]
+            if branch_text.startswith("No commits yet on "):
+                branch_text = branch_text.removeprefix("No commits yet on ")
+            elif branch_text.startswith("Initial commit on "):
+                branch_text = branch_text.removeprefix("Initial commit on ")
+            branch_text = branch_text.split("...", 1)[0]
+            if branch_text not in ("HEAD (no branch)", "HEAD"):
+                branch_value = safe_string(branch_text)
+        names: list[str] = []
+        for item in items:
+            if not item:
+                continue
+            name = item[3:] if len(item) >= 4 else ""
+            candidate = allowlisted_changed_path(name)
+            if candidate is not None:
+                names.append(candidate)
+        names = sorted(set(names))
+        state = "truncated" if len(names) > MAX_CHANGED_FILES else "complete"
+        return branch_value, names[:MAX_CHANGED_FILES], state
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return None, [], "missing"
+
+
+def relationship_context(
+    payload: dict[str, Any], key: bytes | None
+) -> dict[str, Any]:
+    task = next(
+        (
+            value
+            for field in ("task_id", "issue_id")
+            if (value := safe_string(payload.get(field))) is not None
+        ),
+        None,
+    )
+    task_source = "payload" if task is not None else None
+    if task is None:
+        for field in (
+            "FLIGHT_RECORDER_TASK_ID", "LINEAR_ISSUE_ID", "GITHUB_ISSUE"
+        ):
+            value = safe_string(os.environ.get(field))
+            if value is not None:
+                task, task_source = value, "env"
+                break
+    branch = safe_string(payload.get("branch_or_worktree"))
+    supplied_files = payload.get("changed_files")
+    files: list[str] | None = None
+    files_state = "missing"
+    if isinstance(supplied_files, list):
+        values = [
+            allowed
+            for item in supplied_files
+            if (allowed := allowlisted_changed_path(item)) is not None
+        ]
+        files = sorted(set(values))
+        files_state = (
+            "truncated" if len(files) > MAX_CHANGED_FILES else "complete"
+        )
+        files = files[:MAX_CHANGED_FILES]
+    if branch is None or files is None:
+        git_branch, git_files, git_state = _git_relationship_metadata(
+            payload.get("cwd")
+        )
+        if branch is None:
+            branch = git_branch
+        if files is None:
+            files, files_state = git_files, git_state
+    if task is None and branch is not None:
+        candidates = sorted(set(ISSUE_TOKEN_RE.findall(branch)))
+        if len(candidates) == 1:
+            task, task_source = candidates[0], "branch"
+    fingerprints = sorted(
+        fingerprint
+        for item in files
+        if (
+            fingerprint := hash_relationship_identifier(
+                item, key, "changed_file"
+            )
+        ) is not None
+    )
+    if key is None:
+        files_state = "missing"
+    task_hash = hash_relationship_identifier(task, key, "task")
+    return {
+        "task_id_hash": task_hash,
+        "task_source": task_source if task_hash is not None else None,
+        "branch_or_worktree_id": hash_relationship_identifier(
+            branch, key, "branch_or_worktree"
+        ),
+        "changed_file_fingerprints": fingerprints,
+        "changed_files_state": files_state,
+    }
 
 
 def metric_value(value: Any) -> int | float | None:
@@ -188,7 +427,7 @@ def normalize(
 ) -> dict[str, Any]:
     source = safe_string(payload.get("hook_event_name"))
     known_source = source if source in EVENT_KINDS else "unknown"
-    return {
+    event = {
         "schema_version": 1,
         "event_id": str(uuid.uuid4()),
         "recorded_at": recorded_at(),
@@ -204,6 +443,10 @@ def normalize(
         "metrics": metrics_from(payload),
         "outcome": None,
     }
+    # New writes are Event v2. Event v1 remains reader/chunk compatible.
+    event["schema_version"] = 2
+    event["relationship_context"] = relationship_context(payload, key)
+    return event
 
 
 def resolve_harness(requested: str) -> str:

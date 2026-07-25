@@ -43,9 +43,35 @@ run_cli() {
 
 record_event() {
   local state="$1" now="$2"
-  FLIGHT_RECORDER_STATE_DIR="$state" \
-    AGENT_FLIGHT_RECORDER_NOW="$now" \
-    "$RECORDER" --harness claude-code <"$FIXTURE" >/dev/null 2>&1
+  mkdir -p "$state/inbox"
+  python3 - "$state/inbox/events.jsonl" "$now" <<'PY'
+import json
+import pathlib
+import sys
+import uuid
+
+path, recorded_at = sys.argv[1:]
+event = {
+    "schema_version": 1,
+    "event_id": str(uuid.uuid5(uuid.NAMESPACE_URL, recorded_at)),
+    "recorded_at": recorded_at,
+    "harness": "claude-code",
+    "source_event": "Stop",
+    "event_kind": "turn.completed",
+    "session_id_hash": "sha256:" + "1" * 24,
+    "turn_id_hash": None,
+    "workspace_id": "sha256:" + "2" * 24,
+    "model": None,
+    "permission_mode": None,
+    "tool": None,
+    "metrics": None,
+    "outcome": None,
+}
+pathlib.Path(path).write_text(
+    json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+PY
 }
 
 init_remote() {
@@ -322,7 +348,7 @@ tables = {
     )
 }
 assert required_tables <= tables
-assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
 
 def columns(table):
     return {row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')}
@@ -336,7 +362,11 @@ assert {
     "event_id", "chunk_id", "ordinal", "schema_version", "recorded_at",
     "harness", "source_event", "event_kind", "session_id_hash",
     "turn_id_hash", "workspace_id", "model", "permission_mode", "tool",
-    "metrics_json", "outcome_json", "canonical_event_json",
+    "metrics_json", "outcome_json",
+    "relationship_task_id_hash", "relationship_task_source",
+    "relationship_branch_or_worktree_id",
+    "relationship_changed_file_fingerprints_json",
+    "relationship_changed_files_state", "canonical_event_json",
 } <= columns("source_events")
 assert {
     "chunk_id", "source_path", "git_blob_oid", "cache_path",
@@ -348,15 +378,27 @@ source_only = {
 }
 assert not (source_only & columns("derived_state"))
 
-metadata = [
-    str(value)
-    for row in connection.execute("SELECT * FROM schema_metadata")
-    for value in row
-]
-assert "source_of_truth" in metadata
-assert "encrypted_chunk_v1" in metadata
-assert "index_role" in metadata
-assert "derived_rebuildable" in metadata
+metadata = dict(connection.execute("SELECT key, value FROM schema_metadata"))
+assert metadata["event_schema_versions"] == "1,2"
+assert metadata["schema_version"] == "2"
+assert metadata["source_of_truth"] == "encrypted_chunk_v1_event_v1_v2"
+assert metadata["index_role"] == "derived_rebuildable"
+
+# This fixture was recorded as Event v1. SQLite v2 must preserve its existing
+# projection while representing absent v2 relationship context as SQL NULL,
+# rather than manufacturing a misleading "same missing value" signal.
+v1_projection = connection.execute(
+    """
+    SELECT schema_version,
+           relationship_task_id_hash,
+           relationship_task_source,
+           relationship_branch_or_worktree_id,
+           relationship_changed_file_fingerprints_json,
+           relationship_changed_files_state
+    FROM source_events
+    """
+).fetchone()
+assert v1_projection == (1, None, None, None, None, None)
 
 event_foreign_keys = list(
     connection.execute('PRAGMA foreign_key_list("source_events")')
@@ -369,9 +411,9 @@ assert any(row[2] == "source_chunks" and row[3] == "chunk_id" for row in provena
 assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 PY
   then
-    pass "SQLite v1はsource/derived境界・provenance・FKを明示する"
+    pass "SQLite v2はv1互換source・v2 context・derived境界・provenance・FKを明示する"
   else
-    fail "SQLite v1はsource/derived境界・provenance・FKを明示する"
+    fail "SQLite v2はv1互換source・v2 context・derived境界・provenance・FKを明示する"
   fi
 
   if python3 - "$db" <<'PY' 2>/dev/null

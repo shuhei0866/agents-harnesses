@@ -56,7 +56,7 @@ header = json.loads(lines[0])
 event = json.loads(lines[1])
 assert header["record_type"] == "chunk_header"
 assert header["schema_version"] == 1
-assert header["event_schema_version"] == 1
+assert header["event_schema_version"] == 2
 assert header["event_count"] == 1
 assert header["vault_id"] == config["vault_id"]
 assert header["device_id"] == config["devices"][0]["device_id"]
