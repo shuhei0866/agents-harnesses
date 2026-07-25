@@ -373,7 +373,8 @@ An attempt is durably reserved before invoking the adapter, so a process crash
 cannot automatically charge the same policy/model/evidence scope again.
 Automatic evaluator failures are recorded with a finite diagnostic and never
 change sync health, hook behavior, or CLI exit status. Re-running `configure`
-is the explicit reset for pending or failed reservations. A custom relationship
+is the explicit reset for pending or failed reservations; background health
+stays in an error state while either remains unresolved. A custom relationship
 policy must be selected with its owner-held file via `--policy`, rather than by
 an unauthenticated version string alone.
 

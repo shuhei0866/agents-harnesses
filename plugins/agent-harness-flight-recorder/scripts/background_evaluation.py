@@ -476,10 +476,18 @@ def _run_once(root: Path) -> dict[str, Any]:
         attempts.pop(attempt_fingerprint)
         with vault_lock(root):
             _store_attempts(root, attempts)
+    attempt_states = {item["state"] for item in attempts.values()}
+    diagnostic_code = (
+        "evaluator_failed"
+        if "failed" in attempt_states
+        else "attempt_pending"
+        if "pending" in attempt_states
+        else None
+    )
     status = {
         "schema_version": 1,
-        "state": "healthy",
-        "diagnostic_code": None,
+        "state": "error" if diagnostic_code is not None else "healthy",
+        "diagnostic_code": diagnostic_code,
         "attempt_count": len(attempts),
     }
     with vault_lock(root):

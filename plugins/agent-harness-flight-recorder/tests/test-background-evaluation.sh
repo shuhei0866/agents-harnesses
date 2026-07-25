@@ -219,14 +219,19 @@ PY
     run_cli auto-evaluation run --json \
       >"$output" 2>"$TEST_ROOT/failure-repeat.err" \
     && [[ "$(cat "$counter")" == "1" ]] \
-    && python3 - "$output" <<'PY'
+    && python3 - "$output" "$STATE" <<'PY'
 import json
 import pathlib
 import sys
 
 value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+status = json.loads(
+    (pathlib.Path(sys.argv[2]) / "auto-evaluation/status.json").read_text()
+)
 assert value["attempt_skip_count"] == 1
 assert value["evaluated_count"] == 0
+assert status["state"] == "error"
+assert status["diagnostic_code"] == "evaluator_failed"
 PY
   then
     pass "失敗した同一fingerprintをscheduler周期ごとに無制限再試行しない"
@@ -671,9 +676,14 @@ value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 ledger = json.loads(
     (pathlib.Path(sys.argv[2]) / "auto-evaluation/attempts.json").read_text()
 )
+status = json.loads(
+    (pathlib.Path(sys.argv[2]) / "auto-evaluation/status.json").read_text()
+)
 assert value["evaluated_count"] == 0
 assert value["attempt_skip_count"] == 1
 assert ledger["attempts"][0]["state"] == "pending"
+assert status["state"] == "error"
+assert status["diagnostic_code"] == "attempt_pending"
 PY
   then
     pass "provider応答前のprocess crash後も同一requestを再課金しない"
