@@ -70,6 +70,29 @@ reviews:
         - tools の指定が最小権限になっているか（read-only で足りる用途に書き込みを渡していないか）
         - system prompt が親の文脈に依存せず単体で成立しているか
 
+    # 上の shell 向け指示は *.sh と hooks 配下しか捉えられないが、
+    # このリポジトリには拡張子を持たない shell の実行ファイルがある
+    # （plugins/agent-harness-flight-recorder/scripts/record-event と flight-recorder は
+    # どちらも #!/bin/sh で、hooks.json から自動実行される）。
+    # 取りこぼしを防ぐため、次の 2 つだけはリポジトリ全体に掛ける。
+    - path: '**'
+      instructions: |
+        ファイルの拡張子や置き場所によらず、次の 2 つは必ず指摘する。
+        対象は shell・Python・JSON 設定を問わず、実行される全てのコードとする。
+
+        1. secret のログ出力
+           token・API キー・パスワード・環境変数の値を、標準出力・標準エラー・
+           ログファイル・transcript にマスクせず書き出している場合。
+           エラーハンドラーが URL の query や環境変数を丸ごと出す経路、
+           認証情報を含むリクエストに対する curl -v や set -x の有効化も対象。
+           先頭数文字のみ残すなどのマスクを経ていれば指摘しない。
+
+        2. 確認なしの破壊的操作
+           rm -rf / git worktree remove / git branch -D / git reset --hard /
+           git push --force を、ユーザー確認も dry-run も経ずに実行している場合。
+           対象パスが変数で、その変数が空になりうる経路があるときは特に重く扱う。
+           確認手順・dry-run オプション・明示的な force フラグで守られていれば指摘しない。
+
   # このリポジトリは public なので、CodeRabbit の Pro プランが無期限で無料になる。
   # ただし custom_checks・fix_ci・resolve_merge_conflict は Pro+ 限定なので動かない。
   # secret のログ出力と確認なしの破壊的操作は、上の path_instructions に畳んである。
