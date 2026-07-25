@@ -695,7 +695,20 @@ def status(root: Path) -> dict[str, Any]:
             ),
         }
     except VaultError:
-        components["sync"] = {"state": "invalid", "pending": None}
+        components["sync"] = {
+            "state": "invalid",
+            "pending": None,
+            "pending_phase": None,
+            "attempt_count": None,
+            "pending_chunk_count": None,
+            "imported_chunk_count": None,
+            "last_success_at": None,
+            "failure_class": None,
+            "diagnostic_code": None,
+            "next_action_code": None,
+            "next_retry_at": None,
+            "consecutive_failure_count": None,
+        }
 
     index_path = root / DATABASE_PATH
     if index_path.is_symlink():

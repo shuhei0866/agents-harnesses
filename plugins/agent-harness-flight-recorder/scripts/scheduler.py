@@ -14,6 +14,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +24,7 @@ from chunk_rotation import (
     local_device,
     safe_subdirectory,
 )
-from sync import load_pending, sync
+from sync import sync
 from vault import (
     VaultError,
     ensure_managed_gitignore,
@@ -45,6 +46,8 @@ HEALTHY_INTERVAL_SECONDS = 86400
 RETRY_BASE_SECONDS = 300
 RETRY_CAP_SECONDS = 86400
 MAX_FAILURE_COUNT = 1_000_000
+MANUAL_LOCK_TIMEOUT_SECONDS = 5
+LOCK_RETRY_INTERVAL_SECONDS = 0.05
 FAILURE_CLASSES = {"transient", "permanent"}
 DIAGNOSTIC_CODES = {
     "remote_unavailable",
@@ -959,7 +962,9 @@ def _load_state(root: Path) -> dict[str, Any] | None:
         category = value.get("last_error_category")
         if category not in (None, "remote", "rebase", "integrity", "sync"):
             raise VaultError("scheduler state is invalid")
-        transient = category in ("remote", "rebase")
+        # "sync" was the pre-classification generic category. It is not local
+        # proof, so retry once and derive the current classification.
+        transient = category in ("remote", "rebase", "sync")
         return {
             "schema_version": 2,
             "last_attempt_at": value.get("last_attempt_at"),
@@ -1016,7 +1021,7 @@ def _load_state(root: Path) -> dict[str, Any] | None:
         isinstance(count, bool)
         or not isinstance(count, int)
         or count < 0
-        or count > MAX_FAILURE_COUNT
+        or count >= MAX_FAILURE_COUNT
     ):
         raise VaultError("scheduler state is invalid")
     failure_class = value.get("failure_class")
@@ -1093,16 +1098,20 @@ def _run_lock(root: Path, *, blocking: bool) -> Any:
             or metadata.st_mode & 0o077
         ):
             raise VaultError("scheduler run lock is unsafe")
-        try:
-            operation = fcntl.LOCK_EX
-            if not blocking:
-                operation |= fcntl.LOCK_NB
-            fcntl.flock(descriptor, operation)
-        except BlockingIOError:
-            yield False
-            return
-        except OSError as error:
-            raise VaultError("scheduler run lock is unavailable") from error
+        deadline = time.monotonic() + MANUAL_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if not blocking:
+                    yield False
+                    return
+                if time.monotonic() >= deadline:
+                    raise VaultError("synchronization is already running")
+                time.sleep(LOCK_RETRY_INTERVAL_SECONDS)
+            except OSError as error:
+                raise VaultError("scheduler run lock is unavailable") from error
         yield True
     finally:
         os.close(descriptor)
@@ -1115,11 +1124,6 @@ def _failure_state(
     now: dt.datetime,
     error: VaultError,
 ) -> dict[str, Any]:
-    try:
-        pending = load_pending(root)
-    except VaultError:
-        pending = None
-    pending_category = pending.get("last_error_category") if pending else None
     failure_class = getattr(error, "failure_class", None)
     diagnostic_code = getattr(error, "diagnostic_code", None)
     next_action_code = getattr(error, "next_action_code", None)
@@ -1128,14 +1132,12 @@ def _failure_state(
         or diagnostic_code not in DIAGNOSTIC_CODES
         or next_action_code not in NEXT_ACTION_CODES
     ):
-        if pending_category in ("remote", "rebase"):
-            failure_class = "transient"
-            diagnostic_code = "remote_unavailable"
-            next_action_code = "retry_automatically"
-        else:
-            failure_class = "permanent"
-            diagnostic_code = "local_integrity_invalid"
-            next_action_code = "repair_configuration"
+        # Current remote operations are wrapped in SyncFailure by sync.py.
+        # An unclassified error therefore has no current proof of transience;
+        # never let a stale pending marker override the current failure.
+        failure_class = "permanent"
+        diagnostic_code = "local_integrity_invalid"
+        next_action_code = "repair_configuration"
     return _state_after_failure(
         previous,
         now=now,

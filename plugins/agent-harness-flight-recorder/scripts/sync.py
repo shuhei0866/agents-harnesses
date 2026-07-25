@@ -337,15 +337,18 @@ def pull_rebase(root: Path) -> None:
     if remote_has_main(root):
         try:
             git(root, ["pull", "--rebase", "-q", "origin", "main"])
-        except VaultError:
+        except VaultError as error:
             git_dir = root / ".git"
             conflict = (git_dir / "rebase-merge").exists() or (
                 git_dir / "rebase-apply"
             ).exists()
             if conflict:
-                git(root, ["rebase", "--abort"])
-                raise permanent_sync_failure("rebase_conflict")
-            raise transient_remote_failure()
+                try:
+                    git(root, ["rebase", "--abort"])
+                except VaultError:
+                    pass
+                raise permanent_sync_failure("rebase_conflict") from error
+            raise transient_remote_failure() from error
 
 
 def verify_after_pull(root: Path, expected_remote: str) -> dict[str, object]:

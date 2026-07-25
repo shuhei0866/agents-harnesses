@@ -184,11 +184,12 @@ test_v1_migration_and_tamper_validation() {
   chmod 600 "$root/scheduler/state.json"
   if python3 - "$SCRIPTS" "$root" <<'PY' 2>/dev/null
 import json
+import datetime as dt
 import pathlib
 import sys
 
 sys.path.insert(0, sys.argv[1])
-from scheduler import VaultError, _load_state, _write_state
+from scheduler import VaultError, _load_state, _scheduler_due, _write_state
 
 root = pathlib.Path(sys.argv[2])
 path = root / "scheduler/state.json"
@@ -201,6 +202,20 @@ assert state["diagnostic_code"] == "remote_unavailable"
 assert state["next_retry_at"] is None
 _write_state(root, state)
 assert json.loads(path.read_text())["schema_version"] == 2
+
+path.write_text(json.dumps({
+    "schema_version": 1,
+    "last_attempt_at": "2026-07-24T00:00:00Z",
+    "last_success_at": None,
+    "last_error_category": "sync",
+}))
+state = _load_state(root)
+assert state["failure_class"] == "transient"
+assert state["diagnostic_code"] == "remote_unavailable"
+assert state["next_action_code"] == "retry_automatically"
+assert _scheduler_due(
+    state, dt.datetime(2026, 7, 25, tzinfo=dt.timezone.utc)
+) is True
 
 bad = dict(state)
 bad["unknown"] = "field"
@@ -219,11 +234,106 @@ PY
   fi
 }
 
+test_current_failure_ignores_stale_pending() {
+  echo "test_current_failure_ignores_stale_pending:"
+  local root="$TEST_ROOT/stale-pending"
+  mkdir -m 700 -p "$root/queue"
+  printf '%s\n' \
+    '{"last_error_category":"remote","schema_version":1}' \
+    >"$root/queue/pending-sync.json"
+  if python3 - "$SCRIPTS" "$root" <<'PY' 2>/dev/null
+import datetime as dt
+import pathlib
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from scheduler import VaultError, _failure_state
+
+root = pathlib.Path(sys.argv[2])
+state = _failure_state(
+    root,
+    None,
+    now=dt.datetime(2026, 7, 25, tzinfo=dt.timezone.utc),
+    error=VaultError("current local failure"),
+)
+assert state["failure_class"] == "permanent"
+assert state["diagnostic_code"] == "local_integrity_invalid"
+assert state["next_action_code"] == "repair_configuration"
+assert state["next_retry_at"] is None
+PY
+  then
+    pass "現在のlocal failureを古いremote pendingでtransientへ誤分類しない"
+  else
+    fail "現在のlocal failureを古いremote pendingでtransientへ誤分類しない"
+  fi
+}
+
+test_conflict_and_lock_failure_boundaries() {
+  echo "test_conflict_and_lock_failure_boundaries:"
+  local root="$TEST_ROOT/failure-boundaries"
+  mkdir -m 700 -p "$root/scheduler" "$root/.git/rebase-merge"
+  if python3 - "$SCRIPTS" "$root" <<'PY' 2>/dev/null
+import pathlib
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import scheduler
+import sync
+
+root = pathlib.Path(sys.argv[2])
+
+original_remote_has_main = sync.remote_has_main
+original_git = sync.git
+sync.remote_has_main = lambda _root: True
+sync.git = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+    sync.VaultError("git failed")
+)
+try:
+    try:
+        sync.pull_rebase(root)
+    except sync.SyncFailure as error:
+        assert error.failure_class == "permanent"
+        assert error.diagnostic_code == "rebase_conflict"
+    else:
+        raise AssertionError("rebase conflict must remain permanent")
+finally:
+    sync.remote_has_main = original_remote_has_main
+    sync.git = original_git
+
+original_flock = scheduler.fcntl.flock
+original_monotonic = scheduler.time.monotonic
+original_sleep = scheduler.time.sleep
+ticks = iter((0.0, 6.0))
+scheduler.fcntl.flock = lambda *_args: (_ for _ in ()).throw(BlockingIOError())
+scheduler.time.monotonic = lambda: next(ticks)
+scheduler.time.sleep = lambda _seconds: None
+try:
+    try:
+        with scheduler._run_lock(root, blocking=True):
+            raise AssertionError("busy lock must not be acquired")
+    except scheduler.VaultError as error:
+        assert "already running" in str(error)
+    else:
+        raise AssertionError("manual lock wait must be bounded")
+finally:
+    scheduler.fcntl.flock = original_flock
+    scheduler.time.monotonic = original_monotonic
+    scheduler.time.sleep = original_sleep
+PY
+  then
+    pass "abort失敗でもconflictをpermanentに保ちmanual lock待機をboundedにする"
+  else
+    fail "abort失敗でもconflictをpermanentに保ちmanual lock待機をboundedにする"
+  fi
+}
+
 echo "=== Flight Recorder Durable Retry Policy Tests ==="
 test_bounded_deterministic_backoff
 test_retry_state_survives_process_restart
 test_failure_and_success_transitions
 test_v1_migration_and_tamper_validation
+test_current_failure_ignores_stale_pending
+test_conflict_and_lock_failure_boundaries
 echo
 echo "Results: $PASS passed, $FAIL failed"
 [[ "$FAIL" -eq 0 ]]

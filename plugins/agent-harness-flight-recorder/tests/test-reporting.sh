@@ -277,6 +277,25 @@ import sys
 
 value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 assert value["sync"]["state"] == "invalid"
+assert set(value["sync"]) == {
+    "state",
+    "pending",
+    "pending_phase",
+    "attempt_count",
+    "pending_chunk_count",
+    "imported_chunk_count",
+    "last_success_at",
+    "failure_class",
+    "diagnostic_code",
+    "next_action_code",
+    "next_retry_at",
+    "consecutive_failure_count",
+}
+assert all(
+    item is None
+    for key, item in value["sync"].items()
+    if key != "state"
+)
 assert value["queue"]["state"] == "invalid"
 PY
   then

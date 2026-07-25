@@ -37,7 +37,8 @@ Accepted decisions remain recorded when later superseded.
 
 - Status: accepted
 - Decision: validate synchronization through an explicit command in R1, then
-  move quickly to daily OS scheduling with a durable retry queue in R1.1.
+  move quickly to a five-minute OS wake policy with a durable retry queue in
+  R1.1; healthy synchronization remains limited to once per 24 hours.
 - Reason: invisible operation is a core product property, but Git, encryption,
   and recovery semantics need an observable bootstrap path first.
 - Consequence: background failures never block a harness and surface only in
