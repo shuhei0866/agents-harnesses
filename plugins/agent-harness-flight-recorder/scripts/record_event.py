@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 import selectors
+import shlex
 import stat
 import subprocess
 import sys
@@ -41,7 +42,17 @@ METRIC_NAMES = (
     "cache_creation_input_tokens",
     "cache_read_input_tokens",
     "total_cost_usd",
+    "retry_count",
 )
+
+OPERATION_KINDS = {
+    "test",
+    "build",
+    "lint",
+    "git_commit",
+    "pull_request",
+}
+SHELL_TOOLS = {"bash", "shell"}
 
 
 def safe_string(value: Any) -> str | None:
@@ -310,10 +321,142 @@ def metrics_from(payload: dict[str, Any]) -> dict[str, int | float] | None:
     for name in METRIC_NAMES:
         for source in sources:
             value = metric_value(source.get(name))
+            if name == "retry_count" and not isinstance(value, int):
+                value = None
             if value is not None:
                 metrics[name] = value
                 break
     return metrics or None
+
+
+def _command_operation(command: object) -> str | None:
+    text = safe_string(command)
+    if text is None or any(character in text for character in "\r\n;&|"):
+        return None
+    try:
+        tokens = shlex.split(text, posix=True)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    executable = os.path.basename(tokens[0]).lower()
+    raw_arguments = tokens[1:]
+    arguments = [token.lower() for token in raw_arguments]
+    command_tokens = [executable, *arguments]
+    if any(token in {"--help", "-h", "--version", "-V"} for token in raw_arguments):
+        return None
+
+    if command_tokens[:2] == ["git", "commit"] and "--dry-run" not in arguments:
+        return "git_commit"
+    if (
+        command_tokens[:3] == ["gh", "pr", "create"]
+        and "--dry-run" not in arguments
+    ):
+        return "pull_request"
+    if executable in {"pytest", "py.test"}:
+        return "test"
+    if command_tokens[:3] in (
+        ["python", "-m", "pytest"],
+        ["python3", "-m", "pytest"],
+        ["uv", "run", "pytest"],
+    ):
+        return "test"
+    if command_tokens[:2] in (
+        ["cargo", "test"],
+        ["go", "test"],
+        ["make", "test"],
+        ["npm", "test"],
+        ["pnpm", "test"],
+        ["yarn", "test"],
+        ["bun", "test"],
+    ) or command_tokens[:3] in (
+        ["npm", "run", "test"],
+        ["pnpm", "run", "test"],
+        ["yarn", "run", "test"],
+    ):
+        return "test"
+    if command_tokens[:2] in (
+        ["cargo", "build"],
+        ["go", "build"],
+        ["make", "build"],
+        ["npm", "build"],
+        ["pnpm", "build"],
+        ["yarn", "build"],
+        ["bun", "build"],
+    ) or command_tokens[:3] in (
+        ["npm", "run", "build"],
+        ["pnpm", "run", "build"],
+        ["yarn", "run", "build"],
+    ):
+        return "build"
+    if executable in {"ruff", "eslint"}:
+        return "lint"
+    if command_tokens[:2] in (
+        ["cargo", "clippy"],
+        ["make", "lint"],
+        ["npm", "lint"],
+        ["pnpm", "lint"],
+        ["yarn", "lint"],
+        ["biome", "check"],
+        ["biome", "lint"],
+    ) or command_tokens[:3] in (
+        ["npm", "run", "lint"],
+        ["pnpm", "run", "lint"],
+        ["yarn", "run", "lint"],
+    ):
+        return "lint"
+    return None
+
+
+def operation_from(payload: dict[str, Any]) -> str | None:
+    if payload.get("hook_event_name") != "PostToolUse":
+        return None
+    tool = safe_string(payload.get("tool_name"))
+    normalized = tool.lower() if tool is not None else ""
+    if normalized.endswith("create_pull_request"):
+        return "pull_request"
+    if normalized not in SHELL_TOOLS:
+        return None
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return None
+    operation = _command_operation(tool_input.get("command"))
+    return operation if operation in OPERATION_KINDS else None
+
+
+def outcome_from(payload: dict[str, Any]) -> dict[str, object] | None:
+    if payload.get("hook_event_name") != "PostToolUse":
+        return None
+    response = payload.get("tool_response")
+    sources = (response, payload) if isinstance(response, dict) else (payload,)
+    exit_code = None
+    succeeded = None
+    for source in sources:
+        candidate = source.get("exit_code")
+        if (
+            exit_code is None
+            and isinstance(candidate, int)
+            and not isinstance(candidate, bool)
+            and 0 <= candidate <= 255
+        ):
+            exit_code = candidate
+        success = source.get("success")
+        if succeeded is None and isinstance(success, bool):
+            succeeded = success
+    if exit_code is None and succeeded is None:
+        return None
+    inferred = None if exit_code is None else exit_code == 0
+    status = (
+        "unknown"
+        if inferred is not None and succeeded is not None and inferred != succeeded
+        else "success"
+        if (succeeded if succeeded is not None else inferred)
+        else "failure"
+    )
+    outcome: dict[str, object] = {"status": status}
+    if exit_code is not None:
+        outcome["exit_code"] = exit_code
+    return outcome
 
 
 def recorded_at() -> str:
@@ -428,7 +571,8 @@ def normalize(
     source = safe_string(payload.get("hook_event_name"))
     known_source = source if source in EVENT_KINDS else "unknown"
     event = {
-        "schema_version": 1,
+        # New writes are Event v3. Event v1/v2 remain reader/chunk compatible.
+        "schema_version": 3,
         "event_id": str(uuid.uuid4()),
         "recorded_at": recorded_at(),
         "harness": harness,
@@ -441,11 +585,10 @@ def normalize(
         "permission_mode": safe_string(payload.get("permission_mode")),
         "tool": safe_string(payload.get("tool_name")),
         "metrics": metrics_from(payload),
-        "outcome": None,
+        "outcome": outcome_from(payload),
     }
-    # New writes are Event v2. Event v1 remains reader/chunk compatible.
-    event["schema_version"] = 2
     event["relationship_context"] = relationship_context(payload, key)
+    event["operation_kind"] = operation_from(payload)
     return event
 
 

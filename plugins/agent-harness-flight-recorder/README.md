@@ -34,6 +34,9 @@ Stored:
 - harness and lifecycle event names
 - model, permission mode, and tool name when present
 - a fixed allowlist of numeric duration, token, and cost metrics
+- a finite `test`, `build`, `lint`, `git_commit`, or `pull_request`
+  classification and allowlisted exit status when a completed tool invocation
+  can be classified without retaining its command
 - random event ID and timestamp
 - truncated HMAC-SHA-256 identifiers for session, turn, and workspace correlation
 - domain-separated HMAC identifiers for tasks, branches/worktrees, and up to
@@ -231,8 +234,10 @@ foreign keys and SQLite integrity, then atomically publishes
 `index/vault.sqlite`. A corrupt or unsupported existing database is replaced
 only after the new index is complete. Full rebuild restores the bundled
 `default-v1` relationship view; custom views are derived local state and must
-be reapplied from their owner-held policy files. To add only unseen chunks to
-a current schema-v2 database, use:
+be reapplied from their owner-held policy files. Schema v3 also rebuilds
+stable deterministic evidence IDs with their source event, collector version,
+and collection timestamp. To add only unseen chunks to a current schema-v3
+database, use:
 
 ```bash
 scripts/flight-recorder rebuild-index --incremental
@@ -248,8 +253,9 @@ state, has user-only permissions, and remains outside the Git sync allowlist.
 
 Event v2 adds privacy-safe relationship context: domain-separated HMACs for
 explicit tasks and branches/worktrees plus a bounded set of changed-file
-fingerprints. Raw identifiers and paths are discarded. Mixed Event v1/v2
-inboxes are rotated into homogeneous Chunk v1 files.
+fingerprints. Event v3 adds only a finite operation classification and safe
+outcome; raw commands, outputs, diffs, and artifacts remain discarded. Mixed
+Event v1/v2/v3 inboxes are rotated into homogeneous Chunk v1 files.
 
 Recompute one versioned relationship view without changing source evidence:
 
@@ -279,11 +285,16 @@ also supplies the version; selecting a custom version stored only in the
 derived database is rejected.
 
 Before displaying a card, the CLI reauthenticates the receipt/cache projection
-against the SQLite source rows and deterministically rederives the requested
-relationship view. An internally consistent but forged local database is
-rejected. Timestamp span (`elapsed_ms`) remains separate from recorded duration
-metrics. Missing task type, retry count, model, metric, cost, or outcome evidence
-stays `null`, `missing`, or `partial`; it is never silently converted to zero,
+against the SQLite source rows and deterministically rederives both the
+requested relationship view and deterministic evidence rows. An internally
+consistent but forged local database is rejected. Each deterministic fact
+exposes a stable evidence ID, source event ID, collector version, timestamp,
+state, and bounded value. A recognized operation with no trustworthy result is
+`missing`, which remains distinct from an observed `failure`.
+
+Timestamp span (`elapsed_ms`) remains separate from recorded duration metrics.
+Missing task type, retry count, model, metric, cost, or outcome evidence stays
+`null`, `missing`, or `partial`; it is never silently converted to zero,
 success, or a guessed label. Numeric metric values are labeled as the sum of
 recorded values and include coverage counts. Confidence is the minimum
 supporting relationship score and policy threshold, not an invented percentage.
@@ -338,6 +349,7 @@ bash plugins/agent-harness-flight-recorder/tests/test-chunk-rotation-age-e2e.sh
 bash plugins/agent-harness-flight-recorder/tests/test-git-sync.sh
 bash plugins/agent-harness-flight-recorder/tests/test-git-sync-age-e2e.sh
 bash plugins/agent-harness-flight-recorder/tests/test-evidence-index.sh
+bash plugins/agent-harness-flight-recorder/tests/test-deterministic-evidence.sh
 bash plugins/agent-harness-flight-recorder/tests/test-relationship-graph.sh
 bash plugins/agent-harness-flight-recorder/tests/test-reporting.sh
 bash plugins/agent-harness-flight-recorder/tests/test-retention.sh
@@ -350,5 +362,5 @@ fail-open behavior, optional fields, shared auto-detection, and 50 concurrent
 writers. Reporting tests also cover human/JSON parity, policy scope, unknown
 values, sync health, and forged source/relationship projections. The stable
 source contracts are in `schema/event-v1.schema.json`,
-`schema/event-v2.schema.json`, `schema/vault-v1.schema.json`, and
-`schema/chunk-v1.schema.json`.
+`schema/event-v2.schema.json`, `schema/event-v3.schema.json`,
+`schema/vault-v1.schema.json`, and `schema/chunk-v1.schema.json`.

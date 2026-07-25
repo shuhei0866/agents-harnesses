@@ -106,6 +106,7 @@ tables = (
     "source_chunks",
     "source_events",
     "import_provenance",
+    "deterministic_evidence",
     "derived_state",
 )
 connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
@@ -348,7 +349,7 @@ tables = {
     )
 }
 assert required_tables <= tables
-assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
 
 def columns(table):
     return {row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')}
@@ -362,7 +363,7 @@ assert {
     "event_id", "chunk_id", "ordinal", "schema_version", "recorded_at",
     "harness", "source_event", "event_kind", "session_id_hash",
     "turn_id_hash", "workspace_id", "model", "permission_mode", "tool",
-    "metrics_json", "outcome_json",
+    "metrics_json", "outcome_json", "operation_kind",
     "relationship_task_id_hash", "relationship_task_source",
     "relationship_branch_or_worktree_id",
     "relationship_changed_file_fingerprints_json",
@@ -372,6 +373,10 @@ assert {
     "chunk_id", "source_path", "git_blob_oid", "cache_path",
     "receipt_schema_version", "index_schema_version",
 } <= columns("import_provenance")
+assert {
+    "evidence_id", "source_event_id", "collector_version", "collected_at",
+    "evidence_type", "state", "value_json",
+} <= columns("deterministic_evidence")
 source_only = {
     "canonical_event_json", "canonical_plaintext_sha256", "git_blob_oid",
     "source_path", "cache_path",
@@ -379,13 +384,13 @@ source_only = {
 assert not (source_only & columns("derived_state"))
 
 metadata = dict(connection.execute("SELECT key, value FROM schema_metadata"))
-assert metadata["event_schema_versions"] == "1,2"
-assert metadata["schema_version"] == "2"
-assert metadata["source_of_truth"] == "encrypted_chunk_v1_event_v1_v2"
+assert metadata["event_schema_versions"] == "1,2,3"
+assert metadata["schema_version"] == "3"
+assert metadata["source_of_truth"] == "encrypted_chunk_v1_event_v1_v2_v3"
 assert metadata["index_role"] == "derived_rebuildable"
 
-# This fixture was recorded as Event v1. SQLite v2 must preserve its existing
-# projection while representing absent v2 relationship context as SQL NULL,
+# This fixture was recorded as Event v1. SQLite v3 must preserve its existing
+# projection while representing absent newer context as SQL NULL,
 # rather than manufacturing a misleading "same missing value" signal.
 v1_projection = connection.execute(
     """
@@ -411,9 +416,9 @@ assert any(row[2] == "source_chunks" and row[3] == "chunk_id" for row in provena
 assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 PY
   then
-    pass "SQLite v2はv1互換source・v2 context・derived境界・provenance・FKを明示する"
+    pass "SQLite v3は旧Event互換・derived境界・provenance・FKを明示する"
   else
-    fail "SQLite v2はv1互換source・v2 context・derived境界・provenance・FKを明示する"
+    fail "SQLite v3は旧Event互換・derived境界・provenance・FKを明示する"
   fi
 
   if python3 - "$db" <<'PY' 2>/dev/null

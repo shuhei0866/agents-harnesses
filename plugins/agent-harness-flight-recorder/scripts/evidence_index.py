@@ -33,7 +33,20 @@ from vault import (
 
 
 DATABASE_PATH = Path("index/vault.sqlite")
-INDEX_VERSION = 2
+INDEX_VERSION = 3
+DETERMINISTIC_COLLECTOR_VERSION = "deterministic-v1"
+DETERMINISTIC_METRICS = (
+    "duration_ms",
+    "duration_api_ms",
+    "tool_duration_ms",
+    "num_turns",
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "total_cost_usd",
+    "retry_count",
+)
 SCHEMA = """
 CREATE TABLE schema_metadata (
     key TEXT PRIMARY KEY NOT NULL,
@@ -67,6 +80,11 @@ CREATE TABLE source_events (
     tool TEXT,
     metrics_json TEXT,
     outcome_json TEXT,
+    operation_kind TEXT CHECK (
+        operation_kind IS NULL OR operation_kind IN (
+            'test', 'build', 'lint', 'git_commit', 'pull_request'
+        )
+    ),
     relationship_task_id_hash TEXT,
     relationship_task_source TEXT,
     relationship_branch_or_worktree_id TEXT,
@@ -85,6 +103,20 @@ CREATE TABLE import_provenance (
     receipt_schema_version INTEGER NOT NULL,
     index_schema_version INTEGER NOT NULL,
     FOREIGN KEY (chunk_id) REFERENCES source_chunks(chunk_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+) WITHOUT ROWID;
+CREATE TABLE deterministic_evidence (
+    evidence_id TEXT PRIMARY KEY NOT NULL,
+    source_event_id TEXT NOT NULL,
+    collector_version TEXT NOT NULL,
+    collected_at TEXT NOT NULL,
+    evidence_type TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (
+        state IN ('present', 'success', 'failure', 'unknown', 'missing')
+    ),
+    value_json TEXT,
+    UNIQUE (source_event_id, collector_version, evidence_type),
+    FOREIGN KEY (source_event_id) REFERENCES source_events(event_id)
         ON UPDATE RESTRICT ON DELETE RESTRICT
 ) WITHOUT ROWID;
 CREATE TABLE derived_state (
@@ -150,12 +182,14 @@ CREATE INDEX source_events_by_session_time
     ON source_events(session_id_hash, recorded_at);
 CREATE INDEX source_events_by_workspace_time
     ON source_events(workspace_id, recorded_at);
+CREATE INDEX deterministic_evidence_by_source
+    ON deterministic_evidence(source_event_id, evidence_type);
 """
 METADATA = (
-    ("event_schema_versions", "1,2"),
+    ("event_schema_versions", "1,2,3"),
     ("index_role", "derived_rebuildable"),
-    ("schema_version", "2"),
-    ("source_of_truth", "encrypted_chunk_v1_event_v1_v2"),
+    ("schema_version", "3"),
+    ("source_of_truth", "encrypted_chunk_v1_event_v1_v2_v3"),
 )
 
 
@@ -355,6 +389,7 @@ def load_chunks(root: Path) -> list[Chunk]:
                     event["tool"],
                     _json_text(event["metrics"]),
                     _json_text(event["outcome"]),
+                    event.get("operation_kind"),
                     *relationship,
                     canonical_json(event).decode("utf-8"),
                 )
@@ -428,13 +463,111 @@ def insert_chunk(connection: sqlite3.Connection, chunk: Chunk) -> None:
     )
     connection.executemany(
         "INSERT INTO source_events VALUES "
-        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         chunk.event_rows,
     )
     connection.execute(
         "INSERT INTO import_provenance VALUES (?, ?, ?, ?, ?, ?)",
         chunk.provenance_row,
     )
+
+
+def _deterministic_evidence_rows(
+    connection: sqlite3.Connection,
+) -> list[tuple[str, str, str, str, str, str, str | None]]:
+    rows: list[tuple[str, str, str, str, str, str, str | None]] = []
+    for (
+        event_id,
+        recorded_at,
+        metrics_json,
+        outcome_json,
+        operation_kind,
+    ) in connection.execute(
+        """
+        SELECT event_id, recorded_at, metrics_json, outcome_json,
+               operation_kind
+        FROM source_events
+        ORDER BY event_id
+        """
+    ):
+        try:
+            metrics = (
+                json.loads(metrics_json) if metrics_json is not None else {}
+            )
+            outcome = (
+                json.loads(outcome_json) if outcome_json is not None else None
+            )
+        except (TypeError, json.JSONDecodeError) as error:
+            raise VaultError("deterministic evidence source is invalid") from error
+        facts: list[tuple[str, str, dict[str, Any] | None]] = []
+        if operation_kind is not None:
+            state = (
+                outcome.get("status")
+                if isinstance(outcome, dict)
+                and outcome.get("status")
+                in ("success", "failure", "unknown")
+                else "missing"
+            )
+            operation_value = (
+                {"exit_code": outcome["exit_code"]}
+                if isinstance(outcome, dict) and "exit_code" in outcome
+                else None
+            )
+            facts.append((operation_kind, state, operation_value))
+        if isinstance(outcome, dict) and "exit_code" in outcome:
+            facts.append(
+                (
+                    "exit_status",
+                    "present",
+                    {"exit_code": outcome["exit_code"]},
+                )
+            )
+        if not isinstance(metrics, dict):
+            raise VaultError("deterministic evidence source is invalid")
+        for metric in DETERMINISTIC_METRICS:
+            if metric in metrics:
+                facts.append((metric, "present", {"value": metrics[metric]}))
+        for evidence_type, state, value in facts:
+            value_json = (
+                canonical_json(value).decode("utf-8")
+                if value is not None
+                else None
+            )
+            identity = canonical_json(
+                {
+                    "collector_version": DETERMINISTIC_COLLECTOR_VERSION,
+                    "collected_at": recorded_at,
+                    "evidence_type": evidence_type,
+                    "source_event_id": event_id,
+                    "state": state,
+                    "value": value,
+                }
+            )
+            evidence_id = f"sha256:{hashlib.sha256(identity).hexdigest()}"
+            rows.append(
+                (
+                    evidence_id,
+                    event_id,
+                    DETERMINISTIC_COLLECTOR_VERSION,
+                    recorded_at,
+                    evidence_type,
+                    state,
+                    value_json,
+                )
+            )
+    return sorted(rows)
+
+
+def rebuild_deterministic_evidence(
+    connection: sqlite3.Connection,
+) -> int:
+    rows = _deterministic_evidence_rows(connection)
+    connection.execute("DELETE FROM deterministic_evidence")
+    connection.executemany(
+        "INSERT INTO deterministic_evidence VALUES (?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    return len(rows)
 
 
 def validate_database(connection: sqlite3.Connection) -> None:
@@ -687,6 +820,7 @@ def rebuild_full(root: Path, chunks: list[Chunk]) -> tuple[int, int]:
         connection.execute("BEGIN IMMEDIATE")
         for chunk in chunks:
             insert_chunk(connection, chunk)
+        rebuild_deterministic_evidence(connection)
         from relationship_graph import DEFAULT_POLICY, rebuild_relationships
 
         rebuild_relationships(connection, DEFAULT_POLICY)
@@ -738,6 +872,7 @@ def rebuild_incremental(root: Path, chunks: list[Chunk]) -> tuple[int, int]:
             added_events += len(chunk.event_rows)
         validate_database(connection)
         validate_source_projection(connection, chunks, exact=True)
+        rebuild_deterministic_evidence(connection)
         policies = load_stored_policies(connection)
         for policy in policies:
             rebuild_relationships(connection, policy)

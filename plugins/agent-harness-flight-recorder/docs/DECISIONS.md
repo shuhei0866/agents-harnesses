@@ -216,3 +216,18 @@ Accepted decisions remain recorded when later superseded.
 - Consequence: `report` and `inspect` fail closed on source or graph drift;
   missing and partial evidence stays explicit, while `status` remains a
   network-free local health snapshot rather than proof of remote freshness.
+
+## D-20260725-19: Classify deterministic facts before discarding tool content
+
+- Status: accepted
+- Decision: add Event v3 with only a finite operation kind and bounded tool
+  outcome, then rebuild SQLite v3 deterministic evidence rows from canonical
+  events. Derive each evidence ID from its collector version, source event,
+  timestamp, type, state, and bounded value.
+- Reason: test, build, lint, commit, pull-request, retry, duration, token, and
+  cost signals are valuable before model evaluation, but retaining commands,
+  output, diffs, or artifact bodies would violate the default privacy boundary.
+- Consequence: only simple allowlisted invocations are classified. A recognized
+  operation without a trustworthy outcome remains `missing`, distinct from
+  `failure`. Card reads rederive and authenticate evidence rows, and an older
+  local SQLite schema requires a full rebuild from the immutable chunks.
