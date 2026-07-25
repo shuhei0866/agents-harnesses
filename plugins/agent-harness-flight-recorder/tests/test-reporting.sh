@@ -220,6 +220,27 @@ PY
   fi
   rm "$STATE/queue/pending-sync.json"
 
+  printf '%s\n' '{"detached":"fixture"}' \
+    >"$STATE/queue/00000000-0000-4000-8000-000000000001.jsonl.pending"
+  if run_cli status --json >"$json_output" 2>"$TEST_ROOT/status-rotation.err" \
+    && python3 - "$json_output" <<'PY'
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert value["queue"]["state"] == "pending"
+assert value["queue"]["pending_count"] == 1
+assert value["queue"]["rotation_job_count"] == 1
+assert value["overall"] == "attention"
+PY
+  then
+    pass "statusはdetached rotation retry jobをpendingとして数える"
+  else
+    fail "statusはdetached rotation retry jobをpendingとして数える"
+  fi
+  rm "$STATE/queue/00000000-0000-4000-8000-000000000001.jsonl.pending"
+
   ln -s "$TEST_ROOT/missing-pending" "$STATE/queue/pending-sync.json"
   if run_cli status --json >"$json_output" 2>"$TEST_ROOT/status-symlink.err" \
     && python3 - "$json_output" <<'PY'

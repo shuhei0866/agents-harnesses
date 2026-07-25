@@ -705,7 +705,7 @@ def status(root: Path) -> dict[str, Any]:
             rotation = sum(
                 1
                 for path in queue_directory.iterdir()
-                if path.name != PENDING_PATH.name and path.name.endswith(".jsonl")
+                if path.name.endswith(".jsonl.pending")
             )
         quarantine = _regular_count(root / "quarantine")
         sync_pending = components["sync"].get("pending") is True
