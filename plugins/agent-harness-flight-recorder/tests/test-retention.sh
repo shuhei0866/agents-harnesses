@@ -180,20 +180,21 @@ import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
+attempts = [
+    {
+        "fingerprint": "sha256:" + "1" * 64,
+        "episode_id": sys.argv[2],
+        "state": "pending",
+    },
+    {
+        "fingerprint": "sha256:" + "2" * 64,
+        "episode_id": sys.argv[3],
+        "state": "failed",
+    },
+]
 value = {
     "schema_version": 2,
-    "attempts": [
-        {
-            "fingerprint": "sha256:" + "1" * 64,
-            "episode_id": sys.argv[2],
-            "state": "pending",
-        },
-        {
-            "fingerprint": "sha256:" + "2" * 64,
-            "episode_id": sys.argv[3],
-            "state": "failed",
-        },
-    ],
+    "attempts": sorted(attempts, key=lambda item: item["fingerprint"]),
 }
 path.write_text(
     json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",

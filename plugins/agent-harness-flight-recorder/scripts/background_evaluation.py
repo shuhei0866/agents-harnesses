@@ -195,10 +195,19 @@ def _load_attempts(root: Path) -> dict[str, dict[str, str]]:
         or metadata.st_uid != os.geteuid()
         or metadata.st_nlink != 1
         or metadata.st_mode & 0o077
+        or not isinstance(value, dict)
         or set(value) != {"schema_version", "attempts"}
         or value["schema_version"] != 2
         or not isinstance(items, list)
-        or items != sorted(items, key=lambda item: repr(item))
+        or items
+        != sorted(
+            items,
+            key=lambda item: (
+                item.get("fingerprint", "")
+                if isinstance(item, dict)
+                else ""
+            ),
+        )
         or any(
             not isinstance(item, dict)
             or set(item) != {
@@ -228,7 +237,8 @@ def _store_attempts(
             {
                 "schema_version": 2,
                 "attempts": sorted(
-                    attempts.values(), key=lambda item: repr(item)
+                    attempts.values(),
+                    key=lambda item: item["fingerprint"],
                 ),
             }
         )
@@ -290,14 +300,19 @@ def restore_attempts(root: Path, snapshot: bytes | None) -> None:
 @contextmanager
 def run_lock(root: Path, *, blocking: bool):
     path = root.parent / f".{root.name}.auto-evaluation.lock"
-    descriptor = os.open(
-        path,
-        os.O_CREAT
-        | os.O_RDWR
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0),
-        0o600,
-    )
+    try:
+        descriptor = os.open(
+            path,
+            os.O_CREAT
+            | os.O_RDWR
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+    except OSError as error:
+        raise VaultError(
+            "auto-evaluation run lock is unavailable or unsafe"
+        ) from error
     try:
         metadata = os.fstat(descriptor)
         if (

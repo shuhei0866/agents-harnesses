@@ -505,7 +505,7 @@ def _validate_record(
     ):
         raise VaultError("stored evaluation criteria are invalid")
     if not legacy:
-        if value.get("trigger") not in {"on_demand", "background"}:
+        if value.get("trigger") != "background":
             raise VaultError("stored evaluation trigger is invalid")
         measured = value.get("measured_cost_microusd")
         if (

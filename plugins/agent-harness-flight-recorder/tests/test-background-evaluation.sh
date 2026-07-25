@@ -7,7 +7,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CLI="$PLUGIN_DIR/scripts/flight-recorder"
 FAKE_BIN="$SCRIPT_DIR/fixtures/fake-bin"
-TEST_ROOT="$(mktemp -d)"
+TEST_ROOT="$(mktemp -d)" || exit 1
+[[ -n "$TEST_ROOT" && -d "$TEST_ROOT" ]] || {
+  echo "failed to create temporary directory" >&2
+  exit 1
+}
 STATE="$TEST_ROOT/vault"
 PASS=0
 FAIL=0
@@ -678,6 +682,50 @@ PY
   fi
 }
 
+test_malformed_state_and_unsafe_lock_fail_cleanly() {
+  echo "test_malformed_state_and_unsafe_lock_fail_cleanly:"
+  local attempts="$STATE/auto-evaluation/attempts.json"
+  local lock="$TEST_ROOT/.vault.auto-evaluation.lock"
+  local status=0
+  run_cli auto-evaluation configure \
+    --evaluator flight-recorder-background-evaluator \
+    --model malformed-state-model \
+    --policy-version default-v1 \
+    --uncertainty-score-below 700 \
+    --max-evaluations-per-run 1 \
+    --max-cost-microusd-per-run 50000 \
+    --json >/dev/null 2>&1 || {
+      fail "malformed state fixtureを構成できる"
+      return
+    }
+  printf '%s\n' '[]' >"$attempts"
+  chmod 600 "$attempts"
+  run_cli auto-evaluation run --json >"$TEST_ROOT/malformed.out" \
+    2>"$TEST_ROOT/malformed.err" || status=$?
+  local malformed_ok=0
+  if [[ "$status" -ne 0 && ! -s "$TEST_ROOT/malformed.out" ]] \
+    && grep -Fq "attempts are invalid" "$TEST_ROOT/malformed.err" \
+    && ! grep -q "Traceback" "$TEST_ROOT/malformed.err"; then
+    malformed_ok=1
+  fi
+
+  rm -f "$attempts" "$lock"
+  mkdir "$lock"
+  status=0
+  run_cli auto-evaluation run --json >"$TEST_ROOT/unsafe-lock.out" \
+    2>"$TEST_ROOT/unsafe-lock.err" || status=$?
+  rmdir "$lock"
+  if [[ "$malformed_ok" -eq 1 && "$status" -ne 0 \
+    && ! -s "$TEST_ROOT/unsafe-lock.out" ]] \
+    && grep -Fq "run lock is unavailable or unsafe" \
+      "$TEST_ROOT/unsafe-lock.err" \
+    && ! grep -q "Traceback" "$TEST_ROOT/unsafe-lock.err"; then
+    pass "malformed ledgerとunsafe lockをtracebackなしで拒否する"
+  else
+    fail "malformed ledgerとunsafe lockをtracebackなしで拒否する"
+  fi
+}
+
 echo "=== Flight Recorder Background Evaluation Tests ==="
 if ! init_fixture; then
   echo "fixture setup failed" >&2
@@ -693,6 +741,7 @@ if [[ -f "$STATE/auto-evaluation/config.json" ]]; then
   test_failure_is_fail_open_and_attempt_bounded
   test_run_reservation_and_configuration_are_serialized
   test_crash_leaves_charge_suppressing_reservation
+  test_malformed_state_and_unsafe_lock_fail_cleanly
   test_scheduler_sync_health_is_independent
 fi
 echo
