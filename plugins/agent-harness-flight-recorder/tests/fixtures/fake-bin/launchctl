@@ -1,0 +1,38 @@
+#!/bin/sh
+set -eu
+
+: "${FLIGHT_RECORDER_SCHEDULER_CALL_LOG:?}"
+: "${FLIGHT_RECORDER_SCHEDULER_MANAGER_STATE:?}"
+{
+  printf 'launchctl'
+  printf '\t%s' "$@"
+  printf '\n'
+} >>"$FLIGHT_RECORDER_SCHEDULER_CALL_LOG"
+
+case "${1:-}" in
+  print)
+    if [ -f "$FLIGHT_RECORDER_SCHEDULER_MANAGER_STATE" ]; then
+      path=$(sed -n 's/^launchd	//p' "$FLIGHT_RECORDER_SCHEDULER_MANAGER_STATE")
+      if [ -n "$path" ]; then
+        printf 'path = %s\n' "$path"
+        exit 0
+      fi
+    fi
+    exit 113
+    ;;
+  bootstrap)
+    if [ -n "${FLIGHT_RECORDER_SCHEDULER_TEST_DELAY:-}" ]; then
+      sleep "$FLIGHT_RECORDER_SCHEDULER_TEST_DELAY"
+    fi
+    if [ -n "${FLIGHT_RECORDER_SCHEDULER_BOOTSTRAP_FAIL_FOREIGN_PATH:-}" ]; then
+      printf 'launchd\t%s\n' \
+        "$FLIGHT_RECORDER_SCHEDULER_BOOTSTRAP_FAIL_FOREIGN_PATH" \
+        >"$FLIGHT_RECORDER_SCHEDULER_MANAGER_STATE"
+      exit 1
+    fi
+    printf 'launchd\t%s\n' "$3" >"$FLIGHT_RECORDER_SCHEDULER_MANAGER_STATE"
+    ;;
+  bootout)
+    : >"$FLIGHT_RECORDER_SCHEDULER_MANAGER_STATE"
+    ;;
+esac

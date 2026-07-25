@@ -51,6 +51,7 @@ from retention_state import load_forgotten
 
 
 OUTPUT_VERSION = 1
+STATUS_OUTPUT_VERSION = 2
 DEFAULT_POLICY_VERSION = "default-v1"
 EPISODE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 DURATION_RE = re.compile(r"^([1-9][0-9]*)([smhdw])$")
@@ -741,13 +742,34 @@ def status(root: Path) -> dict[str, Any]:
     except (OSError, VaultError):
         components["queue"] = {"state": "invalid", "pending_count": None}
 
+    try:
+        from scheduler import status as scheduler_status
+
+        components["scheduler"] = scheduler_status(root)
+    except VaultError:
+        components["scheduler"] = {
+            "state": "invalid",
+            "configured": None,
+            "platform": None,
+            "last_attempt_at": None,
+            "last_success_at": None,
+            "last_error_category": None,
+        }
+
     states = [component["state"] for component in components.values()]
     overall = "ready" if all(
-        state in ("initialized", "idle", "ready", "empty")
+        state in (
+            "initialized",
+            "idle",
+            "ready",
+            "empty",
+            "healthy",
+            "unconfigured",
+        )
         for state in states
     ) else "attention"
     return {
-        "schema_version": OUTPUT_VERSION,
+        "schema_version": STATUS_OUTPUT_VERSION,
         "command": "status",
         "overall": overall,
         **components,
@@ -772,6 +794,11 @@ def render_status(value: dict[str, Any]) -> str:
             (
                 f"Queue: {value['queue']['state']} "
                 f"(pending: {value['queue'].get('pending_count')})"
+            ),
+            (
+                f"Scheduler: {value['scheduler']['state']} "
+                f"(configured: {value['scheduler'].get('configured')}, "
+                f"platform: {value['scheduler'].get('platform')})"
             ),
         )
     )

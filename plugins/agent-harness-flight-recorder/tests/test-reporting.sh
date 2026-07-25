@@ -165,10 +165,11 @@ import sys
 
 value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 human = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
-assert value["schema_version"] == 1
+assert value["schema_version"] == 2
 assert value["command"] == "status"
 assert set(value) == {
-    "schema_version", "command", "overall", "vault", "sync", "index", "queue"
+    "schema_version", "command", "overall", "vault", "sync", "index", "queue",
+    "scheduler"
 }
 assert value["vault"]["state"] == "initialized"
 assert value["sync"]["state"] == "idle"
@@ -177,8 +178,11 @@ assert value["index"]["state"] == "ready"
 assert value["index"]["source_event_count"] == 3
 assert value["index"]["episode_count"] == 2
 assert value["queue"]["pending_count"] == 0
+assert value["scheduler"]["state"] == "unconfigured"
+assert value["scheduler"]["configured"] is False
 assert "status" in human.lower()
 assert "ready" in human.lower()
+assert "scheduler" in human.lower()
 PY
   then
     pass "statusはsync/index/queue healthをJSONと人間表示で返す"
