@@ -250,3 +250,21 @@ Accepted decisions remain recorded when later superseded.
   from Vault Git in R1.2 and are part of purge rollback. A timeout, process
   failure, invalid response, changed evidence set, or unsafe artifact leaves
   existing episodes and evidence untouched.
+
+## D-20260725-21: Bound automatic evaluation by local policy and two budgets
+
+- Status: accepted
+- Decision: run metadata-only evaluation after a successful scheduled sync,
+  selecting only episodes below an owner-configured relationship-confidence
+  threshold. Bound each run by episode count and integer micro-USD, and retain
+  a local fingerprint ledger for failed attempts.
+- Reason: automatic evaluation must remain outside hook and sync critical paths
+  and must not repeatedly spend on unchanged evidence or ambiguous floating
+  point cost comparisons.
+- Consequence: automatic requests cannot include artifact content; records
+  identify their background trigger and measured cost. Background failure uses
+  a separate finite local status and cannot downgrade successful sync health.
+  On-demand adapters remain on their exact v1 contract; budgeted background
+  adapters use v2 with mandatory measured cost. The system reserves an attempt
+  before invocation, serializes configure/run/purge, and requires an owner-held
+  file for any non-default relationship policy.

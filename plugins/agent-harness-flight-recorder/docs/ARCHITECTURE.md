@@ -289,6 +289,22 @@ directory with a minimal environment and an OS-enforced stdout limit. Failure,
 timeout, invalid JSON, an out-of-rubric response, or changed evidence creates
 no evaluation record and does not mutate episode evidence.
 
+Background evaluation is enabled only by an owner-held local policy containing
+the relationship-policy version, uncertainty threshold, adapter/model, maximum
+episodes per run, and maximum micro-USD per run. The daily scheduler runs it
+only after sync health has been committed as successful. Requests have no
+artifact-content surface. The existing on-demand adapter and record contracts
+remain exact v1. Background adapters use v2, receive the remaining run budget,
+and must return measured micro-USD; their records identify the background
+trigger. Presentation treats exact v1 records as on-demand without rewriting
+their stored schema. A local fingerprint ledger reserves an attempt before
+provider invocation and bounds pending or failed retries; successful records
+provide the corresponding idempotency boundary. Configure, automatic runs, and
+applied purge share an outer lock, and purge removes or transactionally restores
+matching reservations. Background health is separate from sync health and
+exposes finite diagnostics only. Custom relationship policies require their
+owner-held file as the authenticity anchor.
+
 The deterministic collector is deliberately narrower than a shell parser.
 Event v3 recognizes only finite operation kinds from simple allowlisted tool
 invocations. It stores the classification and a bounded outcome but never the
@@ -306,13 +322,15 @@ flight-recorder status
 flight-recorder report --last 7d
 flight-recorder inspect <episode-id>
 flight-recorder evaluate <episode-id> --evaluator ADAPTER --model MODEL
+flight-recorder auto-evaluation configure ...
+flight-recorder auto-evaluation run
 ```
 
 The primary output is an Episode Evidence Card containing task type, model,
 duration, measured cost, deterministic outcomes, retry count, confidence, and
 supporting evidence. A dashboard is not required for the first value test.
 
-All four commands accept `--json` and build their human and machine output
+All evaluation and reporting commands accept `--json` and build their output
 from the same versioned domain object. `report` uses an explicit positive
 duration and includes an episode when its last recorded event is inside the UTC
 window. `report` and `inspect` default to `default-v1`; another coexisting view

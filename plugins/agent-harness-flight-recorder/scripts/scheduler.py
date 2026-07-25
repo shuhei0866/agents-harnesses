@@ -1151,6 +1151,7 @@ def _failure_state(
 def run(root: Path) -> None:
     ensure_safe_existing_root(root)
     ensure_managed_gitignore(root)
+    should_evaluate = False
     with _run_lock(root, blocking=False) as acquired:
         if not acquired:
             return
@@ -1167,6 +1168,27 @@ def run(root: Path) -> None:
             )
             return
         _write_state(root, _state_after_success(previous, now=now))
+        should_evaluate = True
+    config_path = root / "auto-evaluation/config.json"
+    if should_evaluate and (
+        config_path.exists() or config_path.is_symlink()
+    ):
+        try:
+            from background_evaluation import (
+                record_failure,
+                run as run_evaluation,
+            )
+
+            run_evaluation(root)
+        except VaultError:
+            # Automatic evaluation is deliberately outside sync health.
+            # Preserve a finite local diagnostic when configuration itself
+            # fails before the evaluator can write its normal status.
+            try:
+                record_failure(root, "configuration_invalid")
+            except VaultError:
+                pass
+            return
 
 
 def manual_sync(root: Path) -> None:

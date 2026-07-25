@@ -15,7 +15,7 @@ import stat
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from chunk_rotation import canonical_json, parse_time, safe_subdirectory
 from vault import (
@@ -28,8 +28,9 @@ from vault import (
 
 
 OUTPUT_VERSION = 1
-RECORD_VERSION = 1
+RECORD_VERSION = 2
 PROTOCOL_VERSION = 1
+BACKGROUND_PROTOCOL_VERSION = 2
 DEFAULT_RUBRIC = (
     Path(__file__).resolve().parent.parent / "rubrics/on-demand-v1.json"
 )
@@ -53,6 +54,7 @@ RESPONSE_FIELDS = {
     "evidence_ids",
     "criteria",
 }
+RESPONSE_V2_FIELDS = RESPONSE_FIELDS | {"measured_cost_microusd"}
 RECORD_FIELDS = {
     "schema_version",
     "evaluation_id",
@@ -73,6 +75,12 @@ RECORD_FIELDS = {
     "conclusion",
     "confidence",
     "criteria",
+    "trigger",
+    "measured_cost_microusd",
+}
+LEGACY_RECORD_FIELDS = RECORD_FIELDS - {
+    "trigger",
+    "measured_cost_microusd",
 }
 CONCLUSIONS = {"successful", "mixed", "unsuccessful", "inconclusive"}
 CONFIDENCE_LEVELS = {"low", "medium", "high"}
@@ -271,6 +279,7 @@ def _validate_response(
     raw: bytes,
     rubric: dict[str, Any],
     available_evidence_ids: set[str],
+    remaining_cost_microusd: int | None = None,
 ) -> dict[str, Any]:
     if len(raw) > MAX_EVALUATOR_OUTPUT_BYTES:
         raise VaultError("evaluator response exceeds the size limit")
@@ -282,10 +291,20 @@ def _validate_response(
     evidence_ids = (
         response.get("evidence_ids") if isinstance(response, dict) else None
     )
+    expected_fields = (
+        RESPONSE_FIELDS
+        if remaining_cost_microusd is None
+        else RESPONSE_V2_FIELDS
+    )
+    expected_version = (
+        PROTOCOL_VERSION
+        if remaining_cost_microusd is None
+        else BACKGROUND_PROTOCOL_VERSION
+    )
     if (
         not isinstance(response, dict)
-        or set(response) != RESPONSE_FIELDS
-        or response.get("schema_version") != PROTOCOL_VERSION
+        or set(response) != expected_fields
+        or response.get("schema_version") != expected_version
         or response.get("conclusion") not in rubric["conclusions"]
         or response.get("confidence") not in rubric["confidence_levels"]
         or not isinstance(evidence_ids, list)
@@ -302,6 +321,18 @@ def _validate_response(
         )
     ):
         raise VaultError("evaluator response violates the protocol")
+    measured = response.get("measured_cost_microusd", 0)
+    if (
+        isinstance(measured, bool)
+        or not isinstance(measured, int)
+        or measured < 0
+        or (
+            remaining_cost_microusd is not None
+            and measured > remaining_cost_microusd
+        )
+    ):
+        raise VaultError("evaluator response violates the cost budget")
+    response["measured_cost_microusd"] = measured
     return response
 
 
@@ -386,12 +417,24 @@ def _validate_record(
     *,
     evidence_ids: set[str] | None = None,
 ) -> dict[str, Any]:
+    legacy = (
+        isinstance(value, dict)
+        and set(value) == LEGACY_RECORD_FIELDS
+        and value.get("schema_version") == 1
+        and value.get("evaluator_protocol_version") == 1
+    )
     if (
         not isinstance(value, dict)
-        or set(value) != RECORD_FIELDS
-        or value.get("schema_version") != RECORD_VERSION
+        or (
+            not legacy
+            and (
+                set(value) != RECORD_FIELDS
+                or value.get("schema_version") != RECORD_VERSION
+                or value.get("evaluator_protocol_version")
+                != BACKGROUND_PROTOCOL_VERSION
+            )
+        )
         or value.get("judgment_type") != "model"
-        or value.get("evaluator_protocol_version") != PROTOCOL_VERSION
     ):
         raise VaultError("stored evaluation is invalid")
     for field in (
@@ -461,6 +504,16 @@ def _validate_record(
         or any(item not in CRITERION_STATES for item in criteria.values())
     ):
         raise VaultError("stored evaluation criteria are invalid")
+    if not legacy:
+        if value.get("trigger") not in {"on_demand", "background"}:
+            raise VaultError("stored evaluation trigger is invalid")
+        measured = value.get("measured_cost_microusd")
+        if (
+            isinstance(measured, bool)
+            or not isinstance(measured, int)
+            or measured < 0
+        ):
+            raise VaultError("stored evaluation cost is invalid")
     expected_id = _sha256(
         canonical_json(
             {
@@ -567,6 +620,10 @@ def evaluate(
     allow_artifact_content: bool,
     artifact_preview_token: str | None,
     timeout_seconds: int,
+    *,
+    trigger: str = "on_demand",
+    remaining_cost_microusd: int | None = None,
+    before_invoke: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     from reporting import inspect_episode
 
@@ -629,14 +686,26 @@ def evaluate(
         "artifact_hashes": artifact_hashes,
     }
     input_fingerprint = _sha256(canonical_json(fingerprint_source))
+    background = trigger == "background"
+    if trigger not in {"on_demand", "background"}:
+        raise VaultError("evaluation trigger is invalid")
+    if background != (remaining_cost_microusd is not None):
+        raise VaultError("background evaluation requires a cost budget")
     request = {
-        "schema_version": PROTOCOL_VERSION,
+        "schema_version": (
+            BACKGROUND_PROTOCOL_VERSION if background else PROTOCOL_VERSION
+        ),
         "rubric": rubric,
         "model": selected_model,
         "metadata_only": not bool(request_artifacts),
         "episode": episode,
         "artifacts": request_artifacts,
     }
+    if background:
+        request["trigger"] = trigger
+        request["remaining_cost_microusd"] = remaining_cost_microusd
+    if before_invoke is not None:
+        before_invoke(card)
     response = _validate_response(
         _invoke(
             evaluator_path,
@@ -649,10 +718,11 @@ def evaluate(
             fact["evidence_id"]
             for fact in card["deterministic_evidence"]
         },
+        remaining_cost_microusd,
     )
 
     record: dict[str, Any] = {
-        "schema_version": RECORD_VERSION,
+        "schema_version": RECORD_VERSION if background else 1,
         "evaluation_id": "",
         "judgment_type": "model",
         "policy_version": before["policy_version"],
@@ -661,7 +731,9 @@ def evaluate(
         "rubric_sha256": rubric_sha256,
         "evaluator": evaluator_id,
         "evaluator_sha256": evaluator_sha256,
-        "evaluator_protocol_version": PROTOCOL_VERSION,
+        "evaluator_protocol_version": (
+            BACKGROUND_PROTOCOL_VERSION if background else PROTOCOL_VERSION
+        ),
         "model": selected_model,
         "evaluated_at": _evaluated_at(),
         "input_fingerprint": input_fingerprint,
@@ -675,6 +747,11 @@ def evaluate(
         "confidence": response["confidence"],
         "criteria": response["criteria"],
     }
+    if background:
+        record["trigger"] = trigger
+        record["measured_cost_microusd"] = response[
+            "measured_cost_microusd"
+        ]
     record["evaluation_id"] = _sha256(
         canonical_json(
             {

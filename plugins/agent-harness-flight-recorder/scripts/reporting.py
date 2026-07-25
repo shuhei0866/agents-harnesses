@@ -1067,7 +1067,9 @@ def render_inspect(value: dict[str, Any]) -> str:
         "Model judgments:",
         *(
             f"  {item['evaluation_id']} "
-            f"{item['conclusion']} confidence={item['confidence']}"
+            f"{item['conclusion']} confidence={item['confidence']} "
+            f"trigger={item.get('trigger', 'on_demand')} "
+            f"cost_microusd={item.get('measured_cost_microusd', 0)}"
             for item in card["model_evaluations"]
         ),
         "Supporting relationship edges:",

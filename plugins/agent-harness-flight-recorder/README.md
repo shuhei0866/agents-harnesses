@@ -348,6 +348,35 @@ stdout. Treat the owner-selected adapter itself as trusted code. A failed,
 timed-out, or protocol-invalid evaluator writes nothing. `report` and `inspect`
 show deterministic facts and model judgments in separate Card fields.
 
+### Metadata-only automatic evaluation
+
+Configure a local policy once; the existing daily scheduler evaluates only
+episodes whose relationship confidence is missing or below the selected score:
+
+```bash
+scripts/flight-recorder auto-evaluation configure \
+  --evaluator /path/to/adapter \
+  --model MODEL_ID \
+  --policy-version default-v1 \
+  --uncertainty-score-below 700 \
+  --max-evaluations-per-run 2 \
+  --max-cost-microusd-per-run 50000
+```
+
+The policy, attempt ledger, and health are owner-only local files under
+`auto-evaluation/` and are excluded from Git. Automatic requests are always
+metadata-only and expose no artifact option. Each run enforces both an
+evaluation-count budget and a micro-USD budget, passing only the remaining
+budget to the adapter. Budgeted adapters must return protocol v2 with an
+explicit measured micro-USD value; the on-demand protocol remains exact v1.
+An attempt is durably reserved before invoking the adapter, so a process crash
+cannot automatically charge the same policy/model/evidence scope again.
+Automatic evaluator failures are recorded with a finite diagnostic and never
+change sync health, hook behavior, or CLI exit status. Re-running `configure`
+is the explicit reset for pending or failed reservations. A custom relationship
+policy must be selected with its owner-held file via `--policy`, rather than by
+an unauthenticated version string alone.
+
 ### Forget and best-effort purge
 
 Logical removal keeps immutable source evidence but excludes one episode from
@@ -403,6 +432,7 @@ bash plugins/agent-harness-flight-recorder/tests/test-evidence-index.sh
 bash plugins/agent-harness-flight-recorder/tests/test-deterministic-evidence.sh
 bash plugins/agent-harness-flight-recorder/tests/test-relationship-graph.sh
 bash plugins/agent-harness-flight-recorder/tests/test-reporting.sh
+bash plugins/agent-harness-flight-recorder/tests/test-background-evaluation.sh
 bash plugins/agent-harness-flight-recorder/tests/test-retention.sh
 bash plugins/agent-harness-flight-recorder/tests/test-retry-policy.sh
 bash plugins/agent-harness-flight-recorder/tests/test-scheduler.sh
