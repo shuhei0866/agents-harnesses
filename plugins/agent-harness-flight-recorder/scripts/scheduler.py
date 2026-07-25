@@ -1,0 +1,887 @@
+"""Install and run a daily user-level Flight Recorder sync scheduler."""
+
+from __future__ import annotations
+
+import contextlib
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+import plistlib
+import re
+import shutil
+import stat
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+from chunk_rotation import atomic_replace, canonical_json, safe_subdirectory
+from sync import load_pending, sync
+from vault import (
+    VaultError,
+    ensure_managed_gitignore,
+    ensure_safe_existing_root,
+)
+
+
+LABEL = "io.agent-harness.flight-recorder.sync"
+UNIT = "agent-harness-flight-recorder-sync"
+STATE_PATH = Path("scheduler/state.json")
+MANIFEST_PATH = Path("scheduler/install.json")
+RUNTIME_PATH = (
+    "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+)
+
+
+def platform_name() -> str:
+    override = os.environ.get("FLIGHT_RECORDER_SCHEDULER_PLATFORM")
+    if override is not None:
+        if override not in ("macos", "linux"):
+            raise VaultError("scheduler platform override is invalid")
+        return override
+    if sys.platform == "darwin":
+        return "macos"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    raise VaultError("scheduler platform is unsupported")
+
+
+def _cli_path() -> Path:
+    path = (Path(__file__).parent / "flight-recorder").resolve()
+    if not path.is_file():
+        raise VaultError("flight-recorder CLI path is invalid")
+    return path
+
+
+def _absolute_env(name: str, default: Path) -> Path:
+    raw = os.environ.get(name)
+    path = Path(raw) if raw is not None else default
+    if not path.is_absolute() or "\n" in str(path) or "\0" in str(path):
+        raise VaultError("scheduler configuration path is invalid")
+    return path
+
+
+def _targets(platform: str) -> list[Path]:
+    home = _absolute_env("HOME", Path.home())
+    config = _absolute_env(
+        "XDG_CONFIG_HOME", home / ".config"
+    )
+    if platform == "macos":
+        return [home / "Library" / "LaunchAgents" / f"{LABEL}.plist"]
+    directory = config / "systemd" / "user"
+    return [directory / f"{UNIT}.service", directory / f"{UNIT}.timer"]
+
+
+def _configuration_base(platform: str) -> Path:
+    home = _absolute_env("HOME", Path.home())
+    if platform == "macos":
+        return home
+    return _absolute_env("XDG_CONFIG_HOME", home / ".config")
+
+
+def _validate_directory_chain(
+    platform: str, directory: Path, *, create: bool
+) -> None:
+    base = _configuration_base(platform)
+    try:
+        relative = directory.relative_to(base)
+    except ValueError as error:
+        raise VaultError("scheduler configuration path is invalid") from error
+    current = base
+    for part in (".", *relative.parts):
+        if part != ".":
+            current = current / part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            if not create:
+                return
+            current.mkdir(mode=0o700)
+            metadata = current.lstat()
+        except OSError as error:
+            raise VaultError("scheduler configuration directory is unsafe") from error
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o022
+        ):
+            raise VaultError("scheduler configuration directory is unsafe")
+
+
+def _runtime_path() -> str:
+    test_path = os.environ.get(
+        "AGENT_FLIGHT_RECORDER_TEST_SCHEDULER_RUNTIME_PATH"
+    )
+    if test_path is not None:
+        if os.environ.get("FLIGHT_RECORDER_SCHEDULER_PLATFORM") is None:
+            raise VaultError("scheduler runtime path override is test-only")
+        return test_path
+    return RUNTIME_PATH
+
+
+def _validate_runtime_commands(runtime_path: str) -> None:
+    for command in ("git", "age", "python3"):
+        if shutil.which(command, path=runtime_path) is None:
+            raise VaultError(f"required command is unavailable: {command}")
+
+
+def _systemd_quote(value: str) -> str:
+    if "\n" in value or "\r" in value or "\0" in value:
+        raise VaultError("scheduler configuration value is invalid")
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("%", "%%")
+    )
+    if not any(
+        character.isspace() or character in "\\\"'"
+        for character in value
+    ) and "%" not in value:
+        return value
+    return '"' + escaped + '"'
+
+
+def _systemd_exec_quote(value: str) -> str:
+    # systemd expands $VAR/${VAR} in ExecStart= even inside double quotes.
+    # A doubled dollar is the documented literal form for executable paths.
+    return _systemd_quote(value.replace("$", "$$"))
+
+
+def _expected(root: Path, platform: str) -> dict[Path, bytes]:
+    cli = _cli_path()
+    runtime_path = _runtime_path()
+    targets = _targets(platform)
+    if platform == "macos":
+        value = {
+            "Label": LABEL,
+            "ProgramArguments": [str(cli), "scheduler", "run"],
+            "EnvironmentVariables": {
+                "FLIGHT_RECORDER_STATE_DIR": str(root),
+                "PATH": runtime_path,
+            },
+            "StartCalendarInterval": {"Hour": 3, "Minute": 0},
+            "RunAtLoad": True,
+            "ProcessType": "Background",
+        }
+        return {
+            targets[0]: plistlib.dumps(value, sort_keys=True)
+        }
+    service = (
+        "[Unit]\n"
+        "Description=Daily Agent Harness Flight Recorder sync\n\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"Environment={_systemd_quote(f'FLIGHT_RECORDER_STATE_DIR={root}')} "
+        f"{_systemd_quote(f'PATH={runtime_path}')}\n"
+        f"ExecStart={_systemd_exec_quote(str(cli))} scheduler run\n"
+    ).encode()
+    timer = (
+        "[Unit]\n"
+        "Description=Run Agent Harness Flight Recorder sync daily\n\n"
+        "[Timer]\n"
+        "OnCalendar=daily\n"
+        "Persistent=true\n\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    ).encode()
+    return {targets[0]: service, targets[1]: timer}
+
+
+def _safe_existing(path: Path) -> bytes | None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise VaultError("scheduler configuration is unsafe") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o077
+    ):
+        raise VaultError("scheduler configuration is unsafe")
+    try:
+        return path.read_bytes()
+    except OSError as error:
+        raise VaultError("scheduler configuration is unsafe") from error
+
+
+def _run_command(
+    arguments: list[str],
+    *,
+    allowed: tuple[int, ...] = (0,),
+    capture: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            arguments,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            shell=False,
+            text=True,
+        )
+    except FileNotFoundError as error:
+        raise VaultError("required scheduler command is unavailable") from error
+    if result.returncode not in allowed:
+        raise VaultError("scheduler command failed")
+    return result
+
+
+def _command(arguments: list[str], *, allowed: tuple[int, ...] = (0,)) -> None:
+    _run_command(arguments, allowed=allowed)
+
+
+def _digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _manifest_value(
+    platform: str,
+    expected: dict[Path, bytes],
+    *,
+    phase: str,
+    previous_targets: dict[str, str] | None,
+) -> dict[str, Any]:
+    identifiers = [LABEL] if platform == "macos" else [
+        f"{UNIT}.service",
+        f"{UNIT}.timer",
+    ]
+    return {
+        "schema_version": 1,
+        "platform": platform,
+        "manager_identifiers": identifiers,
+        "phase": phase,
+        "targets": {
+            str(path): _digest(data) for path, data in expected.items()
+        },
+        "previous_targets": previous_targets,
+    }
+
+
+def _validate_scheduler_directory(root: Path) -> bool:
+    directory = root / "scheduler"
+    try:
+        metadata = directory.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise VaultError("scheduler state directory is unsafe") from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o077
+    ):
+        raise VaultError("scheduler state directory is unsafe")
+    return True
+
+
+def _load_manifest(root: Path) -> dict[str, Any] | None:
+    if not _validate_scheduler_directory(root):
+        return None
+    path = root / MANIFEST_PATH
+    data = _safe_existing(path)
+    if data is None:
+        return None
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise VaultError("scheduler install manifest is invalid") from error
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {
+            "schema_version",
+            "platform",
+            "manager_identifiers",
+            "phase",
+            "targets",
+            "previous_targets",
+        }
+        or value.get("schema_version") != 1
+        or value.get("platform") not in ("macos", "linux")
+        or value.get("phase") not in ("installing", "active")
+        or not isinstance(value.get("manager_identifiers"), list)
+        or not isinstance(value.get("targets"), dict)
+        or (
+            value.get("previous_targets") is not None
+            and not isinstance(value.get("previous_targets"), dict)
+        )
+    ):
+        raise VaultError("scheduler install manifest is invalid")
+    identifiers = (
+        [LABEL]
+        if value["platform"] == "macos"
+        else [f"{UNIT}.service", f"{UNIT}.timer"]
+    )
+    if value["manager_identifiers"] != identifiers:
+        raise VaultError("scheduler install manifest is invalid")
+    for target_set in (value["targets"], value["previous_targets"] or {}):
+        if any(
+            not isinstance(path, str)
+            or not Path(path).is_absolute()
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            for path, digest in target_set.items()
+        ):
+            raise VaultError("scheduler install manifest is invalid")
+    return value
+
+
+def _write_manifest(root: Path, value: dict[str, Any]) -> None:
+    directory = safe_subdirectory(root, "scheduler")
+    path = root / MANIFEST_PATH
+    atomic_replace(path, canonical_json(value) + b"\n")
+    path.chmod(0o600)
+    directory.chmod(0o700)
+
+
+def _manifest_target_hashes(
+    manifest: dict[str, Any],
+) -> dict[str, set[str]]:
+    hashes = {
+        path: {digest} for path, digest in manifest["targets"].items()
+    }
+    for path, digest in (manifest["previous_targets"] or {}).items():
+        hashes.setdefault(path, set()).add(digest)
+    return hashes
+
+
+def _validate_manifest_scope(
+    manifest: dict[str, Any],
+    platform: str,
+    expected: dict[Path, bytes],
+) -> None:
+    if (
+        manifest["platform"] != platform
+        or set(manifest["targets"]) != {str(path) for path in expected}
+        or not set(manifest["previous_targets"] or {}).issubset(
+            {str(path) for path in expected}
+        )
+    ):
+        raise VaultError("scheduler install manifest is not for this configuration")
+
+
+def _validate_owned_files(
+    existing: dict[Path, bytes | None],
+    manifest: dict[str, Any],
+) -> None:
+    allowed = _manifest_target_hashes(manifest)
+    for path, data in existing.items():
+        if data is not None and _digest(data) not in allowed.get(str(path), set()):
+            raise VaultError("scheduler configuration is not managed by Flight Recorder")
+
+
+def _manager_origins(platform: str) -> dict[str, Path]:
+    if platform == "macos":
+        result = _run_command(
+            ["launchctl", "print", f"gui/{os.getuid()}/{LABEL}"],
+            allowed=(0, 3, 113),
+            capture=True,
+        )
+        if result.returncode != 0:
+            return {}
+        match = re.search(r"(?m)^\s*path\s*=\s*(.+?)\s*$", result.stdout)
+        if match is None:
+            raise VaultError("loaded scheduler origin cannot be verified")
+        raw = match.group(1).strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] == '"':
+            raw = raw[1:-1]
+        path = Path(raw)
+        if not path.is_absolute():
+            raise VaultError("loaded scheduler origin is invalid")
+        return {LABEL: path}
+
+    origins: dict[str, Path] = {}
+    for identifier in (f"{UNIT}.service", f"{UNIT}.timer"):
+        result = _run_command(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                "--property=LoadState",
+                "--property=FragmentPath",
+                identifier,
+            ],
+            capture=True,
+        )
+        properties: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            if "=" in line:
+                name, value = line.split("=", 1)
+                properties[name] = value
+        load_state = properties.get("LoadState")
+        fragment = properties.get("FragmentPath")
+        if load_state == "not-found" and not fragment:
+            continue
+        if load_state is None or not fragment:
+            raise VaultError("loaded scheduler origin cannot be verified")
+        path = Path(fragment)
+        if not path.is_absolute():
+            raise VaultError("loaded scheduler origin is invalid")
+        origins[identifier] = path
+    return origins
+
+
+def _validate_manager_origins(
+    platform: str,
+    origins: dict[str, Path],
+    expected: dict[Path, bytes],
+) -> None:
+    paths = list(expected)
+    allowed = (
+        {LABEL: paths[0]}
+        if platform == "macos"
+        else {
+            f"{UNIT}.service": paths[0],
+            f"{UNIT}.timer": paths[1],
+        }
+    )
+    if any(allowed.get(identifier) != path for identifier, path in origins.items()):
+        raise VaultError("scheduler name is owned by another configuration")
+
+
+@contextlib.contextmanager
+def _scheduler_transaction() -> Any:
+    directory = Path("/tmp") / (
+        f"agent-harness-flight-recorder-{os.geteuid()}"
+    )
+    try:
+        directory.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        raise VaultError("scheduler transaction lock is unavailable") from error
+    try:
+        directory_metadata = directory.lstat()
+    except OSError as error:
+        raise VaultError("scheduler transaction lock is unsafe") from error
+    if (
+        not stat.S_ISDIR(directory_metadata.st_mode)
+        or directory_metadata.st_uid != os.geteuid()
+        or directory_metadata.st_mode & 0o077
+    ):
+        raise VaultError("scheduler transaction lock is unsafe")
+    lock_path = directory / "install.lock"
+    if lock_path.is_symlink():
+        raise VaultError("scheduler transaction lock is unsafe")
+    try:
+        descriptor = os.open(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+            0o600,
+        )
+    except OSError as error:
+        raise VaultError("scheduler transaction lock is unavailable") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or metadata.st_mode & 0o077
+        ):
+            raise VaultError("scheduler transaction lock is unsafe")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise VaultError("scheduler configuration is busy") from error
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def _install(root: Path) -> None:
+    ensure_safe_existing_root(root)
+    ensure_managed_gitignore(root)
+    platform = platform_name()
+    expected = _expected(root, platform)
+    _validate_runtime_commands(_runtime_path())
+    for path in expected:
+        _validate_directory_chain(platform, path.parent, create=True)
+    existing = {path: _safe_existing(path) for path in expected}
+    manifest = _load_manifest(root)
+    if manifest is None:
+        if any(data is not None for data in existing.values()):
+            raise VaultError(
+                "scheduler configuration is not managed by Flight Recorder"
+            )
+    else:
+        _validate_manifest_scope(manifest, platform, expected)
+        _validate_owned_files(existing, manifest)
+    origins = _manager_origins(platform)
+    _validate_manager_origins(platform, origins, expected)
+    if manifest is None and origins:
+        raise VaultError("scheduler name is owned by another configuration")
+
+    previous_manifest = manifest
+    previous_bytes = dict(existing)
+    previous_hashes = {
+        str(path): _digest(data)
+        for path, data in existing.items()
+        if data is not None
+    } or None
+    installing_manifest = _manifest_value(
+        platform,
+        expected,
+        phase="installing",
+        previous_targets=previous_hashes,
+    )
+    activation_attempted = False
+    loaded_before = bool(origins)
+    configuration_changed = any(
+        existing[path] != data for path, data in expected.items()
+    )
+    try:
+        _write_manifest(root, installing_manifest)
+        for path, data in expected.items():
+            if existing[path] == data:
+                continue
+            atomic_replace(path, data)
+            path.chmod(0o600)
+        if platform == "macos":
+            if origins and configuration_changed:
+                activation_attempted = True
+                _command(
+                    ["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"],
+                    allowed=(0, 3, 113),
+                )
+            if not origins or configuration_changed:
+                activation_attempted = True
+                _command(
+                    [
+                        "launchctl",
+                        "bootstrap",
+                        f"gui/{os.getuid()}",
+                        str(next(iter(expected))),
+                    ]
+                )
+        else:
+            _command(["systemctl", "--user", "daemon-reload"])
+            activation_attempted = True
+            _command(
+                ["systemctl", "--user", "enable", "--now", f"{UNIT}.timer"]
+            )
+        _write_manifest(
+            root,
+            _manifest_value(
+                platform,
+                expected,
+                phase="active",
+                previous_targets=None,
+            ),
+        )
+    except (OSError, VaultError) as error:
+        if activation_attempted:
+            try:
+                rollback_origins = _manager_origins(platform)
+                _validate_manager_origins(
+                    platform, rollback_origins, expected
+                )
+                if platform == "macos":
+                    if rollback_origins:
+                        _command(
+                            [
+                                "launchctl",
+                                "bootout",
+                                f"gui/{os.getuid()}/{LABEL}",
+                            ],
+                            allowed=(0, 3, 113),
+                        )
+                elif rollback_origins:
+                    _command(
+                        [
+                            "systemctl",
+                            "--user",
+                            "disable",
+                            "--now",
+                            f"{UNIT}.timer",
+                        ],
+                        allowed=(0, 1, 5),
+                    )
+            except VaultError:
+                pass
+        for path, data in previous_bytes.items():
+            try:
+                if data is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    atomic_replace(path, data)
+                    path.chmod(0o600)
+            except OSError:
+                pass
+        try:
+            manifest_path = root / MANIFEST_PATH
+            if previous_manifest is None:
+                manifest_path.unlink(missing_ok=True)
+            else:
+                _write_manifest(root, previous_manifest)
+        except (OSError, VaultError):
+            pass
+        if platform == "linux":
+            try:
+                _command(["systemctl", "--user", "daemon-reload"])
+                if loaded_before:
+                    _command(
+                        [
+                            "systemctl",
+                            "--user",
+                            "enable",
+                            "--now",
+                            f"{UNIT}.timer",
+                        ]
+                    )
+            except VaultError:
+                pass
+        elif loaded_before:
+            try:
+                _command(
+                    [
+                        "launchctl",
+                        "bootstrap",
+                        f"gui/{os.getuid()}",
+                        str(next(iter(expected))),
+                    ]
+                )
+            except VaultError:
+                pass
+        if isinstance(error, OSError):
+            raise VaultError("scheduler installation failed") from error
+        raise
+
+
+def _uninstall(root: Path) -> None:
+    try:
+        ensure_safe_existing_root(root)
+        platform = platform_name()
+        expected = _expected(root, platform)
+        for path in expected:
+            _validate_directory_chain(platform, path.parent, create=False)
+        existing = {path: _safe_existing(path) for path in expected}
+        manifest = _load_manifest(root)
+        if manifest is None:
+            if any(data is not None for data in existing.values()):
+                raise VaultError(
+                    "scheduler configuration is not managed by Flight Recorder"
+                )
+            return
+        _validate_manifest_scope(manifest, platform, expected)
+        _validate_owned_files(existing, manifest)
+        origins = _manager_origins(platform)
+        _validate_manager_origins(platform, origins, expected)
+        if platform == "macos":
+            if origins:
+                _command(
+                    ["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"],
+                    allowed=(0, 3, 113),
+                )
+        else:
+            _command(
+                ["systemctl", "--user", "disable", "--now", f"{UNIT}.timer"],
+                allowed=(0, 1, 5),
+            )
+        for path in expected:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        (root / MANIFEST_PATH).unlink()
+        if platform == "linux":
+            _command(["systemctl", "--user", "daemon-reload"])
+    except OSError as error:
+        raise VaultError("scheduler uninstall failed") from error
+
+
+def install(root: Path) -> None:
+    ensure_safe_existing_root(root)
+    with _scheduler_transaction():
+        _install(root)
+
+
+def uninstall(root: Path) -> None:
+    ensure_safe_existing_root(root)
+    with _scheduler_transaction():
+        _uninstall(root)
+
+
+def _time() -> str:
+    return (
+        dt.datetime.now(dt.timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _write_state(root: Path, value: dict[str, Any]) -> None:
+    directory = safe_subdirectory(root, "scheduler")
+    path = root / STATE_PATH
+    atomic_replace(path, canonical_json(value) + b"\n")
+    path.chmod(0o600)
+    directory.chmod(0o700)
+
+
+def _load_state(root: Path) -> dict[str, Any] | None:
+    if not _validate_scheduler_directory(root):
+        return None
+    path = root / STATE_PATH
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise VaultError("scheduler state is unsafe") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o077
+    ):
+        raise VaultError("scheduler state is unsafe")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise VaultError("scheduler state is invalid") from error
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != 1
+        or set(value)
+        != {
+            "schema_version",
+            "last_attempt_at",
+            "last_success_at",
+            "last_error_category",
+        }
+    ):
+        raise VaultError("scheduler state is invalid")
+    return value
+
+
+def run(root: Path) -> None:
+    ensure_safe_existing_root(root)
+    ensure_managed_gitignore(root)
+    directory = safe_subdirectory(root, "scheduler")
+    lock_path = directory / "run.lock"
+    if lock_path.is_symlink():
+        raise VaultError("scheduler run lock is unsafe")
+    descriptor = os.open(
+        lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or metadata.st_mode & 0o077
+        ):
+            raise VaultError("scheduler run lock is unsafe")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        previous = _load_state(root)
+        attempt = _time()
+        state = {
+            "schema_version": 1,
+            "last_attempt_at": attempt,
+            "last_success_at": (
+                previous.get("last_success_at") if previous else None
+            ),
+            "last_error_category": None,
+        }
+        _write_state(root, state)
+        try:
+            sync(root)
+        except VaultError:
+            try:
+                pending = load_pending(root)
+            except VaultError:
+                pending = None
+            category = (
+                pending.get("last_error_category")
+                if pending is not None
+                else "integrity"
+            )
+            if category == "rebase":
+                # R1 sync cannot yet distinguish an offline pull from a true
+                # rebase conflict. At the scheduler surface it is a remote
+                # failure; IAM-114 introduces durable retry classification.
+                category = "remote"
+            state["last_error_category"] = (
+                category if isinstance(category, str) else "sync"
+            )
+            _write_state(root, state)
+            return
+        state["last_success_at"] = _time()
+        _write_state(root, state)
+    finally:
+        os.close(descriptor)
+
+
+def status(root: Path) -> dict[str, Any]:
+    platform = platform_name()
+    expected = _expected(root, platform)
+    try:
+        for path in expected:
+            _validate_directory_chain(platform, path.parent, create=False)
+        existing = {path: _safe_existing(path) for path in expected}
+        present = [value is not None for value in existing.values()]
+        if any(present) and not all(present):
+            raise VaultError("scheduler configuration is incomplete")
+        manifest = _load_manifest(root)
+        if manifest is None:
+            if any(present):
+                raise VaultError("scheduler configuration provenance is missing")
+            configured = False
+        else:
+            _validate_manifest_scope(manifest, platform, expected)
+            _validate_owned_files(existing, manifest)
+            if (
+                manifest["phase"] != "active"
+                or not all(
+                    existing[path] == data for path, data in expected.items()
+                )
+            ):
+                raise VaultError("scheduler configuration is incomplete")
+            origins = _manager_origins(platform)
+            _validate_manager_origins(platform, origins, expected)
+            if len(origins) != (1 if platform == "macos" else 2):
+                raise VaultError("scheduler is not loaded")
+            configured = True
+        state = _load_state(root)
+        error = state.get("last_error_category") if state else None
+        health = (
+            "error"
+            if error is not None
+            else "healthy"
+            if state and state.get("last_success_at")
+            else "idle"
+            if configured
+            else "unconfigured"
+        )
+        return {
+            "state": health,
+            "configured": configured,
+            "platform": platform,
+            "last_attempt_at": (
+                state.get("last_attempt_at") if state else None
+            ),
+            "last_success_at": (
+                state.get("last_success_at") if state else None
+            ),
+            "last_error_category": error,
+        }
+    except VaultError:
+        return {
+            "state": "invalid",
+            "configured": None,
+            "platform": platform,
+            "last_attempt_at": None,
+            "last_success_at": None,
+            "last_error_category": None,
+        }

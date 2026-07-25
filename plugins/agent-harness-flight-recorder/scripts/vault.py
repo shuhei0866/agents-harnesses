@@ -49,7 +49,7 @@ GIT_SYNC_ALLOWLIST = [
     "devices/**/*.jsonl.age",
 ]
 LEGACY_GIT_SYNC_ALLOWLIST = [".gitignore", CONFIG_NAME, str(ENVELOPE_PATH)]
-GITIGNORE = """# Local-only Flight Recorder state
+PRE_SCHEDULER_GITIGNORE = """# Local-only Flight Recorder state
 /hash.key
 /events.jsonl
 /keys/*.agekey
@@ -67,6 +67,9 @@ GITIGNORE = """# Local-only Flight Recorder state
 /*.lock
 /*.tmp
 """
+GITIGNORE = PRE_SCHEDULER_GITIGNORE.replace(
+    "/tmp/\n", "/tmp/\n/scheduler/\n"
+)
 LEGACY_GITIGNORE = """# Local-only Flight Recorder state
 /hash.key
 /events.jsonl
@@ -328,6 +331,29 @@ def ensure_safe_existing_root(root: Path) -> None:
         candidate = root / relative
         if candidate.is_symlink():
             raise VaultError("vault contains an unsafe symlink")
+
+
+def ensure_managed_gitignore(root: Path) -> None:
+    path = root / ".gitignore"
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise VaultError("vault Git ignore file is missing or unsafe") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or metadata.st_mode & 0o022
+    ):
+        raise VaultError("vault Git ignore file is unsafe")
+    try:
+        contents = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise VaultError("vault Git ignore file is unsafe") from error
+    if contents in (LEGACY_GITIGNORE, PRE_SCHEDULER_GITIGNORE):
+        atomic_replace(path, GITIGNORE.encode("utf-8"))
+    elif contents != GITIGNORE:
+        raise VaultError("vault Git ignore file is not managed by this version")
 
 
 def recover_interrupted_init(root: Path) -> None:
@@ -780,6 +806,13 @@ def parser() -> argparse.ArgumentParser:
     )
     purge.add_argument("--apply", action="store_true")
     purge.add_argument("--json", action="store_true")
+    scheduler = commands.add_parser("scheduler")
+    scheduler_commands = scheduler.add_subparsers(
+        dest="scheduler_command", required=True
+    )
+    scheduler_commands.add_parser("install")
+    scheduler_commands.add_parser("uninstall")
+    scheduler_commands.add_parser("run")
     return top
 
 
@@ -802,6 +835,7 @@ def main() -> int:
         "inspect",
         "forget",
         "purge",
+        "scheduler",
     ):
         # The shell wrapper executes this file as __main__. Register that module
         # under its import name so chunk_rotation shares this VaultError class
@@ -850,7 +884,7 @@ def main() -> int:
                     args.policy,
                 )
                 emit(value, as_json=args.json, human=render_inspect(value))
-        else:
+        elif args.command in ("forget", "purge"):
             from reporting import emit
             from retention import (
                 forget,
@@ -876,6 +910,18 @@ def main() -> int:
                     apply=args.apply,
                 )
                 emit(value, as_json=args.json, human=render_purge(value))
+        else:
+            from scheduler import install, run, uninstall
+
+            if args.scheduler_command == "install":
+                install(root)
+            elif args.scheduler_command == "uninstall":
+                uninstall(root)
+            else:
+                # Background execution records failures in scheduler status and
+                # deliberately exits zero so OS managers do not create a retry
+                # storm. IAM-114 adds durable bounded retry.
+                run(root)
     return 0
 
 

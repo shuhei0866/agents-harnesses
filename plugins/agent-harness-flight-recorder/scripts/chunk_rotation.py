@@ -22,12 +22,11 @@ from vault import (
     DEVICE_IDENTITY_PATH,
     HASH_KEY_PATH,
     VaultError,
-    GITIGNORE,
     GIT_SYNC_ALLOWLIST,
-    LEGACY_GITIGNORE,
     CONFIG_NAME,
     all_recipients,
     derive_recipient,
+    ensure_managed_gitignore,
     ensure_safe_existing_root,
     fsync_directory,
     json_bytes,
@@ -435,16 +434,7 @@ def rotate_locked(root: Path) -> None:
     if len(key) != 32:
         raise VaultError("local correlation key has an invalid length")
     verify_recipient_state_hmac(config, key)
-    gitignore = root / ".gitignore"
-    if gitignore.is_symlink():
-        raise VaultError("vault Git ignore file is unsafe")
-    if not gitignore.is_file():
-        raise VaultError("vault Git ignore file is missing or unsafe")
-    gitignore_contents = gitignore.read_text(encoding="utf-8")
-    if gitignore_contents == LEGACY_GITIGNORE:
-        atomic_replace(gitignore, GITIGNORE.encode("utf-8"))
-    elif gitignore_contents != GITIGNORE:
-        raise VaultError("vault Git ignore file is not managed by this version")
+    ensure_managed_gitignore(root)
     if config["git_sync_allowlist"] != GIT_SYNC_ALLOWLIST:
         config["git_sync_allowlist"] = GIT_SYNC_ALLOWLIST
         atomic_replace(root / CONFIG_NAME, json_bytes(config))

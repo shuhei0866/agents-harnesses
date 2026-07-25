@@ -1,0 +1,40 @@
+#!/bin/sh
+set -eu
+
+: "${FLIGHT_RECORDER_SCHEDULER_CALL_LOG:?}"
+: "${FLIGHT_RECORDER_SCHEDULER_MANAGER_STATE:?}"
+{
+  printf 'systemctl'
+  printf '\t%s' "$@"
+  printf '\n'
+} >>"$FLIGHT_RECORDER_SCHEDULER_CALL_LOG"
+
+if [ "${2:-}" = "show" ]; then
+  identifier="${5:-}"
+  fragment=""
+  if [ -f "$FLIGHT_RECORDER_SCHEDULER_MANAGER_STATE" ]; then
+    fragment=$(awk -F '	' -v name="$identifier" \
+      '$1 == name { print $2 }' "$FLIGHT_RECORDER_SCHEDULER_MANAGER_STATE")
+  fi
+  if [ -n "$fragment" ]; then
+    printf 'LoadState=loaded\nFragmentPath=%s\n' "$fragment"
+  else
+    printf 'LoadState=not-found\nFragmentPath=\n'
+  fi
+  exit 0
+fi
+
+case "${2:-}" in
+  enable)
+    units="${XDG_CONFIG_HOME}/systemd/user"
+    {
+      printf 'agent-harness-flight-recorder-sync.service\t%s\n' \
+        "$units/agent-harness-flight-recorder-sync.service"
+      printf 'agent-harness-flight-recorder-sync.timer\t%s\n' \
+        "$units/agent-harness-flight-recorder-sync.timer"
+    } >"$FLIGHT_RECORDER_SCHEDULER_MANAGER_STATE"
+    ;;
+  disable)
+    : >"$FLIGHT_RECORDER_SCHEDULER_MANAGER_STATE"
+    ;;
+esac

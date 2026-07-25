@@ -195,10 +195,26 @@ their owner-held policy files. R1 does not migrate evidence rows in place.
 An unsupported schema is recovered through a full rebuild from canonical
 chunks, leaving encrypted evidence and decoded inputs untouched.
 
-The next release runs the same operation once per day through `launchd` on macOS
-and a `systemd` timer on Linux. Failures use backoff and remain invisible during
-normal harness operation; prolonged failures are visible through
-`flight-recorder status`.
+R1.1 runs the same operation once per day through `launchd` on macOS and a
+`systemd --user` timer on Linux. `RunAtLoad` and `Persistent=true` recover
+missed runs after login or wake. A separate non-blocking scheduler lock
+collapses concurrent starts before they enter the existing serialized sync
+core. Background failure never changes a harness hook's exit status and is
+visible through `flight-recorder status`; durable bounded retry and backoff are
+the next R1.1 layer.
+
+Scheduler ownership is fail-closed. A `0600` local install manifest records the
+platform, manager identifiers, target paths, content hashes, and transaction
+phase. Install and uninstall also inspect the origin currently loaded in the
+`launchd` or `systemd` namespace. Manager operations are allowed only when both
+signals identify Flight Recorder's own target, so a same-name user job from
+another path is never replaced or stopped. During a config upgrade the manifest
+temporarily accepts both the previous and replacement hashes, allowing repair
+after an interrupted write without treating copied same-content config as
+owned. A user-global, owner-only transaction lock serializes install and
+uninstall across Vaults sharing the same OS scheduler namespace. The local
+`scheduler/` directory is excluded from Git so its absolute paths, timestamps,
+locks, and failure state remain device-local.
 
 ## Work episode model
 
