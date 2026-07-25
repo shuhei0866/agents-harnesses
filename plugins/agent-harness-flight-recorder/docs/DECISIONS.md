@@ -191,3 +191,20 @@ Accepted decisions remain recorded when later superseded.
   source evidence must remain immutable, privacy-safe, and reproducible.
   Contradictory explicit task IDs veto direct links and transitive component
   bridges. Singleton episodes preserve events with insufficient evidence.
+- Consequence: policy views coexist and can be rebuilt without rewriting source
+  events; a full rebuild restores the bundled view and owner-held custom
+  policies must be reapplied explicitly.
+
+## D-20260725-18: Authenticate Evidence Cards and preserve unknown values
+
+- Status: accepted
+- Decision: generate human and JSON Evidence Cards from one domain object only
+  after comparing SQLite source rows with authenticated chunk provenance and
+  rederiving the selected relationship policy in memory. Keep timestamp span,
+  recorded metrics, and unavailable fields distinct.
+- Reason: a structurally valid local database can still be forged, and a zero,
+  success, task label, retry count, or confidence percentage invented from
+  missing evidence would turn the value-return layer into a false signal.
+- Consequence: `report` and `inspect` fail closed on source or graph drift;
+  missing and partial evidence stays explicit, while `status` remains a
+  network-free local health snapshot rather than proof of remote freshness.

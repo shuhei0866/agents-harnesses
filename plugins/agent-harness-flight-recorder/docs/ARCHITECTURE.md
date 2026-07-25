@@ -257,6 +257,29 @@ The primary output is an Episode Evidence Card containing task type, model,
 duration, measured cost, deterministic outcomes, retry count, confidence, and
 supporting evidence. A dashboard is not required for the first value test.
 
+All three commands accept `--json` and build their human and machine output
+from the same versioned domain object. `report` uses an explicit positive
+duration and includes an episode when its last recorded event is inside the UTC
+window. `report` and `inspect` default to `default-v1`; another coexisting view
+requires its owner-held file through `--policy`. A custom definition stored
+only in the derived database is not an authenticity anchor.
+
+Card reads are authenticated, not ordinary SQLite selects. Under the Vault
+lock, the reader validates imported chunks and receipts, compares the complete
+source projection, authenticates the stored policy, and rederives that policy's
+edges and episodes in memory. It returns a card only when the stored graph
+matches the deterministic projection exactly. Human-readable output never
+weakens this check.
+
+`elapsed_ms` is the observed timestamp span. Recorded duration and cost metrics
+are labeled as sums of recorded values and carry `complete`, `partial`, or
+`missing` coverage. Models carry the same coverage instead of hiding events
+where no model was recorded. Task type and retry count remain null until their
+own evidence exists. Relationship confidence exposes the minimum supporting
+integer score beside the policy threshold; it is not a normalized probability.
+`status` performs no network request and describes a missing pending marker
+only as locally `idle`, never as proof of a successful remote sync.
+
 ## Retention and deletion
 
 Privacy-safe encrypted events are retained until the owner deletes them. Normal

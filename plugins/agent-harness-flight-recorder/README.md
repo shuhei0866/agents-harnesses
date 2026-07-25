@@ -226,6 +226,32 @@ scripts/flight-recorder rebuild-relationships --policy /path/to/policy.json
 Policies use integer weights and thresholds. Different versions coexist, and
 an invalid policy or failed rebuild leaves every existing view unchanged.
 
+Read local health and grounded Episode Evidence Cards without a dashboard:
+
+```bash
+scripts/flight-recorder status
+scripts/flight-recorder report --last 7d
+scripts/flight-recorder inspect sha256:<episode-digest>
+```
+
+Add `--json` to any command for a canonical, single-document JSON response that
+Claude Code, Codex, or another local tool can consume. `report` and `inspect`
+use `default-v1` unless `--policy-version <version>` is explicit. Reports
+include episodes whose last recorded event is inside the requested UTC window;
+durations accept a positive integer followed by `s`, `m`, `h`, `d`, or `w`.
+Custom views require their owner-held policy file through `--policy`; selecting
+a custom version stored only in the derived database is rejected.
+
+Before displaying a card, the CLI reauthenticates the receipt/cache projection
+against the SQLite source rows and deterministically rederives the requested
+relationship view. An internally consistent but forged local database is
+rejected. Timestamp span (`elapsed_ms`) remains separate from recorded duration
+metrics. Missing task type, retry count, model, metric, cost, or outcome evidence
+stays `null`, `missing`, or `partial`; it is never silently converted to zero,
+success, or a guessed label. Numeric metric values are labeled as the sum of
+recorded values and include coverage counts. Confidence is the minimum
+supporting relationship score and policy threshold, not an invented percentage.
+
 ## Local development
 
 Claude Code can load the plugin directly for one session:
@@ -253,10 +279,13 @@ bash plugins/agent-harness-flight-recorder/tests/test-git-sync.sh
 bash plugins/agent-harness-flight-recorder/tests/test-git-sync-age-e2e.sh
 bash plugins/agent-harness-flight-recorder/tests/test-evidence-index.sh
 bash plugins/agent-harness-flight-recorder/tests/test-relationship-graph.sh
+bash plugins/agent-harness-flight-recorder/tests/test-reporting.sh
 ```
 
 The tests exercise official-shape fixtures for both harnesses, privacy canaries,
 fail-open behavior, optional fields, shared auto-detection, and 50 concurrent
-writers. The stable contracts are in `schema/event-v1.schema.json`,
+writers. Reporting tests also cover human/JSON parity, policy scope, unknown
+values, sync health, and forged source/relationship projections. The stable
+source contracts are in `schema/event-v1.schema.json`,
 `schema/event-v2.schema.json`, `schema/vault-v1.schema.json`, and
 `schema/chunk-v1.schema.json`.
