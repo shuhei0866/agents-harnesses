@@ -2,9 +2,9 @@
 
 Local, privacy-first lifecycle telemetry for Claude Code and Codex.
 
-This first slice only observes work. It does not route models, score developers,
-upload data, or call an evaluator model. The purpose is to create a trustworthy
-`work episode` event stream before adding recommendations.
+The recorder observes work and can evaluate an owner-selected episode through
+an explicit local evaluator adapter. It does not route models, score
+developers, upload data, or evaluate work in the background.
 
 The accepted product architecture and release boundaries are documented in
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The reasons behind the major
@@ -41,6 +41,8 @@ Stored:
 - truncated HMAC-SHA-256 identifiers for session, turn, and workspace correlation
 - domain-separated HMAC identifiers for tasks, branches/worktrees, and up to
   128 allowlisted changed-file paths, with explicit missing/truncated state
+- finite model judgments, rubric/model provenance, referenced evidence IDs,
+  and artifact hashes after an explicit `evaluate` command
 
 Never stored by default:
 
@@ -49,6 +51,7 @@ Never stored by default:
 - transcript contents or transcript paths
 - raw session IDs, turn IDs, or workspace paths
 - raw task IDs, branch/worktree names, or changed-file paths
+- evaluator input transcripts or additional artifact bodies
 - unknown future hook fields
 
 The HMAC key is generated locally beside the event log with user-only
@@ -299,6 +302,52 @@ success, or a guessed label. Numeric metric values are labeled as the sum of
 recorded values and include coverage counts. Confidence is the minimum
 supporting relationship score and policy threshold, not an invented percentage.
 
+### On-demand model evaluation
+
+Evaluate one selected episode through a local executable that implements the
+versioned JSON evaluator protocol:
+
+```bash
+scripts/flight-recorder evaluate <episode-id> \
+  --evaluator /path/to/claude-or-codex-adapter \
+  --model MODEL_ID
+```
+
+`FLIGHT_RECORDER_EVALUATOR` and `FLIGHT_RECORDER_EVALUATOR_MODEL` can provide
+the two defaults. The adapter receives one JSON document on stdin and must
+return one strict JSON object on stdout. The bundled
+[`rubrics/on-demand-v1.json`](rubrics/on-demand-v1.json) limits output to:
+
+- `successful`, `mixed`, `unsuccessful`, or `inconclusive`;
+- `low`, `medium`, or `high` confidence;
+- one finite state per rubric criterion;
+- evidence IDs from the supplied deterministic facts.
+
+The default request is metadata-only. Additional UTF-8 artifacts require two
+steps so the scope is visible before any content reaches the evaluator:
+
+```bash
+scripts/flight-recorder evaluate <episode-id> \
+  --evaluator ADAPTER --model MODEL_ID \
+  --artifact /path/to/artifact --json
+
+scripts/flight-recorder evaluate <episode-id> \
+  --evaluator ADAPTER --model MODEL_ID \
+  --artifact /path/to/artifact --allow-artifact-content \
+  --artifact-preview-token TOKEN_FROM_FIRST_COMMAND
+```
+
+The first command only previews canonical paths and byte sizes and returns a
+keyed receipt bound to file identity and metadata. The second may send the
+selected bodies to the adapter only while that receipt still matches. Flight
+Recorder persists only SHA-256 hashes and sizes. Evaluation records are
+user-only, content-addressed local files under `evaluations/`; they are
+Git-ignored in R1.2. The selected evaluator executable is pinned by SHA-256 and
+runs from an empty temporary directory with a minimal environment and bounded
+stdout. Treat the owner-selected adapter itself as trusted code. A failed,
+timed-out, or protocol-invalid evaluator writes nothing. `report` and `inspect`
+show deterministic facts and model judgments in separate Card fields.
+
 ### Forget and best-effort purge
 
 Logical removal keeps immutable source evidence but excludes one episode from
@@ -316,9 +365,11 @@ scripts/flight-recorder purge <episode-id>
 scripts/flight-recorder purge <episode-id> --apply
 ```
 
-`--apply` removes matching local cache/index state, rewrites the dedicated
-Vault Git history, and force-pushes its `main` branch. An episode can share an
-immutable chunk with other events, so inspect the preview before applying.
+`--apply` removes matching local cache/index and evaluation state, rewrites the
+dedicated Vault Git history, and force-pushes its `main` branch. A rejected
+force-push restores the local evaluation records with the other retryable
+state. An episode can share an immutable chunk with other events, so inspect
+the preview before applying.
 Deletion from independent or uncontrolled clones, provider caches, and backups
 cannot be guaranteed; purge is best-effort outside repositories the owner
 controls.

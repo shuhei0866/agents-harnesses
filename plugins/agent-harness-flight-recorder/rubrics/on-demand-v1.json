@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "rubric_version": "on-demand-v1",
+  "criteria": ["goal_achievement", "quality", "efficiency"],
+  "conclusions": ["successful", "mixed", "unsuccessful", "inconclusive"],
+  "confidence_levels": ["low", "medium", "high"],
+  "criterion_states": ["supported", "unsupported", "unknown"]
+}

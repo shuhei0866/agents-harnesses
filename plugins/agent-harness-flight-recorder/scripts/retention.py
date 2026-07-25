@@ -11,6 +11,7 @@ from typing import Any
 
 from chunk_rotation import atomic_replace, canonical_json
 from evidence_index import DATABASE_PATH, rebuild_index_locked
+from evaluation import evaluation_record_snapshots
 from reporting import (
     EPISODE_ID_RE,
     OUTPUT_VERSION,
@@ -86,6 +87,11 @@ def _scope(
                 }
                 for source, cache, chunk in rows
             ],
+            "evaluation_record_count": len(
+                evaluation_record_snapshots(
+                    root, policy_version, episode_id
+                )
+            ),
             "limitation": LIMITATION,
         }
 
@@ -304,12 +310,26 @@ def purge(
         original_pending = (
             pending_path.read_bytes() if pending_path.exists() else None
         )
+        evaluation_snapshots = evaluation_record_snapshots(
+            root, selected, episode_id
+        )
         _rewrite_history(root, paths)
         _remove_local_derivatives(root, scope)
         rebuild_index_locked(root, incremental=False)
         forgotten = set(original_forgotten)
         forgotten.discard((selected, episode_id))
         store_forgotten(root, forgotten)
+        removed_evaluations: list[tuple[Path, bytes]] = []
+        try:
+            for evaluation_path, evaluation_bytes in evaluation_snapshots:
+                evaluation_path.unlink()
+                removed_evaluations.append(
+                    (evaluation_path, evaluation_bytes)
+                )
+        except OSError as error:
+            for evaluation_path, evaluation_bytes in removed_evaluations:
+                atomic_replace(evaluation_path, evaluation_bytes)
+            raise VaultError("evaluation storage is unsafe") from error
         try:
             # Keep refs/original until the remote accepts the rewrite. A push
             # rejection restores the local Vault to a retryable pre-purge state.
@@ -326,6 +346,8 @@ def purge(
                     pass
             else:
                 atomic_replace(pending_path, original_pending)
+            for evaluation_path, evaluation_bytes in evaluation_snapshots:
+                atomic_replace(evaluation_path, evaluation_bytes)
             _cleanup_original_history(root)
             raise
         _cleanup_original_history(root)
@@ -348,5 +370,6 @@ def render_purge(value: dict[str, Any]) -> str:
     return (
         f"{mode}: purge episode {value['episode_id']}\n"
         f"Affected encrypted chunks:\n{paths}\n"
+        f"Local evaluation records: {value['evaluation_record_count']}\n"
         f"{value['limitation']}\n"
     )

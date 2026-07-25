@@ -318,7 +318,7 @@ import sys
 
 value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 human = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
-assert value["schema_version"] == 2
+assert value["schema_version"] == 3
 assert value["command"] == "report"
 assert value["policy_version"] == "default-v1"
 assert value["window"]["requested"] == "1h"
@@ -396,7 +396,7 @@ import sys
 value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 human = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
 episode = sys.argv[3]
-assert value["schema_version"] == 2
+assert value["schema_version"] == 3
 assert value["command"] == "inspect"
 assert value["policy_version"] == "default-v1"
 assert value["card"]["episode_id"] == episode
@@ -424,6 +424,279 @@ PY
     pass "inspectはepisode形成根拠とsource evidence IDを示す"
   else
     fail "inspectはepisode形成根拠とsource evidence IDを示す"
+  fi
+}
+
+test_on_demand_model_evaluation() {
+  echo "test_on_demand_model_evaluation:"
+  local episode output preview artifact capture evaluation_root before after
+  local preview_token status=0
+  episode="$(episode_id_for 30000000-0000-4000-8000-000000000001)"
+  output="$TEST_ROOT/evaluate.json"
+  preview="$TEST_ROOT/evaluate-preview.json"
+  artifact="$TEST_ROOT/additional-artifact.txt"
+  capture="$TEST_ROOT/evaluator-request.json"
+  evaluation_root="$STATE/evaluations"
+  printf '%s\n' "PRIVATE_ARTIFACT_BODY_iam116" >"$artifact"
+
+  if FLIGHT_RECORDER_NOW="2026-07-25T12:00:00Z" \
+    FLIGHT_RECORDER_TEST_EVALUATOR_CAPTURE="$capture" \
+    run_cli evaluate "$episode" \
+      --evaluator flight-recorder-evaluator \
+      --model evaluator-test-model \
+      --json >"$output" 2>"$TEST_ROOT/evaluate.err" \
+    && python3 - "$output" "$capture" "$evaluation_root" "$STATE" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+request = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+root = pathlib.Path(sys.argv[3])
+state = pathlib.Path(sys.argv[4])
+records = list(root.glob("*.json"))
+assert value["schema_version"] == 1
+assert value["command"] == "evaluate"
+assert value["mode"] == "completed"
+evaluation = value["evaluation"]
+assert evaluation["rubric_version"] == "on-demand-v1"
+assert evaluation["evaluator"] == "flight-recorder-evaluator"
+assert evaluation["evaluator_sha256"].startswith("sha256:")
+assert evaluation["model"] == "evaluator-test-model"
+assert evaluation["conclusion"] == "successful"
+assert evaluation["confidence"] == "high"
+assert evaluation["artifact_hashes"] == []
+assert evaluation["evidence_ids"]
+assert evaluation["input_fingerprint"].startswith("sha256:")
+assert len(records) == 1
+stored = records[0].read_text(encoding="utf-8")
+assert "PRIVATE_ARTIFACT_BODY_iam116" not in stored
+assert request["metadata_only"] is True
+assert request["artifacts"] == []
+assert "source_event_ids" not in request["episode"]
+assert "models" not in request["episode"]
+assert "INJECTED" not in json.dumps(request)
+assert evaluation["source_evidence_ids"]
+assert set(evaluation["evidence_ids"]).issubset(
+    set(evaluation["source_evidence_ids"])
+)
+assert "/evaluations/\n" in (state / ".gitignore").read_text(encoding="utf-8")
+assert subprocess.check_output(
+    ["git", "-C", str(state), "status", "--porcelain", "--", "evaluations"],
+    text=True,
+) == ""
+PY
+  then
+    pass "metadata-only評価を既定にし有限値provenanceだけを保存する"
+  else
+    cat "$TEST_ROOT/evaluate.err" >&2
+    fail "metadata-only評価を既定にし有限値provenanceだけを保存する"
+    return
+  fi
+
+  before="$(python3 - "$output" <<'PY'
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(value["evaluation"]["input_fingerprint"])
+PY
+)"
+  if FLIGHT_RECORDER_NOW="2026-07-25T12:00:00Z" \
+    run_cli evaluate "$episode" \
+      --evaluator flight-recorder-evaluator \
+      --model evaluator-test-model \
+      --json >"$output" 2>"$TEST_ROOT/evaluate-repeat.err" \
+    && [[ "$before" == "$(python3 - "$output" <<'PY'
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(value["evaluation"]["input_fingerprint"])
+PY
+)" ]] \
+    && [[ "$(find "$evaluation_root" -type f -name '*.json' | wc -l | tr -d ' ')" == "1" ]]
+  then
+    pass "同じrubric・model・evidenceの再評価provenanceを安定化する"
+  else
+    fail "同じrubric・model・evidenceの再評価provenanceを安定化する"
+  fi
+
+  rm -f "$capture"
+  if run_cli evaluate "$episode" \
+    --evaluator flight-recorder-evaluator \
+    --model evaluator-test-model \
+    --artifact "$artifact" \
+    --json >"$preview" 2>"$TEST_ROOT/evaluate-preview.err" \
+    && [[ ! -e "$capture" ]] \
+    && python3 - "$preview" "$artifact" <<'PY'
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert value["command"] == "evaluate"
+assert value["mode"] == "artifact_scope_preview"
+assert value["requires_explicit_permission"] is True
+assert value["artifact_scope"] == [{
+    "path": str(pathlib.Path(sys.argv[2]).resolve()),
+    "size_bytes": len("PRIVATE_ARTIFACT_BODY_iam116\n".encode()),
+}]
+assert value["artifact_preview_token"].startswith("hmac-sha256:")
+PY
+  then
+    pass "追加artifactはmodel実行前にscope previewと明示許可を要求する"
+  else
+    fail "追加artifactはmodel実行前にscope previewと明示許可を要求する"
+  fi
+
+  preview_token="$(python3 - "$preview" <<'PY'
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(value["artifact_preview_token"])
+PY
+)"
+  status=0
+  run_cli evaluate "$episode" \
+    --evaluator flight-recorder-evaluator \
+    --model evaluator-test-model \
+    --artifact "$artifact" \
+    --allow-artifact-content \
+    --json >"$TEST_ROOT/evaluate-bypass.out" \
+    2>"$TEST_ROOT/evaluate-bypass.err" || status=$?
+  if [[ "$status" -ne 0 && ! -s "$TEST_ROOT/evaluate-bypass.out" ]] \
+    && ! grep -q "Traceback" "$TEST_ROOT/evaluate-bypass.err"; then
+    pass "artifact本文許可は直前preview receiptなしでは迂回できない"
+  else
+    fail "artifact本文許可は直前preview receiptなしでは迂回できない"
+  fi
+
+  python3 - "$artifact" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+original = path.read_bytes()
+replacement = b"X" * (len(original) - 1) + b"\n"
+assert len(replacement) == len(original)
+path.write_bytes(replacement)
+PY
+  status=0
+  run_cli evaluate "$episode" \
+    --evaluator flight-recorder-evaluator \
+    --model evaluator-test-model \
+    --artifact "$artifact" \
+    --allow-artifact-content \
+    --artifact-preview-token "$preview_token" \
+    --json >"$TEST_ROOT/evaluate-replaced.out" \
+    2>"$TEST_ROOT/evaluate-replaced.err" || status=$?
+  printf '%s\n' "PRIVATE_ARTIFACT_BODY_iam116" >"$artifact"
+  run_cli evaluate "$episode" \
+    --evaluator flight-recorder-evaluator \
+    --model evaluator-test-model \
+    --artifact "$artifact" \
+    --json >"$preview" 2>"$TEST_ROOT/evaluate-preview-refresh.err"
+  preview_token="$(python3 - "$preview" <<'PY'
+import json
+import pathlib
+import sys
+
+print(json.loads(pathlib.Path(sys.argv[1]).read_text())["artifact_preview_token"])
+PY
+)"
+  if [[ "$status" -ne 0 && ! -s "$TEST_ROOT/evaluate-replaced.out" ]]; then
+    pass "preview後の同サイズartifact差し替えをreceipt検証で拒否する"
+  else
+    fail "preview後の同サイズartifact差し替えをreceipt検証で拒否する"
+  fi
+
+  if FLIGHT_RECORDER_TEST_EVALUATOR_CAPTURE="$capture" \
+    run_cli evaluate "$episode" \
+      --evaluator flight-recorder-evaluator \
+      --model evaluator-test-model \
+      --artifact "$artifact" \
+      --allow-artifact-content \
+      --artifact-preview-token "$preview_token" \
+      --json >"$output" 2>"$TEST_ROOT/evaluate-artifact.err" \
+    && python3 - "$output" "$capture" "$evaluation_root" "$artifact" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+request_text = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+request = json.loads(request_text)
+records = list(pathlib.Path(sys.argv[3]).glob("*.json"))
+artifact = pathlib.Path(sys.argv[4])
+digest = "sha256:" + hashlib.sha256(artifact.read_bytes()).hexdigest()
+assert request["metadata_only"] is False
+assert request["artifacts"][0]["content"] == "PRIVATE_ARTIFACT_BODY_iam116\n"
+assert value["evaluation"]["artifact_hashes"] == [{
+    "sha256": digest,
+    "size_bytes": artifact.stat().st_size,
+}]
+assert len(records) == 2
+assert all(
+    "PRIVATE_ARTIFACT_BODY_iam116" not in record.read_text(encoding="utf-8")
+    and str(artifact) not in record.read_text(encoding="utf-8")
+    for record in records
+)
+PY
+  then
+    pass "許可済みartifactは本文を永続化せずhashだけをprovenanceへ残す"
+  else
+    fail "許可済みartifactは本文を永続化せずhashだけをprovenanceへ残す"
+  fi
+
+  before="$(find "$evaluation_root" -type f -name '*.json' -print | sort | xargs shasum -a 256)"
+  status=0
+  FLIGHT_RECORDER_TEST_EVALUATOR_FAIL=1 \
+    run_cli evaluate "$episode" \
+      --evaluator flight-recorder-evaluator \
+      --model evaluator-test-model \
+      --json >"$TEST_ROOT/evaluate-fail.out" \
+      2>"$TEST_ROOT/evaluate-fail.err" || status=$?
+  after="$(find "$evaluation_root" -type f -name '*.json' -print | sort | xargs shasum -a 256)"
+  if [[ "$status" -ne 0 && ! -s "$TEST_ROOT/evaluate-fail.out" \
+    && "$before" == "$after" ]] \
+    && run_cli inspect "$episode" --json >"$output" \
+      2>"$TEST_ROOT/evaluate-inspect.err" \
+    && python3 - "$output" <<'PY'
+import json
+import pathlib
+import sys
+
+card = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["card"]
+assert card["deterministic_evidence"]
+assert len(card["model_evaluations"]) == 2
+assert all(item["judgment_type"] == "model" for item in card["model_evaluations"])
+PY
+  then
+    pass "model失敗を非破壊にしCardで決定論的事実と判断を分離する"
+  else
+    fail "model失敗を非破壊にしCardで決定論的事実と判断を分離する"
+  fi
+
+  status=0
+  FLIGHT_RECORDER_TEST_EVALUATOR_OVERSIZE=1 \
+    run_cli evaluate "$episode" \
+      --evaluator flight-recorder-evaluator \
+      --model evaluator-test-model \
+      --json >"$TEST_ROOT/evaluate-oversize.out" \
+      2>"$TEST_ROOT/evaluate-oversize.err" || status=$?
+  if [[ "$status" -ne 0 && ! -s "$TEST_ROOT/evaluate-oversize.out" ]] \
+    && grep -Eq "size limit|execution failed" \
+      "$TEST_ROOT/evaluate-oversize.err"; then
+    pass "evaluator stdoutをOSレベルの有限上限で打ち切る"
+  else
+    fail "evaluator stdoutをOSレベルの有限上限で打ち切る"
   fi
 }
 
@@ -638,6 +911,7 @@ fi
 test_status_contract
 test_report_grounded_cards
 test_inspect_supporting_evidence
+test_on_demand_model_evaluation
 test_explicit_policy_scope
 test_missing_receipt_cannot_hide_tracked_evidence
 test_invalid_queries_fail_cleanly

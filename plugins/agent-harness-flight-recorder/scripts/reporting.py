@@ -51,7 +51,7 @@ from vault import (
 from retention_state import load_forgotten
 
 
-OUTPUT_VERSION = 2
+OUTPUT_VERSION = 3
 STATUS_OUTPUT_VERSION = 3
 DEFAULT_POLICY_VERSION = "default-v1"
 EPISODE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -354,6 +354,7 @@ def _edges_by_episode(
 
 
 def _episode_card(
+    root: Path,
     connection: sqlite3.Connection,
     policy: dict[str, Any],
     episode_id: str,
@@ -474,6 +475,8 @@ def _episode_card(
             "minimum_supporting_score": min(edge["score"] for edge in edges),
             "threshold": policy["threshold"],
         }
+    from evaluation import load_evaluations
+
     card = {
         "schema_version": OUTPUT_VERSION,
         "episode_id": episode_id,
@@ -502,6 +505,12 @@ def _episode_card(
             "evidence": outcome_evidence,
         },
         "deterministic_evidence": deterministic_evidence,
+        "model_evaluations": load_evaluations(
+            root,
+            policy["policy_version"],
+            episode_id,
+            {fact["evidence_id"] for fact in deterministic_evidence},
+        ),
         "retry_count": _measurement(events, "retry_count"),
         "confidence": confidence,
         "source_event_ids": event_ids,
@@ -544,7 +553,7 @@ def report(
         cards = []
         for episode_id in episode_ids:
             card, _edges = _episode_card(
-                connection, policy, episode_id, edges_by_episode
+                root, connection, policy, episode_id, edges_by_episode
             )
             last_recorded = parse_time(card["time"]["last_recorded_at"])
             if start <= last_recorded <= end:
@@ -578,6 +587,8 @@ def inspect_episode(
     episode_id: str,
     policy_version: str | None,
     policy_path: Path | None = None,
+    *,
+    locked: bool = False,
 ) -> dict[str, Any]:
     if EPISODE_ID_RE.fullmatch(episode_id) is None:
         raise VaultError("episode ID is invalid")
@@ -592,7 +603,7 @@ def inspect_episode(
             raise VaultError("episode is forgotten for relationship policy")
         edges_by_episode = _edges_by_episode(connection, policy_version)
         card, edges = _episode_card(
-            connection, policy, episode_id, edges_by_episode
+            root, connection, policy, episode_id, edges_by_episode
         )
         return {
             "schema_version": OUTPUT_VERSION,
@@ -602,9 +613,10 @@ def inspect_episode(
             "supporting_edges": edges,
         }
 
-    return _authenticated_query(
-        root, policy_version, query, trusted_policy
+    authenticated = (
+        _authenticated_query_locked if locked else _authenticated_query
     )
+    return authenticated(root, policy_version, query, trusted_policy)
 
 
 def _regular_count(directory: Path, suffix: str | None = None) -> int:
@@ -972,6 +984,7 @@ def render_report(value: dict[str, Any]) -> str:
                     "  Deterministic evidence: "
                     f"{len(card['deterministic_evidence'])}"
                 ),
+                f"  Model evaluations: {len(card['model_evaluations'])}",
                 (
                     "  Confidence: "
                     + (
@@ -1051,9 +1064,17 @@ def render_inspect(value: dict[str, Any]) -> str:
             f"{fact['evidence_type']}={fact['state']}"
             for fact in card["deterministic_evidence"]
         ),
+        "Model judgments:",
+        *(
+            f"  {item['evaluation_id']} "
+            f"{item['conclusion']} confidence={item['confidence']}"
+            for item in card["model_evaluations"]
+        ),
         "Supporting relationship edges:",
     ]
     if not card["deterministic_evidence"]:
+        lines.insert(lines.index("Model judgments:"), "  none")
+    if not card["model_evaluations"]:
         lines.insert(lines.index("Supporting relationship edges:"), "  none")
     if value["supporting_edges"]:
         for edge in value["supporting_edges"]:

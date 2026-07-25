@@ -154,10 +154,19 @@ import sys
 root = pathlib.Path(sys.argv[1])
 paths = sorted((root / "devices").rglob("*.jsonl.age"))
 paths += sorted((root / "cache" / "imported").rglob("*.jsonl"))
+paths += sorted((root / "evaluations").glob("*.json"))
 paths.append(root / "index" / "imported-chunks.json")
 for path in paths:
     print(path.relative_to(root), hashlib.sha256(path.read_bytes()).hexdigest())
 PY
+}
+
+evaluation_count() {
+  if [[ ! -d "$1/evaluations" ]]; then
+    echo 0
+    return
+  fi
+  find "$1/evaluations" -type f -name '*.json' | wc -l | tr -d ' '
 }
 
 test_forget_preserves_source_and_survives_rebuild() {
@@ -237,6 +246,12 @@ test_purge_dry_run_previews_scope_without_rewriting_history() {
     return
   }
   episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+  run_cli "$state" evaluate "$episode" \
+    --evaluator flight-recorder-evaluator \
+    --model evaluator-test-model --json >/dev/null 2>&1 || {
+      fail "purge対象episodeのevaluationを作成できる"
+      return
+    }
   target_path="$(db_value_for_event "$db" "$TARGET_EVENT" source_path)"
   unrelated_path="$(db_value_for_event "$db" "$UNRELATED_EVENT" source_path)"
   local_head="$(git -C "$state" rev-parse HEAD)"
@@ -285,7 +300,8 @@ test_purge_apply_removes_target_history_and_keeps_unrelated_chunk() {
   if [[ ! -e "$state/$target_path" \
     && -f "$state/$unrelated_path" \
     && ! -e "$state/$target_cache" \
-    && -f "$state/$unrelated_cache" ]] \
+    && -f "$state/$unrelated_cache" \
+    && "$(evaluation_count "$state")" == "0" ]] \
     && ! grep -Fq " $target_path" "$history_objects" \
     && grep -Fq " $unrelated_path" "$history_objects" \
     && python3 - "$db" "$TARGET_EVENT" "$UNRELATED_EVENT" <<'PY'
@@ -303,9 +319,9 @@ assert target == 0
 assert unrelated == 1
 PY
   then
-    pass "purgeは対象chunkをlocal/Git全履歴から除去しunrelated chunkを保持する"
+    pass "purgeは対象chunk・local evaluationを除去しunrelated chunkを保持する"
   else
-    fail "purgeは対象chunkをlocal/Git全履歴から除去しunrelated chunkを保持する"
+    fail "purgeは対象chunk・local evaluationを除去しunrelated chunkを保持する"
   fi
 }
 
@@ -321,6 +337,12 @@ test_purge_push_rejection_restores_retryable_local_state() {
     return
   }
   episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+  run_cli "$state" evaluate "$episode" \
+    --evaluator flight-recorder-evaluator \
+    --model evaluator-test-model --json >/dev/null 2>&1 || {
+      fail "push rejection対象episodeのevaluationを作成できる"
+      return
+    }
   target_path="$(db_value_for_event "$db" "$TARGET_EVENT" source_path)"
   target_cache="$(db_value_for_event "$db" "$TARGET_EVENT" cache_path)"
   before_head="$(git -C "$state" rev-parse HEAD)"
@@ -352,7 +374,8 @@ test_purge_push_rejection_restores_retryable_local_state() {
   if run_cli "$state" purge "$episode" --apply \
     >"$base/retry.txt" 2>"$base/retry.err" \
     && [[ ! -e "$state/$target_path" \
-      && ! -e "$state/$target_cache" ]] \
+      && ! -e "$state/$target_cache" \
+      && "$(evaluation_count "$state")" == "0" ]] \
     && ! git --git-dir="$remote" cat-file -e \
       "main:$target_path" 2>/dev/null; then
     pass "push拒否後はlocal stateを復元し同じpurgeを安全に再試行できる"
