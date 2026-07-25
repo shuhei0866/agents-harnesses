@@ -47,6 +47,7 @@ from vault import (
     vault_lock,
     verify_recipient_state_hmac,
 )
+from retention_state import load_forgotten
 
 
 OUTPUT_VERSION = 1
@@ -214,32 +215,43 @@ def _authenticated_query(
     trusted_policy: dict[str, Any] | None = None,
 ) -> T:
     with vault_lock(root):
-        chunks = _authenticated_chunks(root)
-        connection = _open_reporting(root / DATABASE_PATH)
-        try:
-            connection.execute("BEGIN")
-            validate_source_projection(connection, chunks, exact=True)
-            validate_database(connection)
-            policy = _policy(connection, policy_version)
-            if (
-                trusted_policy is not None
-                and canonical_json(policy) != canonical_json(trusted_policy)
-            ):
-                raise VaultError("stored relationship policy conflicts")
-            _verify_graph(connection, chunks, policy)
-            result = query(connection, policy)
-            connection.execute("COMMIT")
-            return result
-        except VaultError:
-            if connection.in_transaction:
-                connection.execute("ROLLBACK")
-            raise
-        except sqlite3.Error as error:
-            if connection.in_transaction:
-                connection.execute("ROLLBACK")
-            raise VaultError("evidence index query failed") from error
-        finally:
-            connection.close()
+        return _authenticated_query_locked(
+            root, policy_version, query, trusted_policy
+        )
+
+
+def _authenticated_query_locked(
+    root: Path,
+    policy_version: str,
+    query: Callable[[sqlite3.Connection, dict[str, Any]], T],
+    trusted_policy: dict[str, Any] | None = None,
+) -> T:
+    chunks = _authenticated_chunks(root)
+    connection = _open_reporting(root / DATABASE_PATH)
+    try:
+        connection.execute("BEGIN")
+        validate_source_projection(connection, chunks, exact=True)
+        validate_database(connection)
+        policy = _policy(connection, policy_version)
+        if (
+            trusted_policy is not None
+            and canonical_json(policy) != canonical_json(trusted_policy)
+        ):
+            raise VaultError("stored relationship policy conflicts")
+        _verify_graph(connection, chunks, policy)
+        result = query(connection, policy)
+        connection.execute("COMMIT")
+        return result
+    except VaultError:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    except sqlite3.Error as error:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise VaultError("evidence index query failed") from error
+    finally:
+        connection.close()
 
 
 def _iso(value: dt.datetime) -> str:
@@ -465,6 +477,7 @@ def report(
     def query(
         connection: sqlite3.Connection, policy: dict[str, Any]
     ) -> dict[str, Any]:
+        forgotten = load_forgotten(root)
         episode_ids = [
             row[0]
             for row in connection.execute(
@@ -472,6 +485,7 @@ def report(
                 "WHERE policy_version = ? ORDER BY episode_id",
                 (policy_version,),
             )
+            if (policy_version, row[0]) not in forgotten
         ]
         edges_by_episode = _edges_by_episode(connection, policy_version)
         cards = []
@@ -521,6 +535,8 @@ def inspect_episode(
     def query(
         connection: sqlite3.Connection, policy: dict[str, Any]
     ) -> dict[str, Any]:
+        if (policy_version, episode_id) in load_forgotten(root):
+            raise VaultError("episode is forgotten for relationship policy")
         edges_by_episode = _edges_by_episode(connection, policy_version)
         card, edges = _episode_card(
             connection, policy, episode_id, edges_by_episode

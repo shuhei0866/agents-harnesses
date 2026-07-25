@@ -253,6 +253,30 @@ success, or a guessed label. Numeric metric values are labeled as the sum of
 recorded values and include coverage counts. Confidence is the minimum
 supporting relationship score and policy threshold, not an invented percentage.
 
+### Forget and best-effort purge
+
+Logical removal keeps immutable source evidence but excludes one episode from
+normal reports and later evaluation:
+
+```bash
+scripts/flight-recorder forget <episode-id>
+```
+
+Destructive purge is a two-step operation. The default command only previews
+the encrypted chunks that would be removed:
+
+```bash
+scripts/flight-recorder purge <episode-id>
+scripts/flight-recorder purge <episode-id> --apply
+```
+
+`--apply` removes matching local cache/index state, rewrites the dedicated
+Vault Git history, and force-pushes its `main` branch. An episode can share an
+immutable chunk with other events, so inspect the preview before applying.
+Deletion from independent or uncontrolled clones, provider caches, and backups
+cannot be guaranteed; purge is best-effort outside repositories the owner
+controls.
+
 ## Local development
 
 Claude Code can load the plugin directly for one session:
@@ -281,6 +305,7 @@ bash plugins/agent-harness-flight-recorder/tests/test-git-sync-age-e2e.sh
 bash plugins/agent-harness-flight-recorder/tests/test-evidence-index.sh
 bash plugins/agent-harness-flight-recorder/tests/test-relationship-graph.sh
 bash plugins/agent-harness-flight-recorder/tests/test-reporting.sh
+bash plugins/agent-harness-flight-recorder/tests/test-retention.sh
 ```
 
 The tests exercise official-shape fixtures for both harnesses, privacy canaries,
