@@ -1,0 +1,130 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/shuhei0866/agents-harnesses/plugins/agent-harness-flight-recorder/schema/event-v3.schema.json",
+  "title": "Agent Harness Flight Recorder Event v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "event_id", "recorded_at", "harness", "source_event",
+    "event_kind", "session_id_hash", "turn_id_hash", "workspace_id", "model",
+    "permission_mode", "tool", "metrics", "outcome", "relationship_context",
+    "operation_kind"
+  ],
+  "properties": {
+    "schema_version": { "const": 3 },
+    "event_id": { "type": "string", "format": "uuid" },
+    "recorded_at": { "type": "string", "format": "date-time" },
+    "harness": { "enum": ["claude-code", "codex"] },
+    "source_event": {
+      "enum": [
+        "SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "unknown"
+      ]
+    },
+    "event_kind": {
+      "enum": [
+        "session.started", "turn.prompted", "tool.completed",
+        "turn.completed", "hook.observed"
+      ]
+    },
+    "session_id_hash": { "$ref": "#/$defs/hashOrNull" },
+    "turn_id_hash": { "$ref": "#/$defs/hashOrNull" },
+    "workspace_id": { "$ref": "#/$defs/hashOrNull" },
+    "model": { "$ref": "#/$defs/stringOrNull" },
+    "permission_mode": { "$ref": "#/$defs/stringOrNull" },
+    "tool": { "$ref": "#/$defs/stringOrNull" },
+    "metrics": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "duration_ms": { "$ref": "#/$defs/nonNegativeNumber" },
+            "duration_api_ms": { "$ref": "#/$defs/nonNegativeNumber" },
+            "tool_duration_ms": { "$ref": "#/$defs/nonNegativeNumber" },
+            "num_turns": { "$ref": "#/$defs/nonNegativeNumber" },
+            "input_tokens": { "$ref": "#/$defs/nonNegativeNumber" },
+            "output_tokens": { "$ref": "#/$defs/nonNegativeNumber" },
+            "cache_creation_input_tokens": {
+              "$ref": "#/$defs/nonNegativeNumber"
+            },
+            "cache_read_input_tokens": {
+              "$ref": "#/$defs/nonNegativeNumber"
+            },
+            "total_cost_usd": { "$ref": "#/$defs/nonNegativeNumber" },
+            "retry_count": { "type": "integer", "minimum": 0 }
+          }
+        }
+      ]
+    },
+    "outcome": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status"],
+          "properties": {
+            "status": { "enum": ["success", "failure", "unknown"] },
+            "exit_code": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 255
+            }
+          }
+        }
+      ]
+    },
+    "relationship_context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "task_id_hash", "task_source", "branch_or_worktree_id",
+        "changed_file_fingerprints", "changed_files_state"
+      ],
+      "properties": {
+        "task_id_hash": { "$ref": "#/$defs/hashOrNull" },
+        "task_source": { "enum": ["payload", "env", "branch", null] },
+        "branch_or_worktree_id": { "$ref": "#/$defs/hashOrNull" },
+        "changed_file_fingerprints": {
+          "type": "array",
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/hash" }
+        },
+        "changed_files_state": {
+          "enum": ["complete", "truncated", "missing"]
+        }
+      }
+    },
+    "operation_kind": {
+      "enum": ["test", "build", "lint", "git_commit", "pull_request", null]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "operation_kind": { "type": "string" }
+        }
+      },
+      "then": {
+        "properties": {
+          "source_event": { "const": "PostToolUse" },
+          "event_kind": { "const": "tool.completed" }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "hash": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{24}$"
+    },
+    "hashOrNull": {
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/hash" }]
+    },
+    "stringOrNull": { "type": ["string", "null"], "maxLength": 256 },
+    "nonNegativeNumber": { "type": "number", "minimum": 0 }
+  }
+}

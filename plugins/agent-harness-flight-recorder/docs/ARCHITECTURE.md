@@ -173,13 +173,16 @@ import receipt + canonical decoded cache
 index/vault.sqlite (derived, local-only, replaceable)
 ```
 
-Schema v2 separates immutable source projections from recomputable state:
+Schema v3 separates immutable source projections from recomputable state:
 
 - `source_chunks` records chunk identity, source path, Git blob OID, producer,
   event count, and canonical plaintext digest;
-- `source_events` stores ordered Event v1/v2 projections, canonical JSON, and
-  nullable Event v2 relationship-context projections;
+- `source_events` stores ordered Event v1/v2/v3 projections, canonical JSON,
+  nullable Event v2 relationship context, and nullable Event v3 operation kind;
 - `import_provenance` records the receipt and cache path used for each chunk;
+- `deterministic_evidence` contains rebuildable, source-linked facts with
+  stable IDs, collector versions, timestamps, explicit states, and bounded
+  values;
 - `derived_state` is namespaced and policy-versioned;
 - `relationship_policies`, `relationship_edges`, `episodes`, and
   `episode_members` contain recomputable versioned relationship views.
@@ -269,6 +272,14 @@ Stored evaluation provenance includes the rubric version, evaluator and model,
 timestamp, evidence identifiers, artifact hashes, conclusions, and confidence.
 Artifact bodies and evaluator input transcripts are not persisted by default.
 
+The deterministic collector is deliberately narrower than a shell parser.
+Event v3 recognizes only finite operation kinds from simple allowlisted tool
+invocations. It stores the classification and a bounded outcome but never the
+raw command, tool output, diff, or artifact body. SQLite derives one stable
+evidence ID from the collector version, source event, timestamp, type, state,
+and bounded value. A recognized operation without a trustworthy outcome is
+`missing`; a trustworthy unsuccessful outcome is `failure`.
+
 ## User interface
 
 The first interface is a stable CLI that agent harnesses can also invoke:
@@ -292,17 +303,18 @@ only in the derived database is not an authenticity anchor.
 
 Card reads are authenticated, not ordinary SQLite selects. Under the Vault
 lock, the reader validates imported chunks and receipts, compares the complete
-source projection, authenticates the stored policy, and rederives that policy's
-edges and episodes in memory. It returns a card only when the stored graph
-matches the deterministic projection exactly. Human-readable output never
-weakens this check.
+source projection, authenticates the stored policy, and rederives both
+deterministic evidence and that policy's edges and episodes in memory. It
+returns a card only when all stored derived rows match those projections
+exactly. Human-readable output never weakens this check.
 
 `elapsed_ms` is the observed timestamp span. Recorded duration and cost metrics
 are labeled as sums of recorded values and carry `complete`, `partial`, or
 `missing` coverage. Models carry the same coverage instead of hiding events
-where no model was recorded. Task type and retry count remain null until their
-own evidence exists. Relationship confidence exposes the minimum supporting
-integer score beside the policy threshold; it is not a normalized probability.
+where no model was recorded. Retry count uses the same explicit measurement
+coverage and remains `missing` until its own evidence exists. Relationship
+confidence exposes the minimum supporting integer score beside the policy
+threshold; it is not a normalized probability.
 `status` performs no network request and describes a missing pending marker
 only as locally `idle`, never as proof of a successful remote sync.
 

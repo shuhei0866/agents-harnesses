@@ -22,6 +22,7 @@ from evidence_index import (
     create_schema,
     insert_chunk,
     load_chunks,
+    rebuild_deterministic_evidence,
     validate_database,
     validate_source_projection,
 )
@@ -50,7 +51,7 @@ from vault import (
 from retention_state import load_forgotten
 
 
-OUTPUT_VERSION = 1
+OUTPUT_VERSION = 2
 STATUS_OUTPUT_VERSION = 3
 DEFAULT_POLICY_VERSION = "default-v1"
 EPISODE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -197,6 +198,21 @@ def _verify_graph(
         create_schema(expected)
         for chunk in chunks:
             insert_chunk(expected, chunk)
+        rebuild_deterministic_evidence(expected)
+        actual_evidence = sorted(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT * FROM deterministic_evidence"
+            )
+        )
+        expected_evidence = sorted(
+            tuple(row)
+            for row in expected.execute(
+                "SELECT * FROM deterministic_evidence"
+            )
+        )
+        if actual_evidence != expected_evidence:
+            raise VaultError("deterministic evidence projection conflicts")
         rebuild_relationships(expected, policy)
         validate_database(expected)
         if _graph_rows(connection, policy["policy_version"]) != _graph_rows(
@@ -408,6 +424,41 @@ def _episode_card(
         else:
             outcome_counts["not_recorded"] += 1
     event_ids = [event["event_id"] for event in events]
+    placeholders = ",".join("?" for _ in event_ids)
+    deterministic_evidence = []
+    for (
+        evidence_id,
+        source_event_id,
+        collector_version,
+        collected_at,
+        evidence_type,
+        state,
+        value_json,
+    ) in connection.execute(
+        "SELECT evidence_id, source_event_id, collector_version, "
+        "collected_at, evidence_type, state, value_json "
+        "FROM deterministic_evidence "
+        f"WHERE source_event_id IN ({placeholders}) "
+        "ORDER BY collected_at, source_event_id, evidence_type, evidence_id",
+        event_ids,
+    ):
+        try:
+            evidence_value = (
+                json.loads(value_json) if value_json is not None else None
+            )
+        except (TypeError, json.JSONDecodeError) as error:
+            raise VaultError("deterministic evidence is invalid") from error
+        deterministic_evidence.append(
+            {
+                "evidence_id": evidence_id,
+                "source_event_id": source_event_id,
+                "collector_version": collector_version,
+                "collected_at": collected_at,
+                "evidence_type": evidence_type,
+                "state": state,
+                "value": evidence_value,
+            }
+        )
     known_models = sum(event["model"] is not None for event in events)
     model_state = (
         "missing"
@@ -449,8 +500,8 @@ def _episode_card(
             **outcome_counts,
             "evidence": outcome_evidence,
         },
-        # Retry evidence is introduced by the R1.1 durable retry work.
-        "retry_count": None,
+        "deterministic_evidence": deterministic_evidence,
+        "retry_count": _measurement(events, "retry_count"),
         "confidence": confidence,
         "source_event_ids": event_ids,
     }
@@ -911,7 +962,15 @@ def render_report(value: dict[str, Any]) -> str:
                     "not-recorded="
                     f"{card['deterministic_outcomes']['not_recorded']}"
                 ),
-                f"  Retry count: {_display(card['retry_count'])}",
+                (
+                    "  Retry count: "
+                    f"{_display(card['retry_count']['value'])} "
+                    f"({card['retry_count']['state']})"
+                ),
+                (
+                    "  Deterministic evidence: "
+                    f"{len(card['deterministic_evidence'])}"
+                ),
                 (
                     "  Confidence: "
                     + (
@@ -966,7 +1025,11 @@ def render_inspect(value: dict[str, Any]) -> str:
             f"unknown={card['deterministic_outcomes']['unknown']} "
             f"not-recorded={card['deterministic_outcomes']['not_recorded']}"
         ),
-        f"Retry count: {_display(card['retry_count'])}",
+        (
+            "Retry count: "
+            f"{_display(card['retry_count']['value'])} "
+            f"({card['retry_count']['state']})"
+        ),
         (
             "Confidence: "
             + (
@@ -981,6 +1044,12 @@ def render_inspect(value: dict[str, Any]) -> str:
         ),
         "Source evidence IDs:",
         *(f"  {event_id}" for event_id in card["source_event_ids"]),
+        "Deterministic evidence IDs:",
+        *(
+            f"  {fact['evidence_id']} "
+            f"{fact['evidence_type']}={fact['state']}"
+            for fact in card["deterministic_evidence"]
+        ),
         "Supporting relationship edges:",
     ]
     if value["supporting_edges"]:

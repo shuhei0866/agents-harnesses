@@ -57,6 +57,7 @@ METRIC_NAMES = {
     "cache_creation_input_tokens",
     "cache_read_input_tokens",
     "total_cost_usd",
+    "retry_count",
 }
 EVENT_FIELDS = {
     "schema_version",
@@ -78,6 +79,14 @@ RELATIONSHIP_CONTEXT_FIELDS = {
     "changed_files_state",
 }
 EVENT_V2_FIELDS = EVENT_FIELDS | {"relationship_context"}
+EVENT_V3_FIELDS = EVENT_V2_FIELDS | {"operation_kind"}
+OPERATION_KINDS = {
+    "test",
+    "build",
+    "lint",
+    "git_commit",
+    "pull_request",
+}
 RFC3339_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
     r"(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
@@ -103,10 +112,19 @@ def parse_time(value: object) -> dt.datetime:
 
 
 def validate_event(value: object) -> dict[str, Any]:
-    if not isinstance(value, dict) or value.get("schema_version") not in (1, 2):
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") not in (1, 2, 3)
+    ):
         raise ValueError("unsupported event schema_version")
     version = value["schema_version"]
-    expected_fields = EVENT_FIELDS if version == 1 else EVENT_V2_FIELDS
+    expected_fields = (
+        EVENT_FIELDS
+        if version == 1
+        else EVENT_V2_FIELDS
+        if version == 2
+        else EVENT_V3_FIELDS
+    )
     if set(value) != expected_fields:
         raise ValueError(f"event does not match event-v{version} fields")
     try:
@@ -163,7 +181,7 @@ def validate_event(value: object) -> dict[str, Any]:
             )
         ):
             raise ValueError("invalid outcome")
-    if version == 2:
+    if version >= 2:
         context = value["relationship_context"]
         if not isinstance(context, dict) or set(context) != RELATIONSHIP_CONTEXT_FIELDS:
             raise ValueError("invalid relationship_context")
@@ -197,6 +215,26 @@ def validate_event(value: object) -> dict[str, Any]:
             raise ValueError("invalid changed_files_state")
         if state == "missing" and fingerprints:
             raise ValueError("missing changed files cannot have fingerprints")
+    if version == 3:
+        operation = value["operation_kind"]
+        if operation is not None and operation not in OPERATION_KINDS:
+            raise ValueError("invalid operation_kind")
+        if operation is not None and (
+            value["source_event"] != "PostToolUse"
+            or value["event_kind"] != "tool.completed"
+        ):
+            raise ValueError("operation_kind requires a completed tool event")
+        if outcome is not None:
+            if "status" not in outcome:
+                raise ValueError("Event v3 outcome must include status")
+            exit_code = outcome.get("exit_code")
+            if exit_code is not None and not 0 <= exit_code <= 255:
+                raise ValueError("invalid allowlisted exit_code")
+        retry_count = metrics.get("retry_count") if metrics is not None else None
+        if retry_count is not None and (
+            isinstance(retry_count, bool) or not isinstance(retry_count, int)
+        ):
+            raise ValueError("invalid retry_count")
     return value
 
 
@@ -416,7 +454,7 @@ def publish(root: Path, config: dict[str, object], identity: Path, events: list[
 
 def process_job(root: Path, config: dict[str, object], identity: Path, job: Path) -> None:
     events = read_job(root, job)
-    for version in (1, 2):
+    for version in (1, 2, 3):
         homogeneous = [event for event in events if event["schema_version"] == version]
         if homogeneous:
             publish(root, config, identity, homogeneous)

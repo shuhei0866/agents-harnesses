@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Event v2 / versioned relationship graph contract tests.
+# Event v2/v3 / versioned relationship graph contract tests.
 # External dependencies: git and python3. Network access is not required.
 set -uo pipefail
 
@@ -253,7 +253,8 @@ assert "RAW_RELATIONSHIP_CANARY_79b7" not in raw
 assert "/private/workspace" not in raw
 assert "private/second.py" not in raw
 event = json.loads(raw)
-assert event["schema_version"] == 2
+assert event["schema_version"] == 3
+assert event["operation_kind"] is None
 context = event["relationship_context"]
 assert set(context) == {
     "task_id_hash",
@@ -275,9 +276,9 @@ assert context["task_source"] == "payload"
 assert context["changed_files_state"] == "complete"
 PY
   then
-    pass "Event v2はraw値を捨てdomain-separated HMAC relationship_contextだけを保存する"
+    pass "Event v3はraw値を捨てprivacy-safe contextだけを保存する"
   else
-    fail "Event v2はraw値を捨てdomain-separated HMAC relationship_contextだけを保存する"
+    fail "Event v3はraw値を捨てprivacy-safe contextだけを保存する"
   fi
 
   python3 - "$input" <<'PY'
@@ -489,7 +490,7 @@ import sqlite3
 import sys
 
 connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
-assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
 tables = {
     row[0]
     for row in connection.execute(
@@ -503,7 +504,7 @@ assert {
     "episode_members",
 } <= tables
 metadata = dict(connection.execute("SELECT key, value FROM schema_metadata"))
-assert metadata["event_schema_versions"] == "1,2"
+assert metadata["event_schema_versions"] == "1,2,3"
 
 row = connection.execute(
     """
@@ -540,9 +541,9 @@ for feature in evidence.values():
 assert encoded == json.dumps(evidence, sort_keys=True, separators=(",", ":"))
 PY
   then
-    pass "SQLite v2はversioned graphとcanonicalな全6特徴・integer scoreを保持する"
+    pass "SQLite v3はversioned graphとcanonicalな全6特徴・integer scoreを保持する"
   else
-    fail "SQLite v2はversioned graphとcanonicalな全6特徴・integer scoreを保持する"
+    fail "SQLite v3はversioned graphとcanonicalな全6特徴・integer scoreを保持する"
   fi
 }
 

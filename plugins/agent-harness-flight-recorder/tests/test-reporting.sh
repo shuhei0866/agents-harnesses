@@ -318,7 +318,7 @@ import sys
 
 value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 human = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
-assert value["schema_version"] == 1
+assert value["schema_version"] == 2
 assert value["command"] == "report"
 assert value["policy_version"] == "default-v1"
 assert value["window"]["requested"] == "1h"
@@ -338,7 +338,14 @@ assert linked["model_coverage"] == {
     "total_event_count": 2,
 }
 assert linked["task_type"] is None
-assert linked["retry_count"] is None
+assert linked["retry_count"] == {
+    "value": None,
+    "state": "missing",
+    "aggregation": "sum_of_recorded_values",
+    "known_event_count": 0,
+    "total_event_count": 2,
+}
+assert len(linked["deterministic_evidence"]) == 3
 assert linked["measured_duration_ms"] == {
     "value": 1200,
     "state": "partial",
@@ -356,7 +363,8 @@ assert linked["measured_cost_usd"] == {
 assert linked["deterministic_outcomes"]["success"] == 1
 assert linked["deterministic_outcomes"]["not_recorded"] == 1
 assert singleton["task_type"] is None
-assert singleton["retry_count"] is None
+assert singleton["retry_count"]["state"] == "missing"
+assert singleton["deterministic_evidence"] == []
 assert singleton["model_coverage"]["state"] == "missing"
 assert singleton["measured_duration_ms"]["value"] is None
 assert singleton["measured_cost_usd"]["value"] is None
@@ -388,7 +396,7 @@ import sys
 value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 human = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
 episode = sys.argv[3]
-assert value["schema_version"] == 1
+assert value["schema_version"] == 2
 assert value["command"] == "inspect"
 assert value["policy_version"] == "default-v1"
 assert value["card"]["episode_id"] == episode
