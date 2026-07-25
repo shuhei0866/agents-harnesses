@@ -1,0 +1,147 @@
+language: 'ja-JP'
+
+# このリポジトリはユーザーの実機で動く hook とガードレールを配布する。
+# 誤った shell script がそのまま各デバイスで実行されるため、
+# shell の安全性と secret の取り扱いを最優先のレビュー観点に置く。
+reviews:
+  profile: assertive
+  auto_review:
+    enabled: true
+    ignore_title_keywords:
+      - 'WIP'
+      - 'Draft'
+    drafts: false
+    base_branches:
+      - 'main'
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  enable_prompt_for_ai_agents: true
+  path_filters:
+    - '!**/__pycache__/**'
+    - '!**/.worktrees/**'
+    - '!**/tests/fixtures/**'
+
+  path_instructions:
+    - path: '**/hooks/**'
+      instructions: |
+        hook スクリプトのレビュー観点:
+        - hook はユーザーの実機で自動実行される。失敗時に作業を止めない設計になっているか
+          （exit code が意図せず非ゼロを返してツールチェーンを壊さないか）
+        - 変数展開が引用符で囲まれているか。パスに空白が含まれても壊れないか
+        - コマンド置換の結果をそのままコマンドとして評価していないか（injection）
+        - transcript やログに secret・token・環境変数の値を書き出していないか
+        - 破壊的な操作（rm -rf、git reset --hard、ブランチ削除）を確認なしで実行していないか
+
+    - path: '**/*.sh'
+      instructions: |
+        shell script のレビュー観点:
+        - set -euo pipefail 相当の失敗検知があるか。無い場合は意図的かどうか
+        - 未定義変数を参照して空文字に化ける経路が無いか（rm "$DIR"/* の類）
+        - 外部コマンドの存在確認をしてから呼んでいるか
+        - 一時ファイルを予測可能なパスに作っていないか
+
+        次の 2 つは必ず指摘する:
+
+        1. secret のログ出力
+           token・API キー・パスワード・環境変数の値を、標準出力・標準エラー・
+           ログファイル・transcript にマスクせず書き出している場合。
+           echo / printf / logger での直接出力、エラーハンドラーが URL の query や
+           環境変数を丸ごと出す経路、認証情報を含むリクエストに対する curl -v や
+           set -x の有効化が対象。先頭数文字のみ残すなどのマスクを経ていれば指摘しない。
+
+        2. 確認なしの破壊的操作
+           rm -rf / git worktree remove / git branch -D / git reset --hard /
+           git push --force を、ユーザー確認も dry-run も経ずに実行している場合。
+           対象パスが変数で、その変数が空になりうる経路があるときは特に重く扱う。
+           確認手順・dry-run オプション・明示的な force フラグで守られていれば指摘しない。
+
+    - path: 'claude-code/skills/**'
+      instructions: |
+        スキル定義のレビュー観点:
+        - description が発火条件を具体的に述べているか（曖昧だと誤発火する）
+        - スキルが前提とする外部コマンドやファイルパスが実在するか
+        - 他スキルと発火条件が衝突していないか
+
+    - path: 'claude-code/agents/**'
+      instructions: |
+        サブエージェント定義のレビュー観点:
+        - tools の指定が最小権限になっているか（read-only で足りる用途に書き込みを渡していないか）
+        - system prompt が親の文脈に依存せず単体で成立しているか
+
+    # 上の shell 向け指示は *.sh と hooks 配下しか捉えられないが、
+    # このリポジトリには拡張子を持たない shell の実行ファイルがある
+    # （plugins/agent-harness-flight-recorder/scripts/record-event と flight-recorder は
+    # どちらも #!/bin/sh で、hooks.json から自動実行される）。
+    # 取りこぼしを防ぐため、次の 2 つだけはリポジトリ全体に掛ける。
+    - path: '**'
+      instructions: |
+        ファイルの拡張子や置き場所によらず、次の 2 つは必ず指摘する。
+        対象は shell・Python・JSON 設定を問わず、実行される全てのコードとする。
+
+        1. secret のログ出力
+           token・API キー・パスワード・環境変数の値を、標準出力・標準エラー・
+           ログファイル・transcript にマスクせず書き出している場合。
+           エラーハンドラーが URL の query や環境変数を丸ごと出す経路、
+           認証情報を含むリクエストに対する curl -v や set -x の有効化も対象。
+           先頭数文字のみ残すなどのマスクを経ていれば指摘しない。
+
+        2. 確認なしの破壊的操作
+           rm -rf / git worktree remove / git branch -D / git reset --hard /
+           git push --force を、ユーザー確認も dry-run も経ずに実行している場合。
+           対象パスが変数で、その変数が空になりうる経路があるときは特に重く扱う。
+           確認手順・dry-run オプション・明示的な force フラグで守られていれば指摘しない。
+
+  # このリポジトリは public なので、CodeRabbit の Pro プランが無期限で無料になる。
+  # ただし custom_checks・fix_ci・resolve_merge_conflict は Pro+ 限定なので動かない。
+  # secret のログ出力と確認なしの破壊的操作は、上の path_instructions に畳んである。
+  pre_merge_checks:
+    title:
+      mode: warning
+      requirements: |
+        対象領域（hooks / skills / agents / loops / plugins / scripts）が分かる件名であること。
+        日本語で「何がどう変わるか」を述べていること。
+    description:
+      mode: warning
+    docstrings:
+      # 引用符は必須。裸の off は YAML では真偽値 false としてパースされる。
+      mode: 'off'
+
+  finishing_touches:
+    docstrings:
+      enabled: false
+
+  tools:
+    shellcheck:
+      enabled: true
+    gitleaks:
+      enabled: true
+    trufflehog:
+      enabled: true
+    semgrep:
+      enabled: true
+    actionlint:
+      enabled: true
+    yamllint:
+      enabled: true
+    ruff:
+      enabled: true
+    osvScanner:
+      enabled: true
+    markdownlint:
+      enabled: false
+    languagetool:
+      enabled: false
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  opt_out: false
+  learnings:
+    scope: auto
+  issues:
+    scope: auto
+  pull_requests:
+    scope: auto
