@@ -16,7 +16,7 @@
   "properties": {
     "record_type": { "const": "chunk_header" },
     "schema_version": { "const": 1 },
-    "event_schema_version": { "const": 1 },
+    "event_schema_version": { "enum": [1, 2] },
     "chunk_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
     "vault_id": { "type": "string", "format": "uuid" },
     "device_id": { "type": "string", "format": "uuid" },

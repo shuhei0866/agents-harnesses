@@ -435,10 +435,13 @@ def validate_plaintext(
         + canonical_events
     ).hexdigest()
     first = parse_time(events[0]["recorded_at"]).astimezone(dt.timezone.utc)
+    event_version = events[0]["schema_version"]
+    if any(event["schema_version"] != event_version for event in events):
+        raise VaultError("chunk mixes event schema versions")
     expected_header = {
         "record_type": "chunk_header",
         "schema_version": 1,
-        "event_schema_version": 1,
+        "event_schema_version": event_version,
         "chunk_id": f"sha256:{digest}",
         "vault_id": config["vault_id"],
         "device_id": device_id,

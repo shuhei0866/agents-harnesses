@@ -71,6 +71,14 @@ EVENT_FIELDS = {
     "metrics",
     "outcome",
 }
+RELATIONSHIP_CONTEXT_FIELDS = {
+    "task_id_hash",
+    "task_source",
+    "branch_or_worktree_id",
+    "changed_file_fingerprints",
+    "changed_files_state",
+}
+EVENT_V2_FIELDS = EVENT_FIELDS | {"relationship_context"}
 RFC3339_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
     r"(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
@@ -96,10 +104,12 @@ def parse_time(value: object) -> dt.datetime:
 
 
 def validate_event(value: object) -> dict[str, Any]:
-    if not isinstance(value, dict) or set(value) != EVENT_FIELDS:
-        raise ValueError("event does not match event-v1 fields")
-    if value["schema_version"] != 1:
+    if not isinstance(value, dict) or value.get("schema_version") not in (1, 2):
         raise ValueError("unsupported event schema_version")
+    version = value["schema_version"]
+    expected_fields = EVENT_FIELDS if version == 1 else EVENT_V2_FIELDS
+    if set(value) != expected_fields:
+        raise ValueError(f"event does not match event-v{version} fields")
     try:
         uuid.UUID(value["event_id"])
     except (TypeError, ValueError, AttributeError) as error:
@@ -154,6 +164,40 @@ def validate_event(value: object) -> dict[str, Any]:
             )
         ):
             raise ValueError("invalid outcome")
+    if version == 2:
+        context = value["relationship_context"]
+        if not isinstance(context, dict) or set(context) != RELATIONSHIP_CONTEXT_FIELDS:
+            raise ValueError("invalid relationship_context")
+        for field in ("task_id_hash", "branch_or_worktree_id"):
+            item = context[field]
+            if item is not None and (
+                not isinstance(item, str)
+                or not re.fullmatch(r"sha256:[0-9a-f]{24}", item)
+            ):
+                raise ValueError(f"invalid relationship {field}")
+        task_source = context["task_source"]
+        if (context["task_id_hash"] is None and task_source is not None) or (
+            context["task_id_hash"] is not None
+            and task_source not in ("payload", "env", "branch")
+        ):
+            raise ValueError("invalid relationship task_source")
+        fingerprints = context["changed_file_fingerprints"]
+        if (
+            not isinstance(fingerprints, list)
+            or len(fingerprints) > 128
+            or any(
+                not isinstance(item, str)
+                or not re.fullmatch(r"sha256:[0-9a-f]{24}", item)
+                for item in fingerprints
+            )
+            or fingerprints != sorted(set(fingerprints))
+        ):
+            raise ValueError("invalid changed_file_fingerprints")
+        state = context["changed_files_state"]
+        if state not in ("complete", "truncated", "missing"):
+            raise ValueError("invalid changed_files_state")
+        if state == "missing" and fingerprints:
+            raise ValueError("missing changed files cannot have fingerprints")
     return value
 
 
@@ -321,10 +365,13 @@ def publish(root: Path, config: dict[str, object], identity: Path, events: list[
     ).hexdigest()
     first_time = parse_time(events[0]["recorded_at"]).astimezone(dt.timezone.utc)
     created_at = first_time.isoformat().replace("+00:00", "Z")
+    event_version = events[0]["schema_version"]
+    if any(event["schema_version"] != event_version for event in events):
+        raise VaultError("chunk events must have one schema version")
     header = {
         "record_type": "chunk_header",
         "schema_version": 1,
-        "event_schema_version": 1,
+        "event_schema_version": event_version,
         "chunk_id": f"sha256:{digest}",
         "vault_id": vault_id,
         "device_id": device_id,
@@ -370,8 +417,10 @@ def publish(root: Path, config: dict[str, object], identity: Path, events: list[
 
 def process_job(root: Path, config: dict[str, object], identity: Path, job: Path) -> None:
     events = read_job(root, job)
-    if events:
-        publish(root, config, identity, events)
+    for version in (1, 2):
+        homogeneous = [event for event in events if event["schema_version"] == version]
+        if homogeneous:
+            publish(root, config, identity, homogeneous)
     job.unlink()
     fsync_directory(job.parent)
 

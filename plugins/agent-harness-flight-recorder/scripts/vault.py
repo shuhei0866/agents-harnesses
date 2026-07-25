@@ -741,6 +741,10 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("sync")
     rebuild = commands.add_parser("rebuild-index")
     rebuild.add_argument("--incremental", action="store_true")
+    relationships = commands.add_parser("rebuild-relationships")
+    relationships.add_argument(
+        "--policy", "--policy-file", dest="policy", type=Path
+    )
     return top
 
 
@@ -753,7 +757,7 @@ def main() -> int:
         add_device(root, args.recipient, args.identity)
     elif args.command == "device" and args.device_command == "join":
         join_device(root, args.identity)
-    elif args.command in ("rotate", "sync", "rebuild-index"):
+    elif args.command in ("rotate", "sync", "rebuild-index", "rebuild-relationships"):
         # The shell wrapper executes this file as __main__. Register that module
         # under its import name so chunk_rotation shares this VaultError class
         # instead of loading a second copy that the CLI exception handler misses.
@@ -766,10 +770,14 @@ def main() -> int:
             from sync import sync
 
             sync(root)
-        else:
+        elif args.command == "rebuild-index":
             from evidence_index import rebuild_index
 
             rebuild_index(root, incremental=args.incremental)
+        else:
+            from evidence_index import rebuild_relationship_views
+
+            rebuild_relationship_views(root, args.policy)
     return 0
 
 

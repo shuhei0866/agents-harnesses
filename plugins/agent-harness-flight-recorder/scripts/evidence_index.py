@@ -33,7 +33,7 @@ from vault import (
 
 
 DATABASE_PATH = Path("index/vault.sqlite")
-INDEX_VERSION = 1
+INDEX_VERSION = 2
 SCHEMA = """
 CREATE TABLE schema_metadata (
     key TEXT PRIMARY KEY NOT NULL,
@@ -67,6 +67,11 @@ CREATE TABLE source_events (
     tool TEXT,
     metrics_json TEXT,
     outcome_json TEXT,
+    relationship_task_id_hash TEXT,
+    relationship_task_source TEXT,
+    relationship_branch_or_worktree_id TEXT,
+    relationship_changed_file_fingerprints_json TEXT,
+    relationship_changed_files_state TEXT,
     canonical_event_json TEXT NOT NULL,
     UNIQUE (chunk_id, ordinal),
     FOREIGN KEY (chunk_id) REFERENCES source_chunks(chunk_id)
@@ -89,6 +94,52 @@ CREATE TABLE derived_state (
     value_json TEXT NOT NULL,
     PRIMARY KEY (namespace, key, policy_version)
 ) WITHOUT ROWID;
+CREATE TABLE relationship_policies (
+    policy_version TEXT PRIMARY KEY NOT NULL,
+    schema_version INTEGER NOT NULL,
+    policy_sha256 TEXT NOT NULL,
+    policy_json TEXT NOT NULL
+) WITHOUT ROWID;
+CREATE TABLE relationship_edges (
+    policy_version TEXT NOT NULL,
+    left_event_id TEXT NOT NULL,
+    right_event_id TEXT NOT NULL,
+    score INTEGER NOT NULL,
+    decision TEXT NOT NULL CHECK (
+        decision IN ('link', 'no_link', 'hard_veto', 'component_conflict')
+    ),
+    evidence_json TEXT NOT NULL,
+    PRIMARY KEY (policy_version, left_event_id, right_event_id),
+    CHECK (left_event_id < right_event_id),
+    FOREIGN KEY (policy_version) REFERENCES relationship_policies(policy_version)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (left_event_id) REFERENCES source_events(event_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (right_event_id) REFERENCES source_events(event_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+) WITHOUT ROWID;
+CREATE TABLE episodes (
+    policy_version TEXT NOT NULL,
+    episode_id TEXT NOT NULL,
+    member_count INTEGER NOT NULL CHECK (member_count > 0),
+    PRIMARY KEY (policy_version, episode_id),
+    FOREIGN KEY (policy_version) REFERENCES relationship_policies(policy_version)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+) WITHOUT ROWID;
+CREATE TABLE episode_members (
+    policy_version TEXT NOT NULL,
+    episode_id TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    PRIMARY KEY (policy_version, episode_id, event_id),
+    UNIQUE (policy_version, event_id),
+    UNIQUE (policy_version, episode_id, ordinal),
+    FOREIGN KEY (policy_version, episode_id)
+        REFERENCES episodes(policy_version, episode_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (event_id) REFERENCES source_events(event_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+) WITHOUT ROWID;
 CREATE INDEX source_chunks_by_device_time
     ON source_chunks(device_id, created_at);
 CREATE INDEX source_events_by_time
@@ -101,10 +152,10 @@ CREATE INDEX source_events_by_workspace_time
     ON source_events(workspace_id, recorded_at);
 """
 METADATA = (
-    ("event_schema_version", "1"),
+    ("event_schema_versions", "1,2"),
     ("index_role", "derived_rebuildable"),
-    ("schema_version", "1"),
-    ("source_of_truth", "encrypted_chunk_v1"),
+    ("schema_version", "2"),
+    ("source_of_truth", "encrypted_chunk_v1_event_v1_v2"),
 )
 
 
@@ -271,6 +322,21 @@ def load_chunks(root: Path) -> list[Chunk]:
             if previous is not None:
                 raise VaultError("duplicate event ID across imported chunks")
             event_owners[event_id] = chunk_id
+            context = event.get("relationship_context")
+            if context is None:
+                relationship = (None, None, None, None, None)
+            else:
+                relationship = (
+                    context["task_id_hash"],
+                    context["task_source"],
+                    context["branch_or_worktree_id"],
+                    json.dumps(
+                        context["changed_file_fingerprints"],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    context["changed_files_state"],
+                )
             event_rows.append(
                 (
                     event_id,
@@ -289,6 +355,7 @@ def load_chunks(root: Path) -> list[Chunk]:
                     event["tool"],
                     _json_text(event["metrics"]),
                     _json_text(event["outcome"]),
+                    *relationship,
                     canonical_json(event).decode("utf-8"),
                 )
             )
@@ -361,7 +428,7 @@ def insert_chunk(connection: sqlite3.Connection, chunk: Chunk) -> None:
     )
     connection.executemany(
         "INSERT INTO source_events VALUES "
-        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         chunk.event_rows,
     )
     connection.execute(
@@ -620,6 +687,9 @@ def rebuild_full(root: Path, chunks: list[Chunk]) -> tuple[int, int]:
         connection.execute("BEGIN IMMEDIATE")
         for chunk in chunks:
             insert_chunk(connection, chunk)
+        from relationship_graph import DEFAULT_POLICY, rebuild_relationships
+
+        rebuild_relationships(connection, DEFAULT_POLICY)
         connection.execute("COMMIT")
         validate_database(connection)
         connection.close()
@@ -652,7 +722,13 @@ def rebuild_incremental(root: Path, chunks: list[Chunk]) -> tuple[int, int]:
     added_chunks = 0
     added_events = 0
     try:
+        from relationship_graph import (
+            load_stored_policies,
+            rebuild_relationships,
+        )
+
         validate_source_projection(connection, chunks, exact=False)
+        load_stored_policies(connection)
         connection.execute("BEGIN IMMEDIATE")
         for chunk in chunks:
             if _existing_chunk(connection, chunk):
@@ -662,6 +738,9 @@ def rebuild_incremental(root: Path, chunks: list[Chunk]) -> tuple[int, int]:
             added_events += len(chunk.event_rows)
         validate_database(connection)
         validate_source_projection(connection, chunks, exact=True)
+        policies = load_stored_policies(connection)
+        for policy in policies:
+            rebuild_relationships(connection, policy)
         connection.execute("COMMIT")
     except (sqlite3.Error, VaultError) as error:
         if connection.in_transaction:
@@ -689,4 +768,36 @@ def rebuild_index(root: Path, *, incremental: bool) -> None:
         print(
             f"rebuild-index: mode={mode} "
             f"chunks={added_chunks} events={added_events}"
+        )
+
+
+def rebuild_relationship_views(root: Path, policy_path: Path | None) -> None:
+    """Atomically replace one versioned relationship view only."""
+    from relationship_graph import load_policy, rebuild_relationships
+
+    # Policy parsing and validation happens before opening a write transaction.
+    policy = load_policy(policy_path)
+    with vault_lock(root):
+        safe_index_directory(root)
+        chunks = load_chunks(root)
+        connection = _open_existing(root / DATABASE_PATH)
+        try:
+            validate_source_projection(connection, chunks, exact=True)
+            connection.execute("BEGIN IMMEDIATE")
+            validate_source_projection(connection, chunks, exact=True)
+            edges, episodes = rebuild_relationships(connection, policy)
+            validate_database(connection)
+            connection.execute("COMMIT")
+        except (sqlite3.Error, VaultError) as error:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            if isinstance(error, VaultError):
+                raise
+            raise VaultError("relationship rebuild failed") from error
+        finally:
+            connection.close()
+        os.chmod(root / DATABASE_PATH, 0o600)
+        print(
+            "rebuild-relationships: "
+            f"policy={policy['policy_version']} edges={edges} episodes={episodes}"
         )

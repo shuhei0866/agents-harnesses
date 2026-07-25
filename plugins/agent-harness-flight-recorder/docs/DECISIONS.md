@@ -178,3 +178,16 @@ Accepted decisions remain recorded when later superseded.
   policy-versioned derived state. Unsupported or corrupt databases are
   recovered through full rebuild, and any failure leaves encrypted chunks,
   decoded cache, receipts, and the previous valid database unchanged.
+
+## D-20260725-17: Version relationship context and derived episode policy
+
+- Status: accepted
+- Decision: preserve Event v1 and Chunk v1 compatibility; add exact Event v2
+  relationship context containing only domain-separated HMAC identifiers and
+  bounded changed-file fingerprints. Split mixed inboxes into homogeneous
+  chunks. Project v2 context into rebuildable SQLite schema v2 and derive
+  versioned relationship edges and episodes with integer-only policies.
+- Reason: relationship identity is probabilistic and policy-dependent, while
+  source evidence must remain immutable, privacy-safe, and reproducible.
+  Contradictory explicit task IDs veto direct links and transitive component
+  bridges. Singleton episodes preserve events with insufficient evidence.
