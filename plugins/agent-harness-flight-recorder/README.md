@@ -378,6 +378,47 @@ stays in an error state while either remains unresolved. A custom relationship
 policy must be selected with its owner-held file via `--policy`, rather than by
 an unauthenticated version string alone.
 
+Evidence-free singleton episodes are not automatic-evaluation candidates.
+They contain too little context for a useful model judgment, even when their
+relationship confidence is unknown. A singleton needs a successful or failed
+test, build, lint, commit, or pull-request fact before the background evaluator
+can spend its budget on it.
+
+### Local Semantic Receipts
+
+Register an existing local Claude Code or Codex JSONL session without copying
+its body into the Vault:
+
+```bash
+scripts/flight-recorder source register \
+  --adapter codex \
+  --path /absolute/path/to/session.jsonl
+```
+
+The command returns an opaque source reference plus its content digest and
+size. The owner-only registration under `session-sources/` retains the local
+path; neither the path nor the raw content is Git-synchronized.
+
+Generate a bounded semantic interpretation for one episode from an explicitly
+selected 1-based line span:
+
+```bash
+scripts/flight-recorder receipt generate <episode-id> \
+  --source-ref SOURCE_REF \
+  --span-start-line 120 \
+  --span-end-line 180 \
+  --evaluator ADAPTER \
+  --model MODEL_ID \
+  --rubric /path/to/semantic-rubric.json
+```
+
+The selected span is sent transiently to the trusted local evaluator. Flight
+Recorder stores only the validated task, execution, result, assessment, and
+recorder-generated provenance under `semantic-receipts/`. Source paths and raw
+session bodies are never included in the Receipt. Different source snapshots,
+models, or rubrics coexist as versioned local records so future models can
+reinterpret the original local session without overwriting earlier results.
+
 ### Forget and best-effort purge
 
 Logical removal keeps immutable source evidence but excludes one episode from

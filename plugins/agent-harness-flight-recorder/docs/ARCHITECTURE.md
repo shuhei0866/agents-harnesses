@@ -324,6 +324,8 @@ flight-recorder inspect <episode-id>
 flight-recorder evaluate <episode-id> --evaluator ADAPTER --model MODEL
 flight-recorder auto-evaluation configure ...
 flight-recorder auto-evaluation run
+flight-recorder source register --adapter HARNESS --path SESSION.jsonl
+flight-recorder receipt generate <episode-id> --source-ref REF ...
 ```
 
 The primary output is an Episode Evidence Card containing task type, model,
@@ -353,6 +355,30 @@ confidence exposes the minimum supporting integer score beside the policy
 threshold; it is not a normalized probability.
 `status` performs no network request and describes a missing pending marker
 only as locally `idle`, never as proof of a successful remote sync.
+
+### Local session sources and Semantic Receipts
+
+Lifecycle hooks still discard prompt, response, command, output, and code
+content. Semantic interpretation is a separate, explicit local operation. The
+owner first registers one absolute Claude Code or Codex JSONL session source.
+Flight Recorder stores its local path, adapter, byte size, and content digest
+under Git-ignored `session-sources/`, returning only an opaque source
+reference. It does not copy the source body into the Vault.
+
+`receipt generate` accepts that opaque reference and a required 1-based,
+inclusive line span. Only those bytes are sent on stdin to an owner-selected
+local evaluator. The evaluator runs with the same executable pinning, empty
+working directory, minimal environment, output limit, and timeout boundary as
+on-demand evaluation. Its response is validated against an exact, bounded
+Semantic Receipt contract.
+
+The recorder, not the evaluator, adds source and evidence hashes, source event
+IDs, evaluator/model/rubric identity, and generation time. Content-addressed
+records live under Git-ignored `semantic-receipts/`. A different model, rubric,
+source snapshot, or semantic result produces another record; an existing
+record is never overwritten. `inspect` labels these records as model-derived
+semantics and does not silently promote them into deterministic task or
+outcome fields.
 
 ## Retention and deletion
 
@@ -388,6 +414,13 @@ this limitation clearly.
 - explicit `evaluate` with metadata-only default, finite model judgments,
   provenance, and artifact scope preview;
 - metadata-only background evaluation for uncertain episodes.
+
+### R1.3: Semantic Receipts
+
+- explicit local Claude Code and Codex session source registration;
+- bounded, versioned Semantic Receipt generation from an owner-selected span;
+- model/rubric/source provenance and later-model rederivation;
+- local-only storage with an explicit export boundary.
 
 ### Later
 
