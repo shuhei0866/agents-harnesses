@@ -397,6 +397,12 @@ def _run_once(root: Path) -> dict[str, Any]:
                 >= config["uncertainty_score_below"]
             ):
                 raise _NoLongerCandidate
+            if actual_card["event_count"] <= 1 and not any(
+                fact["evidence_type"] in DECISION_BEARING_EVIDENCE_TYPES
+                and fact["state"] in {"success", "failure"}
+                for fact in actual_card["deterministic_evidence"]
+            ):
+                raise _NoLongerCandidate
             source_ids = {
                 fact["evidence_id"]
                 for fact in actual_card["deterministic_evidence"]

@@ -46,6 +46,9 @@ MAX_DURATION_MS = 365 * 24 * 60 * 60 * 1000
 MAX_COUNT = 10_000_000
 MAX_RECEIPT_SOURCE_EVENTS = 10_000
 HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+TEMP_RECEIPT_RE = re.compile(
+    r"^\.[0-9a-f]{64}\.json\.[A-Za-z0-9_-]+$"
+)
 SAFE_TYPE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 RUBRIC_FIELDS = {
     "schema_version",
@@ -619,7 +622,11 @@ def _stored_receipts(root: Path) -> list[tuple[Path, bytes, dict[str, Any]]]:
         raise VaultError("Semantic Receipt storage is unsafe")
     try:
         metadata = directory.lstat()
-        paths = sorted(directory.iterdir())
+        paths = sorted(
+            path
+            for path in directory.iterdir()
+            if TEMP_RECEIPT_RE.fullmatch(path.name) is None
+        )
     except OSError as error:
         raise VaultError("Semantic Receipt storage is unsafe") from error
     if (

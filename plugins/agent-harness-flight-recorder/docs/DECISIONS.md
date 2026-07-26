@@ -283,9 +283,10 @@ Accepted decisions remain recorded when later superseded.
   lets a later, stronger model rederive a better interpretation instead of
   freezing the current model's understanding.
 - Consequence: source registrations may contain a local path but are owner-only
-  state and are never returned by the CLI. Receipts store hashes and bounded
-  model-derived prose, not raw source paths or bodies. Multiple model or rubric
-  generations coexist without overwriting earlier receipts, and inspect keeps
-  model-derived semantics separate from deterministic evidence. Background
-  metadata evaluation skips evidence-free singleton episodes rather than
-  paying a model to judge an empty envelope.
+  state. The CLI returns only an opaque source reference, content digest, and
+  size; it never returns the local path or raw content. Receipts store hashes
+  and bounded model-derived prose, not raw source paths or bodies. Multiple
+  model or rubric generations coexist without overwriting earlier receipts,
+  and inspect keeps model-derived semantics separate from deterministic
+  evidence. Background metadata evaluation skips evidence-free singleton
+  episodes rather than paying a model to judge an empty envelope.

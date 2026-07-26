@@ -397,7 +397,7 @@ scripts/flight-recorder source register \
 
 The command returns an opaque source reference plus its content digest and
 size. The owner-only registration under `session-sources/` retains the local
-path; neither the path nor the raw content is Git-synchronized.
+path; neither the path nor the raw content is returned or Git-synchronized.
 
 Generate a bounded semantic interpretation for one episode from an explicitly
 selected 1-based line span:

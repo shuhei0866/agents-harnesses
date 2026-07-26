@@ -125,7 +125,10 @@ test_rejects_symlink_and_hardlink_sources() {
   local symlink="$TEST_ROOT/unsafe-source-symlink.jsonl"
   local hardlink="$TEST_ROOT/unsafe-source-hardlink.jsonl"
   cp "$FIXTURES/codex-session.jsonl" "$raw"
-  ln -s "$raw" "$symlink"
+  if ! ln -s "$raw" "$symlink"; then
+    fail "symlink fixtureを作成できる"
+    return
+  fi
 
   if run_cli source register \
     --adapter codex --path "$symlink" --json >/dev/null 2>&1; then
@@ -135,7 +138,10 @@ test_rejects_symlink_and_hardlink_sources() {
     pass "symlink sourceを拒否する"
   fi
 
-  ln "$raw" "$hardlink"
+  if ! ln "$raw" "$hardlink"; then
+    fail "hardlink fixtureを作成できる"
+    return
+  fi
   if run_cli source register \
     --adapter codex --path "$raw" --json >/dev/null 2>&1; then
     fail "hardlink sourceを拒否する"

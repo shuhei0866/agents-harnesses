@@ -331,6 +331,10 @@ test_rejects_tampered_semantic_receipt() {
   local err="$TEST_ROOT/tampered-inspect.err"
   episode="$(episode_id)"
   receipt="$(find "$STATE/semantic-receipts" -type f -name '*.json' | head -n 1)"
+  if [[ -z "$receipt" ]]; then
+    fail "改ざん対象のSemantic Receiptが存在する"
+    return
+  fi
   cp "$receipt" "$backup"
   python3 - "$receipt" <<'PY'
 import json
@@ -354,6 +358,36 @@ PY
     fail "改ざんReceiptの拒否理由が安定している"
   fi
   cp "$backup" "$receipt"
+}
+
+test_ignores_only_crash_left_receipt_temps() {
+  echo "test_ignores_only_crash_left_receipt_temps:"
+  local episode receipt temporary unexpected
+  local err="$TEST_ROOT/receipt-temp.err"
+  episode="$(episode_id)"
+  receipt="$(find "$STATE/semantic-receipts" -type f -name '*.json' | head -n 1)"
+  if [[ -z "$receipt" ]]; then
+    fail "一時ファイル検証用のSemantic Receiptが存在する"
+    return
+  fi
+  temporary="$(dirname "$receipt")/.$(basename "$receipt").crashleft"
+  unexpected="$(dirname "$receipt")/.unexpected"
+  cp "$receipt" "$temporary"
+  if run_cli inspect "$episode" --json >/dev/null 2>"$err"; then
+    pass "atomic replace由来の一時Receipt残骸を安全に無視する"
+  else
+    cat "$err" >&2
+    fail "atomic replace由来の一時Receipt残骸を安全に無視する"
+    return
+  fi
+  rm "$temporary"
+  cp "$receipt" "$unexpected"
+  if run_cli inspect "$episode" --json >/dev/null 2>"$err"; then
+    fail "任意のhidden fileを一時Receiptとして無視しない"
+  else
+    pass "任意のhidden fileはfail closedで拒否する"
+  fi
+  rm "$unexpected"
 }
 
 test_purge_removes_semantic_receipts() {
@@ -384,6 +418,7 @@ if ! build_fixture; then
   exit 1
 fi
 test_generates_complete_semantic_receipt_v1
+test_ignores_only_crash_left_receipt_temps
 test_rejects_tampered_semantic_receipt
 test_rejects_changed_registered_source
 test_purge_removes_semantic_receipts
