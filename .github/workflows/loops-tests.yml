@@ -1,0 +1,36 @@
+name: Loops Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  loops-tests:
+    # loops/lib は sed と grep で JSON を切り出すので、GNU 系と BSD 系の
+    # 方言差でどちらか一方だけ壊れる。実際 progress.sh は grep -oP と BRE の
+    # \? を使っており、macOS では 15 件中 6 件が落ちていた (IAM-119)。
+    # 片側でしか通らない書き方を弾くため、両方の系統で回す。
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show tool flavors
+        run: |
+          if sed --version >/dev/null 2>&1; then sed --version | head -1; else echo "sed: BSD flavor"; fi
+          if grep --version >/dev/null 2>&1; then grep --version | head -1; else echo "grep: BSD flavor"; fi
+          bash --version | head -1
+
+      - name: Run loops tests
+        run: |
+          set -euo pipefail
+          for t in loops/tests/test-*.sh; do
+            echo "::group::$t"
+            bash "$t"
+            echo "::endgroup::"
+          done

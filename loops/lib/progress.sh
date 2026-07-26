@@ -92,7 +92,9 @@ progress_get_prev_issues() {
   fi
 
   local last_issues
-  last_issues="$(grep -oP '(?<=Issues found: )\d+' "$_PROGRESS_FILE" | tail -1)"
+  # grep -oP は PCRE の後読みを使うため BSD grep (macOS 標準) では動かない。
+  # sed の BRE なら GNU と BSD の双方で同じ結果になる。
+  last_issues="$(sed -n 's/.*Issues found:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$_PROGRESS_FILE" | tail -1)"
   echo "${last_issues:-0}"
 }
 
@@ -131,5 +133,10 @@ progress_mark_interrupted() {
 _json_field() {
   local field="$1"
   # Handles: "field": "value" and "field": number
-  sed -n "s/.*\"$field\"[[:space:]]*:[[:space:]]*\"\?\([^\",$}]*\)\"\?.*/\1/p" | head -1
+  #
+  # 値を囲む引用符の有無は \" ではなく \"* で表す。BRE の \? は GNU sed の
+  # 拡張で、BSD sed (macOS 標準) はこれをリテラルの ? として扱うため、
+  # 引用符つきの値がまったく取れなくなる。JSON の値を囲む引用符は 0 個か
+  # 1 個しかないので、\"* に替えても GNU 側の挙動は変わらない。
+  sed -n "s/.*\"$field\"[[:space:]]*:[[:space:]]*\"*\([^\",$}]*\)\"*.*/\1/p" | head -1
 }
