@@ -99,12 +99,16 @@ evidence_ids = [
     if isinstance(item, dict) and isinstance(item.get("evidence_id"), str)
 ]
 support = evidence_ids[:1]
+if mode == "unordered-references":
+    support = list(reversed(evidence_ids))
 for criterion in ("goal_achievement", "quality"):
     semantic["assessment"]["criteria"][criterion][
         "evidence_references"
     ] = support
 if mode == "invalid-schema":
     semantic.pop("assessment")
+if mode == "unsafe-execution-model":
+    semantic["execution"]["model"] = "Claude Sonnet 4.6"
 if mode == "echo-source":
     semantic["result"]["summary"] = "RAW_SOURCE_CANARY_iam178"
 

@@ -404,6 +404,8 @@ test_evaluator_child_is_not_recorded() {
   status=$?
   assert_success "nested evaluator hookをfail-openでno-opにする" "$status"
   assert_file_absent_or_empty \
+    "nested evaluator抑止時にstderrへ何も出さない" "$err"
+  assert_file_absent_or_empty \
     "nested evaluatorをEventやReceipt hintへ再帰記録しない" "$log"
 }
 

@@ -423,6 +423,9 @@ output and timeout, while `FLIGHT_RECORDER_EVALUATOR_CHILD=1` makes any
 remaining managed Recorder hook a no-op. The evaluator resolver recognizes
 only the bundled adapter name and pins its absolute path relative to the active
 CLI, so manual and scheduled discovery do not broaden runtime `PATH`.
+Authentication is deliberately inherited only through the local user's home
+directory and keychain; credential-bearing environment variables are excluded
+so an ambient API key cannot silently change the billing identity.
 
 ## Retention and deletion
 

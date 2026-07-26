@@ -8,12 +8,14 @@ PLUGIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 ADAPTER="$PLUGIN_DIR/scripts/flight-recorder-claude-semantic-evaluator"
 FAKE_CLAUDE_BIN="$SCRIPT_DIR/fixtures/fake-claude-bin"
 TEST_ROOT="$(mktemp -d)" || exit 1
+[[ -n "$TEST_ROOT" && -d "$TEST_ROOT" ]] || exit 1
 REQUEST="$TEST_ROOT/request.json"
 PASS=0
 FAIL=0
 
 cleanup() {
-  rm -rf "$TEST_ROOT"
+  [[ -n "${TEST_ROOT:-}" && -d "$TEST_ROOT" ]] \
+    && rm -rf -- "$TEST_ROOT"
 }
 trap cleanup EXIT
 
@@ -79,6 +81,12 @@ value = {
                 "state": "observed",
                 "value": "success",
             },
+            {
+                "evidence_id": "sha256:" + "0" * 64,
+                "evidence_type": "outcome",
+                "state": "observed",
+                "value": "success",
+            },
         ],
     },
     "source": {
@@ -96,6 +104,11 @@ pathlib.Path(path).write_text(
     encoding="utf-8",
 )
 PY
+  local status=$?
+  if [[ "$status" -ne 0 ]]; then
+    fail "テストfixture生成に失敗した: $destination"
+    exit 1
+  fi
 }
 
 run_adapter() {
@@ -104,6 +117,7 @@ run_adapter() {
   mkdir -p "$capture/bin"
   cp "$FAKE_CLAUDE_BIN/claude" "$capture/bin/claude"
   PATH="$FAKE_CLAUDE_BIN:/usr/bin:/bin" \
+    FLIGHT_RECORDER_TEST_HARNESS=1 \
     FLIGHT_RECORDER_TEST_CLAUDE_EXECUTABLE="$capture/bin/claude" \
     FLIGHT_RECORDER_TEST_CLAUDE_CAPTURE_DIR="$capture" \
     FLIGHT_RECORDER_TEST_CLAUDE_MODE="$mode" \
@@ -202,6 +216,9 @@ assert set(schema["required"]) == {
     "schema_version", "task", "execution", "result", "assessment",
 }
 assert schema["properties"]["schema_version"]["const"] == 1
+assert schema["properties"]["execution"]["properties"]["model"]["pattern"].startswith(
+    "^[A-Za-z0-9]"
+)
 provider_request = json.loads(provider_stdin)
 assert provider_request["source"]["content"] == request["source"]["content"]
 assert provider_request["model"] == request["model"]
@@ -214,6 +231,8 @@ PY
   else
     cat "$error" >&2
     fail "request v2をsafe/tool-less/nonpersistent Claude JSON schema呼出しへ変換する"
+    fail "provider実測USD costをinteger micro-USDへ上向き丸めする"
+    fail "raw sourceをresponse・argvへechoしない"
   fi
 }
 
@@ -222,6 +241,7 @@ test_invalid_and_oversized_input_fail_closed() {
   local malformed="$TEST_ROOT/malformed.json"
   local v1="$TEST_ROOT/v1.json"
   local zero="$TEST_ROOT/zero-budget.json"
+  local unsafe_model="$TEST_ROOT/unsafe-model.json"
   local oversized="$TEST_ROOT/oversized.json"
   printf '%s' '{"schema_version":2,"source":' >"$malformed"
   write_request "$v1"
@@ -235,6 +255,7 @@ value["schema_version"] = 1
 path.write_text(json.dumps(value))
 PY
   write_request "$zero" 0
+  write_request "$unsafe_model" 50000 "--dangerously-skip-permissions"
   python3 - "$oversized" <<'PY'
 import pathlib
 import sys
@@ -246,8 +267,38 @@ PY
     valid "$v1" protocol-v1 no
   assert_fail_closed "zero budgetをprovider実行前に拒否する" \
     valid "$zero" zero-budget no
+  assert_fail_closed "option形式のmodelをprovider実行前に拒否する" \
+    valid "$unsafe_model" unsafe-model no
   assert_fail_closed "oversized requestをbounded readで拒否する" \
     valid "$oversized" oversized-input no
+}
+
+test_normalizes_worker_contract_fields() {
+  echo "test_normalizes_worker_contract_fields:"
+  local capture="$TEST_ROOT/capture-normalized"
+  local output="$TEST_ROOT/normalized.out"
+  local error="$TEST_ROOT/normalized.err"
+  write_request "$REQUEST"
+  if run_adapter unordered-references "$capture" "$REQUEST" \
+      >"$output" 2>"$error" \
+    && python3 - "$output" <<'PY'
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+for criterion in value["assessment"]["criteria"].values():
+    references = criterion["evidence_references"]
+    assert references == sorted(set(references))
+PY
+  then
+    pass "evidence referencesをworker契約のcanonical順へ正規化する"
+  else
+    cat "$error" >&2
+    fail "evidence referencesをworker契約のcanonical順へ正規化する"
+  fi
+  assert_fail_closed "unsafeなexecution modelをpaid responseとして返さない" \
+    unsafe-execution-model "$REQUEST" unsafe-execution-model
 }
 
 test_provider_failures_and_budget_fail_closed() {
@@ -278,6 +329,7 @@ if [[ ! -x "$ADAPTER" ]]; then
 fi
 test_protocol_v2_and_safe_claude_invocation
 test_invalid_and_oversized_input_fail_closed
+test_normalizes_worker_contract_fields
 test_provider_failures_and_budget_fail_closed
 
 echo

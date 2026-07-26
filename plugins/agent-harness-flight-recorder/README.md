@@ -450,6 +450,12 @@ survives safe mode. The CLI resolves this one known bundled adapter relative to
 its own installation, so both manual and scheduled runs are independent of an
 interactive shell's `PATH`.
 
+Authentication intentionally uses the local Claude Code login available through
+the user's home directory and keychain. Credential-bearing environment
+variables such as `ANTHROPIC_API_KEY` are not forwarded to the child, avoiding
+an ambient API key silently changing the billing identity. Environment-token
+and remote-worker authentication are outside this local adapter's scope.
+
 After opt-in, a `Stop` hook writes only a local hint containing the Event ID,
 hashed session/turn identity, source path, file identity, and captured byte
 boundary. It never invokes the evaluator. After successful scheduled sync, the

@@ -462,7 +462,8 @@ test_production_claude_adapter_offline_e2e() {
   local capture="$TEST_ROOT/production-adapter-capture"
   mkdir -p "$capture/bin"
   cp "$FAKE_CLAUDE_BIN/claude" "$capture/bin/claude"
-  PATH="$FAKE_CLAUDE_BIN:$FAKE_BIN:$PATH" \
+  local configure_err="$TEST_ROOT/production-adapter-configure.err"
+  if ! PATH="$FAKE_CLAUDE_BIN:$FAKE_BIN:$PATH" \
     FLIGHT_RECORDER_STATE_DIR="$STATE" \
     "$CLI" receipt-auto configure \
       --claude-code-root "$CLAUDE_ROOT" \
@@ -474,14 +475,21 @@ test_production_claude_adapter_offline_e2e() {
       --quiescence-seconds 0 \
       --max-receipts-per-run 10 \
       --max-cost-microusd-per-run 50000 \
-      --json >/dev/null 2>&1
+      --json >/dev/null 2>"$configure_err"; then
+    cat "$configure_err" >&2
+    fail "production adapterをworkerへ接続しofflineでReceiptを生成する"
+    fail "production adapter経由でも同一fingerprintを再評価しない"
+    return 1
+  fi
   if PATH="$FAKE_CLAUDE_BIN:$PATH" \
+      FLIGHT_RECORDER_TEST_HARNESS=1 \
       FLIGHT_RECORDER_TEST_CLAUDE_EXECUTABLE="$capture/bin/claude" \
       FLIGHT_RECORDER_TEST_CLAUDE_CAPTURE_DIR="$capture" \
       FLIGHT_RECORDER_TEST_CLAUDE_MODE=valid \
       run_cli receipt-auto run --json >"$output" \
         2>"$TEST_ROOT/production-adapter.err" \
     && PATH="$FAKE_CLAUDE_BIN:$PATH" \
+      FLIGHT_RECORDER_TEST_HARNESS=1 \
       FLIGHT_RECORDER_TEST_CLAUDE_EXECUTABLE="$capture/bin/claude" \
       FLIGHT_RECORDER_TEST_CLAUDE_CAPTURE_DIR="$capture" \
       FLIGHT_RECORDER_TEST_CLAUDE_MODE=nonzero \
@@ -514,6 +522,7 @@ PY
     cat "$TEST_ROOT/production-adapter.err" >&2
     cat "$TEST_ROOT/production-adapter-repeat.err" >&2
     fail "production adapterをworkerへ接続しofflineでReceiptを生成する"
+    fail "production adapter経由でも同一fingerprintを再評価しない"
   fi
 }
 
