@@ -336,6 +336,7 @@ def _validate_response(
     rubric: dict[str, Any],
     selected_content: str,
     source_path: str,
+    expected_harness: str | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     if len(raw) > MAX_EVALUATOR_OUTPUT_BYTES:
         raise VaultError("semantic evaluator response exceeds the size limit")
@@ -366,7 +367,13 @@ def _validate_response(
 
     if not isinstance(execution, dict) or set(execution) != EXECUTION_FIELDS:
         raise VaultError("semantic evaluator execution is invalid")
-    if execution.get("harness") not in {"claude-code", "codex"}:
+    if (
+        execution.get("harness") not in {"claude-code", "codex"}
+        or (
+            expected_harness is not None
+            and execution.get("harness") != expected_harness
+        )
+    ):
         raise VaultError("semantic evaluator execution harness is invalid")
     _safe_name(execution.get("model"), "semantic execution model")
     _bounded_integer(
@@ -416,13 +423,44 @@ def _validate_response(
             raise VaultError("semantic evaluator evidence references are invalid")
         referenced.update(references)
 
-    serialized = json.dumps(value, sort_keys=True)
-    if source_path in serialized:
+    def strings(item: object) -> list[str]:
+        if isinstance(item, str):
+            return [item]
+        if isinstance(item, dict):
+            return [
+                text
+                for nested in item.values()
+                for text in strings(nested)
+            ]
+        if isinstance(item, list):
+            return [
+                text
+                for nested in item
+                for text in strings(nested)
+            ]
+        return []
+
+    response_strings = strings(value)
+    if any(source_path in text for text in response_strings):
         raise VaultError("semantic evaluator response exposed a source path")
+    source_fragments: set[str] = set()
     for line in selected_content.splitlines():
         candidate = line.strip()
-        if len(candidate) >= 32 and candidate in serialized:
-            raise VaultError("semantic evaluator response copied raw source content")
+        if len(candidate) >= 32:
+            source_fragments.add(candidate)
+        try:
+            decoded = json.loads(line)
+        except (ValueError, UnicodeError, RecursionError):
+            continue
+        source_fragments.update(
+            text for text in strings(decoded) if len(text.strip()) >= 32
+        )
+    if any(
+        fragment in response_text
+        for fragment in source_fragments
+        for response_text in response_strings
+    ):
+        raise VaultError("semantic evaluator response copied raw source content")
     return value, sorted(referenced)
 
 
@@ -557,6 +595,7 @@ def _validate_receipt_record(value: object) -> dict[str, Any]:
         },
         "",
         "\0",
+        spans[0]["adapter"] if len(spans) == 1 else None,
     )
     if referenced != evidence_ids:
         raise VaultError("stored Semantic Receipt evidence IDs are invalid")
@@ -778,6 +817,7 @@ def generate(
         rubric,
         selected_content,
         source["path"],
+        source["adapter"],
     )
     receipt: dict[str, Any] = {
         "schema_version": RECEIPT_VERSION,

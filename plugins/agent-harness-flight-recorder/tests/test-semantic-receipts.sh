@@ -99,6 +99,16 @@ print(row[0])
 PY
 }
 
+registered_source_ref() {
+  python3 - "$TEST_ROOT/register.json" <<'PY'
+import json
+import pathlib
+import sys
+
+print(json.loads(pathlib.Path(sys.argv[1]).read_text())["source_ref"])
+PY
+}
+
 test_generates_complete_semantic_receipt_v1() {
   echo "test_generates_complete_semantic_receipt_v1:"
   local raw="$TEST_ROOT/codex-session.jsonl"
@@ -279,6 +289,53 @@ PY
   fi
 }
 
+test_rejects_raw_echo_and_harness_mismatch() {
+  echo "test_rejects_raw_echo_and_harness_mismatch:"
+  local episode source_ref
+  local output="$TEST_ROOT/unsafe-semantic-response.out"
+  local err="$TEST_ROOT/unsafe-semantic-response.err"
+  episode="$(episode_id)"
+  source_ref="$(registered_source_ref)"
+
+  if FLIGHT_RECORDER_TEST_SEMANTIC_ECHO_RAW=1 \
+    run_cli receipt generate "$episode" \
+      --source-ref "$source_ref" \
+      --span-start-line 2 \
+      --span-end-line 2 \
+      --evaluator flight-recorder-semantic-evaluator \
+      --model semantic-raw-echo-model \
+      --rubric "$RUBRIC" \
+      --json >"$output" 2>"$err"; then
+    fail "escaped JSONL本文のReceipt混入を拒否する"
+  elif [[ -s "$output" ]] || grep -q "Traceback" "$err"; then
+    fail "raw echoをcontent-freeかつcleanに拒否する"
+  elif grep -q "copied raw source content" "$err"; then
+    pass "escaped JSONL本文のReceipt混入を拒否する"
+  else
+    cat "$err" >&2
+    fail "raw echoの拒否理由が安定している"
+  fi
+
+  if FLIGHT_RECORDER_TEST_SEMANTIC_HARNESS=claude-code \
+    run_cli receipt generate "$episode" \
+      --source-ref "$source_ref" \
+      --span-start-line 2 \
+      --span-end-line 2 \
+      --evaluator flight-recorder-semantic-evaluator \
+      --model semantic-wrong-harness-model \
+      --rubric "$RUBRIC" \
+      --json >"$output" 2>"$err"; then
+    fail "sourceと矛盾するexecution harnessを拒否する"
+  elif [[ -s "$output" ]] || grep -q "Traceback" "$err"; then
+    fail "harness矛盾をcontent-freeかつcleanに拒否する"
+  elif grep -q "execution harness is invalid" "$err"; then
+    pass "sourceと矛盾するexecution harnessを拒否する"
+  else
+    cat "$err" >&2
+    fail "harness矛盾の拒否理由が安定している"
+  fi
+}
+
 test_rejects_changed_registered_source() {
   echo "test_rejects_changed_registered_source:"
   local raw="$TEST_ROOT/mutable-codex-session.jsonl"
@@ -418,6 +475,7 @@ if ! build_fixture; then
   exit 1
 fi
 test_generates_complete_semantic_receipt_v1
+test_rejects_raw_echo_and_harness_mismatch
 test_ignores_only_crash_left_receipt_temps
 test_rejects_tampered_semantic_receipt
 test_rejects_changed_registered_source
