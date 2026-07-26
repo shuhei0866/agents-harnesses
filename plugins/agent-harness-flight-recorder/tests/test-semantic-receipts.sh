@@ -99,6 +99,16 @@ print(row[0])
 PY
 }
 
+registered_source_ref() {
+  python3 - "$TEST_ROOT/register.json" <<'PY'
+import json
+import pathlib
+import sys
+
+print(json.loads(pathlib.Path(sys.argv[1]).read_text())["source_ref"])
+PY
+}
+
 test_generates_complete_semantic_receipt_v1() {
   echo "test_generates_complete_semantic_receipt_v1:"
   local raw="$TEST_ROOT/codex-session.jsonl"
@@ -279,6 +289,53 @@ PY
   fi
 }
 
+test_rejects_raw_echo_and_harness_mismatch() {
+  echo "test_rejects_raw_echo_and_harness_mismatch:"
+  local episode source_ref
+  local output="$TEST_ROOT/unsafe-semantic-response.out"
+  local err="$TEST_ROOT/unsafe-semantic-response.err"
+  episode="$(episode_id)"
+  source_ref="$(registered_source_ref)"
+
+  if FLIGHT_RECORDER_TEST_SEMANTIC_ECHO_RAW=1 \
+    run_cli receipt generate "$episode" \
+      --source-ref "$source_ref" \
+      --span-start-line 2 \
+      --span-end-line 2 \
+      --evaluator flight-recorder-semantic-evaluator \
+      --model semantic-raw-echo-model \
+      --rubric "$RUBRIC" \
+      --json >"$output" 2>"$err"; then
+    fail "escaped JSONL本文のReceipt混入を拒否する"
+  elif [[ -s "$output" ]] || grep -q "Traceback" "$err"; then
+    fail "raw echoをcontent-freeかつcleanに拒否する"
+  elif grep -q "copied raw source content" "$err"; then
+    pass "escaped JSONL本文のReceipt混入を拒否する"
+  else
+    cat "$err" >&2
+    fail "raw echoの拒否理由が安定している"
+  fi
+
+  if FLIGHT_RECORDER_TEST_SEMANTIC_HARNESS=claude-code \
+    run_cli receipt generate "$episode" \
+      --source-ref "$source_ref" \
+      --span-start-line 2 \
+      --span-end-line 2 \
+      --evaluator flight-recorder-semantic-evaluator \
+      --model semantic-wrong-harness-model \
+      --rubric "$RUBRIC" \
+      --json >"$output" 2>"$err"; then
+    fail "sourceと矛盾するexecution harnessを拒否する"
+  elif [[ -s "$output" ]] || grep -q "Traceback" "$err"; then
+    fail "harness矛盾をcontent-freeかつcleanに拒否する"
+  elif grep -q "execution harness is invalid" "$err"; then
+    pass "sourceと矛盾するexecution harnessを拒否する"
+  else
+    cat "$err" >&2
+    fail "harness矛盾の拒否理由が安定している"
+  fi
+}
+
 test_rejects_changed_registered_source() {
   echo "test_rejects_changed_registered_source:"
   local raw="$TEST_ROOT/mutable-codex-session.jsonl"
@@ -331,6 +388,10 @@ test_rejects_tampered_semantic_receipt() {
   local err="$TEST_ROOT/tampered-inspect.err"
   episode="$(episode_id)"
   receipt="$(find "$STATE/semantic-receipts" -type f -name '*.json' | head -n 1)"
+  if [[ -z "$receipt" ]]; then
+    fail "改ざん対象のSemantic Receiptが存在する"
+    return
+  fi
   cp "$receipt" "$backup"
   python3 - "$receipt" <<'PY'
 import json
@@ -354,6 +415,36 @@ PY
     fail "改ざんReceiptの拒否理由が安定している"
   fi
   cp "$backup" "$receipt"
+}
+
+test_ignores_only_crash_left_receipt_temps() {
+  echo "test_ignores_only_crash_left_receipt_temps:"
+  local episode receipt temporary unexpected
+  local err="$TEST_ROOT/receipt-temp.err"
+  episode="$(episode_id)"
+  receipt="$(find "$STATE/semantic-receipts" -type f -name '*.json' | head -n 1)"
+  if [[ -z "$receipt" ]]; then
+    fail "一時ファイル検証用のSemantic Receiptが存在する"
+    return
+  fi
+  temporary="$(dirname "$receipt")/.$(basename "$receipt").crashleft"
+  unexpected="$(dirname "$receipt")/.unexpected"
+  cp "$receipt" "$temporary"
+  if run_cli inspect "$episode" --json >/dev/null 2>"$err"; then
+    pass "atomic replace由来の一時Receipt残骸を安全に無視する"
+  else
+    cat "$err" >&2
+    fail "atomic replace由来の一時Receipt残骸を安全に無視する"
+    return
+  fi
+  rm "$temporary"
+  cp "$receipt" "$unexpected"
+  if run_cli inspect "$episode" --json >/dev/null 2>"$err"; then
+    fail "任意のhidden fileを一時Receiptとして無視しない"
+  else
+    pass "任意のhidden fileはfail closedで拒否する"
+  fi
+  rm "$unexpected"
 }
 
 test_purge_removes_semantic_receipts() {
@@ -384,6 +475,8 @@ if ! build_fixture; then
   exit 1
 fi
 test_generates_complete_semantic_receipt_v1
+test_rejects_raw_echo_and_harness_mismatch
+test_ignores_only_crash_left_receipt_temps
 test_rejects_tampered_semantic_receipt
 test_rejects_changed_registered_source
 test_purge_removes_semantic_receipts

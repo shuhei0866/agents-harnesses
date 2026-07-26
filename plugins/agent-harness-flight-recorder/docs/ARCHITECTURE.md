@@ -364,8 +364,9 @@ Lifecycle hooks still discard prompt, response, command, output, and code
 content. Semantic interpretation is a separate, explicit local operation. The
 owner first registers one absolute Claude Code or Codex JSONL session source.
 Flight Recorder stores its local path, adapter, byte size, and content digest
-under Git-ignored `session-sources/`, returning only an opaque source
-reference. It does not copy the source body into the Vault.
+under Git-ignored `session-sources/`. The CLI returns an opaque source
+reference, content digest, and size; it never returns the local path or raw
+content. It does not copy the source body into the Vault.
 
 `receipt generate` accepts that opaque reference and a required 1-based,
 inclusive line span. Only those bytes are sent on stdin to an owner-selected

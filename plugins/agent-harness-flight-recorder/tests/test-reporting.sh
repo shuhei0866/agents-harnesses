@@ -12,6 +12,7 @@ STATE="$TEST_ROOT/vault"
 SCHEDULER_CALL_LOG="$TEST_ROOT/scheduler-calls.log"
 SCHEDULER_MANAGER_STATE="$TEST_ROOT/scheduler-manager-state"
 TEST_HOME="$TEST_ROOT/home"
+mkdir -p "$TEST_HOME"
 PASS=0
 FAIL=0
 

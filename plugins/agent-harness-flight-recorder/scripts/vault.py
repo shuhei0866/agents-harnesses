@@ -1063,12 +1063,16 @@ def main() -> int:
             from reporting import emit
             from session_sources import register, render_register
 
+            if args.source_command != "register":
+                raise VaultError("unsupported source command")
             value = register(root, args.adapter, args.path)
             emit(value, as_json=args.json, human=render_register(value))
         elif args.command == "receipt":
             from reporting import emit
             from semantic_receipts import generate, render_generate
 
+            if args.receipt_command != "generate":
+                raise VaultError("unsupported receipt command")
             value = generate(
                 root,
                 args.episode_id,

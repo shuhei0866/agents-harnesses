@@ -162,6 +162,40 @@ test_backlog_round_end() {
   assert_contains "has summary" "Summary: Fixed TODO in foo.ts" "$content"
 }
 
+# --- Test: _json_field handles the value shapes we actually emit ---
+#
+# ここが壊れると round_end の出力が丸ごと unknown / 0 になるが、上の
+# assert_contains は「何が欠けたか」しか言わない。値の形ごとに直接あてる。
+# BSD sed (macOS) が BRE の \? を解さず、引用符つきの値を 1 つも取れて
+# いなかった回帰がここに当たる。
+test_json_field_fixtures() {
+  echo "test_json_field_fixtures:"
+
+  source "$LIB_DIR/progress.sh"
+
+  # 文字列値
+  assert_eq "文字列値を取る" "done" \
+    "$(echo '{"status": "done", "summary": "Fixed TODO in foo.ts"}' | _json_field "status")"
+  assert_eq "空白を含む文字列値を取る" "Fixed TODO in foo.ts" \
+    "$(echo '{"status": "done", "summary": "Fixed TODO in foo.ts"}' | _json_field "summary")"
+
+  # 数値
+  assert_eq "数値を取る" "5" \
+    "$(echo '{"issues": 5, "fixed": 4, "skipped": 0}' | _json_field "issues")"
+  assert_eq "0 を取る（空と区別する）" "0" \
+    "$(echo '{"issues": 5, "fixed": 4, "skipped": 0}' | _json_field "skipped")"
+
+  # 空値
+  assert_eq "空文字列は空で返す" "" \
+    "$(echo '{"status": "done", "summary": ""}' | _json_field "summary")"
+  assert_eq "存在しないフィールドは空で返す" "" \
+    "$(echo '{"status": "done"}' | _json_field "summary")"
+
+  # 区切りの空白が無い形（LLM の出力は整形されているとは限らない）
+  assert_eq "コロン前後に空白が無くても取る" "tight" \
+    "$(echo '{"status":"done","summary":"tight"}' | _json_field "summary")"
+}
+
 # --- Run all tests ---
 echo "=== progress.sh tests ==="
 test_progress_init
@@ -171,6 +205,7 @@ test_progress_get_prev_issues
 test_progress_get_prev_issues_no_rounds
 test_progress_summary
 test_backlog_round_end
+test_json_field_fixtures
 
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
