@@ -892,5 +892,23 @@ run_bash_guard "$DESTRUCTIVE_GUARD" 'rm -rf /etc/nginx' trunk-direct warn
 assert_deny "trunk-direct でも critical path の再帰削除は常時 deny"
 
 echo ""
+echo "=== gh pr merge の判定は gh-guard が単独で担う ==="
+
+# commit-guard にも gh pr merge の判定があったが、--repo と cd を解決しないまま
+# hook cwd の repo へ PR 番号を問い合わせていた。別リポジトリの PR を指すと無関係な
+# PR の branch 名を advisory に載せるため、判定を gh-guard へ一本化した。
+set_config 'GIT_WORKFLOW="worktree-pr"'
+
+run_bash_guard "$COMMIT_GUARD" 'gh pr merge 42 --repo other/repo'
+assert_silent_allow "commit-guard は gh pr merge を gh-guard へ委ねる"
+assert_gh_log_not_contains "commit-guard は PR の lookup をしない" "pr view"
+
+run_bash_guard "$COMMIT_GUARD" "cd \"$REPO_B\" && gh pr merge 42"
+assert_silent_allow "cd 付きの gh pr merge でも commit-guard は反応しない"
+
+run_bash_guard "$GH_GUARD" 'gh pr merge 42 --repo other/repo'
+assert_deny "gh pr merge に対する main 向けの advisory は gh-guard 側で維持される"
+
+echo ""
 echo "結果: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]
