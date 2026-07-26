@@ -52,6 +52,7 @@ from retention_state import load_forgotten
 
 
 OUTPUT_VERSION = 3
+INSPECT_OUTPUT_VERSION = 4
 STATUS_OUTPUT_VERSION = 3
 DEFAULT_POLICY_VERSION = "default-v1"
 EPISODE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -605,12 +606,24 @@ def inspect_episode(
         card, edges = _episode_card(
             root, connection, policy, episode_id, edges_by_episode
         )
+        from semantic_receipts import load_semantic_receipts
+
         return {
-            "schema_version": OUTPUT_VERSION,
+            "schema_version": INSPECT_OUTPUT_VERSION,
             "command": "inspect",
             "policy_version": policy_version,
             "card": card,
             "supporting_edges": edges,
+            "semantic_receipts": load_semantic_receipts(
+                root,
+                policy_version,
+                episode_id,
+                card["source_event_ids"],
+                {
+                    item["evidence_id"]
+                    for item in card["deterministic_evidence"]
+                },
+            ),
         }
 
     authenticated = (
@@ -1072,11 +1085,26 @@ def render_inspect(value: dict[str, Any]) -> str:
             f"cost_microusd={item.get('measured_cost_microusd', 0)}"
             for item in card["model_evaluations"]
         ),
+        "Model-derived semantic receipts:",
+        *(
+            f"  {item['receipt_id']} "
+            f"intent={_terminal_text(item['task']['intent'])} "
+            f"outcome={item['result']['outcome']} "
+            f"confidence={item['assessment']['confidence']} "
+            "evaluator-model="
+            f"{_terminal_text(item['provenance']['evaluator_model'])} "
+            f"rubric={_terminal_text(item['provenance']['rubric_version'])}"
+            for item in value["semantic_receipts"]
+        ),
         "Supporting relationship edges:",
     ]
     if not card["deterministic_evidence"]:
         lines.insert(lines.index("Model judgments:"), "  none")
     if not card["model_evaluations"]:
+        lines.insert(
+            lines.index("Model-derived semantic receipts:"), "  none"
+        )
+    if not value["semantic_receipts"]:
         lines.insert(lines.index("Supporting relationship edges:"), "  none")
     if value["supporting_edges"]:
         for edge in value["supporting_edges"]:

@@ -81,6 +81,13 @@ GITIGNORE = PRE_AUTO_EVALUATION_GITIGNORE.replace(
     "/evaluations/\n", "/evaluations/\n/auto-evaluation/\n"
 )
 assert "/auto-evaluation/\n" in GITIGNORE
+PRE_SEMANTIC_RECEIPT_GITIGNORE = GITIGNORE
+GITIGNORE = PRE_SEMANTIC_RECEIPT_GITIGNORE.replace(
+    "/auto-evaluation/\n",
+    "/auto-evaluation/\n/session-sources/\n/semantic-receipts/\n",
+)
+assert "/session-sources/\n" in GITIGNORE
+assert "/semantic-receipts/\n" in GITIGNORE
 LEGACY_GITIGNORE = """# Local-only Flight Recorder state
 /hash.key
 /events.jsonl
@@ -366,6 +373,7 @@ def ensure_managed_gitignore(root: Path) -> None:
         PRE_SCHEDULER_GITIGNORE,
         PRE_EVALUATION_GITIGNORE,
         PRE_AUTO_EVALUATION_GITIGNORE,
+        PRE_SEMANTIC_RECEIPT_GITIGNORE,
     ):
         atomic_replace(path, GITIGNORE.encode("utf-8"))
     elif contents != GITIGNORE:
@@ -846,6 +854,35 @@ def parser() -> argparse.ArgumentParser:
     automatic_configure.add_argument("--json", action="store_true")
     automatic_run = automatic_commands.add_parser("run")
     automatic_run.add_argument("--json", action="store_true")
+    source = commands.add_parser("source")
+    source_commands = source.add_subparsers(
+        dest="source_command", required=True
+    )
+    source_register = source_commands.add_parser("register")
+    source_register.add_argument(
+        "--adapter", required=True, choices=("claude-code", "codex")
+    )
+    source_register.add_argument("--path", required=True, type=Path)
+    source_register.add_argument("--json", action="store_true")
+    receipt = commands.add_parser("receipt")
+    receipt_commands = receipt.add_subparsers(
+        dest="receipt_command", required=True
+    )
+    receipt_generate = receipt_commands.add_parser("generate")
+    receipt_generate.add_argument("episode_id")
+    receipt_policy = receipt_generate.add_mutually_exclusive_group()
+    receipt_policy.add_argument("--policy-version")
+    receipt_policy.add_argument(
+        "--policy", "--policy-file", dest="policy", type=Path
+    )
+    receipt_generate.add_argument("--source-ref", required=True)
+    receipt_generate.add_argument("--span-start-line", required=True, type=int)
+    receipt_generate.add_argument("--span-end-line", required=True, type=int)
+    receipt_generate.add_argument("--evaluator", required=True)
+    receipt_generate.add_argument("--model", required=True)
+    receipt_generate.add_argument("--rubric", required=True, type=Path)
+    receipt_generate.add_argument("--timeout", type=int, default=60)
+    receipt_generate.add_argument("--json", action="store_true")
     forget = commands.add_parser("forget")
     forget.add_argument("episode_id")
     forget_policy = forget.add_mutually_exclusive_group()
@@ -892,6 +929,8 @@ def main() -> int:
         "inspect",
         "evaluate",
         "auto-evaluation",
+        "source",
+        "receipt",
         "forget",
         "purge",
         "scheduler",
@@ -988,6 +1027,34 @@ def main() -> int:
                 as_json=args.json,
                 human=human,
             )
+        elif args.command == "source":
+            from reporting import emit
+            from session_sources import register, render_register
+
+            if args.source_command != "register":
+                raise VaultError("unsupported source command")
+            value = register(root, args.adapter, args.path)
+            emit(value, as_json=args.json, human=render_register(value))
+        elif args.command == "receipt":
+            from reporting import emit
+            from semantic_receipts import generate, render_generate
+
+            if args.receipt_command != "generate":
+                raise VaultError("unsupported receipt command")
+            value = generate(
+                root,
+                args.episode_id,
+                args.source_ref,
+                args.span_start_line,
+                args.span_end_line,
+                args.evaluator,
+                args.model,
+                args.rubric,
+                args.timeout,
+                args.policy_version,
+                args.policy,
+            )
+            emit(value, as_json=args.json, human=render_generate(value))
         elif args.command in ("forget", "purge"):
             from reporting import emit
             from retention import (

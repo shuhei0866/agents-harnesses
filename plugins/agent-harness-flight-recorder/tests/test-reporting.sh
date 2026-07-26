@@ -9,6 +9,10 @@ CLI="$PLUGIN_DIR/scripts/flight-recorder"
 FAKE_BIN="$SCRIPT_DIR/fixtures/fake-bin"
 TEST_ROOT="$(mktemp -d)"
 STATE="$TEST_ROOT/vault"
+SCHEDULER_CALL_LOG="$TEST_ROOT/scheduler-calls.log"
+SCHEDULER_MANAGER_STATE="$TEST_ROOT/scheduler-manager-state"
+TEST_HOME="$TEST_ROOT/home"
+mkdir -p "$TEST_HOME"
 PASS=0
 FAIL=0
 
@@ -28,7 +32,12 @@ fail() {
 }
 
 run_cli() {
-  PATH="$FAKE_BIN:$PATH" FLIGHT_RECORDER_STATE_DIR="$STATE" "$CLI" "$@"
+  PATH="$FAKE_BIN:$PATH" \
+    HOME="$TEST_HOME" \
+    FLIGHT_RECORDER_STATE_DIR="$STATE" \
+    FLIGHT_RECORDER_SCHEDULER_CALL_LOG="$SCHEDULER_CALL_LOG" \
+    FLIGHT_RECORDER_SCHEDULER_MANAGER_STATE="$SCHEDULER_MANAGER_STATE" \
+    "$CLI" "$@"
 }
 
 make_identity() {
@@ -396,9 +405,10 @@ import sys
 value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 human = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
 episode = sys.argv[3]
-assert value["schema_version"] == 3
+assert value["schema_version"] == 4
 assert value["command"] == "inspect"
 assert value["policy_version"] == "default-v1"
+assert value["semantic_receipts"] == []
 assert value["card"]["episode_id"] == episode
 assert value["card"]["source_event_ids"] == [
     "30000000-0000-4000-8000-000000000001",
@@ -419,6 +429,7 @@ assert episode in human
 assert "30000000-0000-4000-8000-000000000001" in human
 assert "explicit_task_id" in human
 assert "contradictory_task_ids" in human
+assert "Model-derived semantic receipts:" in human
 PY
   then
     pass "inspectはepisode形成根拠とsource evidence IDを示す"

@@ -1,0 +1,3 @@
+{"message":{"content":"CLAUDE_OUTSIDE_BEFORE_CANARY","role":"user"},"type":"user"}
+{"message":{"content":"CLAUDE_SELECTED_SPAN_CANARY: diagnose a generic failing test","role":"assistant"},"type":"assistant"}
+{"message":{"content":"CLAUDE_OUTSIDE_AFTER_CANARY","role":"tool_result"},"type":"tool_result"}

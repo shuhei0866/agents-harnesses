@@ -378,6 +378,52 @@ stays in an error state while either remains unresolved. A custom relationship
 policy must be selected with its owner-held file via `--policy`, rather than by
 an unauthenticated version string alone.
 
+Evidence-free singleton episodes are not automatic-evaluation candidates.
+They contain too little context for a useful model judgment, even when their
+relationship confidence is unknown. A singleton needs a successful or failed
+test, build, lint, commit, or pull-request fact before the background evaluator
+can spend its budget on it.
+
+### Local Semantic Receipts
+
+Register an existing local Claude Code or Codex JSONL session without copying
+its body into the Vault:
+
+```bash
+scripts/flight-recorder source register \
+  --adapter codex \
+  --path /absolute/path/to/session.jsonl
+```
+
+The command returns an opaque source reference plus its content digest and
+size. The owner-only registration under `session-sources/` retains the local
+path; neither the path nor the raw content is returned or Git-synchronized.
+
+Generate a bounded semantic interpretation for one episode from an explicitly
+selected 1-based line span:
+
+```bash
+scripts/flight-recorder receipt generate <episode-id> \
+  --source-ref SOURCE_REF \
+  --span-start-line 120 \
+  --span-end-line 180 \
+  --evaluator ADAPTER \
+  --model MODEL_ID \
+  --rubric /path/to/semantic-rubric.json
+```
+
+The selected span is sent transiently to the trusted local evaluator. Flight
+Recorder stores only the validated task, execution, result, assessment, and
+recorder-generated provenance under `semantic-receipts/`. Source paths and raw
+session bodies are never included in the Receipt. Different source snapshots,
+models, or rubrics coexist as versioned local records so future models can
+reinterpret the original local session without overwriting earlier results.
+`flight-recorder inspect <episode-id>` returns matching records in the
+top-level `semantic_receipts` array and labels them as model-derived in human
+output; it does not promote their task or outcome into deterministic Card
+fields. Inspect output is version 4 while the embedded Card and report output
+remain version 3.
+
 ### Forget and best-effort purge
 
 Logical removal keeps immutable source evidence but excludes one episode from
@@ -395,11 +441,11 @@ scripts/flight-recorder purge <episode-id>
 scripts/flight-recorder purge <episode-id> --apply
 ```
 
-`--apply` removes matching local cache/index and evaluation state, rewrites the
-dedicated Vault Git history, and force-pushes its `main` branch. A rejected
-force-push restores the local evaluation records with the other retryable
-state. An episode can share an immutable chunk with other events, so inspect
-the preview before applying.
+`--apply` removes matching local cache/index, evaluation, and Semantic Receipt
+state, rewrites the dedicated Vault Git history, and force-pushes its `main`
+branch. A rejected force-push restores the local derived records with the other
+retryable state. An episode can share an immutable chunk with other events, so
+inspect the preview before applying.
 Deletion from independent or uncontrolled clones, provider caches, and backups
 cannot be guaranteed; purge is best-effort outside repositories the owner
 controls.
@@ -434,6 +480,8 @@ bash plugins/agent-harness-flight-recorder/tests/test-deterministic-evidence.sh
 bash plugins/agent-harness-flight-recorder/tests/test-relationship-graph.sh
 bash plugins/agent-harness-flight-recorder/tests/test-reporting.sh
 bash plugins/agent-harness-flight-recorder/tests/test-background-evaluation.sh
+bash plugins/agent-harness-flight-recorder/tests/test-session-sources.sh
+bash plugins/agent-harness-flight-recorder/tests/test-semantic-receipts.sh
 bash plugins/agent-harness-flight-recorder/tests/test-retention.sh
 bash plugins/agent-harness-flight-recorder/tests/test-retry-policy.sh
 bash plugins/agent-harness-flight-recorder/tests/test-scheduler.sh

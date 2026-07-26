@@ -25,6 +25,7 @@ from reporting import (
     _policy_selection,
 )
 from retention_state import load_forgotten, store_forgotten
+from semantic_receipts import semantic_receipt_record_snapshots
 from sync import (
     CHUNK_PATH_RE,
     PENDING_PATH,
@@ -94,6 +95,11 @@ def _scope(
             ],
             "evaluation_record_count": len(
                 evaluation_record_snapshots(
+                    root, policy_version, episode_id
+                )
+            ),
+            "semantic_receipt_record_count": len(
+                semantic_receipt_record_snapshots(
                     root, policy_version, episode_id
                 )
             ),
@@ -321,6 +327,9 @@ def purge(
             evaluation_snapshots = evaluation_record_snapshots(
                 root, selected, episode_id
             )
+            semantic_receipt_snapshots = semantic_receipt_record_snapshots(
+                root, selected, episode_id
+            )
             attempt_snapshot = remove_episode_attempts(root, episode_id)
             attempt_committed = False
             try:
@@ -330,17 +339,21 @@ def purge(
                 forgotten = set(original_forgotten)
                 forgotten.discard((selected, episode_id))
                 store_forgotten(root, forgotten)
-                removed_evaluations: list[tuple[Path, bytes]] = []
+                derivative_snapshots = [
+                    *evaluation_snapshots,
+                    *semantic_receipt_snapshots,
+                ]
+                removed_derivatives: list[tuple[Path, bytes]] = []
                 try:
-                    for evaluation_path, evaluation_bytes in evaluation_snapshots:
-                        evaluation_path.unlink()
-                        removed_evaluations.append(
-                            (evaluation_path, evaluation_bytes)
+                    for derivative_path, derivative_bytes in derivative_snapshots:
+                        derivative_path.unlink()
+                        removed_derivatives.append(
+                            (derivative_path, derivative_bytes)
                         )
                 except OSError as error:
-                    for evaluation_path, evaluation_bytes in removed_evaluations:
-                        atomic_replace(evaluation_path, evaluation_bytes)
-                    raise VaultError("evaluation storage is unsafe") from error
+                    for derivative_path, derivative_bytes in removed_derivatives:
+                        atomic_replace(derivative_path, derivative_bytes)
+                    raise VaultError("derived record storage is unsafe") from error
                 try:
                     # Keep refs/original until the remote accepts the rewrite.
                     # A rejection restores the Vault to a retryable state.
@@ -359,6 +372,8 @@ def purge(
                         atomic_replace(pending_path, original_pending)
                     for evaluation_path, evaluation_bytes in evaluation_snapshots:
                         atomic_replace(evaluation_path, evaluation_bytes)
+                    for receipt_path, receipt_bytes in semantic_receipt_snapshots:
+                        atomic_replace(receipt_path, receipt_bytes)
                     _cleanup_original_history(root)
                     raise
                 _cleanup_original_history(root)
@@ -386,5 +401,7 @@ def render_purge(value: dict[str, Any]) -> str:
         f"{mode}: purge episode {value['episode_id']}\n"
         f"Affected encrypted chunks:\n{paths}\n"
         f"Local evaluation records: {value['evaluation_record_count']}\n"
+        "Local Semantic Receipt records: "
+        f"{value['semantic_receipt_record_count']}\n"
         f"{value['limitation']}\n"
     )

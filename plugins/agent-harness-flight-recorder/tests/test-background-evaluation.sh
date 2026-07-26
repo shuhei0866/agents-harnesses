@@ -55,24 +55,30 @@ import sys
 
 now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
 events = []
-for index, task in enumerate(("1", "1", "2"), start=1):
+for index, task in enumerate(("1", "1", "2", "3"), start=1):
+    decision_bearing = index == 3
     events.append({
-        "schema_version": 2,
+        "schema_version": 3,
         "event_id": f"51000000-0000-4000-8000-{index:012d}",
         "recorded_at": (
             now - dt.timedelta(seconds=400 - index * 100)
         ).isoformat().replace("+00:00", "Z"),
         "harness": "codex" if index > 1 else "claude-code",
-        "source_event": "Stop",
-        "event_kind": "turn.completed",
+        "source_event": "PostToolUse" if decision_bearing else "Stop",
+        "event_kind": "tool.completed" if decision_bearing else "turn.completed",
         "session_id_hash": "sha256:" + "a" * 24,
         "turn_id_hash": None,
         "workspace_id": "sha256:" + "b" * 24,
         "model": "fixture-model",
         "permission_mode": None,
-        "tool": None,
+        "tool": "Bash" if decision_bearing else None,
         "metrics": None,
-        "outcome": {"status": "success", "exit_code": 0},
+        "outcome": (
+            {"status": "success", "exit_code": 0}
+            if index < 4
+            else None
+        ),
+        "operation_kind": "test" if decision_bearing else None,
         "relationship_context": {
             "task_id_hash": "sha256:" + task * 24,
             "task_source": "payload",

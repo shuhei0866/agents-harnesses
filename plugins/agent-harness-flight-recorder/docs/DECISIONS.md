@@ -268,3 +268,25 @@ Accepted decisions remain recorded when later superseded.
   adapters use v2 with mandatory measured cost. The system reserves an attempt
   before invocation, serializes configure/run/purge, and requires an owner-held
   file for any non-default relationship policy.
+
+## D-20260726-22: Keep raw sessions local and derive versioned semantic receipts
+
+- Status: accepted
+- Decision: treat an explicitly registered Claude Code or Codex session log as
+  a local-only source. Send only an owner-selected line span to a trusted local
+  evaluator and persist a bounded Semantic Receipt containing task, execution,
+  result, assessment, and recorder-generated provenance. Never copy the raw
+  session into the Vault or add source registrations or receipts to the Git
+  sync allowlist.
+- Reason: privacy-safe lifecycle metadata proves that work occurred but cannot
+  explain its intent or result. Keeping the original local source available
+  lets a later, stronger model rederive a better interpretation instead of
+  freezing the current model's understanding.
+- Consequence: source registrations may contain a local path but are owner-only
+  state. The CLI returns only an opaque source reference, content digest, and
+  size; it never returns the local path or raw content. Receipts store hashes
+  and bounded model-derived prose, not raw source paths or bodies. Multiple
+  model or rubric generations coexist without overwriting earlier receipts,
+  and inspect keeps model-derived semantics separate from deterministic
+  evidence. Background metadata evaluation skips evidence-free singleton
+  episodes rather than paying a model to judge an empty envelope.
