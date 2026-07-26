@@ -475,6 +475,8 @@ bash plugins/agent-harness-flight-recorder/tests/test-deterministic-evidence.sh
 bash plugins/agent-harness-flight-recorder/tests/test-relationship-graph.sh
 bash plugins/agent-harness-flight-recorder/tests/test-reporting.sh
 bash plugins/agent-harness-flight-recorder/tests/test-background-evaluation.sh
+bash plugins/agent-harness-flight-recorder/tests/test-session-sources.sh
+bash plugins/agent-harness-flight-recorder/tests/test-semantic-receipts.sh
 bash plugins/agent-harness-flight-recorder/tests/test-retention.sh
 bash plugins/agent-harness-flight-recorder/tests/test-retry-policy.sh
 bash plugins/agent-harness-flight-recorder/tests/test-scheduler.sh

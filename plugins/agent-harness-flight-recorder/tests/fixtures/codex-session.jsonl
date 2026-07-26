@@ -1,0 +1,3 @@
+{"payload":{"id":"generic-session"},"timestamp":"2026-01-01T00:00:00Z","type":"session_meta"}
+{"payload":{"content":[{"text":"CODEX_SELECTED_SPAN_CANARY: implement a generic bounded parser","type":"input_text"}],"role":"user","type":"message"},"timestamp":"2026-01-01T00:00:01Z","type":"response_item"}
+{"payload":{"message":"CODEX_OUTSIDE_AFTER_CANARY"},"timestamp":"2026-01-01T00:00:02Z","type":"event_msg"}

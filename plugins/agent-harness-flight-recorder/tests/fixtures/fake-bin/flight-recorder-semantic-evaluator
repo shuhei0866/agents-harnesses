@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Deterministic local evaluator used by Semantic Receipt integration tests."""
+
+import json
+import os
+import pathlib
+import sys
+
+
+request = json.load(sys.stdin)
+capture = os.environ.get("FLIGHT_RECORDER_TEST_SEMANTIC_CAPTURE")
+if capture:
+    pathlib.Path(capture).write_text(
+        json.dumps(request, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+evidence_ids = [
+    item["evidence_id"]
+    for item in request["episode"]["deterministic_evidence"]
+]
+support = evidence_ids[:1]
+json.dump(
+    {
+        "schema_version": 1,
+        "task": {
+            "type": "bug_fix",
+            "intent": "Diagnose and correct a generic failing test.",
+            "deliverable": "A verified repository change.",
+            "constraints": ["Preserve existing behavior."],
+            "difficulty": "medium",
+        },
+        "execution": {
+            "harness": "codex",
+            "model": "fixture-worker-model",
+            "duration_ms": 1250,
+            "tool_count": 1,
+            "retry_count": 0,
+        },
+        "result": {
+            "summary": "The generic test was corrected and verified.",
+            "artifacts": ["test-result"],
+            "outcome": "success",
+        },
+        "assessment": {
+            "criteria": {
+                "goal_achievement": {
+                    "state": "supported",
+                    "evidence_references": support,
+                },
+                "quality": {
+                    "state": "supported",
+                    "evidence_references": support,
+                },
+                "efficiency": {
+                    "state": "unknown",
+                    "evidence_references": [],
+                },
+            },
+            "confidence": "high",
+        },
+    },
+    sys.stdout,
+    sort_keys=True,
+    separators=(",", ":"),
+)
