@@ -88,6 +88,12 @@ GITIGNORE = PRE_SEMANTIC_RECEIPT_GITIGNORE.replace(
 )
 assert "/session-sources/\n" in GITIGNORE
 assert "/semantic-receipts/\n" in GITIGNORE
+PRE_RECEIPT_AUTOMATION_GITIGNORE = GITIGNORE
+GITIGNORE = PRE_RECEIPT_AUTOMATION_GITIGNORE.replace(
+    "/semantic-receipts/\n",
+    "/semantic-receipts/\n/receipt-automation/\n",
+)
+assert "/receipt-automation/\n" in GITIGNORE
 LEGACY_GITIGNORE = """# Local-only Flight Recorder state
 /hash.key
 /events.jsonl
@@ -883,6 +889,31 @@ def parser() -> argparse.ArgumentParser:
     receipt_generate.add_argument("--rubric", required=True, type=Path)
     receipt_generate.add_argument("--timeout", type=int, default=60)
     receipt_generate.add_argument("--json", action="store_true")
+    receipt_auto = commands.add_parser("receipt-auto")
+    receipt_auto_commands = receipt_auto.add_subparsers(
+        dest="receipt_auto_command", required=True
+    )
+    receipt_auto_configure = receipt_auto_commands.add_parser("configure")
+    receipt_auto_configure.add_argument(
+        "--claude-code-root", required=True, type=Path
+    )
+    receipt_auto_configure.add_argument("--codex-root", required=True, type=Path)
+    receipt_auto_configure.add_argument("--evaluator", required=True)
+    receipt_auto_configure.add_argument("--model", required=True)
+    receipt_auto_configure.add_argument("--rubric", required=True, type=Path)
+    receipt_auto_configure.add_argument("--policy-version", required=True)
+    receipt_auto_configure.add_argument(
+        "--quiescence-seconds", required=True, type=int
+    )
+    receipt_auto_configure.add_argument(
+        "--max-receipts-per-run", required=True, type=int
+    )
+    receipt_auto_configure.add_argument(
+        "--max-cost-microusd-per-run", required=True, type=int
+    )
+    receipt_auto_configure.add_argument("--json", action="store_true")
+    receipt_auto_run = receipt_auto_commands.add_parser("run")
+    receipt_auto_run.add_argument("--json", action="store_true")
     forget = commands.add_parser("forget")
     forget.add_argument("episode_id")
     forget_policy = forget.add_mutually_exclusive_group()
@@ -931,6 +962,7 @@ def main() -> int:
         "auto-evaluation",
         "source",
         "receipt",
+        "receipt-auto",
         "forget",
         "purge",
         "scheduler",
@@ -1051,6 +1083,31 @@ def main() -> int:
                 args.policy,
             )
             emit(value, as_json=args.json, human=render_generate(value))
+        elif args.command == "receipt-auto":
+            from receipt_automation import configure, run as run_receipt_automation
+            from reporting import emit
+
+            if args.receipt_auto_command == "configure":
+                value = configure(
+                    root,
+                    args.claude_code_root,
+                    args.codex_root,
+                    args.evaluator,
+                    args.model,
+                    args.rubric,
+                    args.policy_version,
+                    args.quiescence_seconds,
+                    args.max_receipts_per_run,
+                    args.max_cost_microusd_per_run,
+                )
+                human = "Automatic Semantic Receipts configured.\n"
+            else:
+                value = run_receipt_automation(root)
+                human = (
+                    "Automatic Semantic Receipts completed: "
+                    f"{value['generated_count']} generated.\n"
+                )
+            emit(value, as_json=args.json, human=human)
         elif args.command in ("forget", "purge"):
             from reporting import emit
             from retention import (

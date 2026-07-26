@@ -665,6 +665,70 @@ def append_event(path: str, event: dict[str, Any]) -> None:
         os.close(parent_descriptor)
 
 
+def append_receipt_hint(
+    event_path: str,
+    payload: dict[str, Any],
+    event: dict[str, Any],
+) -> None:
+    """Append a bounded local discovery hint after the canonical event write."""
+    if payload.get("hook_event_name") != "Stop":
+        return
+    source_value = payload.get("transcript_path")
+    if not isinstance(source_value, str) or not os.path.isabs(source_value):
+        return
+    root = os.path.dirname(os.path.dirname(os.path.abspath(event_path)))
+    config_path = os.path.join(root, "receipt-automation", "config.json")
+    try:
+        config_metadata = os.lstat(config_path)
+        if (
+            not stat.S_ISREG(config_metadata.st_mode)
+            or config_metadata.st_uid != os.geteuid()
+            or config_metadata.st_nlink != 1
+            or config_metadata.st_mode & 0o077
+        ):
+            return
+        with open(config_path, "r", encoding="utf-8") as stream:
+            config = json.load(stream)
+        harness = event.get("harness")
+        root_field = (
+            "claude_code_root" if harness == "claude-code" else "codex_root"
+        )
+        configured_root = os.path.realpath(config[root_field])
+        source_path = os.path.realpath(source_value)
+        if os.path.commonpath((configured_root, source_path)) != configured_root:
+            return
+        source_metadata = os.lstat(source_path)
+        if (
+            not stat.S_ISREG(source_metadata.st_mode)
+            or source_metadata.st_uid != os.geteuid()
+            or source_metadata.st_nlink != 1
+        ):
+            return
+        hint = {
+            "schema_version": 1,
+            "event_id": event["event_id"],
+            "harness": harness,
+            "source_path": os.path.abspath(source_value),
+            "captured_size_bytes": source_metadata.st_size,
+            "session_id_hash": event.get("session_id_hash"),
+            "turn_id_hash": event.get("turn_id_hash"),
+            "source_identity": {
+                "device": source_metadata.st_dev,
+                "inode": source_metadata.st_ino,
+                "modified_ns": source_metadata.st_mtime_ns,
+                "changed_ns": source_metadata.st_ctime_ns,
+            },
+            "captured_at": event["recorded_at"],
+        }
+        append_event(
+            os.path.join(root, "receipt-automation", "hints.jsonl"),
+            hint,
+        )
+    except BaseException:
+        # Discovery is optional. Canonical hook recording must remain fail-open.
+        return
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
@@ -684,7 +748,9 @@ def main() -> None:
     if path is None:
         return
     key = correlation_key(path)
-    append_event(path, normalize(payload, resolve_harness(args.harness), key))
+    event = normalize(payload, resolve_harness(args.harness), key)
+    append_event(path, event)
+    append_receipt_hint(path, payload, event)
 
 
 if __name__ == "__main__":

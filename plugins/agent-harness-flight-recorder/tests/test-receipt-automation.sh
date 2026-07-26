@@ -547,6 +547,92 @@ PY
   fi
 }
 
+test_provider_parsers_select_latest_closed_turn() {
+  echo "test_provider_parsers_select_latest_closed_turn:"
+  if PYTHONPATH="$PLUGIN_DIR/scripts" python3 - <<'PY'
+from receipt_automation import _claude_span, _codex_span
+from record_event import hash_identifier
+
+key = b"k" * 32
+claude_session = "claude-multi-turn"
+claude_rows = [
+    {
+        "type": "user",
+        "uuid": "prompt-1",
+        "parentUuid": None,
+        "sessionId": claude_session,
+        "message": {"role": "user", "content": "first prompt"},
+    },
+    {
+        "type": "assistant",
+        "uuid": "answer-1",
+        "parentUuid": "prompt-1",
+        "sessionId": claude_session,
+        "message": {"role": "assistant", "content": "first answer"},
+    },
+    {
+        "type": "last-prompt",
+        "sessionId": claude_session,
+        "leafUuid": "answer-1",
+    },
+    {
+        "type": "user",
+        "uuid": "prompt-2",
+        "parentUuid": "answer-1",
+        "sessionId": claude_session,
+        "message": {"role": "user", "content": "second prompt"},
+    },
+    {
+        "type": "assistant",
+        "uuid": "answer-2",
+        "parentUuid": "prompt-2",
+        "sessionId": claude_session,
+        "message": {"role": "assistant", "content": "second answer"},
+    },
+    {
+        "type": "last-prompt",
+        "sessionId": claude_session,
+        "leafUuid": "answer-2",
+    },
+]
+assert _claude_span(
+    claude_rows,
+    {"session_id_hash": hash_identifier(claude_session, key)},
+    key,
+) == ("exact", 4, 5)
+
+codex_session = "codex-session-id-field"
+codex_turn = "codex-turn"
+codex_rows = [
+    {
+        "type": "session_meta",
+        "payload": {"session_id": codex_session},
+    },
+    {
+        "type": "event_msg",
+        "payload": {"type": "task_started", "turn_id": codex_turn},
+    },
+    {
+        "type": "event_msg",
+        "payload": {"type": "task_complete", "turn_id": codex_turn},
+    },
+]
+assert _codex_span(
+    codex_rows,
+    {
+        "session_id_hash": hash_identifier(codex_session, key),
+        "turn_id_hash": hash_identifier(codex_turn, key),
+    },
+    key,
+) == ("exact", 2, 3)
+PY
+  then
+    pass "複数turnのClaudeは最新promptだけ、Codexはsession_id fieldで照合する"
+  else
+    fail "複数turnのClaudeは最新promptだけ、Codexはsession_id fieldで照合する"
+  fi
+}
+
 echo "=== Flight Recorder Automatic Semantic Receipt Tests ==="
 if ! init_fixture; then
   echo "fixture setup failed" >&2
@@ -560,6 +646,7 @@ if [[ -f "$STATE/receipt-automation/config.json" ]]; then
   test_measured_cost_is_capped
   test_scheduler_failure_is_sync_independent_and_not_recharged
   test_status_is_content_free
+  test_provider_parsers_select_latest_closed_turn
 fi
 
 echo

@@ -1188,7 +1188,24 @@ def run(root: Path) -> None:
                 record_failure(root, "configuration_invalid")
             except VaultError:
                 pass
-            return
+    receipt_config_path = root / "receipt-automation/config.json"
+    if should_evaluate and (
+        receipt_config_path.exists() or receipt_config_path.is_symlink()
+    ):
+        try:
+            from receipt_automation import (
+                record_failure as record_receipt_failure,
+                run as run_receipt_automation,
+            )
+
+            run_receipt_automation(root)
+        except VaultError:
+            # Semantic receipt automation is also outside sync health. Its
+            # worker writes finite diagnostics for evaluator failures.
+            try:
+                record_receipt_failure(root, "configuration_invalid")
+            except VaultError:
+                pass
 
 
 def manual_sync(root: Path) -> None:
