@@ -424,6 +424,44 @@ output; it does not promote their task or outcome into deterministic Card
 fields. Inspect output is version 4 while the embedded Card and report output
 remain version 3.
 
+### Unconscious Semantic Receipts
+
+Opt in once to automatic session matching for both harnesses:
+
+```bash
+scripts/flight-recorder receipt-auto configure \
+  --claude-code-root /absolute/path/to/claude/sessions \
+  --codex-root /absolute/path/to/codex/sessions \
+  --evaluator ADAPTER \
+  --model MODEL_ID \
+  --rubric /path/to/semantic-rubric.json \
+  --policy-version default-v1 \
+  --quiescence-seconds 60 \
+  --max-receipts-per-run 5 \
+  --max-cost-microusd-per-run 50000
+```
+
+After opt-in, a `Stop` hook writes only a local hint containing the Event ID,
+hashed session/turn identity, source path, file identity, and captured byte
+boundary. It never invokes the evaluator. After successful scheduled sync, the
+background worker authenticates the Event-to-Episode mapping and evaluates
+only an exact, closed span: the latest Claude Code parent chain from human
+prompt to final assistant, or one Codex `task_started`/`task_complete` turn.
+Missing, active, mixed-Episode, and ambiguous sources remain uncharged.
+
+Automatic evaluator requests use protocol v2 with the remaining micro-USD
+budget; manual `receipt generate` remains protocol v1. A durable fingerprint
+reservation is written before invocation and includes the Episode evidence,
+captured source prefix, evaluator executable, model, rubric, and policy. A
+successful or failed fingerprint is not charged again automatically.
+`receipt-automation/` is owner-only and Git-ignored. Global `status` exposes
+only finite counts and cost, never source paths, raw identifiers, or content.
+For an explicit local pass, use:
+
+```bash
+scripts/flight-recorder receipt-auto run --json
+```
+
 ### Forget and best-effort purge
 
 Logical removal keeps immutable source evidence but excludes one episode from
@@ -482,6 +520,7 @@ bash plugins/agent-harness-flight-recorder/tests/test-reporting.sh
 bash plugins/agent-harness-flight-recorder/tests/test-background-evaluation.sh
 bash plugins/agent-harness-flight-recorder/tests/test-session-sources.sh
 bash plugins/agent-harness-flight-recorder/tests/test-semantic-receipts.sh
+bash plugins/agent-harness-flight-recorder/tests/test-receipt-automation.sh
 bash plugins/agent-harness-flight-recorder/tests/test-retention.sh
 bash plugins/agent-harness-flight-recorder/tests/test-retry-policy.sh
 bash plugins/agent-harness-flight-recorder/tests/test-scheduler.sh
