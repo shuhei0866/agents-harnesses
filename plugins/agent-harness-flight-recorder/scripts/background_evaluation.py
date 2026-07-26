@@ -29,6 +29,13 @@ STATUS_PATH = Path("auto-evaluation/status.json")
 MAX_UNCERTAINTY_SCORE = 1_000_000_000
 MAX_EVALUATIONS_PER_RUN = 100
 MAX_COST_MICROUSD_PER_RUN = 1_000_000_000_000
+DECISION_BEARING_EVIDENCE_TYPES = {
+    "test",
+    "build",
+    "lint",
+    "git_commit",
+    "pull_request",
+}
 
 
 class _AlreadyEvaluated(Exception):
@@ -353,9 +360,19 @@ def _run_once(root: Path) -> dict[str, Any]:
     candidates = [
         card
         for card in view["cards"]
-        if card["confidence"] is None
-        or card["confidence"]["minimum_supporting_score"]
-        < config["uncertainty_score_below"]
+        if (
+            card["confidence"] is None
+            or card["confidence"]["minimum_supporting_score"]
+            < config["uncertainty_score_below"]
+        )
+        and (
+            card["event_count"] > 1
+            or any(
+                fact["evidence_type"] in DECISION_BEARING_EVIDENCE_TYPES
+                and fact["state"] in {"success", "failure"}
+                for fact in card["deterministic_evidence"]
+            )
+        )
     ]
     evaluated = 0
     idempotent_skips = 0
