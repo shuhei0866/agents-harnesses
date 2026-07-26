@@ -11,7 +11,7 @@ import stat
 from pathlib import Path
 from typing import Any
 
-from chunk_rotation import canonical_json, safe_subdirectory
+from chunk_rotation import canonical_json, parse_time, safe_subdirectory
 from evaluation import (
     MAX_EVALUATOR_OUTPUT_BYTES,
     _episode_request,
@@ -20,7 +20,11 @@ from evaluation import (
     _invoke,
     _safe_name,
 )
-from session_sources import load_registered_source
+from session_sources import (
+    SOURCE_REF_RE,
+    SUPPORTED_ADAPTERS,
+    load_registered_source,
+)
 from vault import (
     VaultError,
     atomic_replace,
@@ -40,6 +44,8 @@ MAX_SHORT_TEXT_LENGTH = 256
 MAX_LIST_ITEMS = 32
 MAX_DURATION_MS = 365 * 24 * 60 * 60 * 1000
 MAX_COUNT = 10_000_000
+MAX_RECEIPT_SOURCE_EVENTS = 10_000
+HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 SAFE_TYPE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 RUBRIC_FIELDS = {
     "schema_version",
@@ -76,6 +82,36 @@ EXECUTION_FIELDS = {
 RESULT_FIELDS = {"summary", "artifacts", "outcome"}
 ASSESSMENT_FIELDS = {"criteria", "confidence"}
 CRITERION_FIELDS = {"state", "evidence_references"}
+RECEIPT_FIELDS = {
+    "schema_version",
+    "receipt_id",
+    "episode_id",
+    "task",
+    "execution",
+    "result",
+    "assessment",
+    "provenance",
+}
+PROVENANCE_FIELDS = {
+    "evaluator_model",
+    "evaluator_adapter",
+    "evaluator_adapter_sha256",
+    "rubric_version",
+    "rubric_sha256",
+    "policy_version",
+    "source_event_ids",
+    "evidence_ids",
+    "source_spans",
+    "generated_at",
+}
+SOURCE_SPAN_FIELDS = {
+    "source_ref",
+    "adapter",
+    "content_sha256",
+    "span_sha256",
+    "start_line",
+    "end_line",
+}
 
 
 def _sha256(value: bytes) -> str:
@@ -387,11 +423,261 @@ def _validate_response(
     return value, sorted(referenced)
 
 
+def _bounded_unique_identifiers(
+    value: object,
+    description: str,
+    *,
+    maximum: int,
+    sorted_values: bool = False,
+    digest: bool = False,
+    allow_empty: bool = False,
+) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or (not value and not allow_empty)
+        or len(value) > maximum
+        or any(
+            not isinstance(item, str)
+            or not item
+            or len(item) > MAX_SHORT_TEXT_LENGTH
+            or (digest and HASH_RE.fullmatch(item) is None)
+            for item in value
+        )
+        or len(set(value)) != len(value)
+        or (sorted_values and value != sorted(value))
+    ):
+        raise VaultError(f"stored Semantic Receipt {description} is invalid")
+    return value
+
+
+def _validate_receipt_record(value: object) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != RECEIPT_FIELDS
+        or value.get("schema_version") != RECEIPT_VERSION
+        or not isinstance(value.get("receipt_id"), str)
+        or HASH_RE.fullmatch(value["receipt_id"]) is None
+        or not isinstance(value.get("episode_id"), str)
+        or HASH_RE.fullmatch(value["episode_id"]) is None
+    ):
+        raise VaultError("stored Semantic Receipt is invalid")
+    provenance = value.get("provenance")
+    if not isinstance(provenance, dict) or set(provenance) != PROVENANCE_FIELDS:
+        raise VaultError("stored Semantic Receipt provenance is invalid")
+    _safe_name(
+        provenance.get("evaluator_model"),
+        "stored Semantic Receipt evaluator model",
+    )
+    _safe_name(
+        provenance.get("evaluator_adapter"),
+        "stored Semantic Receipt evaluator adapter",
+    )
+    _safe_name(
+        provenance.get("rubric_version"),
+        "stored Semantic Receipt rubric version",
+    )
+    _safe_name(
+        provenance.get("policy_version"),
+        "stored Semantic Receipt policy version",
+    )
+    for field in ("evaluator_adapter_sha256", "rubric_sha256"):
+        item = provenance.get(field)
+        if not isinstance(item, str) or HASH_RE.fullmatch(item) is None:
+            raise VaultError("stored Semantic Receipt provenance is invalid")
+    generated_at = provenance.get("generated_at")
+    try:
+        if not isinstance(generated_at, str):
+            raise ValueError
+        parse_time(generated_at)
+    except (TypeError, ValueError) as error:
+        raise VaultError(
+            "stored Semantic Receipt generation time is invalid"
+        ) from error
+    source_event_ids = _bounded_unique_identifiers(
+        provenance.get("source_event_ids"),
+        "source event IDs",
+        maximum=MAX_RECEIPT_SOURCE_EVENTS,
+    )
+    evidence_ids = _bounded_unique_identifiers(
+        provenance.get("evidence_ids"),
+        "evidence IDs",
+        maximum=MAX_RECEIPT_SOURCE_EVENTS,
+        sorted_values=True,
+        digest=True,
+        allow_empty=True,
+    )
+    spans = provenance.get("source_spans")
+    if (
+        not isinstance(spans, list)
+        or not spans
+        or len(spans) > MAX_LIST_ITEMS
+    ):
+        raise VaultError("stored Semantic Receipt source spans are invalid")
+    for span in spans:
+        if (
+            not isinstance(span, dict)
+            or set(span) != SOURCE_SPAN_FIELDS
+            or not isinstance(span.get("source_ref"), str)
+            or SOURCE_REF_RE.fullmatch(span["source_ref"]) is None
+            or span.get("adapter") not in SUPPORTED_ADAPTERS
+            or not isinstance(span.get("content_sha256"), str)
+            or HASH_RE.fullmatch(span["content_sha256"]) is None
+            or not isinstance(span.get("span_sha256"), str)
+            or HASH_RE.fullmatch(span["span_sha256"]) is None
+        ):
+            raise VaultError("stored Semantic Receipt source spans are invalid")
+        start = span.get("start_line")
+        end = span.get("end_line")
+        if (
+            isinstance(start, bool)
+            or isinstance(end, bool)
+            or not isinstance(start, int)
+            or not isinstance(end, int)
+            or start < 1
+            or end < start
+            or end - start + 1 > MAX_SPAN_LINES
+        ):
+            raise VaultError("stored Semantic Receipt source spans are invalid")
+    response = {
+        "schema_version": 1,
+        "task": value["task"],
+        "execution": value["execution"],
+        "result": value["result"],
+        "assessment": value["assessment"],
+    }
+    _response, referenced = _validate_response(
+        canonical_json(response),
+        set(evidence_ids),
+        {
+            "criteria": {name: name for name in RUBRIC_CRITERIA},
+            "allowed_states": sorted(ALLOWED_STATES),
+        },
+        "",
+        "\0",
+    )
+    if referenced != evidence_ids:
+        raise VaultError("stored Semantic Receipt evidence IDs are invalid")
+    expected_id = _sha256(
+        canonical_json(
+            {
+                key: item
+                for key, item in value.items()
+                if key != "receipt_id"
+            }
+        )
+    )
+    if value["receipt_id"] != expected_id:
+        raise VaultError("stored Semantic Receipt ID is invalid")
+    return value
+
+
+def _read_stored_receipt(path: Path) -> tuple[bytes, dict[str, Any]]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or metadata.st_mode & 0o022
+            or metadata.st_size > MAX_STORED_RECEIPT_BYTES
+        ):
+            raise VaultError("stored Semantic Receipt is unsafe")
+        with os.fdopen(descriptor, "rb", closefd=True) as stream:
+            descriptor = -1
+            raw = stream.read(MAX_STORED_RECEIPT_BYTES + 1)
+        after = path.lstat()
+        if (
+            after.st_dev != metadata.st_dev
+            or after.st_ino != metadata.st_ino
+            or after.st_size != metadata.st_size
+            or after.st_mtime_ns != metadata.st_mtime_ns
+            or after.st_ctime_ns != metadata.st_ctime_ns
+        ):
+            raise VaultError("stored Semantic Receipt changed while reading")
+        value = _validate_receipt_record(json.loads(raw))
+    except VaultError:
+        raise
+    except (OSError, ValueError, UnicodeError, RecursionError) as error:
+        raise VaultError("stored Semantic Receipt is invalid or unsafe") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if path.suffix != ".json" or path.stem != value["receipt_id"][7:]:
+        raise VaultError("stored Semantic Receipt filename is invalid")
+    return raw, value
+
+
+def _stored_receipts(root: Path) -> list[tuple[Path, bytes, dict[str, Any]]]:
+    directory = root / "semantic-receipts"
+    if not directory.exists() and not directory.is_symlink():
+        return []
+    if directory.is_symlink():
+        raise VaultError("Semantic Receipt storage is unsafe")
+    try:
+        metadata = directory.lstat()
+        paths = sorted(directory.iterdir())
+    except OSError as error:
+        raise VaultError("Semantic Receipt storage is unsafe") from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o022
+    ):
+        raise VaultError("Semantic Receipt storage is unsafe")
+    return [(path, *_read_stored_receipt(path)) for path in paths]
+
+
+def load_semantic_receipts(
+    root: Path,
+    policy_version: str,
+    episode_id: str,
+    source_event_ids: list[str],
+    available_evidence_ids: set[str],
+) -> list[dict[str, Any]]:
+    result = [
+        value
+        for _path, _raw, value in _stored_receipts(root)
+        if value["episode_id"] == episode_id
+        and value["provenance"]["policy_version"] == policy_version
+        and value["provenance"]["source_event_ids"] == source_event_ids
+        and set(value["provenance"]["evidence_ids"]).issubset(
+            available_evidence_ids
+        )
+    ]
+    result.sort(
+        key=lambda item: (
+            parse_time(item["provenance"]["generated_at"]),
+            item["receipt_id"],
+        )
+    )
+    return result
+
+
+def semantic_receipt_record_snapshots(
+    root: Path,
+    policy_version: str,
+    episode_id: str,
+) -> list[tuple[Path, bytes]]:
+    return [
+        (path, raw)
+        for path, raw, value in _stored_receipts(root)
+        if value["episode_id"] == episode_id
+        and value["provenance"]["policy_version"] == policy_version
+    ]
+
+
 def _store_receipt(root: Path, receipt: dict[str, Any]) -> None:
+    _validate_receipt_record(receipt)
     ensure_managed_gitignore(root)
     directory = safe_subdirectory(root, "semantic-receipts")
     target = directory / f"{receipt['receipt_id'].removeprefix('sha256:')}.json"
     data = canonical_json(receipt) + b"\n"
+    if len(data) > MAX_STORED_RECEIPT_BYTES:
+        raise VaultError("Semantic Receipt exceeds the storage size limit")
     if target.exists() or target.is_symlink():
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)

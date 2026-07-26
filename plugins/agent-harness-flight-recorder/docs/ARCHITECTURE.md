@@ -420,7 +420,8 @@ this limitation clearly.
 - explicit local Claude Code and Codex session source registration;
 - bounded, versioned Semantic Receipt generation from an owner-selected span;
 - model/rubric/source provenance and later-model rederivation;
-- local-only storage with an explicit export boundary.
+- local-only storage with an explicit export boundary;
+- inspect v4 presentation and purge/rollback coverage for derived receipts.
 
 ### Later
 

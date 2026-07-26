@@ -418,6 +418,11 @@ recorder-generated provenance under `semantic-receipts/`. Source paths and raw
 session bodies are never included in the Receipt. Different source snapshots,
 models, or rubrics coexist as versioned local records so future models can
 reinterpret the original local session without overwriting earlier results.
+`flight-recorder inspect <episode-id>` returns matching records in the
+top-level `semantic_receipts` array and labels them as model-derived in human
+output; it does not promote their task or outcome into deterministic Card
+fields. Inspect output is version 4 while the embedded Card and report output
+remain version 3.
 
 ### Forget and best-effort purge
 
@@ -436,11 +441,11 @@ scripts/flight-recorder purge <episode-id>
 scripts/flight-recorder purge <episode-id> --apply
 ```
 
-`--apply` removes matching local cache/index and evaluation state, rewrites the
-dedicated Vault Git history, and force-pushes its `main` branch. A rejected
-force-push restores the local evaluation records with the other retryable
-state. An episode can share an immutable chunk with other events, so inspect
-the preview before applying.
+`--apply` removes matching local cache/index, evaluation, and Semantic Receipt
+state, rewrites the dedicated Vault Git history, and force-pushes its `main`
+branch. A rejected force-push restores the local derived records with the other
+retryable state. An episode can share an immutable chunk with other events, so
+inspect the preview before applying.
 Deletion from independent or uncontrolled clones, provider caches, and backups
 cannot be guaranteed; purge is best-effort outside repositories the owner
 controls.
