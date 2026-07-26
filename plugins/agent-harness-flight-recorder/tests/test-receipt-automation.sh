@@ -425,6 +425,35 @@ PY
   fi
 }
 
+test_paid_invalid_response_stops_the_run() {
+  echo "test_paid_invalid_response_stops_the_run:"
+  local output="$TEST_ROOT/paid-invalid.json"
+  local counter="$TEST_ROOT/paid-invalid-count"
+  local err="$TEST_ROOT/paid-invalid.err"
+  configure_auto 0 10 15000 semantic-paid-invalid-model >/dev/null 2>&1
+  if FLIGHT_RECORDER_TEST_AUTO_SEMANTIC_COUNT="$counter" \
+    FLIGHT_RECORDER_TEST_AUTO_SEMANTIC_COST=12000 \
+    FLIGHT_RECORDER_TEST_AUTO_SEMANTIC_INVALID=1 \
+    run_cli receipt-auto run --json >"$output" 2>"$err" \
+    && [[ "$(cat "$counter")" == "1" ]] \
+    && python3 - "$output" <<'PY'
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert value["failed_count"] == 1
+assert value["generated_count"] == 0
+assert value["measured_cost_microusd"] == 0
+PY
+  then
+    pass "課金後のinvalid payloadでは後続評価を止めrun capを守る"
+  else
+    cat "$err" >&2
+    fail "課金後のinvalid payloadでは後続評価を止めrun capを守る"
+  fi
+}
+
 test_scheduler_failure_is_sync_independent_and_not_recharged() {
   echo "test_scheduler_failure_is_sync_independent_and_not_recharged:"
   local hints="$STATE/receipt-automation/hints.jsonl"
@@ -633,6 +662,108 @@ PY
   fi
 }
 
+test_episode_members_require_complete_correlation() {
+  echo "test_episode_members_require_complete_correlation:"
+  if PLUGIN_DIR="$PLUGIN_DIR" python3 - <<'PY'
+import os
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(os.environ["PLUGIN_DIR"]) / "scripts"))
+import receipt_automation as automatic
+import reporting
+
+episode = {
+    "episode_id": "sha256:" + "1" * 64,
+    "members": [
+        ("event-stop", "claude-code", "Stop", None, None),
+    ],
+    "evidence_ids": [],
+}
+reporting._authenticated_query = lambda *_args: episode
+state, _value = automatic._episode_for_event(
+    pathlib.Path("/unused"),
+    "event-stop",
+    "default-v1",
+    {
+        "harness": "claude-code",
+        "session_id_hash": "sha256:" + "2" * 64,
+        "turn_id_hash": None,
+    },
+)
+assert state == "ambiguous"
+
+episode["members"] = [
+    (
+        "event-stop",
+        "codex",
+        "Stop",
+        "sha256:" + "2" * 64,
+        None,
+    ),
+]
+state, _value = automatic._episode_for_event(
+    pathlib.Path("/unused"),
+    "event-stop",
+    "default-v1",
+    {
+        "harness": "codex",
+        "session_id_hash": "sha256:" + "2" * 64,
+        "turn_id_hash": "sha256:" + "3" * 64,
+    },
+)
+assert state == "ambiguous"
+PY
+  then
+    pass "Episode全memberにsession/turn相関hashの完全一致を要求する"
+  else
+    fail "Episode全memberにsession/turn相関hashの完全一致を要求する"
+  fi
+}
+
+test_terminal_hints_are_compacted_before_the_limit() {
+  echo "test_terminal_hints_are_compacted_before_the_limit:"
+  local hints="$STATE/receipt-automation/hints.jsonl"
+  local output="$TEST_ROOT/hint-compaction.json"
+  python3 - "$hints" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+with path.open("a", encoding="utf-8") as stream:
+    for index in range(101):
+        stream.write(json.dumps({
+            "schema_version": 1,
+            "event_id": f"terminal-invalid-{index}",
+        }, sort_keys=True, separators=(",", ":")) + "\n")
+PY
+  if run_cli receipt-auto run --json >"$output" \
+      2>"$TEST_ROOT/hint-compaction.err" \
+    && python3 - "$hints" <<'PY'
+import json
+import pathlib
+import sys
+
+rows = [
+    json.loads(line)
+    for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+assert not any(
+    str(row.get("event_id", "")).startswith("terminal-invalid-")
+    for row in rows
+)
+assert len(rows) < 100
+PY
+  then
+    pass "終端済みhintを安全に圧縮して上限到達を予防する"
+  else
+    cat "$TEST_ROOT/hint-compaction.err" >&2
+    fail "終端済みhintを安全に圧縮して上限到達を予防する"
+  fi
+}
+
 echo "=== Flight Recorder Automatic Semantic Receipt Tests ==="
 if ! init_fixture; then
   echo "fixture setup failed" >&2
@@ -644,9 +775,12 @@ if [[ -f "$STATE/receipt-automation/config.json" ]]; then
   test_exact_claude_and_codex_generate_bounded_receipts_idempotently
   test_classifies_ambiguous_missing_and_active_without_evaluation
   test_measured_cost_is_capped
+  test_paid_invalid_response_stops_the_run
   test_scheduler_failure_is_sync_independent_and_not_recharged
   test_status_is_content_free
   test_provider_parsers_select_latest_closed_turn
+  test_episode_members_require_complete_correlation
+  test_terminal_hints_are_compacted_before_the_limit
 fi
 
 echo

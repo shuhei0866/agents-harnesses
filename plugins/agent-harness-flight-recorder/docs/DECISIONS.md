@@ -308,7 +308,10 @@ Accepted decisions remain recorded when later superseded.
 - Consequence: active, missing, mixed, or ambiguous candidates never invoke the
   evaluator. Exact candidates receive a durable evidence/source/evaluator/
   rubric fingerprint reservation before protocol-v2 invocation, so completed
-  and failed work is not automatically recharged. Scheduler execution occurs
-  only after successful sync and outside sync health. Hints, paths, attempts,
-  and status stay owner-only and Git-ignored; public status exposes finite
-  counts and measured micro-USD only.
+  and failed work is not automatically recharged. A paid response that fails
+  semantic validation stops the rest of that run, every Episode member must
+  carry the exact authenticated correlation hashes, and terminal hints are
+  periodically compacted under the hook writer lock. Scheduler execution
+  occurs only after successful sync and outside sync health. Hints, paths,
+  attempts, and status stay owner-only and Git-ignored; public status exposes
+  finite counts and measured micro-USD only.

@@ -35,8 +35,7 @@ evidence_ids = [
     for item in request["episode"]["deterministic_evidence"]
 ]
 support = evidence_ids[:1]
-json.dump(
-    {
+response = {
         "schema_version": 2,
         "measured_cost_microusd": measured_cost,
         "task": {
@@ -75,8 +74,7 @@ json.dump(
             },
             "confidence": "high",
         },
-    },
-    sys.stdout,
-    sort_keys=True,
-    separators=(",", ":"),
-)
+    }
+if os.environ.get("FLIGHT_RECORDER_TEST_AUTO_SEMANTIC_INVALID") == "1":
+    response["task"]["type"] = "INVALID TYPE"
+json.dump(response, sys.stdout, sort_keys=True, separators=(",", ":"))

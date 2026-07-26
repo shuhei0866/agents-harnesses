@@ -56,6 +56,7 @@ MAX_SOURCE_PREFIX_BYTES = 64 * 1024 * 1024
 MAX_SOURCE_LINES = 200_000
 MAX_HINTS_BYTES = 64 * 1024 * 1024
 MAX_HINTS = 100_000
+HINT_COMPACTION_THRESHOLD = 100
 MAX_STATE_BYTES = 32 * 1024 * 1024
 MAX_ATTEMPTS = 100_000
 FINGERPRINT_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -250,6 +251,51 @@ def _hints(root: Path) -> list[dict[str, Any]]:
     if len(values) > MAX_HINTS:
         raise VaultError("receipt automation hints exceed the size limit")
     return [item for item in values if isinstance(item, dict)]
+
+
+def _compact_hints(root: Path, terminal_event_ids: set[str]) -> None:
+    if not terminal_event_ids:
+        return
+    directory = safe_subdirectory(root, "receipt-automation")
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    parent_descriptor = os.open(directory, directory_flags)
+    lock_flags = os.O_CREAT | os.O_RDWR
+    lock_flags |= getattr(os, "O_CLOEXEC", 0)
+    lock_flags |= getattr(os, "O_NOFOLLOW", 0)
+    lock_descriptor = -1
+    try:
+        lock_descriptor = os.open(
+            "events.lock", lock_flags, 0o600, dir_fd=parent_descriptor
+        )
+        metadata = os.fstat(lock_descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+        ):
+            raise VaultError("receipt automation hint lock is unsafe")
+        os.fchmod(lock_descriptor, 0o600)
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        current = _hints(root)
+        retained = [
+            hint
+            for hint in current
+            if hint.get("event_id") not in terminal_event_ids
+        ]
+        if len(retained) == len(current):
+            return
+        data = b"".join(canonical_json(hint) + b"\n" for hint in retained)
+        atomic_replace(root / HINTS_PATH, data)
+    except VaultError:
+        raise
+    except OSError as error:
+        raise VaultError("receipt automation hints could not be compacted") from error
+    finally:
+        if lock_descriptor >= 0:
+            os.close(lock_descriptor)
+        os.close(parent_descriptor)
 
 
 def _attempts(root: Path) -> dict[str, dict[str, Any]]:
@@ -599,18 +645,12 @@ def _episode_for_event(
             for member in members
         )
         or any(member[1] != harness for member in members)
-        or any(
-            member[3] is not None and member[3] != session_hash
-            for member in members
-        )
+        or any(member[3] != session_hash for member in members)
         or (
             harness == "codex"
             and (
                 not isinstance(turn_hash, str)
-                or any(
-                    member[4] is not None and member[4] != turn_hash
-                    for member in members
-                )
+                or any(member[4] != turn_hash for member in members)
             )
         )
     ):
@@ -746,15 +786,24 @@ def run(root: Path) -> dict[str, Any]:
             "failed": 0,
         }
         measured_cost = 0
+        terminal_event_ids: set[str] = set()
         for hint in hints:
+            event_id = hint.get("event_id")
             classification, source, _metadata, prefix = _safe_source(hint, config)
             if classification != "candidate":
                 counts[classification] += 1
+                if (
+                    classification != "active"
+                    and isinstance(event_id, str)
+                ):
+                    terminal_event_ids.add(event_id)
                 continue
             assert source is not None and prefix is not None
             rows = _json_lines(prefix)
             if rows is None:
                 counts["ambiguous"] += 1
+                if isinstance(event_id, str):
+                    terminal_event_ids.add(event_id)
                 continue
             if hint.get("harness") == "claude-code":
                 match, start, end = _claude_span(rows, hint, key)
@@ -762,6 +811,8 @@ def run(root: Path) -> dict[str, Any]:
                 match, start, end = _codex_span(rows, hint, key)
             if match != "exact" or start is None or end is None:
                 counts["ambiguous"] += 1
+                if isinstance(event_id, str):
+                    terminal_event_ids.add(event_id)
                 continue
             episode_state, episode = _episode_for_event(
                 root,
@@ -771,6 +822,8 @@ def run(root: Path) -> dict[str, Any]:
             )
             if episode_state != "exact" or episode is None:
                 counts[episode_state] += 1
+                if isinstance(event_id, str):
+                    terminal_event_ids.add(event_id)
                 continue
             counts["matched"] += 1
             fingerprint = _fingerprint(
@@ -789,6 +842,8 @@ def run(root: Path) -> dict[str, Any]:
                     counts["idempotent_skip"] += 1
                 else:
                     counts["attempt_skip"] += 1
+                if isinstance(event_id, str):
+                    terminal_event_ids.add(event_id)
                 continue
             if (
                 counts["generated"] + counts["failed"]
@@ -821,11 +876,17 @@ def run(root: Path) -> dict[str, Any]:
                 attempts[fingerprint]["state"] = "failed"
                 _store_attempts(root, attempts)
                 counts["failed"] += 1
-                continue
+                if isinstance(event_id, str):
+                    terminal_event_ids.add(event_id)
+                break
             measured_cost += generated["measured_cost_microusd"]
             attempts[fingerprint]["state"] = "completed"
             _store_attempts(root, attempts)
             counts["generated"] += 1
+            if isinstance(event_id, str):
+                terminal_event_ids.add(event_id)
+        if len(hints) >= HINT_COMPACTION_THRESHOLD:
+            _compact_hints(root, terminal_event_ids)
         state = (
             "error"
             if counts["failed"]
