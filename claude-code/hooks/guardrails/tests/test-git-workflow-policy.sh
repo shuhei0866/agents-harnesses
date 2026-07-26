@@ -908,6 +908,7 @@ assert_silent_allow "cd 付きの gh pr merge でも commit-guard は反応し�
 
 run_bash_guard "$GH_GUARD" 'gh pr merge 42 --repo other/repo'
 assert_deny "gh pr merge に対する main 向けの advisory は gh-guard 側で維持される"
+assert_gh_log_contains "gh-guard は --repo を lookup へ引き渡し hook cwd の repo を見ない" "--repo other/repo --json baseRefName"
 
 echo ""
 echo "結果: PASS=$PASS FAIL=$FAIL"
