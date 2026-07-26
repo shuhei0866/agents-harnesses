@@ -412,6 +412,18 @@ downgrade sync health. Public status v4 adds only finite automation counts and
 diagnostics; all paths, hints, reservations, and raw session bodies remain
 local under Git-ignored `receipt-automation/`.
 
+The bundled production adapter translates protocol v2 into one Claude Code
+print-mode call. It uses structured output, safe mode, an empty tool set,
+strictly empty MCP configuration, no Chrome, and no session persistence. The
+dynamic request and raw source stay on stdin rather than process arguments.
+Only `structured_output` and `total_cost_usd` are accepted from the provider;
+cost is rounded upward to integer micro-USD and rejected when it exceeds the
+remaining budget. The child runs in an empty temporary directory with bounded
+output and timeout, while `FLIGHT_RECORDER_EVALUATOR_CHILD=1` makes any
+remaining managed Recorder hook a no-op. The evaluator resolver recognizes
+only the bundled adapter name and pins its absolute path relative to the active
+CLI, so manual and scheduled discovery do not broaden runtime `PATH`.
+
 ## Retention and deletion
 
 Privacy-safe encrypted events are retained until the owner deletes them. Normal

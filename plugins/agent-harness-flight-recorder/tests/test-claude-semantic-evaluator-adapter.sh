@@ -101,8 +101,10 @@ PY
 run_adapter() {
   local mode="$1" capture="$2" stdin_path="$3"
   shift 3
+  mkdir -p "$capture/bin"
+  cp "$FAKE_CLAUDE_BIN/claude" "$capture/bin/claude"
   PATH="$FAKE_CLAUDE_BIN:/usr/bin:/bin" \
-    FLIGHT_RECORDER_TEST_CLAUDE_EXECUTABLE="$FAKE_CLAUDE_BIN/claude" \
+    FLIGHT_RECORDER_TEST_CLAUDE_EXECUTABLE="$capture/bin/claude" \
     FLIGHT_RECORDER_TEST_CLAUDE_CAPTURE_DIR="$capture" \
     FLIGHT_RECORDER_TEST_CLAUDE_MODE="$mode" \
     "$@" "$ADAPTER" <"$stdin_path"

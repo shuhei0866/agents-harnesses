@@ -460,6 +460,8 @@ test_production_claude_adapter_offline_e2e() {
   local output="$TEST_ROOT/production-adapter.json"
   local repeat="$TEST_ROOT/production-adapter-repeat.json"
   local capture="$TEST_ROOT/production-adapter-capture"
+  mkdir -p "$capture/bin"
+  cp "$FAKE_CLAUDE_BIN/claude" "$capture/bin/claude"
   PATH="$FAKE_CLAUDE_BIN:$FAKE_BIN:$PATH" \
     FLIGHT_RECORDER_STATE_DIR="$STATE" \
     "$CLI" receipt-auto configure \
@@ -474,13 +476,13 @@ test_production_claude_adapter_offline_e2e() {
       --max-cost-microusd-per-run 50000 \
       --json >/dev/null 2>&1
   if PATH="$FAKE_CLAUDE_BIN:$PATH" \
-      FLIGHT_RECORDER_TEST_CLAUDE_EXECUTABLE="$FAKE_CLAUDE_BIN/claude" \
+      FLIGHT_RECORDER_TEST_CLAUDE_EXECUTABLE="$capture/bin/claude" \
       FLIGHT_RECORDER_TEST_CLAUDE_CAPTURE_DIR="$capture" \
       FLIGHT_RECORDER_TEST_CLAUDE_MODE=valid \
       run_cli receipt-auto run --json >"$output" \
         2>"$TEST_ROOT/production-adapter.err" \
     && PATH="$FAKE_CLAUDE_BIN:$PATH" \
-      FLIGHT_RECORDER_TEST_CLAUDE_EXECUTABLE="$FAKE_CLAUDE_BIN/claude" \
+      FLIGHT_RECORDER_TEST_CLAUDE_EXECUTABLE="$capture/bin/claude" \
       FLIGHT_RECORDER_TEST_CLAUDE_CAPTURE_DIR="$capture" \
       FLIGHT_RECORDER_TEST_CLAUDE_MODE=nonzero \
       run_cli receipt-auto run --json >"$repeat" \

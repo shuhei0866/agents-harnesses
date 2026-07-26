@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "rubric_version": "semantic-receipt-v1",
+  "criteria": {
+    "goal_achievement": "Whether the stated deliverable was achieved.",
+    "quality": "Whether deterministic evidence supports the result.",
+    "efficiency": "Whether the observed process was proportionate to the task."
+  },
+  "allowed_states": ["supported", "unsupported", "unknown"]
+}

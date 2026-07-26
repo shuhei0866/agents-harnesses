@@ -31,6 +31,7 @@ OUTPUT_VERSION = 1
 RECORD_VERSION = 2
 PROTOCOL_VERSION = 1
 BACKGROUND_PROTOCOL_VERSION = 2
+BUNDLED_EVALUATORS = {"flight-recorder-claude-semantic-evaluator"}
 DEFAULT_RUBRIC = (
     Path(__file__).resolve().parent.parent / "rubrics/on-demand-v1.json"
 )
@@ -337,7 +338,11 @@ def _validate_response(
 
 
 def _executable_identity(executable: str) -> tuple[Path, str]:
-    located = shutil.which(executable)
+    if executable in BUNDLED_EVALUATORS:
+        candidate = Path(__file__).resolve().parent / executable
+        located = str(candidate) if candidate.exists() else None
+    else:
+        located = shutil.which(executable)
     if located is None:
         raise VaultError("evaluator executable was not found")
     try:
