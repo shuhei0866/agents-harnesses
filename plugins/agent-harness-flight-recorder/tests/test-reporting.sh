@@ -404,9 +404,10 @@ import sys
 value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 human = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
 episode = sys.argv[3]
-assert value["schema_version"] == 3
+assert value["schema_version"] == 4
 assert value["command"] == "inspect"
 assert value["policy_version"] == "default-v1"
+assert value["semantic_receipts"] == []
 assert value["card"]["episode_id"] == episode
 assert value["card"]["source_event_ids"] == [
     "30000000-0000-4000-8000-000000000001",
@@ -427,6 +428,7 @@ assert episode in human
 assert "30000000-0000-4000-8000-000000000001" in human
 assert "explicit_task_id" in human
 assert "contradictory_task_ids" in human
+assert "Model-derived semantic receipts:" in human
 PY
   then
     pass "inspectはepisode形成根拠とsource evidence IDを示す"

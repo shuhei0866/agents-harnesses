@@ -106,6 +106,10 @@ test_generates_complete_semantic_receipt_v1() {
   local capture="$TEST_ROOT/evaluator-input.json"
   local output="$TEST_ROOT/receipt.json"
   local repeat="$TEST_ROOT/receipt-repeat.json"
+  local version_b="$TEST_ROOT/receipt-version-b.json"
+  local inspect_json="$TEST_ROOT/receipt-inspect.json"
+  local inspect_human="$TEST_ROOT/receipt-inspect.txt"
+  local purge_preview="$TEST_ROOT/receipt-purge-preview.json"
   local err="$TEST_ROOT/receipt.err"
   local source_ref episode
 
@@ -153,8 +157,21 @@ PY
         --model semantic-evaluator-model-a \
         --rubric "$RUBRIC" \
         --json >"$repeat" 2>>"$err" \
+    && FLIGHT_RECORDER_NOW="2026-01-02T03:04:06Z" \
+      run_cli receipt generate "$episode" \
+        --source-ref "$source_ref" \
+        --span-start-line 2 \
+        --span-end-line 2 \
+        --evaluator flight-recorder-semantic-evaluator \
+        --model semantic-evaluator-model-b \
+        --rubric "$RUBRIC" \
+        --json >"$version_b" 2>>"$err" \
+    && run_cli inspect "$episode" --json >"$inspect_json" 2>>"$err" \
+    && run_cli inspect "$episode" >"$inspect_human" 2>>"$err" \
+    && run_cli purge "$episode" --json >"$purge_preview" 2>>"$err" \
     && python3 - \
-      "$output" "$repeat" "$capture" "$raw" "$EVALUATOR" "$episode" "$STATE" <<'PY'
+      "$output" "$repeat" "$version_b" "$inspect_json" "$inspect_human" \
+      "$purge_preview" "$capture" "$raw" "$EVALUATOR" "$episode" "$STATE" <<'PY'
 import datetime as dt
 import hashlib
 import json
@@ -165,6 +182,10 @@ import sys
 (
     output,
     repeat,
+    version_b,
+    inspect_json,
+    inspect_human,
+    purge_preview,
     capture,
     raw_path,
     evaluator_path,
@@ -173,10 +194,18 @@ import sys
 ) = sys.argv[1:]
 value = json.loads(pathlib.Path(output).read_text(encoding="utf-8"))
 repeat_value = json.loads(pathlib.Path(repeat).read_text(encoding="utf-8"))
+version_b_value = json.loads(pathlib.Path(version_b).read_text(encoding="utf-8"))
+inspect_value = json.loads(pathlib.Path(inspect_json).read_text(encoding="utf-8"))
+inspect_text = pathlib.Path(inspect_human).read_text(encoding="utf-8")
+purge_value = json.loads(pathlib.Path(purge_preview).read_text(encoding="utf-8"))
 request = json.loads(pathlib.Path(capture).read_text(encoding="utf-8"))
 receipt = value["receipt"]
 
 assert repeat_value == value
+assert version_b_value["receipt"]["receipt_id"] != receipt["receipt_id"]
+assert version_b_value["receipt"]["provenance"]["evaluator_model"] == (
+    "semantic-evaluator-model-b"
+)
 assert value["schema_version"] == 1
 assert value["command"] == "receipt generate"
 assert set(receipt) == {
@@ -218,13 +247,29 @@ assert raw_path not in evaluator_input
 assert "provenance" not in request.get("expected_output", {})
 
 stored = list((pathlib.Path(state_path) / "semantic-receipts").glob("*.json"))
-assert len(stored) == 1
-stored_value = json.loads(stored[0].read_text(encoding="utf-8"))
-assert stored_value == receipt
-serialized_receipt = json.dumps(stored_value, sort_keys=True)
+assert len(stored) == 2
+stored_values = [
+    json.loads(path.read_text(encoding="utf-8")) for path in stored
+]
+assert receipt in stored_values
+serialized_receipt = json.dumps(stored_values, sort_keys=True)
 assert raw_path not in serialized_receipt
 assert "CODEX_SELECTED_SPAN_CANARY" not in serialized_receipt
 assert "CODEX_OUTSIDE_AFTER_CANARY" not in serialized_receipt
+
+assert inspect_value["schema_version"] == 4
+assert inspect_value["card"]["task_type"] is None
+assert len(inspect_value["semantic_receipts"]) == 2
+assert {
+    item["provenance"]["evaluator_model"]
+    for item in inspect_value["semantic_receipts"]
+} == {"semantic-evaluator-model-a", "semantic-evaluator-model-b"}
+assert "Model-derived semantic receipts:" in inspect_text
+assert "Diagnose and correct a generic failing test." in inspect_text
+assert "outcome=success" in inspect_text
+assert "confidence=high" in inspect_text
+assert purge_value["apply"] is False
+assert purge_value["semantic_receipt_record_count"] == 2
 PY
   then
     pass "選択spanからcontent-addressedなSemantic Receipt v1を生成する"
@@ -279,13 +324,69 @@ PY
   fi
 }
 
+test_rejects_tampered_semantic_receipt() {
+  echo "test_rejects_tampered_semantic_receipt:"
+  local episode receipt backup="$TEST_ROOT/receipt-backup.json"
+  local output="$TEST_ROOT/tampered-inspect.json"
+  local err="$TEST_ROOT/tampered-inspect.err"
+  episode="$(episode_id)"
+  receipt="$(find "$STATE/semantic-receipts" -type f -name '*.json' | head -n 1)"
+  cp "$receipt" "$backup"
+  python3 - "$receipt" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+value = json.loads(path.read_text(encoding="utf-8"))
+value["result"]["summary"] = "tampered"
+path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+PY
+
+  if run_cli inspect "$episode" --json >"$output" 2>"$err"; then
+    fail "改ざんSemantic Receiptを拒否する"
+  elif [[ -s "$output" ]] || grep -q "Traceback" "$err"; then
+    fail "改ざんReceiptをcontent-freeかつcleanに拒否する"
+  elif grep -q "stored Semantic Receipt ID is invalid" "$err"; then
+    pass "改ざんSemantic Receiptをfail closedで拒否する"
+  else
+    cat "$err" >&2
+    fail "改ざんReceiptの拒否理由が安定している"
+  fi
+  cp "$backup" "$receipt"
+}
+
+test_purge_removes_semantic_receipts() {
+  echo "test_purge_removes_semantic_receipts:"
+  local episode
+  local err="$TEST_ROOT/receipt-purge-apply.err"
+  episode="$(episode_id)"
+
+  if run_cli purge "$episode" --apply --json >/dev/null 2>"$err" \
+    && python3 - "$STATE" <<'PY'
+import pathlib
+import sys
+
+directory = pathlib.Path(sys.argv[1]) / "semantic-receipts"
+assert list(directory.glob("*.json")) == []
+PY
+  then
+    pass "purge applyで対象Semantic Receiptを削除する"
+  else
+    cat "$err" >&2
+    fail "purge applyで対象Semantic Receiptを削除する"
+  fi
+}
+
 echo "=== Flight Recorder Semantic Receipt Tests ==="
 if ! build_fixture; then
   echo "fixture setup failed" >&2
   exit 1
 fi
 test_generates_complete_semantic_receipt_v1
+test_rejects_tampered_semantic_receipt
 test_rejects_changed_registered_source
+test_purge_removes_semantic_receipts
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
