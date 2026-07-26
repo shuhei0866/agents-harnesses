@@ -391,6 +391,22 @@ test_oversized_input_fail_open() {
   assert_file_absent_or_empty "1 MiB超の入力を記録しない" "$log"
 }
 
+test_evaluator_child_is_not_recorded() {
+  echo "test_evaluator_child_is_not_recorded:"
+  local log="$TMPDIR_TEST/evaluator-child/events.jsonl"
+  local out="$TMPDIR_TEST/evaluator-child.out"
+  local err="$TMPDIR_TEST/evaluator-child.err"
+  local status
+  FLIGHT_RECORDER_EVALUATOR_CHILD=1 \
+    AGENT_FLIGHT_RECORDER_PATH="$log" \
+    "$RECORDER" --harness claude-code \
+    <"$FIXTURES/claude-code-stop.json" >"$out" 2>"$err"
+  status=$?
+  assert_success "nested evaluator hookをfail-openでno-opにする" "$status"
+  assert_file_absent_or_empty \
+    "nested evaluatorをEventやReceipt hintへ再帰記録しない" "$log"
+}
+
 echo "=== agent-harness-flight-recorder tests ==="
 test_claude_code_schema
 test_codex_same_schema
@@ -408,6 +424,7 @@ test_relative_vault_state_fails_open
 test_default_state_keeps_key_at_vault_root
 test_malformed_vault_key_is_not_replaced
 test_oversized_input_fail_open
+test_evaluator_child_is_not_recorded
 
 echo ""
 echo "結果: PASS=$PASS FAIL=$FAIL"

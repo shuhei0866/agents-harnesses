@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Offline Claude CLI fixture for the production semantic adapter contract."""
+
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import sys
+
+
+capture_value = os.environ.get("FLIGHT_RECORDER_TEST_CLAUDE_CAPTURE_DIR")
+if not capture_value:
+    raise SystemExit(90)
+capture = pathlib.Path(capture_value)
+capture.mkdir(parents=True, exist_ok=True)
+prompt = sys.stdin.read()
+try:
+    request = json.loads(prompt)
+except json.JSONDecodeError:
+    request = {}
+(capture / "argv.json").write_text(
+    json.dumps(sys.argv[1:], separators=(",", ":")),
+    encoding="utf-8",
+)
+(capture / "stdin.txt").write_text(prompt, encoding="utf-8")
+(capture / "cwd.txt").write_text(os.getcwd(), encoding="utf-8")
+(capture / "env.json").write_text(
+    json.dumps(
+        {
+            "FLIGHT_RECORDER_EVALUATOR_CHILD": os.environ.get(
+                "FLIGHT_RECORDER_EVALUATOR_CHILD"
+            ),
+            "USER": os.environ.get("USER"),
+            "LOGNAME": os.environ.get("LOGNAME"),
+        },
+        separators=(",", ":"),
+    ),
+    encoding="utf-8",
+)
+
+mode = os.environ.get("FLIGHT_RECORDER_TEST_CLAUDE_MODE", "valid")
+if mode == "nonzero":
+    print(prompt, file=sys.stderr)
+    raise SystemExit(19)
+if mode == "invalid-json":
+    sys.stdout.write('{"type":"result","structured_output":')
+    raise SystemExit(0)
+if mode == "oversized":
+    sys.stdout.write("x" * (2 * 1024 * 1024))
+    raise SystemExit(0)
+
+semantic = {
+    "schema_version": 1,
+    "task": {
+        "type": "bug_fix",
+        "intent": "Diagnose a bounded generic failure.",
+        "deliverable": "A verified repository change.",
+        "constraints": ["Preserve existing behavior."],
+        "difficulty": "medium",
+    },
+    "execution": {
+        "harness": request.get("source", {}).get("adapter", "claude-code"),
+        "model": "fixture-worker-model",
+        "duration_ms": 1200,
+        "tool_count": 0,
+        "retry_count": 0,
+    },
+    "result": {
+        "summary": "The bounded generic failure was corrected.",
+        "artifacts": ["test-result"],
+        "outcome": "success",
+    },
+    "assessment": {
+        "criteria": {
+            "goal_achievement": {
+                "state": "supported",
+                "evidence_references": [
+                    "sha256:" + "1" * 64,
+                ],
+            },
+            "quality": {
+                "state": "supported",
+                "evidence_references": [
+                    "sha256:" + "1" * 64,
+                ],
+            },
+            "efficiency": {
+                "state": "unknown",
+                "evidence_references": [],
+            },
+        },
+        "confidence": "high",
+    },
+}
+evidence_ids = [
+    item["evidence_id"]
+    for item in request.get("episode", {}).get("deterministic_evidence", [])
+    if isinstance(item, dict) and isinstance(item.get("evidence_id"), str)
+]
+support = evidence_ids[:1]
+for criterion in ("goal_achievement", "quality"):
+    semantic["assessment"]["criteria"][criterion][
+        "evidence_references"
+    ] = support
+if mode == "invalid-schema":
+    semantic.pop("assessment")
+if mode == "echo-source":
+    semantic["result"]["summary"] = "RAW_SOURCE_CANARY_iam178"
+
+total_cost_usd: object = 0.012345000001
+if mode == "over-budget":
+    total_cost_usd = 0.0500001
+elif mode == "invalid-cost":
+    total_cost_usd = "0.001"
+
+json.dump(
+    {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "",
+        "structured_output": semantic,
+        "total_cost_usd": total_cost_usd,
+    },
+    sys.stdout,
+    sort_keys=True,
+    separators=(",", ":"),
+)

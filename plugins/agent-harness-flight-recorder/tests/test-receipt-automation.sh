@@ -9,7 +9,8 @@ CLI="$PLUGIN_DIR/scripts/flight-recorder"
 RECORDER="$PLUGIN_DIR/scripts/record-event"
 FIXTURES="$SCRIPT_DIR/fixtures"
 FAKE_BIN="$FIXTURES/fake-bin"
-RUBRIC="$FIXTURES/semantic-receipt-rubric-v1.json"
+FAKE_CLAUDE_BIN="$FIXTURES/fake-claude-bin"
+RUBRIC="$PLUGIN_DIR/rubrics/semantic-receipt-v1.json"
 TEST_ROOT="$(mktemp -d)" || exit 1
 STATE="$TEST_ROOT/vault"
 CLAUDE_ROOT="$TEST_ROOT/claude-sessions"
@@ -454,6 +455,66 @@ PY
   fi
 }
 
+test_production_claude_adapter_offline_e2e() {
+  echo "test_production_claude_adapter_offline_e2e:"
+  local output="$TEST_ROOT/production-adapter.json"
+  local repeat="$TEST_ROOT/production-adapter-repeat.json"
+  local capture="$TEST_ROOT/production-adapter-capture"
+  PATH="$FAKE_CLAUDE_BIN:$FAKE_BIN:$PATH" \
+    FLIGHT_RECORDER_STATE_DIR="$STATE" \
+    "$CLI" receipt-auto configure \
+      --claude-code-root "$CLAUDE_ROOT" \
+      --codex-root "$CODEX_ROOT" \
+      --evaluator flight-recorder-claude-semantic-evaluator \
+      --model claude-sonnet-fixture \
+      --rubric "$RUBRIC" \
+      --policy-version default-v1 \
+      --quiescence-seconds 0 \
+      --max-receipts-per-run 10 \
+      --max-cost-microusd-per-run 50000 \
+      --json >/dev/null 2>&1
+  if PATH="$FAKE_CLAUDE_BIN:$PATH" \
+      FLIGHT_RECORDER_TEST_CLAUDE_EXECUTABLE="$FAKE_CLAUDE_BIN/claude" \
+      FLIGHT_RECORDER_TEST_CLAUDE_CAPTURE_DIR="$capture" \
+      FLIGHT_RECORDER_TEST_CLAUDE_MODE=valid \
+      run_cli receipt-auto run --json >"$output" \
+        2>"$TEST_ROOT/production-adapter.err" \
+    && PATH="$FAKE_CLAUDE_BIN:$PATH" \
+      FLIGHT_RECORDER_TEST_CLAUDE_EXECUTABLE="$FAKE_CLAUDE_BIN/claude" \
+      FLIGHT_RECORDER_TEST_CLAUDE_CAPTURE_DIR="$capture" \
+      FLIGHT_RECORDER_TEST_CLAUDE_MODE=nonzero \
+      run_cli receipt-auto run --json >"$repeat" \
+        2>"$TEST_ROOT/production-adapter-repeat.err" \
+    && python3 - "$output" "$repeat" "$capture" <<'PY'
+import json
+import pathlib
+import sys
+
+output_path, repeat_path, capture_path = map(pathlib.Path, sys.argv[1:])
+value = json.loads(output_path.read_text(encoding="utf-8"))
+repeat = json.loads(repeat_path.read_text(encoding="utf-8"))
+argv = json.loads((capture_path / "argv.json").read_text(encoding="utf-8"))
+assert value["generated_count"] >= 2
+assert value["failed_count"] == 0
+assert value["measured_cost_microusd"] == value["generated_count"] * 12346
+assert repeat["generated_count"] == 0
+assert repeat["failed_count"] == 0
+assert repeat["idempotent_skip_count"] == value["generated_count"]
+assert "--safe-mode" in argv
+assert "--no-session-persistence" in argv
+PY
+  then
+    pass "production adapterをworkerへ接続しofflineでReceiptを生成する"
+    pass "production adapter経由でも同一fingerprintを再評価しない"
+  else
+    cat "$output" >&2
+    cat "$repeat" >&2
+    cat "$TEST_ROOT/production-adapter.err" >&2
+    cat "$TEST_ROOT/production-adapter-repeat.err" >&2
+    fail "production adapterをworkerへ接続しofflineでReceiptを生成する"
+  fi
+}
+
 test_scheduler_failure_is_sync_independent_and_not_recharged() {
   echo "test_scheduler_failure_is_sync_independent_and_not_recharged:"
   local hints="$STATE/receipt-automation/hints.jsonl"
@@ -776,6 +837,7 @@ if [[ -f "$STATE/receipt-automation/config.json" ]]; then
   test_classifies_ambiguous_missing_and_active_without_evaluation
   test_measured_cost_is_capped
   test_paid_invalid_response_stops_the_run
+  test_production_claude_adapter_offline_e2e
   test_scheduler_failure_is_sync_independent_and_not_recharged
   test_status_is_content_free
   test_provider_parsers_select_latest_closed_turn
