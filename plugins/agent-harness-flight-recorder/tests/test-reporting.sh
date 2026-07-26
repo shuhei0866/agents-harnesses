@@ -9,6 +9,9 @@ CLI="$PLUGIN_DIR/scripts/flight-recorder"
 FAKE_BIN="$SCRIPT_DIR/fixtures/fake-bin"
 TEST_ROOT="$(mktemp -d)"
 STATE="$TEST_ROOT/vault"
+SCHEDULER_CALL_LOG="$TEST_ROOT/scheduler-calls.log"
+SCHEDULER_MANAGER_STATE="$TEST_ROOT/scheduler-manager-state"
+TEST_HOME="$TEST_ROOT/home"
 PASS=0
 FAIL=0
 
@@ -28,7 +31,12 @@ fail() {
 }
 
 run_cli() {
-  PATH="$FAKE_BIN:$PATH" FLIGHT_RECORDER_STATE_DIR="$STATE" "$CLI" "$@"
+  PATH="$FAKE_BIN:$PATH" \
+    HOME="$TEST_HOME" \
+    FLIGHT_RECORDER_STATE_DIR="$STATE" \
+    FLIGHT_RECORDER_SCHEDULER_CALL_LOG="$SCHEDULER_CALL_LOG" \
+    FLIGHT_RECORDER_SCHEDULER_MANAGER_STATE="$SCHEDULER_MANAGER_STATE" \
+    "$CLI" "$@"
 }
 
 make_identity() {
