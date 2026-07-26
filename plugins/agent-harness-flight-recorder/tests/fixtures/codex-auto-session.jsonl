@@ -1,0 +1,6 @@
+{"payload":{"id":"codex-auto-session"},"timestamp":"2026-07-25T00:00:00Z","type":"session_meta"}
+{"payload":{"turn_id":"codex-auto-turn","type":"task_started"},"timestamp":"2026-07-25T00:00:01Z","type":"event_msg"}
+{"payload":{"turn_id":"codex-auto-turn","model":"fixture-worker-model"},"timestamp":"2026-07-25T00:00:02Z","type":"turn_context"}
+{"payload":{"content":[{"text":"CODEX_AUTO_SELECTED_USER_CANARY: implement the bounded fixture","type":"input_text"}],"role":"user","type":"message"},"timestamp":"2026-07-25T00:00:03Z","type":"response_item"}
+{"payload":{"content":[{"text":"CODEX_AUTO_SELECTED_ASSISTANT_CANARY: bounded fixture complete","type":"output_text"}],"role":"assistant","type":"message"},"timestamp":"2026-07-25T00:00:04Z","type":"response_item"}
+{"payload":{"turn_id":"codex-auto-turn","type":"task_complete"},"timestamp":"2026-07-25T00:00:05Z","type":"event_msg"}

@@ -1,0 +1,6 @@
+{"type":"user","uuid":"ambiguous-prompt","parentUuid":null,"sessionId":"claude-ambiguous-session","message":{"role":"user","content":"CLAUDE_AMBIGUOUS_SELECTED_PROMPT"}}
+{"type":"assistant","uuid":"ambiguous-assistant-1","parentUuid":"ambiguous-prompt","sessionId":"claude-ambiguous-session","message":{"role":"assistant","content":[{"type":"text","text":"CLAUDE_AMBIGUOUS_SELECTED_ASSISTANT"}]}}
+{"type":"user","uuid":"selected-branch","parentUuid":"ambiguous-assistant-1","sessionId":"claude-ambiguous-session","message":{"role":"user","content":"CLAUDE_AMBIGUOUS_SELECTED_BRANCH"}}
+{"type":"user","uuid":"other-branch","parentUuid":"ambiguous-assistant-1","sessionId":"claude-ambiguous-session","message":{"role":"user","content":"CLAUDE_AMBIGUOUS_INTERLEAVED_OTHER_BRANCH"}}
+{"type":"assistant","uuid":"ambiguous-final","parentUuid":"selected-branch","sessionId":"claude-ambiguous-session","message":{"role":"assistant","content":[{"type":"text","text":"CLAUDE_AMBIGUOUS_FINAL"}]}}
+{"type":"last-prompt","sessionId":"claude-ambiguous-session","leafUuid":"ambiguous-final"}

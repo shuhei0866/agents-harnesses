@@ -1,0 +1,6 @@
+{"type":"user","uuid":"noise-root","parentUuid":null,"sessionId":"claude-auto-session","message":{"role":"user","content":"CLAUDE_OUTSIDE_BEFORE_CANARY"}}
+{"type":"user","uuid":"prompt-1","parentUuid":null,"sessionId":"claude-auto-session","message":{"role":"user","content":"CLAUDE_AUTO_SELECTED_USER_CANARY: diagnose the bounded fixture"}}
+{"type":"assistant","uuid":"assistant-1","parentUuid":"prompt-1","sessionId":"claude-auto-session","message":{"role":"assistant","content":[{"type":"text","text":"CLAUDE_AUTO_SELECTED_ASSISTANT_CANARY: inspect the failing contract"}]}}
+{"type":"user","uuid":"tool-result-1","parentUuid":"assistant-1","sessionId":"claude-auto-session","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":"CLAUDE_AUTO_SELECTED_TOOL_CANARY"}]}}
+{"type":"assistant","uuid":"assistant-2","parentUuid":"tool-result-1","sessionId":"claude-auto-session","message":{"role":"assistant","content":[{"type":"text","text":"CLAUDE_AUTO_SELECTED_FINAL_CANARY: the bounded fixture is fixed"}]}}
+{"type":"last-prompt","sessionId":"claude-auto-session","leafUuid":"assistant-2"}
