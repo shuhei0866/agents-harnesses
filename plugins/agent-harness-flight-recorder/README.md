@@ -432,14 +432,29 @@ Opt in once to automatic session matching for both harnesses:
 scripts/flight-recorder receipt-auto configure \
   --claude-code-root /absolute/path/to/claude/sessions \
   --codex-root /absolute/path/to/codex/sessions \
-  --evaluator ADAPTER \
-  --model MODEL_ID \
-  --rubric /path/to/semantic-rubric.json \
+  --evaluator flight-recorder-claude-semantic-evaluator \
+  --model claude-sonnet-4-6 \
+  --rubric "$(pwd)/rubrics/semantic-receipt-v1.json" \
   --policy-version default-v1 \
   --quiescence-seconds 60 \
   --max-receipts-per-run 5 \
   --max-cost-microusd-per-run 50000
 ```
+
+The bundled Claude adapter uses non-interactive structured output with safe
+mode, no tools, no MCP servers, no Chrome, and no session persistence. Raw
+source is passed only on the child process stdin; the adapter returns only the
+validated semantic body and provider-measured micro-USD. A dedicated child
+marker makes Flight Recorder hooks no-op even if an administrator-managed hook
+survives safe mode. The CLI resolves this one known bundled adapter relative to
+its own installation, so both manual and scheduled runs are independent of an
+interactive shell's `PATH`.
+
+Authentication intentionally uses the local Claude Code login available through
+the user's home directory and keychain. Credential-bearing environment
+variables such as `ANTHROPIC_API_KEY` are not forwarded to the child, avoiding
+an ambient API key silently changing the billing identity. Environment-token
+and remote-worker authentication are outside this local adapter's scope.
 
 After opt-in, a `Stop` hook writes only a local hint containing the Event ID,
 hashed session/turn identity, source path, file identity, and captured byte

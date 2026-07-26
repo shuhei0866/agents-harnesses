@@ -315,3 +315,21 @@ Accepted decisions remain recorded when later superseded.
   occurs only after successful sync and outside sync health. Hints, paths,
   attempts, and status stay owner-only and Git-ignored; public status exposes
   finite counts and measured micro-USD only.
+
+## D-20260726-24: Use a tool-less Claude CLI adapter with a recorder child guard
+
+- Status: accepted
+- Decision: ship a standalone protocol-v2 adapter that invokes Claude Code in
+  print and safe modes with structured output, no tools, no MCP servers, no
+  Chrome, and no session persistence. Pass the dynamic request only on stdin
+  and set `FLIGHT_RECORDER_EVALUATOR_CHILD=1` for the provider process.
+- Reason: local OAuth/keychain authentication rules out bare mode, while safe
+  mode alone may retain administrator-managed settings. The explicit Recorder
+  child guard prevents recursive Event and hint creation without weakening
+  provider authentication.
+- Consequence: only provider `structured_output` and `total_cost_usd` cross
+  back into the worker. Cost is rounded upward to integer micro-USD and
+  over-budget output fails closed. The CLI resolves only this known bundled
+  adapter relative to its own scripts directory rather than broadening the
+  scheduler runtime path. Real provider calls remain disabled until the owner
+  configures a positive local cost budget.

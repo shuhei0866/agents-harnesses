@@ -730,6 +730,8 @@ def append_receipt_hint(
 
 
 def main() -> None:
+    if os.environ.get("FLIGHT_RECORDER_EVALUATOR_CHILD") == "1":
+        return
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
         "--harness", required=True, choices=("auto", "claude-code", "codex")
