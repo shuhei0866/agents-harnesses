@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""Protocol-v2 evaluator for automatic Semantic Receipt contract tests."""
+
+import json
+import os
+import pathlib
+import sys
+
+
+request = json.load(sys.stdin)
+capture = os.environ.get("FLIGHT_RECORDER_TEST_AUTO_SEMANTIC_CAPTURE")
+if capture:
+    with pathlib.Path(capture).open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(request, sort_keys=True, separators=(",", ":")) + "\n")
+
+counter = os.environ.get("FLIGHT_RECORDER_TEST_AUTO_SEMANTIC_COUNT")
+if counter:
+    path = pathlib.Path(counter)
+    try:
+        count = int(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        count = 0
+    path.write_text(str(count + 1), encoding="utf-8")
+
+if os.environ.get("FLIGHT_RECORDER_TEST_AUTO_SEMANTIC_FAIL") == "1":
+    raise SystemExit(17)
+
+remaining = request["remaining_cost_microusd"]
+configured_cost = int(
+    os.environ.get("FLIGHT_RECORDER_TEST_AUTO_SEMANTIC_COST", "1000")
+)
+measured_cost = min(remaining, configured_cost)
+evidence_ids = [
+    item["evidence_id"]
+    for item in request["episode"]["deterministic_evidence"]
+]
+support = evidence_ids[:1]
+response = {
+        "schema_version": 2,
+        "measured_cost_microusd": measured_cost,
+        "task": {
+            "type": "bug_fix",
+            "intent": "Diagnose and correct a bounded fixture.",
+            "deliverable": "A verified repository change.",
+            "constraints": ["Preserve existing behavior."],
+            "difficulty": "medium",
+        },
+        "execution": {
+            "harness": request["episode"]["harnesses"][0],
+            "model": "fixture-worker-model",
+            "duration_ms": 1000,
+            "tool_count": 1,
+            "retry_count": 0,
+        },
+        "result": {
+            "summary": "The bounded fixture was corrected and verified.",
+            "artifacts": ["test-result"],
+            "outcome": "success",
+        },
+        "assessment": {
+            "criteria": {
+                "goal_achievement": {
+                    "state": "supported",
+                    "evidence_references": support,
+                },
+                "quality": {
+                    "state": "supported",
+                    "evidence_references": support,
+                },
+                "efficiency": {
+                    "state": "unknown",
+                    "evidence_references": [],
+                },
+            },
+            "confidence": "high",
+        },
+    }
+if os.environ.get("FLIGHT_RECORDER_TEST_AUTO_SEMANTIC_INVALID") == "1":
+    response["task"]["type"] = "INVALID TYPE"
+json.dump(response, sys.stdout, sort_keys=True, separators=(",", ":"))

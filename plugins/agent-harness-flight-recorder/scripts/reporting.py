@@ -53,7 +53,7 @@ from retention_state import load_forgotten
 
 OUTPUT_VERSION = 3
 INSPECT_OUTPUT_VERSION = 4
-STATUS_OUTPUT_VERSION = 3
+STATUS_OUTPUT_VERSION = 4
 DEFAULT_POLICY_VERSION = "default-v1"
 EPISODE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 DURATION_RE = re.compile(r"^([1-9][0-9]*)([smhdw])$")
@@ -878,6 +878,32 @@ def status(root: Path) -> dict[str, Any]:
             "next_retry_at": None,
         }
 
+    receipt_configured = (
+        (root / "receipt-automation/config.json").exists()
+        or (root / "receipt-automation/config.json").is_symlink()
+    )
+    if receipt_configured:
+        try:
+            from receipt_automation import status as receipt_automation_status
+
+            components["receipt_automation"] = receipt_automation_status(root)
+        except VaultError:
+            components["receipt_automation"] = {
+                "state": "error",
+                "enabled": False,
+                "discovered": 0,
+                "matched": 0,
+                "ambiguous": 0,
+                "missing": 0,
+                "active": 0,
+                "queued": 0,
+                "generated": 0,
+                "failed": 0,
+                "measured_cost_microusd": 0,
+                "diagnostic_code": "state_invalid",
+                "attempt_count": 0,
+            }
+
     states = [component["state"] for component in components.values()]
     overall = "ready" if all(
         state in (
@@ -891,7 +917,7 @@ def status(root: Path) -> dict[str, Any]:
         for state in states
     ) else "attention"
     return {
-        "schema_version": STATUS_OUTPUT_VERSION,
+        "schema_version": STATUS_OUTPUT_VERSION if receipt_configured else 3,
         "command": "status",
         "overall": overall,
         **components,
@@ -899,8 +925,7 @@ def status(root: Path) -> dict[str, Any]:
 
 
 def render_status(value: dict[str, Any]) -> str:
-    return "\n".join(
-        (
+    lines = [
             "Flight Recorder status",
             f"Overall: {value['overall']}",
             f"Vault: {value['vault']['state']}",
@@ -925,8 +950,17 @@ def render_status(value: dict[str, Any]) -> str:
                 f"(configured: {value['scheduler'].get('configured')}, "
                 f"platform: {value['scheduler'].get('platform')})"
             ),
+    ]
+    if "receipt_automation" in value:
+        lines.append(
+            (
+                f"Receipt automation: {value['receipt_automation']['state']} "
+                f"(generated: "
+                f"{value['receipt_automation'].get('generated')}, "
+                f"failed: {value['receipt_automation'].get('failed')})"
+            )
         )
-    )
+    return "\n".join(lines)
 
 
 def _display(value: object) -> str:

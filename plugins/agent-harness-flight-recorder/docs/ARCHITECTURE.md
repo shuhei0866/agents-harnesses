@@ -326,6 +326,8 @@ flight-recorder auto-evaluation configure ...
 flight-recorder auto-evaluation run
 flight-recorder source register --adapter HARNESS --path SESSION.jsonl
 flight-recorder receipt generate <episode-id> --source-ref REF ...
+flight-recorder receipt-auto configure ...
+flight-recorder receipt-auto run
 ```
 
 The primary output is an Episode Evidence Card containing task type, model,
@@ -381,6 +383,35 @@ record is never overwritten. `inspect` labels these records as model-derived
 semantics and does not silently promote them into deterministic task or
 outcome fields.
 
+Automatic Semantic Receipts add a hook-assisted discovery layer without
+changing Event v3. When explicitly configured, the `Stop` recorder first
+persists its canonical metadata Event, releases the Event lock, and then
+best-effort appends a Git-ignored local hint. The hint binds the Event ID and
+HMAC session/turn identifiers to an allowed local source, file identity, and
+captured byte boundary. Hook failure never changes agent behavior and the hook
+never calls a model.
+
+The asynchronous worker reads only the captured prefix, bounds its bytes and
+line count, and classifies the candidate as exact, active, missing, or
+ambiguous. Claude Code exactness follows the latest `last-prompt` leaf backward
+to the nearest non-tool human prompt and rejects interleaved branches. Codex
+exactness requires one matching session and one closed
+`task_started`/`task_complete` turn. Before evaluation, an authenticated index
+query proves that the Stop Event belongs to one Episode whose members all
+agree on harness and non-null correlation identifiers.
+
+The worker pins the evaluator and rubric by SHA-256, includes the Episode,
+source prefix, selected lines, evidence set, model, and policy in its durable
+fingerprint, and reserves that fingerprint before invocation. Automatic
+requests use evaluator protocol v2 with an integer remaining-cost budget and
+mandatory measured cost; manual generation remains exact v1. Completed,
+pending, and failed fingerprints are not automatically charged again.
+Scheduler invocation occurs only after successful sync and outside the sync
+critical section, so matching, configuration, or evaluator failure cannot
+downgrade sync health. Public status v4 adds only finite automation counts and
+diagnostics; all paths, hints, reservations, and raw session bodies remain
+local under Git-ignored `receipt-automation/`.
+
 ## Retention and deletion
 
 Privacy-safe encrypted events are retained until the owner deletes them. Normal
@@ -423,6 +454,14 @@ this limitation clearly.
 - model/rubric/source provenance and later-model rederivation;
 - local-only storage with an explicit export boundary;
 - inspect v4 presentation and purge/rollback coverage for derived receipts.
+
+### R1.4: Unconscious Semantic Receipts
+
+- Stop-hook local hints with captured source boundaries;
+- exact-only Claude Code parent-chain and Codex turn matching;
+- durable pre-invocation reservations and protocol-v2 cost budgets;
+- scheduler integration isolated from sync health;
+- content-free status v4 automation counts.
 
 ### Later
 

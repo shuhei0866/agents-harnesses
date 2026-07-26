@@ -773,6 +773,7 @@ def generate(
     timeout_seconds: int,
     policy_version: str | None = None,
     policy_path: Path | None = None,
+    remaining_cost_microusd: int | None = None,
 ) -> dict[str, Any]:
     from reporting import inspect_episode
 
@@ -790,7 +791,7 @@ def generate(
     card = before["card"]
     episode = _episode_request(card)
     request = {
-        "schema_version": 1,
+        "schema_version": 2 if remaining_cost_microusd is not None else 1,
         "model": selected_model,
         "rubric": rubric,
         "episode": episode,
@@ -803,13 +804,44 @@ def generate(
             "content": selected_content,
         },
     }
-    response, evidence_ids = _validate_response(
-        _invoke(
+    if remaining_cost_microusd is not None:
+        if (
+            isinstance(remaining_cost_microusd, bool)
+            or not isinstance(remaining_cost_microusd, int)
+            or remaining_cost_microusd < 0
+        ):
+            raise VaultError("semantic evaluator cost budget is invalid")
+        request["remaining_cost_microusd"] = remaining_cost_microusd
+    raw_response = _invoke(
             evaluator_path,
             evaluator_sha256,
             request,
             timeout_seconds,
-        ),
+        )
+    measured_cost_microusd = 0
+    if remaining_cost_microusd is not None:
+        try:
+            automatic_response = json.loads(raw_response)
+        except (ValueError, UnicodeError, RecursionError) as error:
+            raise VaultError("semantic evaluator returned invalid JSON") from error
+        measured_cost_microusd = automatic_response.get(
+            "measured_cost_microusd"
+        ) if isinstance(automatic_response, dict) else None
+        if (
+            not isinstance(automatic_response, dict)
+            or automatic_response.get("schema_version") != 2
+            or isinstance(measured_cost_microusd, bool)
+            or not isinstance(measured_cost_microusd, int)
+            or measured_cost_microusd < 0
+            or measured_cost_microusd > remaining_cost_microusd
+        ):
+            raise VaultError("semantic evaluator response violates the cost budget")
+        automatic_response = dict(automatic_response)
+        automatic_response["schema_version"] = 1
+        automatic_response.pop("measured_cost_microusd", None)
+        raw_response = canonical_json(automatic_response)
+    response, evidence_ids = _validate_response(
+        raw_response,
         {
             item["evidence_id"]
             for item in card["deterministic_evidence"]
@@ -892,6 +924,11 @@ def generate(
         "schema_version": OUTPUT_VERSION,
         "command": "receipt generate",
         "receipt": receipt,
+        **(
+            {"measured_cost_microusd": measured_cost_microusd}
+            if remaining_cost_microusd is not None
+            else {}
+        ),
     }
 
 

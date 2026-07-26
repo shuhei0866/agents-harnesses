@@ -290,3 +290,28 @@ Accepted decisions remain recorded when later superseded.
   and inspect keeps model-derived semantics separate from deterministic
   evidence. Background metadata evaluation skips evidence-free singleton
   episodes rather than paying a model to judge an empty envelope.
+
+## D-20260726-23: Discover exact session spans in hooks and evaluate off-path
+
+- Status: accepted
+- Decision: after a canonical Stop Event is recorded, append a bounded
+  local-only hint that binds its Event ID and HMAC correlation identifiers to
+  an allowed session source, file identity, and captured byte boundary. Let a
+  later worker evaluate only a uniquely closed Claude Code parent chain or
+  Codex turn whose authenticated Episode members agree on harness and
+  correlation identity.
+- Reason: automatic use must require no per-task human classification, but a
+  hook cannot safely block on model latency, scan broad local directories, or
+  guess between multiple turns. The captured boundary makes later appends
+  irrelevant to span selection, while exact-only matching keeps ambiguity from
+  becoming paid false evidence.
+- Consequence: active, missing, mixed, or ambiguous candidates never invoke the
+  evaluator. Exact candidates receive a durable evidence/source/evaluator/
+  rubric fingerprint reservation before protocol-v2 invocation, so completed
+  and failed work is not automatically recharged. A paid response that fails
+  semantic validation stops the rest of that run, every Episode member must
+  carry the exact authenticated correlation hashes, and terminal hints are
+  periodically compacted under the hook writer lock. Scheduler execution
+  occurs only after successful sync and outside sync health. Hints, paths,
+  attempts, and status stay owner-only and Git-ignored; public status exposes
+  finite counts and measured micro-USD only.
