@@ -4,7 +4,7 @@
 # メインワークツリーでの保護ブランチ (main/develop) への直接コミット、
 # --no-verify によるフックスキップ、force push、ブランチ切り替え、
 # main への直接マージ（hotfix 除く）、develop ブランチ削除などを検出してブロックする。
-# gh pr merge による main 向け PR マージもブロック（hotfix/*, chore/promote-main-*, develop は除く）。
+# gh pr merge の判定は gh-guard.sh が担う（コマンドの分割と --repo / cd の解決を持つため）。
 
 set -uo pipefail
 
@@ -671,29 +671,6 @@ if ! guard_is_trunk_direct; then
     esac
     ADVISORY_INDEX=$((ADVISORY_INDEX + 1))
   done
-fi
-
-# --- チェック 4b: gh pr merge で main 向け PR のマージ防止（hotfix/* 除く） ---
-if echo "$COMMAND_FOR_MATCH" | grep -qE '(^|&&|\|\||[;|])\s*gh\s+pr\s+merge' && ! guard_is_trunk_direct; then
-  PR_NUM=$(echo "$COMMAND" | grep -oE '(^|&&|\|\||[;|])\s*gh[[:space:]]+pr[[:space:]]+merge[[:space:]]+([0-9]+)' | grep -oE '[0-9]+' | head -1)
-
-  if [ -n "$PR_NUM" ]; then
-    PR_VIEW_ARGS="$PR_NUM"
-  else
-    PR_VIEW_ARGS=""
-  fi
-
-  PR_INFO=$(gh pr view $PR_VIEW_ARGS --json baseRefName,headRefName 2>/dev/null || echo "")
-  if [ -n "$PR_INFO" ]; then
-    BASE_BRANCH=$(echo "$PR_INFO" | jq -r '.baseRefName // empty')
-    HEAD_BRANCH=$(echo "$PR_INFO" | jq -r '.headRefName // empty')
-
-    if [ "$BASE_BRANCH" = "main" ] || [ "$BASE_BRANCH" = "master" ]; then
-      if ! echo "$HEAD_BRANCH" | grep -qE '^hotfix/|^chore/promote-main-|^develop$'; then
-        guard_respond "advisory" "ブランチ戦略ガード" "${HEAD_BRANCH} → ${BASE_BRANCH} への PR マージはブロックされています。develop を経由してマージしてください。hotfix の場合は hotfix/* ブランチを使用してください。"
-      fi
-    fi
-  fi
 fi
 
 exit 0
