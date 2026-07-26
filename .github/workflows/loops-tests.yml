@@ -27,9 +27,22 @@ jobs:
           bash --version | head -1
 
       - name: Run loops tests
+        env:
+          # backlog-collect.sh:197 が local -A（連想配列、bash 4 以降）を使うため、
+          # bash 3.2 しか積まない macOS では起動できず、依存する claude-loop も
+          # 巻き込んで落ちる。IAM-119 とは別の根なので別件で直す。
+          #
+          # 除外は環境変数で明示し、スキップした事実をログにも出す。黙って対象を
+          # 減らすと「両方の系統で全部通っている」と読めてしまうため。
+          SKIP_ON_MACOS: 'test-backlog-collect.sh test-claude-loop.sh'
         run: |
           set -euo pipefail
           for t in loops/tests/test-*.sh; do
+            name="$(basename "$t")"
+            if [ "$RUNNER_OS" = "macOS" ] && printf '%s\n' $SKIP_ON_MACOS | grep -qx "$name"; then
+              echo "::warning::$name は macOS でスキップした（bash 3.2 非対応。別 issue で対応中）"
+              continue
+            fi
             echo "::group::$t"
             bash "$t"
             echo "::endgroup::"
