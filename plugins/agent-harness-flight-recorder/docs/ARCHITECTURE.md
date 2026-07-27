@@ -426,6 +426,12 @@ CLI, so manual and scheduled discovery do not broaden runtime `PATH`.
 Authentication is deliberately inherited only through the local user's home
 directory and keychain; credential-bearing environment variables are excluded
 so an ambient API key cannot silently change the billing identity.
+The production Claude child has a finite 180-second deadline. Automatic
+Semantic Receipt generation gives that bundled adapter a 240-second outer
+deadline, leaving 60 seconds for startup, validation, and process-group cleanup
+before the worker boundary fires. Custom evaluators retain the existing
+60-second outer deadline. Test-only timeout shortening is ignored unless the
+explicit test-harness marker is also present.
 
 ## Retention and deletion
 
