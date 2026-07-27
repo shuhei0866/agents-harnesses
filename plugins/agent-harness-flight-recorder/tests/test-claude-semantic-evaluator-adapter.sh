@@ -320,6 +320,176 @@ test_provider_failures_and_budget_fail_closed() {
     echo-source "$REQUEST" provider-source-echo
 }
 
+test_timeout_budget_contract() {
+  echo "test_timeout_budget_contract:"
+  if python3 - "$ADAPTER" "$PLUGIN_DIR/scripts/receipt_automation.py" \
+    2>/dev/null <<'PY'
+import ast
+import pathlib
+import sys
+
+adapter_path, worker_path = map(pathlib.Path, sys.argv[1:])
+sys.path.insert(0, str(worker_path.parent))
+
+def integer_constant(tree, name):
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == name
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, int)
+        ):
+            return node.value.value
+    raise AssertionError(f"missing integer constant: {name}")
+
+adapter_tree = ast.parse(adapter_path.read_text(encoding="utf-8"))
+worker_tree = ast.parse(worker_path.read_text(encoding="utf-8"))
+inner = integer_constant(adapter_tree, "DEFAULT_TIMEOUT_SECONDS")
+outer = integer_constant(
+    worker_tree, "BUNDLED_EVALUATOR_TIMEOUT_SECONDS"
+)
+default_outer = integer_constant(
+    worker_tree, "DEFAULT_EVALUATOR_TIMEOUT_SECONDS"
+)
+assert inner == 180
+assert outer == 240
+assert default_outer == 60
+assert inner < outer
+assert outer - inner >= 60
+assert outer <= 300
+
+calls = [
+    node
+    for node in ast.walk(worker_tree)
+    if isinstance(node, ast.Call)
+    and isinstance(node.func, ast.Name)
+    and node.func.id == "generate"
+]
+assert len(calls) == 1
+timeout_argument = calls[0].args[8]
+assert isinstance(timeout_argument, ast.Call)
+assert isinstance(timeout_argument.func, ast.Name)
+assert timeout_argument.func.id == "_evaluator_timeout_seconds"
+assert len(timeout_argument.args) == 1
+assert isinstance(timeout_argument.args[0], ast.Name)
+assert timeout_argument.args[0].id == "evaluator_path"
+
+namespace = {"__file__": str(worker_path)}
+exec(compile(worker_tree, str(worker_path), "exec"), namespace)
+timeout_for = namespace["_evaluator_timeout_seconds"]
+bundled_path = (
+    worker_path.parent / "flight-recorder-claude-semantic-evaluator"
+).resolve()
+assert timeout_for(bundled_path) == outer
+assert timeout_for(pathlib.Path("/tmp/custom-evaluator")) == default_outer
+
+identity = namespace["_executable_identity"]
+resolved_bundled, _digest = identity(str(bundled_path))
+assert resolved_bundled == bundled_path
+assert timeout_for(resolved_bundled) == outer
+PY
+  then
+    pass "bundledだけinner=180・outer=240、custom=60秒を固定する"
+  else
+    fail "bundledだけinner=180・outer=240、custom=60秒を固定する"
+  fi
+}
+
+test_timeout_override_is_harness_only() {
+  echo "test_timeout_override_is_harness_only:"
+  local contract_status=0
+  local process_status=0
+  local capture="$TEST_ROOT/capture-invalid-timeout"
+  local output="$TEST_ROOT/invalid-timeout.out"
+  local error="$TEST_ROOT/invalid-timeout.err"
+  python3 - "$ADAPTER" 2>/dev/null <<'PY' || contract_status=$?
+import os
+import runpy
+import sys
+
+namespace = runpy.run_path(sys.argv[1])
+timeout_seconds = namespace["_timeout_seconds"]
+adapter_error = namespace["AdapterError"]
+default = namespace["DEFAULT_TIMEOUT_SECONDS"]
+assert default == 180
+
+saved = {
+    name: os.environ.get(name)
+    for name in (
+        "FLIGHT_RECORDER_TEST_HARNESS",
+        "FLIGHT_RECORDER_TEST_CLAUDE_TIMEOUT_SECONDS",
+    )
+}
+try:
+    os.environ.pop("FLIGHT_RECORDER_TEST_HARNESS", None)
+    os.environ.pop("FLIGHT_RECORDER_TEST_CLAUDE_TIMEOUT_SECONDS", None)
+    assert timeout_seconds() == default
+
+    # Ambient overrideだけではproduction defaultを変えない。
+    os.environ["FLIGHT_RECORDER_TEST_CLAUDE_TIMEOUT_SECONDS"] = "1"
+    assert timeout_seconds() == default
+    os.environ["FLIGHT_RECORDER_TEST_HARNESS"] = "0"
+    assert timeout_seconds() == default
+
+    # 明示test harnessだけが短縮を許可する。
+    os.environ["FLIGHT_RECORDER_TEST_HARNESS"] = "1"
+    assert timeout_seconds() == 1
+    for invalid in ("0", "181", "invalid"):
+        os.environ["FLIGHT_RECORDER_TEST_CLAUDE_TIMEOUT_SECONDS"] = invalid
+        try:
+            timeout_seconds()
+        except adapter_error:
+            pass
+        else:
+            raise AssertionError("invalid harness timeout must fail closed")
+
+    # 無効値もambientなら無視してdefaultを使う。
+    os.environ.pop("FLIGHT_RECORDER_TEST_HARNESS", None)
+    assert timeout_seconds() == default
+finally:
+    for name, value in saved.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+PY
+  write_request "$REQUEST"
+  run_adapter valid "$capture" "$REQUEST" \
+    env FLIGHT_RECORDER_TEST_CLAUDE_TIMEOUT_SECONDS=invalid \
+    >"$output" 2>"$error" || process_status=$?
+  if [[ "$contract_status" -eq 0 && "$process_status" -eq 1 ]] \
+    && [[ ! -s "$output" && ! -e "$capture/argv.json" ]] \
+    && [[ "$(cat "$error")" == \
+      "flight recorder Claude evaluator failed" ]]; then
+    pass "timeout短縮overrideを明示test harnessだけに限定する"
+  else
+    fail "timeout短縮overrideを明示test harnessだけに限定する"
+  fi
+}
+
+test_slow_provider_times_out_cleanly() {
+  echo "test_slow_provider_times_out_cleanly:"
+  local capture="$TEST_ROOT/capture-timeout"
+  local output="$TEST_ROOT/timeout.out"
+  local error="$TEST_ROOT/timeout.err"
+  local status=0
+  write_request "$REQUEST"
+  run_adapter slow "$capture" "$REQUEST" \
+    env FLIGHT_RECORDER_TEST_CLAUDE_TIMEOUT_SECONDS=1 \
+    >"$output" 2>"$error" || status=$?
+  sleep 3
+  if [[ "$status" -eq 1 && ! -s "$output" ]] \
+    && [[ ! -e "$capture/slow-child-finished" ]] \
+    && [[ "$(cat "$error")" == \
+      "flight recorder Claude evaluator failed" ]]; then
+    pass "slow providerのprocess groupを停止し固定stderrだけを返す"
+  else
+    fail "slow providerのprocess groupを停止し固定stderrだけを返す"
+  fi
+}
+
 echo "=== Flight Recorder Claude Semantic Evaluator Adapter Tests ==="
 if [[ ! -x "$ADAPTER" ]]; then
   fail "production Claude semantic evaluator adapterが実行可能である"
@@ -331,6 +501,9 @@ test_protocol_v2_and_safe_claude_invocation
 test_invalid_and_oversized_input_fail_closed
 test_normalizes_worker_contract_fields
 test_provider_failures_and_budget_fail_closed
+test_timeout_budget_contract
+test_timeout_override_is_harness_only
+test_slow_provider_times_out_cleanly
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

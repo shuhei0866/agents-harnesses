@@ -333,3 +333,20 @@ Accepted decisions remain recorded when later superseded.
   adapter relative to its own scripts directory rather than broadening the
   scheduler runtime path. Real provider calls remain disabled until the owner
   configures a positive local cost budget.
+
+## D-20260727-25: Give the bundled Claude adapter cleanup room inside the worker deadline
+
+- Status: accepted
+- Decision: bound the production Claude child at 180 seconds and the automatic
+  worker invocation of that bundled adapter at 240 seconds. Keep the existing
+  60-second deadline for custom evaluators and ignore timeout-shortening
+  environment variables outside the explicit test harness.
+- Reason: real structured Semantic Receipt calls crossed the previous
+  50-second child and 60-second worker deadlines even though authentication and
+  a minimal structured-output call succeeded. Because the worker deadline
+  starts before the adapter starts its child, a ten-second gap could also kill
+  the adapter before process-group cleanup completed.
+- Consequence: the bundled adapter has a finite 60-second cleanup margin while
+  remaining under the Semantic Receipt protocol's 300-second maximum.
+  Timeout failures stay fail-closed and their durable attempt reservation still
+  prevents automatic recharging.

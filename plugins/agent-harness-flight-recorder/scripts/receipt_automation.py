@@ -18,7 +18,7 @@ from typing import Any, Iterator
 from chunk_rotation import canonical_json, safe_subdirectory
 from record_event import hash_identifier
 from semantic_receipts import _load_rubric, generate
-from evaluation import _executable_identity
+from evaluation import BUNDLED_EVALUATORS, _executable_identity
 from session_sources import register
 from vault import (
     VaultError,
@@ -62,6 +62,19 @@ MAX_ATTEMPTS = 100_000
 FINGERPRINT_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 AUTOMATION_STATES = {"idle", "completed", "attention", "error"}
 DIAGNOSTIC_CODES = {None, "configuration_invalid", "evaluator_failed"}
+DEFAULT_EVALUATOR_TIMEOUT_SECONDS = 60
+BUNDLED_EVALUATOR_TIMEOUT_SECONDS = 240
+
+
+def _evaluator_timeout_seconds(evaluator_path: Path) -> int:
+    bundled_directory = Path(__file__).resolve().parent
+    bundled_paths = {
+        (bundled_directory / evaluator).resolve()
+        for evaluator in BUNDLED_EVALUATORS
+    }
+    if evaluator_path in bundled_paths:
+        return BUNDLED_EVALUATOR_TIMEOUT_SECONDS
+    return DEFAULT_EVALUATOR_TIMEOUT_SECONDS
 
 
 def _absolute_directory(path: Path, description: str) -> Path:
@@ -771,7 +784,7 @@ def run(root: Path) -> dict[str, Any]:
         hints = _hints(root)
         attempts = _attempts(root)
         key = authorized_key(root, None)
-        _evaluator_path, evaluator_sha256 = _executable_identity(
+        evaluator_path, evaluator_sha256 = _executable_identity(
             config["evaluator"]
         )
         _rubric, rubric_sha256 = _load_rubric(Path(config["rubric_path"]))
@@ -867,7 +880,7 @@ def run(root: Path) -> dict[str, Any]:
                     config["evaluator"],
                     config["model"],
                     Path(config["rubric_path"]),
-                    60,
+                    _evaluator_timeout_seconds(evaluator_path),
                     config["policy_version"],
                     None,
                     config["max_cost_microusd_per_run"] - measured_cost,

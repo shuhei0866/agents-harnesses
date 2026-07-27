@@ -26,7 +26,7 @@ MAX_SOURCE_BYTES = 256 * 1024
 MAX_TEXT_LENGTH = 2048
 MAX_SHORT_TEXT_LENGTH = 256
 MAX_LIST_ITEMS = 32
-DEFAULT_TIMEOUT_SECONDS = 50
+DEFAULT_TIMEOUT_SECONDS = 180
 SAFE_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$"
 SAFE_NAME_RE = re.compile(SAFE_NAME_PATTERN)
 HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -327,6 +327,8 @@ def _limit_provider() -> None:
 
 
 def _timeout_seconds() -> int:
+    if os.environ.get("FLIGHT_RECORDER_TEST_HARNESS") != "1":
+        return DEFAULT_TIMEOUT_SECONDS
     value = os.environ.get("FLIGHT_RECORDER_TEST_CLAUDE_TIMEOUT_SECONDS")
     if value is None:
         return DEFAULT_TIMEOUT_SECONDS
@@ -399,6 +401,7 @@ def _invoke_claude(
     prompt = json.dumps(
         request, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
+    timeout_seconds = _timeout_seconds()
     process: subprocess.Popen[bytes] | None = None
     try:
         with tempfile.TemporaryDirectory(
@@ -415,7 +418,7 @@ def _invoke_claude(
                 preexec_fn=_limit_provider,
             )
             try:
-                process.communicate(prompt, timeout=_timeout_seconds())
+                process.communicate(prompt, timeout=timeout_seconds)
             except subprocess.TimeoutExpired as error:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()

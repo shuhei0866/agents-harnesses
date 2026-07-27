@@ -6,7 +6,9 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import subprocess
 import sys
+import time
 
 
 capture_value = os.environ.get("FLIGHT_RECORDER_TEST_CLAUDE_CAPTURE_DIR")
@@ -40,6 +42,20 @@ except json.JSONDecodeError:
 )
 
 mode = os.environ.get("FLIGHT_RECORDER_TEST_CLAUDE_MODE", "valid")
+if mode == "slow":
+    subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import pathlib,time;"
+                "time.sleep(2);"
+                f"pathlib.Path({str(capture / 'slow-child-finished')!r})"
+                ".write_text('orphan',encoding='utf-8')"
+            ),
+        ],
+    )
+    time.sleep(5)
 if mode == "nonzero":
     print(prompt, file=sys.stderr)
     raise SystemExit(19)
