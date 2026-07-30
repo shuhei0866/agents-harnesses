@@ -22,3 +22,8 @@ __pycache__/
 
 # Repository-local worktrees
 /.worktrees/
+
+# harness.config は my-skynet-hub の registry/repos.yaml から生成される派生物である。
+# 各 clone で `python3 ~/Documents/my-skynet-hub/scripts/sync_guard_config.py --write`
+# を実行すれば再現できるので追跡しない。
+.claude/harness.config
