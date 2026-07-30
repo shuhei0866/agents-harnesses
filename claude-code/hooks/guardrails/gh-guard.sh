@@ -351,16 +351,71 @@ is_proxy_approve() {
   [ "$pr_author" != "$current_user" ]
 }
 
+# --- ヘルパー: 昇格元ブランチ（develop）を持つ repo かどうか ---
+#
+# このガードは「develop → main の昇格は人間が行う」という運用を前提にしている。
+# ところが develop を持たない repo では feature → main が唯一の経路なので、
+# その前提が成立せず、正しい操作に対して誤った警告を出していた。実例として
+# orbit-social-graph は registry で「feature branch から main への PR マージ」を
+# 明示的に許可しているのに、main 向けというだけで警告が出ていた。
+#
+# **判定できないときは develop があるものとして扱う（fail closed）。** 通信断や
+# gh の不在で制限が黙って外れる方が危ないためである。404 を確認できたときだけ
+# 制限を外す。
+#
+# repo の解決は get_pr_base と同じ順序に揃える（--repo 指定 > 実行ディレクトリ）。
+_gh_guard_repo_has_develop() {
+  local cmd="${1:-}" working_dir="${2:-}" repo_arg="" out="" rc=0
+
+  if [ -n "$cmd" ]; then
+    repo_arg=$(guard_extract_gh_repo_selector "$cmd" 2>/dev/null || echo "")
+  fi
+
+  if [ -n "$repo_arg" ]; then
+    out=$(gh api "repos/$repo_arg/branches/develop" --jq .name 2>&1)
+    rc=$?
+  elif [ -n "$working_dir" ] && [ -d "$working_dir" ]; then
+    out=$(cd "$working_dir" 2>/dev/null && gh api "repos/{owner}/{repo}/branches/develop" --jq .name 2>&1)
+    rc=$?
+  else
+    out=$(gh api "repos/{owner}/{repo}/branches/develop" --jq .name 2>&1)
+    rc=$?
+  fi
+
+  if [ "$rc" -eq 0 ] && [ "$out" = "develop" ]; then
+    return 0
+  fi
+  # 404 と確認できたときだけ「develop 無し」と判定する。
+  case "$out" in
+    *"Not Found"*|*"404"*) return 1 ;;
+  esac
+  return 0
+}
+
 # --- ヘルパー: approve の deny 判定 ---
 should_deny_approve() {
-  local base="$1"
-  [ "$base" = "main" ] || [ "$base" = "master" ] || [ "$base" = "__UNKNOWN__" ]
+  local base="$1" cmd="${2:-}" working_dir="${3:-}"
+  if [ "$base" = "__UNKNOWN__" ]; then
+    return 0
+  fi
+  case "$base" in
+    main|master) ;;
+    *) return 1 ;;
+  esac
+  _gh_guard_repo_has_develop "$cmd" "$working_dir"
 }
 
 # --- ヘルパー: merge の deny 判定 ---
 should_deny_merge() {
-  local base="$1"
-  [ "$base" = "main" ] || [ "$base" = "master" ] || [ "$base" = "__UNKNOWN__" ]
+  local base="$1" cmd="${2:-}" working_dir="${3:-}"
+  if [ "$base" = "__UNKNOWN__" ]; then
+    return 0
+  fi
+  case "$base" in
+    main|master) ;;
+    *) return 1 ;;
+  esac
+  _gh_guard_repo_has_develop "$cmd" "$working_dir"
 }
 
 _gh_guard_review_is_approve() {
@@ -404,7 +459,7 @@ if ! guard_is_trunk_direct; then
 
       if [ "$IS_CLOUD" = "1" ]; then
         if is_proxy_approve "$PR_TARGET" "$GH_SEGMENT" "$GH_DIR" "$GH_CONTEXT_UNKNOWN"; then
-          if should_deny_approve "$BASE"; then
+          if should_deny_approve "$BASE" "$GH_SEGMENT" "$GH_DIR"; then
             REASON="main 向け PR は代理 approve でもブロックされています。"
             [ "$BASE" = "__UNKNOWN__" ] && REASON="PR のターゲットブランチを確認できなかったため、安全のためブロックしました。"
             guard_respond "advisory" "GH ガード" "${REASON} develop → main の昇格は人間が承認・実行してください。"
@@ -412,7 +467,7 @@ if ! guard_is_trunk_direct; then
         else
           guard_respond "advisory" "GH ガード" "VPS 環境での自己 approve はブロックされています。代理 approve（PR 作成者と異なるアカウント）は develop 向け PR で許可されます。"
         fi
-      elif should_deny_approve "$BASE"; then
+      elif should_deny_approve "$BASE" "$GH_SEGMENT" "$GH_DIR"; then
         REASON="main 向け PR の approve はブロックされています。"
         [ "$BASE" = "__UNKNOWN__" ] && REASON="PR のターゲットブランチを確認できなかったため、安全のためブロックしました。"
         guard_respond "advisory" "GH ガード" "${REASON} develop → main の昇格は人間が承認・実行してください。"
@@ -420,7 +475,7 @@ if ! guard_is_trunk_direct; then
     elif [ "$GH_OP" = "merge" ]; then
       PR_TARGET=$(extract_pr_target "$GH_SEGMENT" "merge")
       BASE=$(get_pr_base "$PR_TARGET" "$GH_SEGMENT" "$GH_DIR" "$GH_CONTEXT_UNKNOWN")
-      if should_deny_merge "$BASE"; then
+      if should_deny_merge "$BASE" "$GH_SEGMENT" "$GH_DIR"; then
         REASON="main 向け PR のマージはブロックされています。"
         [ "$BASE" = "__UNKNOWN__" ] && REASON="PR のターゲットブランチを確認できなかったため、安全のためブロックしました。"
         guard_respond "advisory" "GH ガード" "${REASON} develop → main の昇格は人間が実行してください。"
