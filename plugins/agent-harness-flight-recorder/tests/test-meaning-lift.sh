@@ -587,6 +587,89 @@ PY
   fi
 }
 
+test_rejects_multi_task_span_before_provider() {
+  echo "test_rejects_multi_task_span_before_provider:"
+  local source="$TEST_ROOT/multi-task.jsonl"
+  local register="$TEST_ROOT/multi-task-register.json"
+  local output="$TEST_ROOT/multi-task.out"
+  local error="$TEST_ROOT/multi-task.err"
+  local counter="$TEST_ROOT/meaning-evaluator-count"
+  local before_count source_ref episode status=0
+  before_count="$(cat "$counter")"
+  python3 - "$source" <<'PY'
+import json
+import pathlib
+import sys
+
+rows = []
+for turn in ("turn-a", "turn-b"):
+    rows.extend(
+        [
+            {
+                "type": "event_msg",
+                "payload": {"turn_id": turn, "type": "task_started"},
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "role": "user",
+                    "type": "message",
+                    "content": [{"type": "input_text", "text": f"Do {turn}."}],
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "role": "assistant",
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": f"Finished {turn}."}
+                    ],
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {"turn_id": turn, "type": "task_complete"},
+            },
+        ]
+    )
+pathlib.Path(sys.argv[1]).write_text(
+    "".join(
+        json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+        for row in rows
+    ),
+    encoding="utf-8",
+)
+PY
+  run_cli source register \
+    --adapter codex --path "$source" --json >"$register" 2>"$error"
+  source_ref="$(
+    python3 - "$register" <<'PY'
+import json
+import pathlib
+import sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text())["source_ref"])
+PY
+  )"
+  episode="$(episode_id)"
+  FLIGHT_RECORDER_TEST_MEANING_COUNT="$counter" \
+    run_cli meaning generate "$episode" \
+      --source-ref "$source_ref" \
+      --span-start-line 1 --span-end-line 8 \
+      --evaluator flight-recorder-meaning-evaluator \
+      --model meaning-model-multi-task \
+      --max-cost-microusd 50000 --timeout 240 --json \
+      >"$output" 2>"$error" || status=$?
+  if [[ "$status" -ne 0 && ! -s "$output" ]] \
+    && [[ "$(cat "$counter")" == "$before_count" ]] \
+    && grep -Fq "not one exact completed task" "$error" \
+    && ! grep -q "Traceback" "$error"; then
+    pass "複数taskを含むspanをprovider実行前に拒否する"
+  else
+    fail "複数taskを含むspanをprovider実行前に拒否する"
+  fi
+}
+
 test_rehashed_tampered_card_is_rejected() {
   echo "test_rehashed_tampered_card_is_rejected:"
   local first="$TEST_ROOT/meaning-a.json"
@@ -714,6 +797,7 @@ if [[ -f "$TEST_ROOT/meaning-a.json" && -s "$TEST_ROOT/meaning-a.json" ]]; then
   test_unknown_outcome_is_partial_not_covered
   test_raw_packet_fragment_echo_fails_closed
   test_bundled_meaning_evaluator_requires_240_second_outer_timeout
+  test_rejects_multi_task_span_before_provider
   test_rehashed_tampered_card_is_rejected
 fi
 

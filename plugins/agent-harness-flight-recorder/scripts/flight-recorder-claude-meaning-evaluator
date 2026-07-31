@@ -30,6 +30,10 @@ PATH_RE = re.compile(
     r"(?<![A-Za-z0-9_.-])/(?:Users|home|private|tmp|var|etc|opt)/"
     r"[^\s\"'`<>]+"
 )
+EMAIL_RE = re.compile(
+    r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@"
+    r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9._%+-])"
+)
 REQUEST_FIELDS = {
     "schema_version",
     "model",
@@ -148,6 +152,9 @@ def _load_request() -> dict[str, Any]:
             or not 1 <= len(item["kind"]) <= 64
             or not isinstance(item.get("content"), str)
             or not 1 <= len(item["content"]) <= MAX_EVIDENCE_TEXT
+            or SECRET_RE.search(item["content"])
+            or PATH_RE.search(item["content"])
+            or EMAIL_RE.search(item["content"])
         ):
             raise AdapterError
         evidence_ids.append(item["evidence_id"])
@@ -312,10 +319,22 @@ def _response(raw: bytes, request: dict[str, Any]) -> dict[str, Any]:
     if measured > request["remaining_cost_microusd"]:
         raise AdapterError
     if any(
-        SECRET_RE.search(text) or PATH_RE.search(text)
+        SECRET_RE.search(text)
+        or PATH_RE.search(text)
+        or EMAIL_RE.search(text)
         for text in _strings(semantic)
     ):
         raise AdapterError
+    response_texts = [
+        semantic[name]["summary"] for name in MEANING_FIELDS
+    ]
+    for item in request["packet"]["evidence"]:
+        fragment = item["content"].strip()
+        if len(fragment) >= 8 and any(
+            fragment.casefold() in text.casefold()
+            for text in response_texts
+        ):
+            raise AdapterError
     result = dict(semantic)
     result["schema_version"] = 2
     result["measured_cost_microusd"] = measured

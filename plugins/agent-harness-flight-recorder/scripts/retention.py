@@ -17,6 +17,7 @@ from background_evaluation import (
 )
 from evidence_index import DATABASE_PATH, rebuild_index_locked
 from evaluation import evaluation_record_snapshots
+from meaning_lift import meaning_card_record_snapshots
 from reporting import (
     EPISODE_ID_RE,
     OUTPUT_VERSION,
@@ -100,6 +101,11 @@ def _scope(
             ),
             "semantic_receipt_record_count": len(
                 semantic_receipt_record_snapshots(
+                    root, policy_version, episode_id
+                )
+            ),
+            "meaning_card_record_count": len(
+                meaning_card_record_snapshots(
                     root, policy_version, episode_id
                 )
             ),
@@ -330,6 +336,9 @@ def purge(
             semantic_receipt_snapshots = semantic_receipt_record_snapshots(
                 root, selected, episode_id
             )
+            meaning_card_snapshots = meaning_card_record_snapshots(
+                root, selected, episode_id
+            )
             attempt_snapshot = remove_episode_attempts(root, episode_id)
             attempt_committed = False
             try:
@@ -342,6 +351,7 @@ def purge(
                 derivative_snapshots = [
                     *evaluation_snapshots,
                     *semantic_receipt_snapshots,
+                    *meaning_card_snapshots,
                 ]
                 removed_derivatives: list[tuple[Path, bytes]] = []
                 try:
@@ -374,6 +384,8 @@ def purge(
                         atomic_replace(evaluation_path, evaluation_bytes)
                     for receipt_path, receipt_bytes in semantic_receipt_snapshots:
                         atomic_replace(receipt_path, receipt_bytes)
+                    for card_path, card_bytes in meaning_card_snapshots:
+                        atomic_replace(card_path, card_bytes)
                     _cleanup_original_history(root)
                     raise
                 _cleanup_original_history(root)
@@ -403,5 +415,7 @@ def render_purge(value: dict[str, Any]) -> str:
         f"Local evaluation records: {value['evaluation_record_count']}\n"
         "Local Semantic Receipt records: "
         f"{value['semantic_receipt_record_count']}\n"
+        "Local Meaning Card records: "
+        f"{value['meaning_card_record_count']}\n"
         f"{value['limitation']}\n"
     )

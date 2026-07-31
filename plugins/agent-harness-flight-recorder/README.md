@@ -424,6 +424,49 @@ output; it does not promote their task or outcome into deterministic Card
 fields. Inspect output is version 4 while the embedded Card and report output
 remain version 3.
 
+### Meaning Lift pilot
+
+The manual Meaning Lift pilot tests whether a smaller semantic contract makes
+the existing data more useful before changing automatic collection. It parses
+one registered span locally and builds a transient packet from only the first
+human prompt and final assistant text. Tool input/output, thinking, code
+fences, paths, email addresses, and recognized credential forms are omitted or
+redacted before the evaluator runs. The packet is capped at 16 KiB and is never
+stored.
+
+```bash
+scripts/flight-recorder meaning generate <episode-id> \
+  --source-ref SOURCE_REF \
+  --span-start-line 120 \
+  --span-end-line 180 \
+  --evaluator flight-recorder-claude-meaning-evaluator \
+  --model claude-sonnet-4-6 \
+  --max-cost-microusd 50000 \
+  --timeout 240
+```
+
+The result compares the deterministic baseline and model-derived Card using the
+same five questions: intent, deliverable, verification and outcome, reusable
+learning, and time and API cost. The baseline is derived from fields that
+actually exist on the deterministic Evidence Card. Answers score as covered
+(`1`), partial (`0.5`), or uncovered (`0`); an `unknown` model outcome cannot
+turn deliverable or outcome into covered. A model field also needs a bounded
+summary and a packet evidence reference. The Recorder, rather than the model,
+adds the packet digest, source-span digest, evaluator identity, measured
+micro-USD, and latency. Cards are content-addressed under owner-only,
+Git-ignored `meaning-cards/`; the same
+episode/span/model/evaluator/runtime/policy contract returns the existing Card
+without another provider call.
+
+The bundled adapter uses the same safe, tool-less, nonpersistent Claude child
+boundary as automatic Semantic Receipts, but sends only the minimized packet.
+This pilot is deliberately manual: automatic candidate discovery, routing, and
+marketplace export remain unchanged until the measured coverage and usefulness
+justify that expansion.
+
+The first real-task result and its provider/authentication limitations are
+recorded in [`docs/MEANING_LIFT_PILOT.md`](docs/MEANING_LIFT_PILOT.md).
+
 ### Unconscious Semantic Receipts
 
 Opt in once to automatic session matching for both harnesses:
@@ -536,6 +579,8 @@ bash plugins/agent-harness-flight-recorder/tests/test-background-evaluation.sh
 bash plugins/agent-harness-flight-recorder/tests/test-session-sources.sh
 bash plugins/agent-harness-flight-recorder/tests/test-semantic-receipts.sh
 bash plugins/agent-harness-flight-recorder/tests/test-receipt-automation.sh
+bash plugins/agent-harness-flight-recorder/tests/test-meaning-lift.sh
+bash plugins/agent-harness-flight-recorder/tests/test-claude-meaning-evaluator-adapter.sh
 bash plugins/agent-harness-flight-recorder/tests/test-retention.sh
 bash plugins/agent-harness-flight-recorder/tests/test-retry-policy.sh
 bash plugins/agent-harness-flight-recorder/tests/test-scheduler.sh

@@ -433,6 +433,37 @@ before the worker boundary fires. Custom evaluators retain the existing
 60-second outer deadline. Test-only timeout shortening is ignored unless the
 explicit test-harness marker is also present.
 
+### Meaning Lift pilot
+
+The Meaning Lift pilot is a separate manual projection over one registered
+source span. It does not alter Event v3, relationship formation, or automatic
+Receipt selection. A deterministic local extractor accepts only the first
+human message and the final assistant message for supported Claude Code and
+Codex JSONL shapes. Tool calls, tool results, thinking, intermediate assistant
+messages, and fenced code are excluded. Recognized paths, email addresses, and
+credential forms are redacted before a canonical `meaning-packet-v1` is sent
+to an evaluator. The packet is at most 16 KiB and is never persisted.
+
+The evaluator returns only intent, deliverable, verification, outcome,
+reusable learning, confidence, and packet evidence references. The Recorder
+validates every reference against the transient packet and adds source,
+evaluator, policy, cost, latency, and generation provenance. The resulting
+content-addressed `meaning-card-v1` lives under owner-only, Git-ignored
+`meaning-cards/`. A matching episode, source span, packet, evaluator, model,
+policy, and contract reuses the stored Card without another paid invocation.
+
+The command also emits a deterministic baseline and a five-question comparison:
+intent, deliverable, verification and outcome, reusable learning, and time and
+API cost. The baseline reads only fields that exist on the authenticated
+Evidence Card. Coverage is intentionally conservative: answers score as
+covered (`1`), partial (`0.5`), or uncovered (`0`), and an `unknown` model
+outcome leaves deliverable and verification/outcome only partial. A Meaning
+field also needs a bounded summary citing at least one allowed packet evidence
+ID. This measures whether the projection answers previously unanswered
+questions without claiming that fluent prose proves business value. The pilot
+remains outside the scheduler and automatic Receipt worker until real-task
+results justify that integration.
+
 ## Retention and deletion
 
 Privacy-safe encrypted events are retained until the owner deletes them. Normal
@@ -483,6 +514,14 @@ this limitation clearly.
 - durable pre-invocation reservations and protocol-v2 cost budgets;
 - scheduler integration isolated from sync health;
 - content-free status v4 automation counts.
+
+### R1.4.1: Meaning Lift pilot
+
+- deterministic, transient semantic evidence packets;
+- fixed five-question baseline-to-Meaning coverage comparison;
+- recorder-measured cost and latency provenance;
+- owner-only, content-addressed Meaning Cards with paid-call idempotency;
+- manual real-task validation before automatic integration.
 
 ### Later
 
