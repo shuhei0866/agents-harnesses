@@ -155,6 +155,7 @@ root = pathlib.Path(sys.argv[1])
 paths = sorted((root / "devices").rglob("*.jsonl.age"))
 paths += sorted((root / "cache" / "imported").rglob("*.jsonl"))
 paths += sorted((root / "evaluations").glob("*.json"))
+paths += sorted((root / "meaning-cards").glob("*.json"))
 paths.append(root / "index" / "imported-chunks.json")
 for path in paths:
     print(path.relative_to(root), hashlib.sha256(path.read_bytes()).hexdigest())
@@ -167,6 +168,91 @@ evaluation_count() {
     return
   fi
   find "$1/evaluations" -type f -name '*.json' | wc -l | tr -d ' '
+}
+
+meaning_card_count() {
+  local state="$1" episode="$2"
+  python3 - "$state" "$episode" <<'PY'
+import json
+import pathlib
+import sys
+
+directory = pathlib.Path(sys.argv[1]) / "meaning-cards"
+count = 0
+if directory.is_dir():
+    for path in directory.glob("*.json"):
+        value = json.loads(path.read_text(encoding="utf-8"))
+        count += value.get("episode_id") == sys.argv[2]
+print(count)
+PY
+}
+
+generate_meaning_card() {
+  local state="$1" episode="$2" label="$3"
+  local source="$TEST_ROOT/$label-source.jsonl"
+  local registered="$TEST_ROOT/$label-source-register.json"
+  local source_ref
+  python3 - "$source" "$label" <<'PY'
+import json
+import pathlib
+import sys
+
+path, label = sys.argv[1:]
+rows = [
+    {
+        "type": "event_msg",
+        "payload": {"turn_id": label, "type": "task_started"},
+    },
+    {
+        "type": "response_item",
+        "payload": {
+            "role": "user",
+            "type": "message",
+            "content": [{"type": "input_text", "text": f"Diagnose {label}."}],
+        },
+    },
+    {
+        "type": "response_item",
+        "payload": {
+            "role": "assistant",
+            "type": "message",
+            "content": [
+                {"type": "output_text", "text": f"Completed {label}."}
+            ],
+        },
+    },
+    {
+        "type": "event_msg",
+        "payload": {"turn_id": label, "type": "task_complete"},
+    },
+]
+pathlib.Path(path).write_text(
+    "".join(
+        json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+        for row in rows
+    ),
+    encoding="utf-8",
+)
+PY
+  run_cli "$state" source register \
+    --adapter codex --path "$source" --json >"$registered" 2>/dev/null \
+    || return 1
+  source_ref="$(
+    python3 - "$registered" <<'PY'
+import json
+import pathlib
+import sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text())["source_ref"])
+PY
+  )"
+  FLIGHT_RECORDER_NOW="2026-07-31T02:03:04Z" \
+    run_cli "$state" meaning generate "$episode" \
+      --source-ref "$source_ref" \
+      --span-start-line 1 --span-end-line 4 \
+      --evaluator flight-recorder-meaning-evaluator \
+      --model "meaning-$label" \
+      --max-cost-microusd 50000 --timeout 240 --json \
+      >/dev/null 2>&1
 }
 
 write_attempt_ledger() {
@@ -287,6 +373,10 @@ test_purge_dry_run_previews_scope_without_rewriting_history() {
       fail "purge対象episodeのevaluationを作成できる"
       return
     }
+  generate_meaning_card "$state" "$episode" purge-preview || {
+    fail "purge preview対象episodeのMeaning Cardを作成できる"
+    return
+  }
   target_path="$(db_value_for_event "$db" "$TARGET_EVENT" source_path)"
   unrelated_path="$(db_value_for_event "$db" "$UNRELATED_EVENT" source_path)"
   local_head="$(git -C "$state" rev-parse HEAD)"
@@ -299,6 +389,8 @@ test_purge_dry_run_previews_scope_without_rewriting_history() {
     && grep -Eiq 'best[- ]effort' "$output" \
     && grep -Eiq '(independent|remote|uncontrolled)[ -]?clone' "$output" \
     && grep -Eiq 'provider.*cache|cache.*provider' "$output" \
+    && grep -Fq 'Local Meaning Card records: 1' "$output" \
+    && [[ "$(meaning_card_count "$state" "$episode")" == "1" ]] \
     && [[ "$local_head" == "$(git -C "$state" rev-parse HEAD)" \
       && "$remote_head" == "$(git --git-dir="$remote" rev-parse main)" ]] \
     && git -C "$state" cat-file -e "HEAD:$target_path" \
@@ -325,6 +417,15 @@ test_purge_apply_removes_target_history_and_keeps_unrelated_chunk() {
   unrelated_episode="$(
     db_value_for_event "$db" "$UNRELATED_EVENT" episode_id
   )"
+  generate_meaning_card "$state" "$episode" purge-apply-target || {
+    fail "purge apply対象episodeのMeaning Cardを作成できる"
+    return
+  }
+  generate_meaning_card \
+    "$state" "$unrelated_episode" purge-apply-unrelated || {
+      fail "purge apply非対象episodeのMeaning Cardを作成できる"
+      return
+    }
   write_attempt_ledger "$state" "$episode" "$unrelated_episode"
   target_path="$(db_value_for_event "$db" "$TARGET_EVENT" source_path)"
   unrelated_path="$(db_value_for_event "$db" "$UNRELATED_EVENT" source_path)"
@@ -342,6 +443,8 @@ test_purge_apply_removes_target_history_and_keeps_unrelated_chunk() {
     && ! -e "$state/$target_cache" \
     && -f "$state/$unrelated_cache" \
     && "$(evaluation_count "$state")" == "0" ]] \
+    && [[ "$(meaning_card_count "$state" "$episode")" == "0" \
+      && "$(meaning_card_count "$state" "$unrelated_episode")" == "1" ]] \
     && ! grep -Fq " $target_path" "$history_objects" \
     && grep -Fq " $unrelated_path" "$history_objects" \
     && python3 - "$db" "$TARGET_EVENT" "$UNRELATED_EVENT" \
@@ -395,6 +498,10 @@ test_purge_push_rejection_restores_retryable_local_state() {
       fail "push rejection対象episodeのevaluationを作成できる"
       return
     }
+  generate_meaning_card "$state" "$episode" purge-rejection || {
+    fail "push rejection対象episodeのMeaning Cardを作成できる"
+    return
+  }
   target_path="$(db_value_for_event "$db" "$TARGET_EVENT" source_path)"
   target_cache="$(db_value_for_event "$db" "$TARGET_EVENT" cache_path)"
   before_head="$(git -C "$state" rev-parse HEAD)"
@@ -420,7 +527,8 @@ test_purge_push_rejection_restores_retryable_local_state() {
       shasum -a 256 "$state/auto-evaluation/attempts.json"
     )" \
     || ! -f "$state/$target_path" \
-    || ! -f "$state/$target_cache" ]] \
+    || ! -f "$state/$target_cache" \
+    || "$(meaning_card_count "$state" "$episode")" != "1" ]] \
     || grep -q "Traceback" "$base/rejected.err" \
     || ! run_cli "$state" purge "$episode" \
       >"$base/retry-preview.txt" 2>"$base/retry-preview.err"; then
@@ -433,7 +541,8 @@ test_purge_push_rejection_restores_retryable_local_state() {
     >"$base/retry.txt" 2>"$base/retry.err" \
     && [[ ! -e "$state/$target_path" \
       && ! -e "$state/$target_cache" \
-      && "$(evaluation_count "$state")" == "0" ]] \
+      && "$(evaluation_count "$state")" == "0" \
+      && "$(meaning_card_count "$state" "$episode")" == "0" ]] \
     && ! git --git-dir="$remote" cat-file -e \
       "main:$target_path" 2>/dev/null \
     && python3 - "$state/auto-evaluation/attempts.json" \

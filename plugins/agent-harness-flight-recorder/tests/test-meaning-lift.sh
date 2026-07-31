@@ -345,9 +345,11 @@ provenance = card["provenance"]
 assert set(provenance) == {
     "contract_version",
     "packet_sha256",
+    "packet_evidence_ids",
     "evaluator_model",
     "evaluator_adapter",
     "evaluator_adapter_sha256",
+    "evaluator_runtime_sha256",
     "policy_version",
     "source_event_ids",
     "source_span",
@@ -357,10 +359,14 @@ assert set(provenance) == {
 }
 assert provenance["contract_version"] == "meaning-card-v1"
 assert provenance["packet_sha256"] == request["packet"]["packet_sha256"]
+assert provenance["packet_evidence_ids"] == sorted(evidence_ids)
 assert provenance["evaluator_model"] == "meaning-model-a"
 assert provenance["evaluator_adapter"] == evaluator.name
 assert provenance["evaluator_adapter_sha256"] == (
     "sha256:" + hashlib.sha256(evaluator.read_bytes()).hexdigest()
+)
+assert provenance["evaluator_runtime_sha256"] == (
+    provenance["evaluator_adapter_sha256"]
 )
 assert provenance["policy_version"] == "default-v1"
 assert provenance["source_event_ids"] == [
@@ -381,31 +387,71 @@ PY
 test_baseline_to_meaning_uses_same_five_question_coverage() {
   echo "test_baseline_to_meaning_uses_same_five_question_coverage:"
   local output="$TEST_ROOT/meaning-a.json"
-  if python3 - "$output" <<'PY'
+  local inspect="$TEST_ROOT/meaning-inspect.json"
+  local episode
+  episode="$(episode_id)"
+  if run_cli inspect "$episode" --json >"$inspect" 2>/dev/null \
+    && python3 - "$output" "$inspect" <<'PY'
 import json
 import pathlib
 import sys
 
 value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+episode = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+card = episode["card"]
 baseline = value["baseline"]
 comparison = value["comparison"]
 questions = {
-    "intent", "deliverable", "verification", "outcome", "reusable_learning"
+    "intent",
+    "deliverable",
+    "verification_and_outcome",
+    "reusable_learning",
+    "time_and_api_cost",
 }
 assert set(baseline["answers"]) == questions
 assert set(comparison["questions"]) == questions
-assert set(value["meaning_card"]).issuperset(questions)
-assert baseline["covered_count"] == sum(
-    answer["state"] == "covered"
+assert baseline["score"] == sum(
+    {"covered": 1.0, "partial": 0.5, "uncovered": 0.0}[
+        answer["state"]
+    ]
     for answer in baseline["answers"].values()
 )
-assert comparison["baseline_covered_count"] == baseline["covered_count"]
-assert comparison["meaning_covered_count"] == 5
-assert comparison["coverage_lift"] == (
-    comparison["meaning_covered_count"]
-    - comparison["baseline_covered_count"]
-)
-assert comparison["coverage_lift"] > 0
+evidence = card["deterministic_evidence"]
+evidence_ids = {item["evidence_id"] for item in evidence}
+verification_ids = {
+    item["evidence_id"]
+    for item in evidence
+    if item["evidence_type"] in {"test", "build", "lint", "typecheck"}
+    and item["state"] == "success"
+}
+assert card["task_type"] is None
+assert card["deterministic_outcomes"] == {
+    "success": 1,
+    "failure": 0,
+    "unknown": 0,
+    "not_recorded": 0,
+    "evidence": card["deterministic_outcomes"]["evidence"],
+}
+assert baseline["answers"]["intent"] == {
+    "state": "uncovered", "evidence_references": []
+}
+assert baseline["answers"]["deliverable"] == {
+    "state": "uncovered", "evidence_references": []
+}
+assert baseline["answers"]["verification_and_outcome"]["state"] == "covered"
+assert set(
+    baseline["answers"]["verification_and_outcome"]["evidence_references"]
+) == verification_ids
+assert baseline["answers"]["reusable_learning"] == {
+    "state": "uncovered", "evidence_references": []
+}
+assert baseline["answers"]["time_and_api_cost"] == {
+    "state": "partial", "evidence_references": []
+}
+assert baseline["score"] == 1.5
+assert comparison["baseline_score"] == baseline["score"]
+assert comparison["meaning_score"] == 5.0
+assert comparison["score_lift"] == 3.5
 for question, states in comparison["questions"].items():
     assert states["baseline"] == baseline["answers"][question]["state"]
     assert states["meaning"] == "covered"
@@ -414,6 +460,183 @@ PY
     pass "baselineとMeaning Cardを同一5問で比較しcoverage liftを算出する"
   else
     fail "baselineとMeaning Cardを同一5問で比較しcoverage liftを算出する"
+  fi
+}
+
+test_unknown_outcome_is_partial_not_covered() {
+  echo "test_unknown_outcome_is_partial_not_covered:"
+  local register="$TEST_ROOT/source-register.json"
+  local capture="$TEST_ROOT/meaning-requests.jsonl"
+  local counter="$TEST_ROOT/meaning-evaluator-count"
+  local output="$TEST_ROOT/meaning-unknown.json"
+  local episode source_ref status=0
+  episode="$(episode_id)"
+  source_ref="$(
+    python3 - "$register" <<'PY'
+import json
+import pathlib
+import sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text())["source_ref"])
+PY
+  )"
+  FLIGHT_RECORDER_NOW="2026-07-31T01:02:03Z" \
+    FLIGHT_RECORDER_TEST_MEANING_CAPTURE="$capture" \
+    FLIGHT_RECORDER_TEST_MEANING_COUNT="$counter" \
+    FLIGHT_RECORDER_TEST_MEANING_COST=7000 \
+    FLIGHT_RECORDER_TEST_MEANING_OUTCOME=unknown \
+    run_cli meaning generate "$episode" \
+      --source-ref "$source_ref" \
+      --span-start-line 1 --span-end-line 6 \
+      --evaluator flight-recorder-meaning-evaluator \
+      --model meaning-model-unknown \
+      --max-cost-microusd 50000 --timeout 240 --json \
+      >"$output" 2>"$TEST_ROOT/meaning-unknown.err" || status=$?
+  if [[ "$status" -eq 0 ]] \
+    && python3 - "$output" <<'PY'
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text())
+outcome = value["meaning_card"]["outcome"]
+comparison = value["comparison"]
+assert outcome["state"] == "unknown"
+assert outcome["summary"] and outcome["evidence_references"]
+assert comparison["questions"]["deliverable"]["meaning"] == "partial"
+assert comparison["questions"]["verification_and_outcome"]["meaning"] == (
+    "partial"
+)
+assert comparison["questions"]["intent"]["meaning"] == "covered"
+assert comparison["questions"]["reusable_learning"]["meaning"] == "covered"
+assert comparison["questions"]["time_and_api_cost"]["meaning"] == "covered"
+assert comparison["meaning_score"] == 4.0
+assert comparison["score_lift"] == (
+    4.0 - comparison["baseline_score"]
+)
+PY
+  then
+    pass "summary+refsがあってもunknown outcomeはpartialとして数える"
+  else
+    cat "$TEST_ROOT/meaning-unknown.err" >&2
+    fail "summary+refsがあってもunknown outcomeはpartialとして数える"
+  fi
+}
+
+test_raw_packet_fragment_echo_fails_closed() {
+  echo "test_raw_packet_fragment_echo_fails_closed:"
+  local register="$TEST_ROOT/source-register.json"
+  local output="$TEST_ROOT/meaning-fragment-echo.out"
+  local error="$TEST_ROOT/meaning-fragment-echo.err"
+  local episode source_ref status=0
+  episode="$(episode_id)"
+  source_ref="$(
+    python3 - "$register" <<'PY'
+import json
+import pathlib
+import sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text())["source_ref"])
+PY
+  )"
+  FLIGHT_RECORDER_TEST_MEANING_ECHO_FRAGMENT=1 \
+    run_cli meaning generate "$episode" \
+      --source-ref "$source_ref" \
+      --span-start-line 1 --span-end-line 6 \
+      --evaluator flight-recorder-meaning-evaluator \
+      --model meaning-model-fragment-echo \
+      --max-cost-microusd 50000 --timeout 240 --json \
+      >"$output" 2>"$error" || status=$?
+  if [[ "$status" -ne 0 && ! -s "$output" ]] \
+    && ! grep -q "Traceback" "$error" \
+    && ! grep -q "MEANING_INTENT_CANARY" "$error"; then
+    pass "safe packet fragmentをsummaryへ丸写ししたresponseをfail closedする"
+  else
+    fail "safe packet fragmentをsummaryへ丸写ししたresponseをfail closedする"
+  fi
+}
+
+test_bundled_meaning_evaluator_requires_240_second_outer_timeout() {
+  echo "test_bundled_meaning_evaluator_requires_240_second_outer_timeout:"
+  local register="$TEST_ROOT/source-register.json"
+  local output="$TEST_ROOT/meaning-short-timeout.out"
+  local error="$TEST_ROOT/meaning-short-timeout.err"
+  local episode source_ref status=0
+  episode="$(episode_id)"
+  source_ref="$(
+    python3 - "$register" <<'PY'
+import json
+import pathlib
+import sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text())["source_ref"])
+PY
+  )"
+  PATH="$PLUGIN_DIR/scripts:$FAKE_BIN:$PATH" \
+    FLIGHT_RECORDER_STATE_DIR="$STATE" \
+    "$CLI" meaning generate "$episode" \
+      --source-ref "$source_ref" \
+      --span-start-line 1 --span-end-line 6 \
+      --evaluator flight-recorder-claude-meaning-evaluator \
+      --model claude-sonnet-fixture \
+      --max-cost-microusd 50000 --timeout 239 --json \
+      >"$output" 2>"$error" || status=$?
+  if [[ "$status" -ne 0 && ! -s "$output" ]] \
+    && grep -Fq "at least 240 seconds" "$error" \
+    && ! grep -q "Traceback" "$error"; then
+    pass "bundled Meaning evaluatorのouter timeoutを240秒未満にできない"
+  else
+    fail "bundled Meaning evaluatorのouter timeoutを240秒未満にできない"
+  fi
+}
+
+test_rehashed_tampered_card_is_rejected() {
+  echo "test_rehashed_tampered_card_is_rejected:"
+  local first="$TEST_ROOT/meaning-a.json"
+  local register="$TEST_ROOT/source-register.json"
+  local output="$TEST_ROOT/meaning-tampered.out"
+  local error="$TEST_ROOT/meaning-tampered.err"
+  local episode source_ref status=0
+  episode="$(episode_id)"
+  source_ref="$(
+    python3 - "$register" <<'PY'
+import json
+import pathlib
+import sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text())["source_ref"])
+PY
+  )"
+  python3 - "$STATE" "$first" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+output = json.loads(pathlib.Path(sys.argv[2]).read_text())
+old_id = output["meaning_card"]["meaning_card_id"].removeprefix("sha256:")
+old_path = root / "meaning-cards" / f"{old_id}.json"
+card = json.loads(old_path.read_text())
+card["intent"]["summary"] = "/Users/customer/raw/source/transcript.jsonl"
+body = {key: value for key, value in card.items() if key != "meaning_card_id"}
+canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+card["meaning_card_id"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
+new_path = root / "meaning-cards" / (
+    card["meaning_card_id"].removeprefix("sha256:") + ".json"
+)
+new_path.write_text(
+    json.dumps(card, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+new_path.chmod(0o600)
+old_path.unlink()
+PY
+  generate_meaning \
+    "$episode" "$source_ref" meaning-model-a "$output" \
+    "$TEST_ROOT/meaning-requests.jsonl" \
+    "$TEST_ROOT/meaning-evaluator-count" 2>"$error" || status=$?
+  if [[ "$status" -ne 0 && ! -s "$output" ]] \
+    && ! grep -q "Traceback" "$error"; then
+    pass "public IDを再hashした改ざんMeaning Cardもstrictに拒否する"
+  else
+    fail "public IDを再hashした改ざんMeaning Cardもstrictに拒否する"
   fi
 }
 
@@ -488,6 +711,10 @@ if [[ -f "$TEST_ROOT/meaning-a.json" && -s "$TEST_ROOT/meaning-a.json" ]]; then
   test_compact_card_has_five_meaning_fields_and_recorder_provenance
   test_baseline_to_meaning_uses_same_five_question_coverage
   test_cards_are_local_content_free_and_idempotent
+  test_unknown_outcome_is_partial_not_covered
+  test_raw_packet_fragment_echo_fails_closed
+  test_bundled_meaning_evaluator_requires_240_second_outer_timeout
+  test_rehashed_tampered_card_is_rejected
 fi
 
 echo

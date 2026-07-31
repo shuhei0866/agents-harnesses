@@ -285,6 +285,8 @@ test_private_values_never_reach_argv_stdout_or_stderr() {
   write_request "$REQUEST"
   assert_fail_closed "providerによるraw path/secret echoを拒否する" \
     meaning-echo "$REQUEST" meaning-echo
+  assert_fail_closed "providerによるsafe packet fragmentの丸写しを拒否する" \
+    meaning-fragment-echo "$REQUEST" meaning-fragment-echo
 }
 
 test_timeout_kills_provider_process_group() {

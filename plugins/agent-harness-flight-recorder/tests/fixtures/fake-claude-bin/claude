@@ -134,7 +134,7 @@ if mode.startswith("meaning-"):
     semantic = {
         "schema_version": 1,
         "intent": {
-            "summary": "Diagnose the bounded failing behavior.",
+            "summary": "Investigate the constrained observed failure.",
             "evidence_references": meaning_support,
         },
         "deliverable": {
@@ -165,6 +165,10 @@ if mode.startswith("meaning-"):
             "/Users/private/customer-project "
             "sk-test-secret-meaning-adapter"
         )
+    if mode == "meaning-fragment-echo":
+        semantic["intent"]["summary"] = request["packet"]["evidence"][0][
+            "content"
+        ]
 if mode == "invalid-schema":
     semantic.pop("assessment")
 if mode == "unsafe-execution-model":
