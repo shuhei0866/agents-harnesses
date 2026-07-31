@@ -121,6 +121,50 @@ for criterion in ("goal_achievement", "quality"):
     semantic["assessment"]["criteria"][criterion][
         "evidence_references"
     ] = support
+if mode.startswith("meaning-"):
+    meaning_evidence_ids = [
+        item["evidence_id"]
+        for item in request.get("packet", {}).get("evidence", [])
+        if isinstance(item, dict)
+        and isinstance(item.get("evidence_id"), str)
+    ]
+    meaning_support = meaning_evidence_ids[:1]
+    if mode == "meaning-invalid-ref":
+        meaning_support = ["sha256:" + "f" * 64]
+    semantic = {
+        "schema_version": 1,
+        "intent": {
+            "summary": "Diagnose the bounded failing behavior.",
+            "evidence_references": meaning_support,
+        },
+        "deliverable": {
+            "summary": "A verified bounded repository change.",
+            "evidence_references": meaning_support,
+        },
+        "verification": {
+            "summary": "The relevant verification completed successfully.",
+            "evidence_references": meaning_support,
+        },
+        "outcome": {
+            "state": "success",
+            "summary": "The requested bounded change was completed.",
+            "evidence_references": meaning_support,
+        },
+        "reusable_learning": {
+            "summary": (
+                "Prefer a small evidence packet before broader automation."
+            ),
+            "evidence_references": meaning_support,
+        },
+        "confidence": "high",
+    }
+    if mode == "meaning-invalid-schema":
+        semantic.pop("confidence")
+    if mode == "meaning-echo":
+        semantic["intent"]["summary"] = (
+            "/Users/private/customer-project "
+            "sk-test-secret-meaning-adapter"
+        )
 if mode == "invalid-schema":
     semantic.pop("assessment")
 if mode == "unsafe-execution-model":
@@ -130,6 +174,8 @@ if mode == "echo-source":
 
 total_cost_usd: object = 0.012345000001
 if mode == "over-budget":
+    total_cost_usd = 0.0500001
+elif mode == "meaning-over-budget":
     total_cost_usd = 0.0500001
 elif mode == "invalid-cost":
     total_cost_usd = "0.001"
