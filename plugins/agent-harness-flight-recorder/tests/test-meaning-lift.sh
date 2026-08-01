@@ -716,6 +716,31 @@ _validate_completed_span(
     ),
 )
 
+claude_unrelated = [
+    {
+        "type": "user",
+        "uuid": "old-prompt",
+        "parentUuid": None,
+        "sessionId": "session",
+        "message": {"role": "user", "content": "Old unrelated task."},
+    },
+    {
+        "type": "assistant",
+        "uuid": "old-answer",
+        "parentUuid": "old-prompt",
+        "sessionId": "session",
+        "message": {"role": "assistant", "content": "Old result."},
+    },
+    *claude_messages,
+    {"type": "last-prompt", "sessionId": "session", "leafUuid": "answer"},
+]
+try:
+    _validate_completed_span("claude-code", encoded(claude_unrelated))
+except VaultError:
+    pass
+else:
+    raise AssertionError("Claude unrelated messages outside chain were accepted")
+
 codex_outside = [
     {
         "type": "response_item",
@@ -750,9 +775,9 @@ else:
     raise AssertionError("Codex message outside task markers was accepted")
 PY
   then
-    pass "Claude last-prompt chainとCodex marker内messageを必須にする"
+    pass "Claude chain外message拒否とCodex marker内messageを必須にする"
   else
-    fail "Claude last-prompt chainとCodex marker内messageを必須にする"
+    fail "Claude chain外message拒否とCodex marker内messageを必須にする"
   fi
 }
 

@@ -302,7 +302,7 @@ def _validate_claude_completed_span(rows: list[dict[str, Any]]) -> None:
     if not found_prompt or not selected:
         raise VaultError("meaning source span is not one exact completed task")
     selected_set = set(selected)
-    for index in range(selected[0], selected[-1] + 1):
+    for index in range(len(rows) - 1):
         if (
             index not in selected_set
             and rows[index].get("type") in {"user", "assistant"}
@@ -512,18 +512,12 @@ def _validate_card_record(value: object) -> dict[str, Any]:
             or any(character in item for character in "\r\n\0")
         ):
             raise VaultError("stored Meaning Card provenance is invalid")
-    source_events = provenance.get("source_event_ids")
+    source_events = _checked_source_event_ids(
+        provenance.get("source_event_ids")
+    )
     source_span = provenance.get("source_span")
     if (
-        not isinstance(source_events, list)
-        or not source_events
-        or source_events != list(dict.fromkeys(source_events))
-        or len(source_events) > 256
-        or any(
-            not isinstance(item, str) or UUID_RE.fullmatch(item) is None
-            for item in source_events
-        )
-        or not isinstance(source_span, dict)
+        not isinstance(source_span, dict)
         or set(source_span) != SOURCE_SPAN_FIELDS
         or source_span.get("adapter") not in {"claude-code", "codex"}
     ):
@@ -579,6 +573,21 @@ def _validate_card_record(value: object) -> dict[str, Any]:
     )
     if value["meaning_card_id"] != expected_id:
         raise VaultError("stored Meaning Card ID is invalid")
+    return value
+
+
+def _checked_source_event_ids(value: object) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or value != list(dict.fromkeys(value))
+        or len(value) > 256
+        or any(
+            not isinstance(item, str) or UUID_RE.fullmatch(item) is None
+            for item in value
+        )
+    ):
+        raise VaultError("stored Meaning Card provenance is invalid")
     return value
 
 
@@ -932,7 +941,9 @@ def generate(
             locked=True,
         )
         baseline = _baseline(before["card"])
-        source_event_ids = before["card"]["source_event_ids"]
+        source_event_ids = _checked_source_event_ids(
+            before["card"]["source_event_ids"]
+        )
         current_source = load_registered_source(root, source_ref)
         _content, current_span_sha256 = _read_registered_span(
             current_source, start_line, end_line
