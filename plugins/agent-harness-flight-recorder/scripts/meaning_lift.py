@@ -97,6 +97,11 @@ SOURCE_SPAN_FIELDS = {
     "end_line",
 }
 HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 CARD_FILE_RE = re.compile(r"^[0-9a-f]{64}\.json$")
 CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 EMAIL_RE = re.compile(
@@ -232,35 +237,116 @@ def _validate_completed_span(adapter: str, selected_content: str) -> None:
         ]
     except (ValueError, UnicodeError, RecursionError) as error:
         raise VaultError("meaning source span is invalid") from error
+    if adapter == "claude-code":
+        _validate_claude_completed_span(rows)
+    elif adapter == "codex":
+        _validate_codex_completed_span(rows)
+    else:
+        raise VaultError("meaning source span is not one exact completed task")
+
+
+def _validate_message_counts(rows: list[dict[str, Any]]) -> None:
     messages = [_message_parts(row) for row in rows]
     human_count = sum(role == "user" and bool(parts) for role, parts in messages)
     assistant_count = sum(
         role == "assistant" and bool(parts) for role, parts in messages
     )
     if human_count != 1 or assistant_count < 1:
-        raise VaultError(
-            "meaning source span is not one exact completed task"
-        )
-    if adapter != "codex":
-        return
-    markers: list[tuple[str, object]] = []
-    for row in rows:
+        raise VaultError("meaning source span is not one exact completed task")
+
+
+def _validate_claude_completed_span(rows: list[dict[str, Any]]) -> None:
+    if (
+        not rows
+        or rows[-1].get("type") != "last-prompt"
+        or not isinstance(rows[-1].get("leafUuid"), str)
+        or not isinstance(rows[-1].get("sessionId"), str)
+    ):
+        raise VaultError("meaning source span is not one exact completed task")
+    marker = rows[-1]
+    uuid_rows = [
+        (row["uuid"], index, row)
+        for index, row in enumerate(rows[:-1])
+        if isinstance(row.get("uuid"), str)
+    ]
+    if len({uuid for uuid, _index, _row in uuid_rows}) != len(uuid_rows):
+        raise VaultError("meaning source span is not one exact completed task")
+    by_uuid = {uuid: (index, row) for uuid, index, row in uuid_rows}
+    selected: list[int] = []
+    current: str | None = marker["leafUuid"]
+    seen: set[str] = set()
+    found_prompt = False
+    while current is not None:
+        if current in seen or current not in by_uuid:
+            raise VaultError(
+                "meaning source span is not one exact completed task"
+            )
+        seen.add(current)
+        index, row = by_uuid[current]
+        if row.get("sessionId") != marker["sessionId"]:
+            raise VaultError(
+                "meaning source span is not one exact completed task"
+            )
+        selected.append(index)
+        role, parts = _message_parts(row)
+        if role == "user" and parts:
+            found_prompt = True
+            break
+        parent = row.get("parentUuid")
+        if parent is not None and not isinstance(parent, str):
+            raise VaultError(
+                "meaning source span is not one exact completed task"
+            )
+        current = parent
+    selected.reverse()
+    if not found_prompt or not selected:
+        raise VaultError("meaning source span is not one exact completed task")
+    selected_set = set(selected)
+    for index in range(selected[0], selected[-1] + 1):
+        if (
+            index not in selected_set
+            and rows[index].get("type") in {"user", "assistant"}
+        ):
+            raise VaultError(
+                "meaning source span is not one exact completed task"
+            )
+    leaf = rows[selected[-1]]
+    leaf_message = leaf.get("message")
+    if (
+        leaf.get("type") != "assistant"
+        or not isinstance(leaf_message, dict)
+        or leaf_message.get("role") != "assistant"
+    ):
+        raise VaultError("meaning source span is not one exact completed task")
+    _validate_message_counts([rows[index] for index in selected])
+
+
+def _validate_codex_completed_span(rows: list[dict[str, Any]]) -> None:
+    markers: list[tuple[int, str, object]] = []
+    for index, row in enumerate(rows):
         payload = row.get("payload") if isinstance(row, dict) else None
         if (
             isinstance(payload, dict)
             and payload.get("type") in {"task_started", "task_complete"}
         ):
-            markers.append((payload["type"], payload.get("turn_id")))
+            markers.append((index, payload["type"], payload.get("turn_id")))
     if (
         len(markers) != 2
-        or [item[0] for item in markers]
-        != ["task_started", "task_complete"]
-        or not isinstance(markers[0][1], str)
-        or markers[0][1] != markers[1][1]
+        or [item[1] for item in markers] != ["task_started", "task_complete"]
+        or not isinstance(markers[0][2], str)
+        or markers[0][2] != markers[1][2]
+        or markers[0][0] >= markers[1][0]
     ):
-        raise VaultError(
-            "meaning source span is not one exact completed task"
-        )
+        raise VaultError("meaning source span is not one exact completed task")
+    start, _kind, _turn = markers[0]
+    end, _kind, _turn = markers[1]
+    selected = rows[start + 1 : end]
+    if any(
+        _message_parts(row)[0] in {"user", "assistant"}
+        for row in rows[: start + 1] + rows[end:]
+    ):
+        raise VaultError("meaning source span is not one exact completed task")
+    _validate_message_counts(selected)
 
 
 def _checked_summary(value: object, description: str) -> str:
@@ -277,6 +363,26 @@ def _checked_summary(value: object, description: str) -> str:
     if ABSOLUTE_PATH_RE.search(value) or EMAIL_RE.search(value):
         raise VaultError("meaning evaluator returned private content")
     return value
+
+
+def _copied_packet_text(fragment: str, summaries: list[str]) -> bool:
+    normalized = fragment.strip().casefold()
+    if not normalized:
+        return False
+    window = 24
+    needles = (
+        {normalized}
+        if len(normalized) < window
+        else {
+            normalized[index : index + window]
+            for index in range(len(normalized) - window + 1)
+        }
+    )
+    return any(
+        needle in summary.casefold()
+        for needle in needles
+        for summary in summaries
+    )
 
 
 def _checked_field(
@@ -353,11 +459,7 @@ def _validate_response(
         response[name]["summary"] for name in MEANING_FIELDS
     ]
     for item in packet["evidence"]:
-        fragment = item["content"].strip()
-        if len(fragment) >= 8 and any(
-            fragment.casefold() in text.casefold()
-            for text in response_texts
-        ):
+        if _copied_packet_text(item["content"], response_texts):
             raise VaultError(
                 "meaning evaluator copied raw packet content"
             )
@@ -416,7 +518,11 @@ def _validate_card_record(value: object) -> dict[str, Any]:
         not isinstance(source_events, list)
         or not source_events
         or source_events != list(dict.fromkeys(source_events))
-        or any(not isinstance(item, str) or not item for item in source_events)
+        or len(source_events) > 256
+        or any(
+            not isinstance(item, str) or UUID_RE.fullmatch(item) is None
+            for item in source_events
+        )
         or not isinstance(source_span, dict)
         or set(source_span) != SOURCE_SPAN_FIELDS
         or source_span.get("adapter") not in {"claude-code", "codex"}
@@ -480,11 +586,15 @@ def _safe_card_directory(root: Path) -> Path:
     return safe_subdirectory(root, "meaning-cards")
 
 
-def _read_card(path: Path) -> dict[str, Any]:
+def _read_card_record(path: Path) -> tuple[bytes, dict[str, Any]]:
     if path.is_symlink() or not CARD_FILE_RE.fullmatch(path.name):
         raise VaultError("stored Meaning Card is unsafe")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
     try:
-        metadata = path.lstat()
+        descriptor = os.open(path, flags)
+        metadata = os.fstat(descriptor)
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_uid != os.geteuid()
@@ -493,21 +603,37 @@ def _read_card(path: Path) -> dict[str, Any]:
             or metadata.st_size > MAX_CARD_BYTES
         ):
             raise VaultError("stored Meaning Card is unsafe")
-        raw = path.read_bytes()
+        with os.fdopen(descriptor, "rb", closefd=True) as stream:
+            descriptor = -1
+            raw = stream.read(MAX_CARD_BYTES + 1)
+        after = path.lstat()
+        if (
+            after.st_dev != metadata.st_dev
+            or after.st_ino != metadata.st_ino
+            or after.st_size != metadata.st_size
+            or after.st_mtime_ns != metadata.st_mtime_ns
+            or after.st_ctime_ns != metadata.st_ctime_ns
+        ):
+            raise VaultError("stored Meaning Card changed while reading")
         value = json.loads(raw)
     except VaultError:
         raise
     except (OSError, ValueError, UnicodeError, RecursionError) as error:
         raise VaultError("stored Meaning Card is invalid") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     value = _validate_card_record(value)
     if path.name != f"{value['meaning_card_id'].removeprefix('sha256:')}.json":
         raise VaultError("stored Meaning Card ID is invalid")
-    return value
+    return raw, value
 
 
-def _stored_cards(root: Path) -> list[dict[str, Any]]:
+def _stored_card_records(
+    root: Path,
+) -> list[tuple[Path, bytes, dict[str, Any]]]:
     directory = root / "meaning-cards"
-    if not directory.exists():
+    if not directory.exists() and not directory.is_symlink():
         return []
     try:
         metadata = directory.lstat()
@@ -520,7 +646,18 @@ def _stored_cards(root: Path) -> list[dict[str, Any]]:
         or metadata.st_mode & 0o077
     ):
         raise VaultError("Meaning Card storage is unsafe")
-    return [_read_card(path) for path in sorted(directory.iterdir())]
+    return [
+        (path, *_read_card_record(path))
+        for path in sorted(directory.iterdir())
+    ]
+
+
+def _read_card(path: Path) -> dict[str, Any]:
+    return _read_card_record(path)[1]
+
+
+def _stored_cards(root: Path) -> list[dict[str, Any]]:
+    return [value for _path, _raw, value in _stored_card_records(root)]
 
 
 def meaning_card_record_snapshots(
@@ -528,18 +665,12 @@ def meaning_card_record_snapshots(
     policy_version: str,
     episode_id: str,
 ) -> list[tuple[Path, bytes]]:
-    directory = root / "meaning-cards"
-    if not directory.exists():
-        return []
-    cards: list[tuple[Path, bytes]] = []
-    for path in sorted(directory.iterdir()):
-        value = _read_card(path)
-        if (
-            value["episode_id"] == episode_id
-            and value["provenance"]["policy_version"] == policy_version
-        ):
-            cards.append((path, path.read_bytes()))
-    return cards
+    return [
+        (path, raw)
+        for path, raw, value in _stored_card_records(root)
+        if value["episode_id"] == episode_id
+        and value["provenance"]["policy_version"] == policy_version
+    ]
 
 
 def _same_generation(
@@ -550,6 +681,8 @@ def _same_generation(
     evaluator_runtime_sha256: str,
     policy_version: str,
     source_span: dict[str, Any],
+    source_event_ids: list[str],
+    packet_evidence_ids: list[str],
 ) -> bool:
     provenance = card.get("provenance")
     return (
@@ -562,6 +695,30 @@ def _same_generation(
         == evaluator_runtime_sha256
         and provenance.get("policy_version") == policy_version
         and provenance.get("source_span") == source_span
+        and provenance.get("source_event_ids") == source_event_ids
+        and provenance.get("packet_evidence_ids") == packet_evidence_ids
+    )
+
+
+def _evaluator_runtime_identity(
+    evaluator_path: Path,
+    evaluator_sha256: str,
+) -> str:
+    if evaluator_path.name != "flight-recorder-claude-meaning-evaluator":
+        return evaluator_sha256
+    shared_path = evaluator_path.parent / (
+        "flight-recorder-claude-semantic-evaluator"
+    )
+    resolved_shared, shared_sha256 = _executable_identity(str(shared_path))
+    if resolved_shared != shared_path.resolve():
+        raise VaultError("meaning evaluator runtime is unsafe")
+    return _sha256(
+        canonical_json(
+            {
+                "meaning_adapter_sha256": evaluator_sha256,
+                "shared_adapter_sha256": shared_sha256,
+            }
+        )
     )
 
 
@@ -670,7 +827,7 @@ def _comparison(
             else "partial"
         ),
         "reusable_learning": "covered",
-        "time_and_api_cost": "covered",
+        "time_and_api_cost": baseline["answers"]["time_and_api_cost"]["state"],
     }
     for name in QUESTION_FIELDS:
         meaning_state = meaning_states[name]
@@ -726,7 +883,6 @@ def generate(
         or maximum_cost_microusd > MAX_COST_MICROUSD
     ):
         raise VaultError("meaning evaluator cost budget is invalid")
-    before = inspect_episode(root, episode_id, policy_version, policy_path)
     source = load_registered_source(root, source_ref)
     selected_content, span_sha256 = _read_registered_span(
         source, start_line, end_line
@@ -738,23 +894,9 @@ def generate(
     evaluator_path, evaluator_sha256 = _executable_identity(
         selected_evaluator
     )
-    evaluator_runtime_sha256 = evaluator_sha256
-    if evaluator_path.name == "flight-recorder-claude-meaning-evaluator":
-        shared_path = evaluator_path.parent / (
-            "flight-recorder-claude-semantic-evaluator"
-        )
-        if not shared_path.is_file() or shared_path.is_symlink():
-            raise VaultError("meaning evaluator runtime is unsafe")
-        evaluator_runtime_sha256 = _sha256(
-            canonical_json(
-                {
-                    "meaning_adapter_sha256": evaluator_sha256,
-                    "shared_adapter_sha256": _sha256(
-                        shared_path.read_bytes()
-                    ),
-                }
-            )
-        )
+    evaluator_runtime_sha256 = _evaluator_runtime_identity(
+        evaluator_path, evaluator_sha256
+    )
     if (
         evaluator_path.name in BUNDLED_EVALUATORS
         and timeout_seconds < 240
@@ -770,87 +912,36 @@ def generate(
         "start_line": start_line,
         "end_line": end_line,
     }
-    baseline = _baseline(before["card"])
     # Validate or migrate the managed ignore boundary before a paid call.
     ensure_managed_gitignore(root)
-    for existing in _stored_cards(root):
-        if _same_generation(
-            existing,
-            episode_id,
-            packet["packet_sha256"],
-            selected_model,
-            evaluator_runtime_sha256,
-            before["policy_version"],
-            source_span,
-        ):
-            return _result(existing, baseline)
     request = {
         "schema_version": 2,
         "model": selected_model,
         "packet": packet,
         "remaining_cost_microusd": maximum_cost_microusd,
     }
-    started = time.monotonic_ns()
-    raw_response = _invoke(
-        evaluator_path, evaluator_sha256, request, timeout_seconds
-    )
-    latency_ms = max(0, (time.monotonic_ns() - started) // 1_000_000)
-    response, measured_cost = _validate_response(
-        raw_response, packet, maximum_cost_microusd
-    )
-    meaning_card: dict[str, Any] = {
-        "schema_version": CARD_VERSION,
-        "meaning_card_id": "",
-        "episode_id": episode_id,
-        **response,
-        "provenance": {
-            "contract_version": CARD_CONTRACT,
-            "packet_sha256": packet["packet_sha256"],
-            "packet_evidence_ids": sorted(
-                item["evidence_id"] for item in packet["evidence"]
-            ),
-            "evaluator_model": selected_model,
-            "evaluator_adapter": evaluator_path.name,
-            "evaluator_adapter_sha256": evaluator_sha256,
-            "evaluator_runtime_sha256": evaluator_runtime_sha256,
-            "policy_version": before["policy_version"],
-            "source_event_ids": before["card"]["source_event_ids"],
-            "source_span": source_span,
-            "generated_at": _evaluated_at(),
-            "measured_cost_microusd": measured_cost,
-            "latency_ms": latency_ms,
-        },
-    }
-    meaning_card["meaning_card_id"] = _sha256(
-        canonical_json(
-            {
-                key: value
-                for key, value in meaning_card.items()
-                if key != "meaning_card_id"
-            }
-        )
+    packet_evidence_ids = sorted(
+        item["evidence_id"] for item in packet["evidence"]
     )
     with vault_lock(root):
-        after = inspect_episode(
+        before = inspect_episode(
             root,
             episode_id,
             policy_version,
             policy_path,
             locked=True,
         )
-        if (
-            after["policy_version"] != before["policy_version"]
-            or after["card"]["source_event_ids"]
-            != before["card"]["source_event_ids"]
-        ):
-            raise VaultError(
-                "episode evidence changed during meaning generation"
-            )
+        baseline = _baseline(before["card"])
+        source_event_ids = before["card"]["source_event_ids"]
         current_source = load_registered_source(root, source_ref)
         _content, current_span_sha256 = _read_registered_span(
             current_source, start_line, end_line
         )
-        if current_span_sha256 != span_sha256:
+        if (
+            current_source["adapter"] != source["adapter"]
+            or current_source["content_sha256"] != source["content_sha256"]
+            or current_span_sha256 != span_sha256
+        ):
             raise VaultError(
                 "registered session source changed during meaning generation"
             )
@@ -863,8 +954,67 @@ def generate(
                 evaluator_runtime_sha256,
                 before["policy_version"],
                 source_span,
+                source_event_ids,
+                packet_evidence_ids,
             ):
                 return _result(existing, baseline)
+        started = time.monotonic_ns()
+        raw_response = _invoke(
+            evaluator_path, evaluator_sha256, request, timeout_seconds
+        )
+        latency_ms = max(0, (time.monotonic_ns() - started) // 1_000_000)
+        response, measured_cost = _validate_response(
+            raw_response, packet, maximum_cost_microusd
+        )
+        if (
+            _evaluator_runtime_identity(evaluator_path, evaluator_sha256)
+            != evaluator_runtime_sha256
+        ):
+            raise VaultError(
+                "meaning evaluator runtime changed during evaluation"
+            )
+        current_source = load_registered_source(root, source_ref)
+        _content, current_span_sha256 = _read_registered_span(
+            current_source, start_line, end_line
+        )
+        if (
+            current_source["adapter"] != source["adapter"]
+            or current_source["content_sha256"] != source["content_sha256"]
+            or current_span_sha256 != span_sha256
+        ):
+            raise VaultError(
+                "registered session source changed during meaning generation"
+            )
+        meaning_card: dict[str, Any] = {
+            "schema_version": CARD_VERSION,
+            "meaning_card_id": "",
+            "episode_id": episode_id,
+            **response,
+            "provenance": {
+                "contract_version": CARD_CONTRACT,
+                "packet_sha256": packet["packet_sha256"],
+                "packet_evidence_ids": packet_evidence_ids,
+                "evaluator_model": selected_model,
+                "evaluator_adapter": evaluator_path.name,
+                "evaluator_adapter_sha256": evaluator_sha256,
+                "evaluator_runtime_sha256": evaluator_runtime_sha256,
+                "policy_version": before["policy_version"],
+                "source_event_ids": source_event_ids,
+                "source_span": source_span,
+                "generated_at": _evaluated_at(),
+                "measured_cost_microusd": measured_cost,
+                "latency_ms": latency_ms,
+            },
+        }
+        meaning_card["meaning_card_id"] = _sha256(
+            canonical_json(
+                {
+                    key: value
+                    for key, value in meaning_card.items()
+                    if key != "meaning_card_id"
+                }
+            )
+        )
         _store_card(root, meaning_card)
     return _result(meaning_card, baseline)
 

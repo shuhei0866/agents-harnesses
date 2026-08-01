@@ -376,8 +376,9 @@ Accepted decisions remain recorded when later superseded.
   Card rather than paying again. Automatic candidate selection, routing, and
   external export remain unchanged pending the pilot result. The first
   corrected real-task pilot increased the comparable score from `0.0` to
-  `4.0/5.0`; deliverable and verification/outcome remained partial because the
-  Card distinguished a completed turn from an unverified real-world outcome.
+  `3.0/5.0`; deliverable and verification/outcome remained partial because the
+  Card distinguished a completed turn from an unverified real-world outcome,
+  while task time/API cost correctly remained uncovered.
   Unattended provider calls remained blocked by local CLI authentication, and
   whole-graph evidence authentication dominated command latency, so automatic
   paid generation remains disabled.

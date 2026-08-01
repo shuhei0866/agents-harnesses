@@ -9,7 +9,8 @@ an automatic-routing benchmark.
 ## Input boundary
 
 The selected completed task was a request to create an issue after checking
-for duplicates. The registered source span contained 11 JSONL lines. The
+for duplicates. The registered source span contained 12 JSONL lines, including
+the exact Claude Code `last-prompt` completion marker. The
 deterministic extractor produced:
 
 - a 743-byte `meaning-packet-v1`;
@@ -23,7 +24,7 @@ summaries, evidence IDs, hashes, and recorder-generated provenance.
 ## Result
 
 The deterministic baseline scored `0.0/5.0`. The Meaning Card scored
-`4.0/5.0` on the same conservative comparison:
+`3.0/5.0` on the same conservative comparison:
 
 | Question | Baseline | Meaning |
 | --- | --- | --- |
@@ -31,7 +32,7 @@ The deterministic baseline scored `0.0/5.0`. The Meaning Card scored
 | Deliverable | uncovered | partial |
 | Verification and outcome | uncovered | partial |
 | Reusable learning | uncovered | covered |
-| Time and API cost | uncovered | covered |
+| Task time and API cost | uncovered | uncovered |
 
 The most useful result was not the score itself. The lifecycle event
 looked completed, while the semantic evidence only showed an intention to file
@@ -41,17 +42,25 @@ material distinction that the metadata-only baseline could not make, and it
 kept both deliverable and verification/outcome at partial rather than awarding
 full credit for fluent summaries.
 
-The corrected interactive evaluator step took 239 ms and recorded zero
-micro-USD. The full command took roughly four minutes because it authenticated
-the complete 15,215-event relationship graph before and after evaluation. One local
-content-addressed Card was stored, and a scan found no source path, recognized
-secret, tool-output canary, or packet canary in local Card storage. The
-automatic evaluator budget remained zero.
+The task-time/API-cost answer deliberately stays uncovered: evaluator cost and
+latency describe the cost of semantic projection, not the resource cost of the
+original task. Counting them as the same answer would inflate lift using a
+different measure.
 
-An earlier draft comparison reported `0/5` to `5/5`. Review found that its
-baseline queried fields that do not exist on the deterministic Card and that
-an `unknown` outcome was over-credited. That number is superseded by the
-corrected `0.0` to `4.0/5.0` result above.
+The corrected interactive evaluator step took 214 ms and recorded zero
+micro-USD. The full command took roughly 138 seconds because authenticating
+the complete 15,215-event relationship graph still dominated execution. The
+pilot now holds a vault lock across the paid boundary, so one authenticated
+graph snapshot is sufficient and concurrent identical calls cannot both reach
+the evaluator. One local content-addressed Card was stored, and a scan found
+no source path, recognized secret, tool-output canary, or packet canary in
+local Card storage. The automatic evaluator budget remained zero.
+
+Earlier draft comparisons reported `0/5` to `5/5`, then `0.0` to `4.0/5.0`.
+Review found that the original baseline queried fields that do not exist on
+the deterministic Card, an `unknown` outcome was over-credited, and evaluator
+cost was incorrectly used as task cost. Those numbers are superseded by the
+corrected `0.0` to `3.0/5.0` result above.
 
 ## Provider smoke results
 

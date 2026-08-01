@@ -30,7 +30,7 @@ evidence_ids = [
     item["evidence_id"] for item in request["packet"]["evidence"]
 ]
 support = evidence_ids[:1]
-intent_summary = "Diagnose the bounded failing behavior."
+intent_summary = "Identify the cause and confirm a narrowly scoped correction."
 if os.environ.get("FLIGHT_RECORDER_TEST_MEANING_ECHO_FRAGMENT") == "1":
     intent_summary = request["packet"]["evidence"][0]["content"]
 json.dump(
@@ -41,18 +41,18 @@ json.dump(
             "evidence_references": support,
         },
         "deliverable": {
-            "summary": "A verified bounded repository change.",
+            "summary": "A repository modification with an explicit check.",
             "evidence_references": support,
         },
         "verification": {
-            "summary": "The relevant verification completed successfully.",
+            "summary": "Checks indicate the scoped modification behaved as intended.",
             "evidence_references": support,
         },
         "outcome": {
             "state": os.environ.get(
                 "FLIGHT_RECORDER_TEST_MEANING_OUTCOME", "success"
             ),
-            "summary": "The requested bounded change was completed.",
+            "summary": "The requested correction reached a successful terminal state.",
             "evidence_references": support,
         },
         "reusable_learning": {

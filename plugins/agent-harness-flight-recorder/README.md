@@ -447,7 +447,7 @@ scripts/flight-recorder meaning generate <episode-id> \
 
 The result compares the deterministic baseline and model-derived Card using the
 same five questions: intent, deliverable, verification and outcome, reusable
-learning, and time and API cost. The baseline is derived from fields that
+learning, and task time and API cost. The baseline is derived from fields that
 actually exist on the deterministic Evidence Card. Answers score as covered
 (`1`), partial (`0.5`), or uncovered (`0`); an `unknown` model outcome cannot
 turn deliverable or outcome into covered. A model field also needs a bounded
@@ -456,7 +456,8 @@ adds the packet digest, source-span digest, evaluator identity, measured
 micro-USD, and latency. Cards are content-addressed under owner-only,
 Git-ignored `meaning-cards/`; the same
 episode/span/model/evaluator/runtime/policy contract returns the existing Card
-without another provider call.
+without another provider call. Manual generation is serialized across the paid
+boundary so concurrent identical calls cannot both invoke the evaluator.
 
 The bundled adapter uses the same safe, tool-less, nonpersistent Claude child
 boundary as automatic Semantic Receipts, but sends only the minimized packet.

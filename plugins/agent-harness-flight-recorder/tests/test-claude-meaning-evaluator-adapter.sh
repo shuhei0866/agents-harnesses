@@ -238,6 +238,7 @@ test_bounds_references_and_budget_fail_closed() {
   local oversized="$TEST_ROOT/oversized.json"
   local too_many="$TEST_ROOT/too-many.json"
   local long_content="$TEST_ROOT/long-content.json"
+  local over_cap="$TEST_ROOT/over-cap.json"
   printf '%s' '{"schema_version":2,"packet":' >"$malformed"
   python3 - "$oversized" <<'PY'
 import pathlib
@@ -246,6 +247,7 @@ pathlib.Path(sys.argv[1]).write_bytes(b"{" + b"x" * (2 * 1024 * 1024))
 PY
   write_request "$too_many" 50000 too-many-evidence
   write_request "$long_content" 50000 long-content
+  write_request "$over_cap" 100001
   assert_fail_closed "malformed requestをprovider前に拒否する" \
     meaning-valid "$malformed" malformed no
   assert_fail_closed "oversized requestをbounded readで拒否する" \
@@ -254,6 +256,8 @@ PY
     meaning-valid "$too_many" too-many no
   assert_fail_closed "2048文字超のpacket contentをprovider前に拒否する" \
     meaning-valid "$long_content" long-content no
+  assert_fail_closed "100000 micro-USD超のbudgetをprovider前に拒否する" \
+    meaning-valid "$over_cap" over-cap no
   write_request "$REQUEST"
   assert_fail_closed "packet外evidence referenceを拒否する" \
     meaning-invalid-ref "$REQUEST" invalid-ref

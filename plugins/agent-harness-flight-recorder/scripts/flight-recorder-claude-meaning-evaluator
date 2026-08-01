@@ -19,6 +19,7 @@ MAX_PACKET_BYTES = 16 * 1024
 MAX_EVIDENCE_ITEMS = 8
 MAX_EVIDENCE_TEXT = 2_048
 MAX_SUMMARY_TEXT = 512
+MAX_COST_MICROUSD = 100_000
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
 HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 SECRET_RE = re.compile(
@@ -128,6 +129,7 @@ def _load_request() -> dict[str, Any]:
         isinstance(budget, bool)
         or not isinstance(budget, int)
         or budget <= 0
+        or budget > MAX_COST_MICROUSD
         or not isinstance(packet, dict)
         or set(packet) != PACKET_FIELDS
         or packet.get("schema_version") != 1
@@ -329,9 +331,19 @@ def _response(raw: bytes, request: dict[str, Any]) -> dict[str, Any]:
         semantic[name]["summary"] for name in MEANING_FIELDS
     ]
     for item in request["packet"]["evidence"]:
-        fragment = item["content"].strip()
-        if len(fragment) >= 8 and any(
-            fragment.casefold() in text.casefold()
+        fragment = item["content"].strip().casefold()
+        window = 24
+        needles = (
+            {fragment}
+            if len(fragment) < window
+            else {
+                fragment[index : index + window]
+                for index in range(len(fragment) - window + 1)
+            }
+        )
+        if fragment and any(
+            needle in text.casefold()
+            for needle in needles
             for text in response_texts
         ):
             raise AdapterError

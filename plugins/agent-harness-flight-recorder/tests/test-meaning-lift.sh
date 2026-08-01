@@ -450,11 +450,13 @@ assert baseline["answers"]["time_and_api_cost"] == {
 }
 assert baseline["score"] == 1.5
 assert comparison["baseline_score"] == baseline["score"]
-assert comparison["meaning_score"] == 5.0
-assert comparison["score_lift"] == 3.5
+assert comparison["meaning_score"] == 4.5
+assert comparison["score_lift"] == 3.0
 for question, states in comparison["questions"].items():
     assert states["baseline"] == baseline["answers"][question]["state"]
-    assert states["meaning"] == "covered"
+    assert states["meaning"] == (
+        "partial" if question == "time_and_api_cost" else "covered"
+    )
 PY
   then
     pass "baselineとMeaning Cardを同一5問で比較しcoverage liftを算出する"
@@ -508,10 +510,10 @@ assert comparison["questions"]["verification_and_outcome"]["meaning"] == (
 )
 assert comparison["questions"]["intent"]["meaning"] == "covered"
 assert comparison["questions"]["reusable_learning"]["meaning"] == "covered"
-assert comparison["questions"]["time_and_api_cost"]["meaning"] == "covered"
-assert comparison["meaning_score"] == 4.0
+assert comparison["questions"]["time_and_api_cost"]["meaning"] == "partial"
+assert comparison["meaning_score"] == 3.5
 assert comparison["score_lift"] == (
-    4.0 - comparison["baseline_score"]
+    3.5 - comparison["baseline_score"]
 )
 PY
   then
@@ -670,6 +672,132 @@ PY
   fi
 }
 
+test_requires_exact_provider_completion_boundaries() {
+  echo "test_requires_exact_provider_completion_boundaries:"
+  if PYTHONPATH="$PLUGIN_DIR/scripts" python3 - <<'PY'
+import json
+
+from meaning_lift import _validate_completed_span
+from vault import VaultError
+
+
+def encoded(rows):
+    return "\n".join(json.dumps(row) for row in rows) + "\n"
+
+
+claude_messages = [
+    {
+        "type": "user",
+        "uuid": "prompt",
+        "parentUuid": None,
+        "sessionId": "session",
+        "message": {"role": "user", "content": "Do the task."},
+    },
+    {
+        "type": "assistant",
+        "uuid": "answer",
+        "parentUuid": "prompt",
+        "sessionId": "session",
+        "message": {"role": "assistant", "content": "Task complete."},
+    },
+]
+try:
+    _validate_completed_span("claude-code", encoded(claude_messages))
+except VaultError:
+    pass
+else:
+    raise AssertionError("Claude span without last-prompt was accepted")
+
+_validate_completed_span(
+    "claude-code",
+    encoded(
+        claude_messages
+        + [{"type": "last-prompt", "sessionId": "session", "leafUuid": "answer"}]
+    ),
+)
+
+codex_outside = [
+    {
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Outside."}],
+        },
+    },
+    {
+        "type": "event_msg",
+        "payload": {"type": "task_started", "turn_id": "turn"},
+    },
+    {
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Inside."}],
+        },
+    },
+    {
+        "type": "event_msg",
+        "payload": {"type": "task_complete", "turn_id": "turn"},
+    },
+]
+try:
+    _validate_completed_span("codex", encoded(codex_outside))
+except VaultError:
+    pass
+else:
+    raise AssertionError("Codex message outside task markers was accepted")
+PY
+  then
+    pass "Claude last-prompt chainとCodex marker内messageを必須にする"
+  else
+    fail "Claude last-prompt chainとCodex marker内messageを必須にする"
+  fi
+}
+
+test_purge_snapshot_rejects_symlinked_meaning_directory() {
+  echo "test_purge_snapshot_rejects_symlinked_meaning_directory:"
+  local directory="$STATE/meaning-cards"
+  local outside="$TEST_ROOT/outside-meaning-cards"
+  local status=0
+  mv "$directory" "$outside" || status=$?
+  if [[ "$status" -eq 0 ]]; then
+    ln -s "$outside" "$directory" || status=$?
+  fi
+  if [[ "$status" -eq 0 ]]; then
+    PYTHONPATH="$PLUGIN_DIR/scripts" python3 - "$STATE" <<'PY' || status=$?
+import pathlib
+import sys
+
+from meaning_lift import meaning_card_record_snapshots
+from vault import VaultError
+
+root = pathlib.Path(sys.argv[1])
+try:
+    meaning_card_record_snapshots(
+        root,
+        "default-v1",
+        "sha256:" + "a" * 64,
+    )
+except VaultError:
+    pass
+else:
+    raise AssertionError("symlinked Meaning Card directory was accepted")
+PY
+  fi
+  if [[ "$status" -eq 0 ]] \
+    && [[ -n "$(find "$outside" -maxdepth 1 -type f -name '*.json' -print -quit)" ]] \
+    && rm "$directory" \
+    && mv "$outside" "$directory"; then
+    pass "purge snapshotはsymlinked Meaning Card親を辿らない"
+  else
+    [[ -L "$directory" ]] && rm "$directory"
+    [[ -d "$outside" && ! -e "$directory" ]] && mv "$outside" "$directory"
+    fail "purge snapshotはsymlinked Meaning Card親を辿らない"
+  fi
+}
+
 test_rehashed_tampered_card_is_rejected() {
   echo "test_rehashed_tampered_card_is_rejected:"
   local first="$TEST_ROOT/meaning-a.json"
@@ -697,7 +825,9 @@ output = json.loads(pathlib.Path(sys.argv[2]).read_text())
 old_id = output["meaning_card"]["meaning_card_id"].removeprefix("sha256:")
 old_path = root / "meaning-cards" / f"{old_id}.json"
 card = json.loads(old_path.read_text())
-card["intent"]["summary"] = "/Users/customer/raw/source/transcript.jsonl"
+card["provenance"]["source_event_ids"] = [
+    "/Users/customer/raw/source/transcript.jsonl"
+]
 body = {key: value for key, value in card.items() if key != "meaning_card_id"}
 canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
 card["meaning_card_id"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
@@ -717,9 +847,9 @@ PY
     "$TEST_ROOT/meaning-evaluator-count" 2>"$error" || status=$?
   if [[ "$status" -ne 0 && ! -s "$output" ]] \
     && ! grep -q "Traceback" "$error"; then
-    pass "public IDを再hashした改ざんMeaning Cardもstrictに拒否する"
+    pass "private provenanceを再hashした改ざんMeaning Cardもstrictに拒否する"
   else
-    fail "public IDを再hashした改ざんMeaning Cardもstrictに拒否する"
+    fail "private provenanceを再hashした改ざんMeaning Cardもstrictに拒否する"
   fi
 }
 
@@ -798,6 +928,8 @@ if [[ -f "$TEST_ROOT/meaning-a.json" && -s "$TEST_ROOT/meaning-a.json" ]]; then
   test_raw_packet_fragment_echo_fails_closed
   test_bundled_meaning_evaluator_requires_240_second_outer_timeout
   test_rejects_multi_task_span_before_provider
+  test_requires_exact_provider_completion_boundaries
+  test_purge_snapshot_rejects_symlinked_meaning_directory
   test_rehashed_tampered_card_is_rejected
 fi
 

@@ -454,7 +454,7 @@ policy, and contract reuses the stored Card without another paid invocation.
 
 The command also emits a deterministic baseline and a five-question comparison:
 intent, deliverable, verification and outcome, reusable learning, and time and
-API cost. The baseline reads only fields that exist on the authenticated
+API cost for the original task. The baseline reads only fields that exist on the authenticated
 Evidence Card. Coverage is intentionally conservative: answers score as
 covered (`1`), partial (`0.5`), or uncovered (`0`), and an `unknown` model
 outcome leaves deliverable and verification/outcome only partial. A Meaning
