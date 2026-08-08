@@ -1,0 +1,19 @@
+name: Git Safety Pack Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  git-safety-pack-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Git Safety Pack tests
+        run: bash packs/git-safety/tests/test-git-safety.sh
