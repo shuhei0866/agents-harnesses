@@ -130,6 +130,18 @@ else
   fail "未知の mode は無変更で拒否する"
 fi
 
+CASE_DIR="$TMPDIR_TEST/overlapping_install"
+SETTINGS="$CASE_DIR/profile/sub/../settings.json"
+DATA_DIR="$CASE_DIR/profile"
+mkdir -p "$CASE_DIR"
+if run_cli install --mode advisory --settings "$SETTINGS" --data-dir "$DATA_DIR" >/dev/null 2>&1; then
+  fail "data directory 内の settings path を拒否する"
+elif [ ! -e "$DATA_DIR" ]; then
+  pass "危険な settings/data 重複は無変更で拒否する"
+else
+  fail "危険な settings/data 重複は無変更で拒否する"
+fi
+
 new_case symlink
 REAL_SETTINGS="$CASE_DIR/real-settings.json"
 printf '{}\n' > "$REAL_SETTINGS"
@@ -267,6 +279,23 @@ if run_cli uninstall --dry-run --settings "$SETTINGS" --data-dir "$DATA_DIR" >/d
   pass "uninstall --dry-run は settings と data を変更しない"
 else
   fail "uninstall --dry-run は settings と data を変更しない"
+fi
+
+CASE_DIR="$TMPDIR_TEST/overlapping_uninstall"
+DATA_DIR="$CASE_DIR/profile"
+SETTINGS="$DATA_DIR/settings.json"
+mkdir -p "$DATA_DIR"
+printf '{}\n' > "$SETTINGS"
+printf 'keep\n' > "$DATA_DIR/user-file"
+jq -n --arg product "agents-harnesses/git-safety-pack" \
+  '{product:$product,version:"0.1.0",owned_commands:[],settings_structure:{}}' \
+  > "$DATA_DIR/.git-safety-pack.json"
+if run_cli uninstall --settings "$SETTINGS" --data-dir "$DATA_DIR" >/dev/null 2>&1; then
+  fail "旧版の危険な重複配置を uninstall が拒否する"
+elif [ -f "$SETTINGS" ] && [ -f "$DATA_DIR/user-file" ]; then
+  pass "旧版の危険な重複配置も settings と無関係なfileを削除しない"
+else
+  fail "旧版の危険な重複配置も settings と無関係なfileを削除しない"
 fi
 
 new_case unowned_hook

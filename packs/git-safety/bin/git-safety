@@ -109,6 +109,25 @@ def validate_data_dir(data_dir: Path) -> None:
         raise SafetyPackError(f"危険な data directory は指定できません: {data_dir}")
 
 
+def validate_layout(settings_path: Path, data_dir: Path) -> None:
+    settings_resolved = settings_path.resolve(strict=False)
+    data_resolved = data_dir.resolve(strict=False)
+    try:
+        settings_resolved.relative_to(data_resolved)
+        overlaps = True
+    except ValueError:
+        try:
+            data_resolved.relative_to(settings_resolved)
+            overlaps = True
+        except ValueError:
+            overlaps = False
+    if overlaps:
+        raise SafetyPackError(
+            "settings と data directory は同一または包含関係にできません: "
+            f"settings={settings_path}, data={data_dir}"
+        )
+
+
 def all_hook_commands(settings: dict[str, Any]) -> list[str]:
     hooks = settings.get("hooks", {})
     if not isinstance(hooks, dict):
@@ -259,6 +278,7 @@ def install(args: argparse.Namespace) -> int:
     settings_path = absolute_path(args.settings)
     data_dir = absolute_path(args.data_dir)
     validate_data_dir(data_dir)
+    validate_layout(settings_path, data_dir)
     settings, settings_existed = read_settings(settings_path)
     existing_marker = read_marker(data_dir, allow_absent=False) if data_dir.exists() else None
     commands = expected_commands(data_dir)
@@ -308,6 +328,12 @@ def doctor(args: argparse.Namespace) -> int:
     data_dir = absolute_path(args.data_dir)
     problems: list[str] = []
     warnings: list[str] = []
+
+    try:
+        validate_data_dir(data_dir)
+        validate_layout(settings_path, data_dir)
+    except SafetyPackError as exc:
+        problems.append(str(exc))
 
     for dependency in ("git", "jq", "python3"):
         if shutil.which(dependency):
@@ -373,6 +399,7 @@ def uninstall(args: argparse.Namespace) -> int:
     settings_path = absolute_path(args.settings)
     data_dir = absolute_path(args.data_dir)
     validate_data_dir(data_dir)
+    validate_layout(settings_path, data_dir)
     settings, settings_existed = read_settings(settings_path)
     marker = read_marker(data_dir, allow_absent=False) if data_dir.exists() else None
     if marker is None:
