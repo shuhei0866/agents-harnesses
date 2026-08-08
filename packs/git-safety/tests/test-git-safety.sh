@@ -150,7 +150,9 @@ new_case permissions
 printf '{}\n' > "$SETTINGS"
 chmod 600 "$SETTINGS"
 run_cli install --mode advisory --settings "$SETTINGS" --data-dir "$DATA_DIR" >/dev/null
-settings_mode=$(stat -f '%Lp' "$SETTINGS" 2>/dev/null || stat -c '%a' "$SETTINGS")
+settings_mode=$(python3 -c \
+  'import os, stat, sys; print(format(stat.S_IMODE(os.stat(sys.argv[1]).st_mode), "o"))' \
+  "$SETTINGS")
 if [ "$settings_mode" = "600" ]; then
   pass "既存 settings の permission を維持する"
 else
