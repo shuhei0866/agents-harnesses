@@ -477,7 +477,7 @@ CodeRabbit のようなレビューボットが高品質な指摘を出せる理
 ### Completeness & Integration (opus)
 {JSON Lines output from reviewer, as-is}
 
-### Spec Compliance (if --spec)
+### Spec Compliance (スペック文書を検出したか --spec 指定時)
 {JSON Lines output from reviewer, as-is}
 
 ### Codex (if --codex)
