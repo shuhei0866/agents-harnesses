@@ -634,15 +634,22 @@ if ! guard_is_trunk_direct; then
     ADVISORY_UNKNOWN="${_COMMIT_GUARD_ADVISORY_UNKNOWN[$ADVISORY_INDEX]}"
     ADVISORY_DETAIL="${_COMMIT_GUARD_ADVISORY_DETAILS[$ADVISORY_INDEX]}"
 
-    if [ "$ADVISORY_UNKNOWN" -eq 1 ] || [ -z "$ADVISORY_DIR" ]; then
-      guard_respond "advisory" "コミット衛生ガード" "${ADVISORY_OP} の対象リポジトリを一意に確認できませんでした。コマンドの作業ディレクトリまたは \`git -C <path>\` で対象リポジトリを明示してください。"
+    # 特定できない理由は 2 つあり、取るべき行動が違うので文言を分ける。
+    # 「対象リポジトリを明示してください」と一括で案内すると、既に `git -C <path>` を
+    # 使っている入力に対して従いようのない指示になる。
+    if [ "$ADVISORY_UNKNOWN" -eq 1 ]; then
+      guard_respond "advisory" "コミット衛生ガード" "${ADVISORY_OP} の対象リポジトリを特定できませんでした。GIT_DIR / GIT_WORK_TREE の指定や、ガードが追随できない形での作業ディレクトリの変更があります。cd するだけではコマンドローカルの環境変数が対象を上書きし続けるので、GIT_DIR / GIT_WORK_TREE を外したうえで対象リポジトリへ cd してから実行してください。"
+    fi
+
+    if [ -z "$ADVISORY_DIR" ]; then
+      guard_respond "advisory" "コミット衛生ガード" "${ADVISORY_OP} の対象リポジトリを特定できませんでした。指定されたパスが存在しないか、変数（\`git -C \"\$VAR\"\` など）で渡されていて中身をガードが知り得ません。ガードはコマンド文字列だけを読むためです。実在するパスをリテラルで書くか、対象リポジトリへ cd してから実行してください。"
     fi
 
     GIT_COMMON_DIR=$(git -C "$ADVISORY_DIR" rev-parse --git-common-dir 2>/dev/null || echo "")
     GIT_DIR=$(git -C "$ADVISORY_DIR" rev-parse --git-dir 2>/dev/null || echo "")
     BRANCH=$(git -C "$ADVISORY_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
     if [ -z "$GIT_DIR" ] || [ -z "$GIT_COMMON_DIR" ]; then
-      guard_respond "advisory" "コミット衛生ガード" "${ADVISORY_OP} の対象リポジトリを確認できませんでした。コマンドの作業ディレクトリまたは \`git -C <path>\` で対象リポジトリを明示してください。"
+      guard_respond "advisory" "コミット衛生ガード" "${ADVISORY_OP} の対象を git リポジトリとして読めませんでした。パス自体は解決できているので、それが git リポジトリを指しているかを確認してください。"
     fi
 
     case "$ADVISORY_OP" in

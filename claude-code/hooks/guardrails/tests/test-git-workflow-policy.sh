@@ -275,7 +275,7 @@ echo "=== unresolved repository advisories describe the actual decision ==="
 
 run_bash_guard "$COMMIT_GUARD" 'GIT_DIR=/tmp/example.git git commit -m test' worktree-pr warn
 assert_warn_allow "曖昧な commit target は warn 設定で警告して許可する"
-assert_contains "曖昧な target は対象 repo の明示を促す" "対象リポジトリを明示してください"
+assert_contains "曖昧な target は cd してからの実行を促す" "対象リポジトリへ cd してから実行してください"
 assert_not_contains "warn 応答は commit をブロックしたと誤表示しない" "ブロックしました"
 
 run_bash_guard "$COMMIT_GUARD" 'GIT_DIR=/tmp/example.git git commit -m test' worktree-pr deny
@@ -284,7 +284,7 @@ assert_not_contains "deny 応答も固定の誤解を招く文言を使わない
 
 run_bash_guard "$COMMIT_GUARD" "git -C \"$NON_REPO\" commit -m test" worktree-pr warn
 assert_warn_allow "非 Git directory は warn 設定で警告して許可する"
-assert_contains "非 Git directory でも対象 repo の明示を促す" "対象リポジトリを明示してください"
+assert_contains "非 Git directory は repo かどうかの確認を促す" "git リポジトリを指しているかを確認してください"
 assert_not_contains "非 Git directory の warn 応答も block と誤表示しない" "ブロックしました"
 
 run_bash_guard "$COMMIT_GUARD" "git -C \"$NON_REPO\" commit -m test" worktree-pr deny
