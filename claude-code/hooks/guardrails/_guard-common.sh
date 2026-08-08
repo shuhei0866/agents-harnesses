@@ -239,10 +239,133 @@ _guard_git_workflow_from_dir() {
   printf '%s\n' "$workflow"
 }
 
+# --- 同一コマンド内の literal 代入 ---
+# `WT=/path; git -C "$WT" commit` の `$WT` を解決するために、コマンド文字列に
+# 現れた代入だけを記録して展開する。情報源はガードが唯一の入力として読んでいる
+# コマンド文字列そのものなので、展開はガードの回避能力を足さない（回避したい側は
+# 最初からリテラルのパスを書ける）。eval も環境変数の参照も行わない。
+# bash 3.2 に連想配列が無いため、name と value を並列配列で持つ。
+_GUARD_ASSIGN_NAMES=()
+_GUARD_ASSIGN_VALUES=()
+
+guard_reset_command_assignments() {
+  _GUARD_ASSIGN_NAMES=()
+  _GUARD_ASSIGN_VALUES=()
+}
+
+# 代入だけで構成された segment を記録する。segment は実行順に渡す前提で、
+# 同名は後の代入が優先される。
+#
+# `WT=/tmp git -C "$WT" commit` のような command prefix 代入は記録しない。
+# 実 shell では prefix 代入が効くのは引数展開の後なので、記録すると実挙動と
+# 逆の判定になる。
+guard_note_assignment_segment() {
+  local segment="$1" token="" name="" value=""
+  local -a tokens=()
+
+  while IFS= read -r token; do
+    tokens[${#tokens[@]}]="$token"
+  done < <(guard_shell_tokens "$segment")
+
+  if [ "${#tokens[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  # 代入以外の token が 1 つでもあれば prefix 代入なので記録しない。
+  for token in "${tokens[@]}"; do
+    case "$token" in
+      [A-Za-z_]*=*) ;;
+      *) return 0 ;;
+    esac
+  done
+
+  for token in "${tokens[@]}"; do
+    name="${token%%=*}"
+    value="${token#*=}"
+    case "$name" in
+      *[!A-Za-z0-9_]*) continue ;;
+    esac
+    # 値に展開が残るものは連鎖解決になるので記録しない（eval へ近づけない）。
+    case "$value" in
+      ''|*'$'*|*'`'*) continue ;;
+    esac
+    _GUARD_ASSIGN_NAMES[${#_GUARD_ASSIGN_NAMES[@]}]="$name"
+    _GUARD_ASSIGN_VALUES[${#_GUARD_ASSIGN_VALUES[@]}]="$value"
+  done
+}
+
+# コマンド全体から代入を集め直す。
+# 各ガードの入口で 1 度だけ呼び、以降のライブラリ関数は読むだけにする
+# （関数側で reset すると、呼び出し元が積んだ記録を壊すため）。
+guard_collect_command_assignments() {
+  local command="$1" segment=""
+
+  guard_reset_command_assignments
+  while IFS= read -r segment; do
+    guard_note_assignment_segment "$segment"
+  done <<< "$(guard_split_segments "$(guard_strip_heredoc_bodies "$command")")"
+}
+
+# 記録済みの代入で先頭の変数参照だけを展開する。
+# 対応形は `$VAR` `${VAR}` `$VAR/rest` `${VAR}/rest` の 4 つで、中間に埋め込まれた
+# 参照は展開しない。解決できない場合は入力をそのまま返し、呼び出し側の
+# fail closed 判定に委ねる。
+guard_expand_command_assignments() {
+  local value="$1" name="" rest="" i=0
+
+  case "$value" in
+    '$'*) ;;
+    *) printf '%s\n' "$value"; return 0 ;;
+  esac
+
+  case "$value" in
+    '${'*)
+      name="${value#\$\{}"
+      case "$name" in
+        *'}'*)
+          rest="${name#*\}}"
+          name="${name%%\}*}"
+          ;;
+        *) printf '%s\n' "$value"; return 0 ;;
+      esac
+      ;;
+    *)
+      name="${value#\$}"
+      rest=""
+      case "$name" in
+        */*)
+          rest="/${name#*/}"
+          name="${name%%/*}"
+          ;;
+      esac
+      ;;
+  esac
+
+  case "$name" in
+    ''|*[!A-Za-z0-9_]*) printf '%s\n' "$value"; return 0 ;;
+  esac
+
+  i=$((${#_GUARD_ASSIGN_NAMES[@]} - 1))
+  while [ "$i" -ge 0 ]; do
+    if [ "${_GUARD_ASSIGN_NAMES[$i]}" = "$name" ]; then
+      printf '%s\n' "${_GUARD_ASSIGN_VALUES[$i]}${rest}"
+      return 0
+    fi
+    i=$((i - 1))
+  done
+
+  printf '%s\n' "$value"
+}
+
 # base を基準に path を実在ディレクトリへ解決する。
 _guard_resolve_directory() {
   local base="$1" path="$2" literal_tilde="${3:-0}" candidate=""
 
+  if [ -z "$path" ]; then
+    return 1
+  fi
+
+  path=$(guard_expand_command_assignments "$path")
   if [ -z "$path" ]; then
     return 1
   fi
@@ -703,6 +826,7 @@ guard_extract_gh_repo_selector() {
   else
     segments=$(guard_split_segments "$stripped")
   fi
+
   while IFS= read -r segment; do
     tokens=()
     while IFS= read -r token; do
@@ -830,7 +954,7 @@ guard_extract_gh_repo_selector() {
       i=$((i + 1))
     done
     if [ "$found" -eq 1 ]; then
-      printf '%s\n' "$repo_selector"
+      printf '%s\n' "$(guard_expand_command_assignments "$repo_selector")"
       return 0
     fi
   done <<< "$segments"
@@ -1641,6 +1765,9 @@ guard_prime_command_cache() {
   _GUARD_MEMO_SEG_PIPELINE=$(guard_split_segments "$_GUARD_MEMO_STRIPPED" pipeline)
   _GUARD_MEMO_SANITIZED=$(guard_sanitize_command "$_GUARD_MEMO_STRIPPED")
   _GUARD_MEMO_PRIMED=1
+
+  # 同一コマンド内の代入も、コマンドごとに 1 度だけここで確定させる。
+  guard_collect_command_assignments "$command"
 }
 
 # 初期化: source された時点で設定をロード
