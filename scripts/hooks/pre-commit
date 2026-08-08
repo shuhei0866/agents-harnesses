@@ -44,12 +44,16 @@ if [ -z "$PATTERNS" ]; then
 fi
 
 # ステージ済みファイルの差分を取得（追加・変更行のみ）
+# Flight Recorder の privacy テストは、redaction が効くことを確かめるために
+# 囮のローカルパス（/Users/private/... 等）を意図的に置く。パターンファイル自身を
+# 除外しているのと同じ理由でスキャン対象から外す（sensitive-check.yml と同じ一覧を保つ）。
 STAGED_DIFF=$(git diff --cached --diff-filter=ACMR -U0 -- . \
   ':!.sensitive-patterns' \
   ':!.sensitive-patterns.local' \
   ':!.sensitive-patterns.local.example' \
   ':!scripts/hooks/pre-commit' \
   ':!.github/workflows/sensitive-check.yml' \
+  ':!plugins/agent-harness-flight-recorder/tests/*' \
   2>/dev/null || true)
 
 if [ -z "$STAGED_DIFF" ]; then

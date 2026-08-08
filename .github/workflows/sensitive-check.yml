@@ -33,12 +33,16 @@ jobs:
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
 
+          # Flight Recorder の privacy テストは、redaction が効くことを確かめるために
+          # 囮のローカルパス（/Users/private/... 等）を意図的に置く。パターンファイル自身を
+          # 除外しているのと同じ理由でスキャン対象から外す。
           DIFF=$(git diff "$BASE_SHA"..."$HEAD_SHA" --diff-filter=ACMR -U0 -- . \
             ':!.sensitive-patterns' \
             ':!.sensitive-patterns.local' \
             ':!.sensitive-patterns.local.example' \
             ':!scripts/hooks/pre-commit' \
             ':!.github/workflows/sensitive-check.yml' \
+            ':!plugins/agent-harness-flight-recorder/tests/*' \
             || true)
 
           ADDED_LINES=$(echo "$DIFF" | grep '^+' | grep -v '^+++' || true)
