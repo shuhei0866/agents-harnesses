@@ -6,6 +6,8 @@ AI コーディングエージェント（Claude Code / Codex）の生産性を�
 
 ```
 agents-harnesses/
+├── packs/
+│   └── git-safety/               # Git事故防止の導入パック
 ├── plugins/
 │   └── agent-harness-flight-recorder/ # Claude Code / Codex 共通の観測プラグイン
 ├── claude-code/
@@ -37,6 +39,26 @@ agents-harnesses/
     ├── prompts/         # プロンプトテンプレート
     └── tests/           # テスト
 ```
+
+## Git Safety Pack — 5分でGit事故防止を導入
+
+Claude Code の `settings.json` を壊さず、Git/PR/worktree の重大事故を防ぐ4つの
+PreToolUseガードをまとめて導入します。
+
+```bash
+git clone https://github.com/shuhei0866/agents-harnesses.git
+cd agents-harnesses
+./packs/git-safety/bin/git-safety install --mode advisory --dry-run
+./packs/git-safety/bin/git-safety install --mode advisory
+./packs/git-safety/bin/git-safety doctor
+```
+
+`advisory` は通常リスクを警告して許可しますが、`--no-verify`、main/masterへの
+force push、merge済みPR branchへのpush、`.worktrees/`の再帰削除は遮断します。
+すべての検出を遮断するには `--mode enforce` を使います。
+
+詳しい前提条件、モード、アンインストール方法は
+[Git Safety Pack README](packs/git-safety/README.md) を参照してください。
 
 ## Claude Code
 

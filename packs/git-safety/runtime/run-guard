@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+PACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GUARD="${1:-}"
+
+case "$GUARD" in
+  commit-guard|gh-guard|merged-pr-push-guard|worktree-rm-guard) ;;
+  *)
+    echo "git-safety: unknown guard: ${GUARD:-<empty>}" >&2
+    exit 2
+    ;;
+esac
+
+MODE=$(sed -nE 's/.*"mode"[[:space:]]*:[[:space:]]*"(advisory|enforce)".*/\1/p' "$PACK_DIR/config.json" | head -1)
+case "$MODE" in
+  advisory) export GUARD_LEVEL=warn ;;
+  enforce) export GUARD_LEVEL=deny ;;
+  *)
+    echo "git-safety: invalid or missing mode config" >&2
+    exit 2
+    ;;
+esac
+
+exec "$PACK_DIR/guards/$GUARD.sh"

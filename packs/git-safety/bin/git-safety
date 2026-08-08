@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+"""Install, diagnose, or remove the agents-harnesses Git Safety Pack."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import shutil
+import stat
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+
+PRODUCT = "agents-harnesses/git-safety-pack"
+VERSION = "0.1.0"
+GUARDS = (
+    "commit-guard",
+    "gh-guard",
+    "merged-pr-push-guard",
+    "worktree-rm-guard",
+)
+GUARD_FILES = ("_guard-common.sh", *(f"{guard}.sh" for guard in GUARDS))
+
+
+class SafetyPackError(RuntimeError):
+    """A user-actionable, mutation-safe CLI error."""
+
+
+def default_settings() -> Path:
+    return Path.home() / ".claude" / "settings.json"
+
+
+def default_data_dir() -> Path:
+    base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    return base / "agents-harnesses" / "git-safety-pack"
+
+
+def absolute_path(path: Path) -> Path:
+    """Make a path absolute without following its final symlink."""
+    return Path(os.path.abspath(path.expanduser()))
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def marker_path(data_dir: Path) -> Path:
+    return data_dir / ".git-safety-pack.json"
+
+
+def config_path(data_dir: Path) -> Path:
+    return data_dir / "config.json"
+
+
+def wrapper_path(data_dir: Path) -> Path:
+    return data_dir / "runtime" / "run-guard"
+
+
+def expected_commands(data_dir: Path) -> dict[str, str]:
+    wrapper = shlex.quote(str(wrapper_path(data_dir)))
+    return {guard: f"{wrapper} {guard}" for guard in GUARDS}
+
+
+def read_json(path: Path, *, missing: Any = None) -> Any:
+    if not path.exists():
+        return missing
+    try:
+        with path.open(encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SafetyPackError(f"JSON を読めません: {path}: {exc}") from exc
+
+
+def read_settings(path: Path) -> tuple[dict[str, Any], bool]:
+    if path.is_symlink():
+        raise SafetyPackError(f"settings.json の symlink は安全のため変更しません: {path}")
+    existed = path.exists()
+    value = read_json(path, missing={})
+    if not isinstance(value, dict):
+        raise SafetyPackError(f"settings.json の root は JSON object である必要があります: {path}")
+    return value, existed
+
+
+def read_marker(data_dir: Path, *, allow_absent: bool) -> dict[str, Any] | None:
+    marker = marker_path(data_dir)
+    if not data_dir.exists():
+        return None
+    if data_dir.is_symlink():
+        raise SafetyPackError(f"data directory の symlink は安全のため操作しません: {data_dir}")
+    value = read_json(marker, missing=None)
+    if value is None:
+        if allow_absent:
+            return None
+        raise SafetyPackError(f"所有者マーカーがないため操作しません: {data_dir}")
+    if not isinstance(value, dict) or value.get("product") != PRODUCT:
+        raise SafetyPackError(f"所有者マーカーが一致しないため操作しません: {data_dir}")
+    return value
+
+
+def validate_data_dir(data_dir: Path) -> None:
+    resolved = data_dir.resolve()
+    forbidden = {Path("/"), Path.home().resolve(), default_settings().parent.resolve()}
+    if resolved in forbidden or len(resolved.parts) < 3:
+        raise SafetyPackError(f"危険な data directory は指定できません: {data_dir}")
+
+
+def all_hook_commands(settings: dict[str, Any]) -> list[str]:
+    hooks = settings.get("hooks", {})
+    if not isinstance(hooks, dict):
+        return []
+    pre = hooks.get("PreToolUse", [])
+    if not isinstance(pre, list):
+        return []
+    commands: list[str] = []
+    for group in pre:
+        if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+            continue
+        for hook in group["hooks"]:
+            if isinstance(hook, dict) and isinstance(hook.get("command"), str):
+                commands.append(hook["command"])
+    return commands
+
+
+def add_hooks(
+    settings: dict[str, Any], commands: dict[str, str]
+) -> tuple[list[str], dict[str, bool]]:
+    existing = set(all_hook_commands(settings))
+    missing = [command for command in commands.values() if command not in existing]
+    structure = {"hooks_created": False, "pretooluse_created": False}
+    if not missing:
+        return [], structure
+
+    hooks = settings.get("hooks")
+    if hooks is None:
+        hooks = {}
+        settings["hooks"] = hooks
+        structure["hooks_created"] = True
+    if not isinstance(hooks, dict):
+        raise SafetyPackError("settings.json の hooks は JSON object である必要があります")
+
+    pre = hooks.get("PreToolUse")
+    if pre is None:
+        pre = []
+        hooks["PreToolUse"] = pre
+        structure["pretooluse_created"] = True
+    if not isinstance(pre, list):
+        raise SafetyPackError("settings.json の hooks.PreToolUse は JSON array である必要があります")
+
+    pre.append(
+        {
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": command} for command in missing],
+        }
+    )
+    return missing, structure
+
+
+def remove_owned_hooks(
+    settings: dict[str, Any], owned: set[str], structure: dict[str, Any]
+) -> bool:
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+    pre = hooks.get("PreToolUse")
+    if not isinstance(pre, list):
+        return False
+
+    changed = False
+    remaining = set(owned)
+    new_groups: list[Any] = []
+    for group in pre:
+        if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+            new_groups.append(group)
+            continue
+        kept = []
+        for hook in group["hooks"]:
+            command = hook.get("command") if isinstance(hook, dict) else None
+            if command in remaining:
+                changed = True
+                remaining.remove(command)
+            else:
+                kept.append(hook)
+        if kept:
+            copied = dict(group)
+            copied["hooks"] = kept
+            new_groups.append(copied)
+        elif len(group["hooks"]) == 0:
+            new_groups.append(group)
+        else:
+            changed = True
+
+    if changed:
+        hooks["PreToolUse"] = new_groups
+        if not new_groups and structure.get("pretooluse_created"):
+            hooks.pop("PreToolUse", None)
+        if not hooks and structure.get("hooks_created"):
+            settings.pop("hooks", None)
+    return changed
+
+
+def atomic_write_json(path: Path, value: Any, *, preserve_mode: bool = True) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    prior_mode = None
+    if preserve_mode and path.exists():
+        prior_mode = stat.S_IMODE(path.stat().st_mode)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temp_path = Path(temporary)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if prior_mode is not None:
+            temp_path.chmod(prior_mode)
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def backup_settings(path: Path) -> Path:
+    backup = path.with_name(f"{path.name}.git-safety-backup.{time.time_ns()}")
+    shutil.copy2(path, backup)
+    return backup
+
+
+def install_runtime(data_dir: Path, mode: str, marker: dict[str, Any]) -> None:
+    source_root = repo_root()
+    guard_source = source_root / "claude-code" / "hooks" / "guardrails"
+    wrapper_source = source_root / "packs" / "git-safety" / "runtime" / "run-guard"
+    missing = [str(guard_source / name) for name in GUARD_FILES if not (guard_source / name).is_file()]
+    if not wrapper_source.is_file():
+        missing.append(str(wrapper_source))
+    if missing:
+        raise SafetyPackError(f"配布元ファイルが見つかりません: {', '.join(missing)}")
+
+    guards_dir = data_dir / "guards"
+    runtime_dir = data_dir / "runtime"
+    guards_dir.mkdir(parents=True, exist_ok=True)
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    for name in GUARD_FILES:
+        target = guards_dir / name
+        shutil.copy2(guard_source / name, target)
+        target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    target_wrapper = runtime_dir / "run-guard"
+    shutil.copy2(wrapper_source, target_wrapper)
+    target_wrapper.chmod(target_wrapper.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    atomic_write_json(config_path(data_dir), {"mode": mode, "version": VERSION})
+    atomic_write_json(marker_path(data_dir), marker)
+
+
+def install(args: argparse.Namespace) -> int:
+    settings_path = absolute_path(args.settings)
+    data_dir = absolute_path(args.data_dir)
+    validate_data_dir(data_dir)
+    settings, settings_existed = read_settings(settings_path)
+    existing_marker = read_marker(data_dir, allow_absent=False) if data_dir.exists() else None
+    commands = expected_commands(data_dir)
+    added, structure = add_hooks(settings, commands)
+
+    prior_owned = [] if existing_marker is None else existing_marker.get("owned_commands", [])
+    if not isinstance(prior_owned, list) or not all(isinstance(item, str) for item in prior_owned):
+        raise SafetyPackError(f"所有者マーカーの owned_commands が不正です: {marker_path(data_dir)}")
+    owned = list(dict.fromkeys([*prior_owned, *added]))
+    prior_structure = {} if existing_marker is None else existing_marker.get("settings_structure", {})
+    if not isinstance(prior_structure, dict):
+        prior_structure = {}
+    merged_structure = {
+        "hooks_created": bool(prior_structure.get("hooks_created") or structure["hooks_created"]),
+        "pretooluse_created": bool(
+            prior_structure.get("pretooluse_created") or structure["pretooluse_created"]
+        ),
+    }
+    marker = {
+        "product": PRODUCT,
+        "version": VERSION,
+        "owned_commands": owned,
+        "settings_structure": merged_structure,
+    }
+
+    if args.dry_run:
+        print(
+            f"DRY RUN: install mode={args.mode}, hooks_to_add={len(added)}, "
+            f"settings={settings_path}, data={data_dir}"
+        )
+        return 0
+
+    install_runtime(data_dir, args.mode, marker)
+    if added:
+        if settings_existed:
+            backup = backup_settings(settings_path)
+            print(f"backup: {backup}")
+        atomic_write_json(settings_path, settings)
+    print(f"installed: Git Safety Pack {VERSION} ({args.mode})")
+    print(f"settings: {settings_path}")
+    print(f"data: {data_dir}")
+    return 0
+
+
+def doctor(args: argparse.Namespace) -> int:
+    settings_path = absolute_path(args.settings)
+    data_dir = absolute_path(args.data_dir)
+    problems: list[str] = []
+    warnings: list[str] = []
+
+    for dependency in ("git", "jq", "python3"):
+        if shutil.which(dependency):
+            print(f"OK   dependency: {dependency}")
+        else:
+            problems.append(f"missing dependency: {dependency}")
+    if shutil.which("gh"):
+        print("OK   dependency: gh")
+    else:
+        warnings.append("gh がないため merge 済み PR branch の判定は fail-open になります")
+
+    try:
+        settings, _ = read_settings(settings_path)
+    except SafetyPackError as exc:
+        problems.append(str(exc))
+        settings = {}
+    commands = expected_commands(data_dir)
+    installed_commands = all_hook_commands(settings)
+    for guard, command in commands.items():
+        count = installed_commands.count(command)
+        if count == 1:
+            print(f"OK   hook: {guard}")
+        elif count == 0:
+            problems.append(f"missing hook: {guard}")
+        else:
+            problems.append(f"duplicate hook: {guard} ({count})")
+
+    try:
+        read_marker(data_dir, allow_absent=False)
+    except SafetyPackError as exc:
+        problems.append(str(exc))
+
+    config = None
+    try:
+        config = read_json(config_path(data_dir), missing=None)
+    except SafetyPackError as exc:
+        problems.append(str(exc))
+    mode = config.get("mode") if isinstance(config, dict) else None
+    if mode in ("advisory", "enforce"):
+        print(f"OK   mode: {mode}")
+    else:
+        problems.append(f"invalid or missing mode config: {config_path(data_dir)}")
+
+    executables = [wrapper_path(data_dir), *(data_dir / "guards" / name for name in GUARD_FILES)]
+    for executable in executables:
+        if not executable.is_file():
+            problems.append(f"missing runtime file: {executable}")
+        elif not os.access(executable, os.X_OK):
+            problems.append(f"not executable: {executable}")
+
+    for warning in warnings:
+        print(f"WARN {warning}")
+    if problems:
+        for problem in problems:
+            print(f"FAIL {problem}", file=sys.stderr)
+        print("doctor: unhealthy", file=sys.stderr)
+        return 1
+    print("doctor: healthy")
+    return 0
+
+
+def uninstall(args: argparse.Namespace) -> int:
+    settings_path = absolute_path(args.settings)
+    data_dir = absolute_path(args.data_dir)
+    validate_data_dir(data_dir)
+    settings, settings_existed = read_settings(settings_path)
+    marker = read_marker(data_dir, allow_absent=False) if data_dir.exists() else None
+    if marker is None:
+        print("already absent: Git Safety Pack")
+        return 0
+
+    owned_value = marker.get("owned_commands", [])
+    if not isinstance(owned_value, list) or not all(isinstance(item, str) for item in owned_value):
+        raise SafetyPackError(f"所有者マーカーの owned_commands が不正です: {marker_path(data_dir)}")
+    installed_commands = all_hook_commands(settings)
+    for guard, command in expected_commands(data_dir).items():
+        owned_count = 1 if command in owned_value else 0
+        if installed_commands.count(command) > owned_count:
+            raise SafetyPackError(
+                f"installer が所有しない {guard} hook が同じ runtime を参照しています。"
+                "その hook を手動で外してから再実行してください"
+            )
+    structure = marker.get("settings_structure", {})
+    if not isinstance(structure, dict):
+        structure = {}
+    changed = remove_owned_hooks(settings, set(owned_value), structure)
+
+    if args.dry_run:
+        print(
+            f"DRY RUN: uninstall hooks_to_remove={len(owned_value)}, "
+            f"settings={settings_path}, data={data_dir}"
+        )
+        return 0
+
+    if changed:
+        if settings_existed:
+            backup = backup_settings(settings_path)
+            print(f"backup: {backup}")
+        atomic_write_json(settings_path, settings)
+    shutil.rmtree(data_dir)
+    print("uninstalled: Git Safety Pack")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="git-safety", description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    install_parser = subparsers.add_parser("install", help="install or update the pack")
+    install_parser.add_argument("--mode", choices=("advisory", "enforce"), default="advisory")
+    install_parser.add_argument("--settings", type=Path, default=default_settings())
+    install_parser.add_argument("--data-dir", type=Path, default=default_data_dir())
+    install_parser.add_argument("--dry-run", action="store_true")
+    install_parser.set_defaults(handler=install)
+
+    doctor_parser = subparsers.add_parser("doctor", help="diagnose installation health")
+    doctor_parser.add_argument("--settings", type=Path, default=default_settings())
+    doctor_parser.add_argument("--data-dir", type=Path, default=default_data_dir())
+    doctor_parser.set_defaults(handler=doctor)
+
+    uninstall_parser = subparsers.add_parser("uninstall", help="remove only pack-owned wiring")
+    uninstall_parser.add_argument("--settings", type=Path, default=default_settings())
+    uninstall_parser.add_argument("--data-dir", type=Path, default=default_data_dir())
+    uninstall_parser.add_argument("--dry-run", action="store_true")
+    uninstall_parser.set_defaults(handler=uninstall)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        return args.handler(args)
+    except SafetyPackError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"error: filesystem operation failed: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
