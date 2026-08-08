@@ -634,7 +634,14 @@ if ! guard_is_trunk_direct; then
     ADVISORY_UNKNOWN="${_COMMIT_GUARD_ADVISORY_UNKNOWN[$ADVISORY_INDEX]}"
     ADVISORY_DETAIL="${_COMMIT_GUARD_ADVISORY_DETAILS[$ADVISORY_INDEX]}"
 
-    if [ "$ADVISORY_UNKNOWN" -eq 1 ] || [ -z "$ADVISORY_DIR" ]; then
+    # 特定できない理由は 2 つあり、取るべき行動が違うので文言を分ける。
+    # 「対象リポジトリを明示してください」と一括で案内すると、既に `git -C <path>` を
+    # 使っている入力に対して従いようのない指示になる。
+    if [ "$ADVISORY_UNKNOWN" -eq 1 ]; then
+      guard_respond "advisory" "コミット衛生ガード" "${ADVISORY_OP} の対象リポジトリを特定できませんでした。GIT_DIR / GIT_WORK_TREE の指定や、ガードが追随できない形で作業ディレクトリが変わっています。対象リポジトリへ cd してから実行してください。"
+    fi
+
+    if [ -z "$ADVISORY_DIR" ]; then
       guard_respond "advisory" "コミット衛生ガード" "${ADVISORY_OP} の対象リポジトリを特定できませんでした。ガードはコマンド文字列だけを読むため、変数で渡されたパス（\`git -C \"\$VAR\"\` など）は解決できません。リテラルのパスを直接書くか、対象リポジトリへ cd してから実行してください。"
     fi
 

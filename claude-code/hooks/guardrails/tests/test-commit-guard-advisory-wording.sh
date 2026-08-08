@@ -126,6 +126,13 @@ assert_context_matches "cd してから実行する選択肢を示す" "cd し�
 # git -C を使っている入力に対してこれを出すと従いようがないので、出さないことを固定する。
 assert_context_lacks "既に git -C を使っている入力へ git -C を勧め直さない" "\`git -C <path>\` で対象リポジトリを明示"
 
+echo "commit-guard: 特定できない理由が違えば案内も分かれる"
+# GIT_DIR の指定は「変数が解決できない」のとは別の理由なので、リテラルのパスを
+# 書けという案内は当たらない。cd を促す側の文言になることを固定する。
+run_guard 'GIT_DIR=/tmp/example.git git commit -m x'
+assert_context_matches "GIT_DIR 指定では cd を促す" "対象リポジトリへ cd してから実行してください"
+assert_context_lacks "GIT_DIR 指定に変数の説明は出さない" "変数で渡されたパス"
+
 echo "commit-guard: 判定の向きは変えていない"
 run_guard "git -C $MAIN_REPO commit -m x"
 assert_context_matches "リテラル形の main 直接コミットは止まる" "メインワークツリー"
