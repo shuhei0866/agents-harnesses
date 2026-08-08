@@ -290,6 +290,106 @@ path.chmod(0o600)
 PY
 }
 
+write_receipt_attempt_ledger() {
+  local state="$1" target_episode="$2" unrelated_episode="$3"
+  local source="$TEST_ROOT/receipt-attempt-source.jsonl"
+  local registered="$TEST_ROOT/receipt-attempt-source-register.json"
+  local source_ref
+  python3 - "$source" <<'PY'
+import json
+import pathlib
+import sys
+
+rows = [
+    {
+        "type": "event_msg",
+        "payload": {"turn_id": "receipt-attempt", "type": "task_started"},
+    },
+    {
+        "type": "response_item",
+        "payload": {
+            "role": "user",
+            "type": "message",
+            "content": [{"type": "input_text", "text": "Inspect purge."}],
+        },
+    },
+    {
+        "type": "response_item",
+        "payload": {
+            "role": "assistant",
+            "type": "message",
+            "content": [{"type": "output_text", "text": "Purge inspected."}],
+        },
+    },
+    {
+        "type": "event_msg",
+        "payload": {"turn_id": "receipt-attempt", "type": "task_complete"},
+    },
+]
+pathlib.Path(sys.argv[1]).write_text(
+    "".join(
+        json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+        for row in rows
+    ),
+    encoding="utf-8",
+)
+PY
+  run_cli "$state" source register \
+    --adapter codex --path "$source" --json >"$registered" 2>/dev/null \
+    || return 1
+  source_ref="$(
+    python3 - "$registered" <<'PY'
+import json
+import pathlib
+import sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text())["source_ref"])
+PY
+  )"
+  PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$state" "$target_episode" "$unrelated_episode" \
+      "$source_ref" "$PLUGIN_DIR/rubrics/semantic-receipt-v1.json" <<'PY'
+import pathlib
+import sys
+
+from chunk_rotation import canonical_json, safe_subdirectory
+from reporting import inspect_episode
+from semantic_receipts import _prepare_receipt
+
+root = pathlib.Path(sys.argv[1])
+episode_ids = sys.argv[2:4]
+source_ref = sys.argv[4]
+rubric = pathlib.Path(sys.argv[5])
+items = []
+for index, episode_id in enumerate(episode_ids, start=3):
+    snapshot = inspect_episode(root, episode_id, "default-v1", None)
+    prepared = _prepare_receipt(
+        root,
+        snapshot,
+        episode_id,
+        source_ref,
+        start_line=1,
+        end_line=4,
+        evaluator="flight-recorder-auto-semantic-evaluator",
+        model=f"purge-prepared-{index}",
+        rubric_path=rubric,
+        timeout_seconds=60,
+        remaining_cost_microusd=50000,
+    )
+    items.append({
+        "fingerprint": "sha256:" + str(index) * 64,
+        "state": "prepared",
+        "event_id": snapshot["card"]["source_event_ids"][0],
+        "episode_id": episode_id,
+        "prepared": prepared,
+    })
+directory = safe_subdirectory(root, "receipt-automation")
+path = directory / "attempts.json"
+path.write_bytes(canonical_json({"schema_version": 1, "items": items}) + b"\n")
+path.chmod(0o600)
+directory.chmod(0o700)
+PY
+}
+
 test_forget_preserves_source_and_survives_rebuild() {
   echo "test_forget_preserves_source_and_survives_rebuild:"
   local base="$TEST_ROOT/forget"
@@ -425,8 +525,13 @@ test_purge_apply_removes_target_history_and_keeps_unrelated_chunk() {
     "$state" "$unrelated_episode" purge-apply-unrelated || {
       fail "purge apply非対象episodeのMeaning Cardを作成できる"
       return
-    }
+  }
   write_attempt_ledger "$state" "$episode" "$unrelated_episode"
+  write_receipt_attempt_ledger \
+    "$state" "$episode" "$unrelated_episode" || {
+      fail "purge apply用prepared Receipt attemptを作成できる"
+      return
+    }
   target_path="$(db_value_for_event "$db" "$TARGET_EVENT" source_path)"
   unrelated_path="$(db_value_for_event "$db" "$UNRELATED_EVENT" source_path)"
   target_cache="$(db_value_for_event "$db" "$TARGET_EVENT" cache_path)"
@@ -449,6 +554,7 @@ test_purge_apply_removes_target_history_and_keeps_unrelated_chunk() {
     && grep -Fq " $unrelated_path" "$history_objects" \
     && python3 - "$db" "$TARGET_EVENT" "$UNRELATED_EVENT" \
       "$state/auto-evaluation/attempts.json" \
+      "$state/receipt-automation/attempts.json" \
       "$episode" "$unrelated_episode" <<'PY'
 import json
 import pathlib
@@ -464,15 +570,19 @@ unrelated = connection.execute(
 ).fetchone()[0]
 assert target == 0
 assert unrelated == 1
-items = json.loads(pathlib.Path(sys.argv[4]).read_text())["attempts"]
-episodes = {item["episode_id"] for item in items}
-assert sys.argv[5] not in episodes
-assert episodes == {sys.argv[6]}
+evaluation_items = json.loads(pathlib.Path(sys.argv[4]).read_text())["attempts"]
+evaluation_episodes = {item["episode_id"] for item in evaluation_items}
+receipt_items = json.loads(pathlib.Path(sys.argv[5]).read_text())["items"]
+receipt_episodes = {item.get("episode_id") for item in receipt_items}
+assert sys.argv[6] not in evaluation_episodes
+assert evaluation_episodes == {sys.argv[7]}
+assert sys.argv[6] not in receipt_episodes
+assert receipt_episodes == {sys.argv[7]}
 PY
   then
-    pass "purgeは対象chunk・evaluation・attemptを除去しunrelated状態を保持する"
+    pass "purgeは対象chunk・prepared attemptを除去しunrelated状態を保持する"
   else
-    fail "purgeは対象chunk・evaluation・attemptを除去しunrelated状態を保持する"
+    fail "purgeは対象chunk・prepared attemptを除去しunrelated状態を保持する"
   fi
 }
 
@@ -483,6 +593,7 @@ test_purge_push_rejection_restores_retryable_local_state() {
   local remote="$base/remote.git" db="$state/index/vault.sqlite"
   local episode unrelated_episode target_path target_cache
   local before_head before_remote before_source before_files before_attempts
+  local before_receipt_attempts
   init_fixture "$base" || {
     fail "push rejection fixtureを作成できる"
     return
@@ -492,6 +603,11 @@ test_purge_push_rejection_restores_retryable_local_state() {
     db_value_for_event "$db" "$UNRELATED_EVENT" episode_id
   )"
   write_attempt_ledger "$state" "$episode" "$unrelated_episode"
+  write_receipt_attempt_ledger \
+    "$state" "$episode" "$unrelated_episode" || {
+      fail "push rejection用prepared Receipt attemptを作成できる"
+      return
+    }
   run_cli "$state" evaluate "$episode" \
     --evaluator flight-recorder-evaluator \
     --model evaluator-test-model --json >/dev/null 2>&1 || {
@@ -511,6 +627,9 @@ test_purge_push_rejection_restores_retryable_local_state() {
   before_attempts="$(
     shasum -a 256 "$state/auto-evaluation/attempts.json"
   )"
+  before_receipt_attempts="$(
+    shasum -a 256 "$state/receipt-automation/attempts.json"
+  )"
 
   git --git-dir="$remote" config receive.denyNonFastForwards true
   if run_cli "$state" purge "$episode" --apply \
@@ -525,6 +644,9 @@ test_purge_push_rejection_restores_retryable_local_state() {
     || "$before_files" != "$(evidence_file_snapshot "$state")" \
     || "$before_attempts" != "$(
       shasum -a 256 "$state/auto-evaluation/attempts.json"
+    )" \
+    || "$before_receipt_attempts" != "$(
+      shasum -a 256 "$state/receipt-automation/attempts.json"
     )" \
     || ! -f "$state/$target_path" \
     || ! -f "$state/$target_cache" \
@@ -546,20 +668,25 @@ test_purge_push_rejection_restores_retryable_local_state() {
     && ! git --git-dir="$remote" cat-file -e \
       "main:$target_path" 2>/dev/null \
     && python3 - "$state/auto-evaluation/attempts.json" \
+      "$state/receipt-automation/attempts.json" \
       "$episode" "$unrelated_episode" <<'PY'
 import json
 import pathlib
 import sys
 
-items = json.loads(pathlib.Path(sys.argv[1]).read_text())["attempts"]
-episodes = {item["episode_id"] for item in items}
-assert sys.argv[2] not in episodes
-assert episodes == {sys.argv[3]}
+evaluation_items = json.loads(pathlib.Path(sys.argv[1]).read_text())["attempts"]
+evaluation_episodes = {item["episode_id"] for item in evaluation_items}
+receipt_items = json.loads(pathlib.Path(sys.argv[2]).read_text())["items"]
+receipt_episodes = {item.get("episode_id") for item in receipt_items}
+assert sys.argv[3] not in evaluation_episodes
+assert evaluation_episodes == {sys.argv[4]}
+assert sys.argv[3] not in receipt_episodes
+assert receipt_episodes == {sys.argv[4]}
 PY
   then
-    pass "push拒否時はattemptも復元し再試行成功時だけ対象を除く"
+    pass "push拒否時はprepared attemptも復元し成功時だけ対象を除く"
   else
-    fail "push拒否時はattemptも復元し再試行成功時だけ対象を除く"
+    fail "push拒否時はprepared attemptも復元し成功時だけ対象を除く"
   fi
 }
 

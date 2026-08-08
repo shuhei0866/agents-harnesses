@@ -761,8 +761,9 @@ def _store_receipt(root: Path, receipt: dict[str, Any]) -> None:
     atomic_replace(target, data)
 
 
-def generate(
+def _prepare_receipt(
     root: Path,
+    before: dict[str, Any],
     episode_id: str,
     source_ref: str,
     start_line: int,
@@ -771,15 +772,17 @@ def generate(
     model: str,
     rubric_path: Path,
     timeout_seconds: int,
-    policy_version: str | None = None,
-    policy_path: Path | None = None,
     remaining_cost_microusd: int | None = None,
 ) -> dict[str, Any]:
-    from reporting import inspect_episode
-
     if not isinstance(timeout_seconds, int) or not 1 <= timeout_seconds <= 300:
         raise VaultError("semantic evaluator timeout must be between 1 and 300 seconds")
-    before = inspect_episode(root, episode_id, policy_version, policy_path)
+    card = before.get("card") if isinstance(before, dict) else None
+    if (
+        not isinstance(card, dict)
+        or card.get("episode_id") != episode_id
+        or not isinstance(before.get("policy_version"), str)
+    ):
+        raise VaultError("episode snapshot is invalid")
     source = load_registered_source(root, source_ref)
     selected_content, span_sha256 = _read_registered_span(
         source, start_line, end_line
@@ -788,7 +791,6 @@ def generate(
     selected_model = _safe_name(model, "semantic evaluator model")
     evaluator_path, evaluator_sha256 = _executable_identity(selected_evaluator)
     rubric, rubric_sha256 = _load_rubric(rubric_path)
-    card = before["card"]
     episode = _episode_request(card)
     request = {
         "schema_version": 2 if remaining_cost_microusd is not None else 1,
@@ -890,37 +892,7 @@ def generate(
             }
         )
     )
-    with vault_lock(root):
-        after = inspect_episode(
-            root,
-            episode_id,
-            policy_version,
-            policy_path,
-            locked=True,
-        )
-        if (
-            after["policy_version"] != before["policy_version"]
-            or after["card"]["source_event_ids"] != card["source_event_ids"]
-            or [
-                item["evidence_id"]
-                for item in after["card"]["deterministic_evidence"]
-            ]
-            != [
-                item["evidence_id"]
-                for item in card["deterministic_evidence"]
-            ]
-        ):
-            raise VaultError("episode evidence changed during receipt generation")
-        current_source = load_registered_source(root, source_ref)
-        _content, current_span_sha256 = _read_registered_span(
-            current_source, start_line, end_line
-        )
-        if current_span_sha256 != span_sha256:
-            raise VaultError(
-                "registered session source changed during receipt generation"
-            )
-        _store_receipt(root, receipt)
-    return {
+    result = {
         "schema_version": OUTPUT_VERSION,
         "command": "receipt generate",
         "receipt": receipt,
@@ -930,6 +902,194 @@ def generate(
             else {}
         ),
     }
+    prepared = {
+        "result": result,
+        "snapshot": {
+            "policy_version": before["policy_version"],
+            "source_event_ids": list(card["source_event_ids"]),
+            "evidence_ids": [
+                item["evidence_id"]
+                for item in card["deterministic_evidence"]
+            ],
+        },
+        "source": {
+            "source_ref": source_ref,
+            "start_line": start_line,
+            "end_line": end_line,
+            "span_sha256": span_sha256,
+        },
+    }
+    return _validate_prepared_record(prepared)
+
+
+def _validate_prepared_receipt(
+    root: Path,
+    prepared: dict[str, Any],
+    after: dict[str, Any],
+) -> None:
+    snapshot = prepared["snapshot"]
+    card = after["card"]
+    if (
+        after["policy_version"] != snapshot["policy_version"]
+        or card["source_event_ids"] != snapshot["source_event_ids"]
+        or [
+            item["evidence_id"]
+            for item in card["deterministic_evidence"]
+        ]
+        != snapshot["evidence_ids"]
+    ):
+        raise VaultError("episode evidence changed during receipt generation")
+    source_snapshot = prepared["source"]
+    current_source = load_registered_source(
+        root, source_snapshot["source_ref"]
+    )
+    _content, current_span_sha256 = _read_registered_span(
+        current_source,
+        source_snapshot["start_line"],
+        source_snapshot["end_line"],
+    )
+    if current_span_sha256 != source_snapshot["span_sha256"]:
+        raise VaultError(
+            "registered session source changed during receipt generation"
+        )
+
+
+def _validate_prepared_record(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "result",
+        "snapshot",
+        "source",
+    }:
+        raise VaultError("prepared Semantic Receipt is invalid")
+    result = value.get("result")
+    snapshot = value.get("snapshot")
+    source = value.get("source")
+    result_fields = (
+        set(result) if isinstance(result, dict) else set()
+    )
+    base_result_fields = {"schema_version", "command", "receipt"}
+    measured_cost = (
+        result.get("measured_cost_microusd")
+        if isinstance(result, dict)
+        else None
+    )
+    if (
+        not isinstance(result, dict)
+        or frozenset(result_fields)
+        not in {frozenset(base_result_fields), frozenset(base_result_fields | {"measured_cost_microusd"})}
+        or result.get("schema_version") != OUTPUT_VERSION
+        or result.get("command") != "receipt generate"
+        or (
+            "measured_cost_microusd" in result_fields
+            and (
+                isinstance(measured_cost, bool)
+                or not isinstance(measured_cost, int)
+                or not 0 <= measured_cost <= 1_000_000_000_000
+            )
+        )
+        or not isinstance(snapshot, dict)
+        or set(snapshot)
+        != {"policy_version", "source_event_ids", "evidence_ids"}
+        or not isinstance(source, dict)
+        or set(source)
+        != {"source_ref", "start_line", "end_line", "span_sha256"}
+    ):
+        raise VaultError("prepared Semantic Receipt is invalid")
+    receipt = _validate_receipt_record(result.get("receipt"))
+    if len(canonical_json(receipt) + b"\n") > MAX_STORED_RECEIPT_BYTES:
+        raise VaultError("prepared Semantic Receipt is invalid")
+    try:
+        source_event_ids = _bounded_unique_identifiers(
+            snapshot.get("source_event_ids"),
+            "prepared source event IDs",
+            maximum=MAX_RECEIPT_SOURCE_EVENTS,
+        )
+        evidence_ids = _bounded_unique_identifiers(
+            snapshot.get("evidence_ids"),
+            "prepared evidence IDs",
+            maximum=MAX_RECEIPT_SOURCE_EVENTS,
+            digest=True,
+            allow_empty=True,
+        )
+    except VaultError as error:
+        raise VaultError("prepared Semantic Receipt is invalid") from error
+    if (
+        not isinstance(snapshot.get("policy_version"), str)
+        or SOURCE_REF_RE.fullmatch(str(source.get("source_ref"))) is None
+        or isinstance(source.get("start_line"), bool)
+        or not isinstance(source.get("start_line"), int)
+        or isinstance(source.get("end_line"), bool)
+        or not isinstance(source.get("end_line"), int)
+        or source["start_line"] < 1
+        or source["end_line"] < source["start_line"]
+        or source["end_line"] - source["start_line"] + 1 > MAX_SPAN_LINES
+        or HASH_RE.fullmatch(str(source.get("span_sha256"))) is None
+    ):
+        raise VaultError("prepared Semantic Receipt is invalid")
+    provenance = receipt["provenance"]
+    spans = provenance["source_spans"]
+    if (
+        provenance["policy_version"] != snapshot["policy_version"]
+        or provenance["source_event_ids"] != source_event_ids
+        or not set(provenance["evidence_ids"]).issubset(evidence_ids)
+        or len(spans) != 1
+        or spans[0]["source_ref"] != source["source_ref"]
+        or spans[0]["start_line"] != source["start_line"]
+        or spans[0]["end_line"] != source["end_line"]
+        or spans[0]["span_sha256"] != source["span_sha256"]
+    ):
+        raise VaultError("prepared Semantic Receipt is invalid")
+    return value
+
+
+def _store_prepared_receipt(root: Path, prepared: dict[str, Any]) -> None:
+    checked = _validate_prepared_record(prepared)
+    _store_receipt(root, checked["result"]["receipt"])
+
+
+def generate(
+    root: Path,
+    episode_id: str,
+    source_ref: str,
+    start_line: int,
+    end_line: int,
+    evaluator: str,
+    model: str,
+    rubric_path: Path,
+    timeout_seconds: int,
+    policy_version: str | None = None,
+    policy_path: Path | None = None,
+    remaining_cost_microusd: int | None = None,
+) -> dict[str, Any]:
+    from reporting import inspect_episode
+
+    if not isinstance(timeout_seconds, int) or not 1 <= timeout_seconds <= 300:
+        raise VaultError("semantic evaluator timeout must be between 1 and 300 seconds")
+    before = inspect_episode(root, episode_id, policy_version, policy_path)
+    prepared = _prepare_receipt(
+        root,
+        before,
+        episode_id,
+        source_ref,
+        start_line,
+        end_line,
+        evaluator,
+        model,
+        rubric_path,
+        timeout_seconds,
+        remaining_cost_microusd,
+    )
+    with vault_lock(root):
+        after = inspect_episode(
+            root,
+            episode_id,
+            policy_version,
+            policy_path,
+            locked=True,
+        )
+        _validate_prepared_receipt(root, prepared, after)
+        _store_prepared_receipt(root, prepared)
+    return prepared["result"]
 
 
 def render_generate(value: dict[str, Any]) -> str:
