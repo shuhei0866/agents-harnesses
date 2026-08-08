@@ -249,6 +249,11 @@ def backup_settings(path: Path) -> Path:
     return backup
 
 
+def make_owner_executable(path: Path) -> None:
+    mode = stat.S_IMODE(path.stat().st_mode)
+    path.chmod((mode | stat.S_IXUSR) & ~(stat.S_IXGRP | stat.S_IXOTH))
+
+
 def install_runtime(data_dir: Path, mode: str, marker: dict[str, Any]) -> None:
     source_root = repo_root()
     guard_source = source_root / "claude-code" / "hooks" / "guardrails"
@@ -266,10 +271,10 @@ def install_runtime(data_dir: Path, mode: str, marker: dict[str, Any]) -> None:
     for name in GUARD_FILES:
         target = guards_dir / name
         shutil.copy2(guard_source / name, target)
-        target.chmod(target.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        make_owner_executable(target)
     target_wrapper = runtime_dir / "run-guard"
     shutil.copy2(wrapper_source, target_wrapper)
-    target_wrapper.chmod(target_wrapper.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    make_owner_executable(target_wrapper)
     atomic_write_json(config_path(data_dir), {"mode": mode, "version": VERSION})
     atomic_write_json(marker_path(data_dir), marker)
 
@@ -417,6 +422,21 @@ def uninstall(args: argparse.Namespace) -> int:
                 f"installer が所有しない {guard} hook が同じ runtime を参照しています。"
                 "その hook を手動で外してから再実行してください"
             )
+    owned_directories = [data_dir / "guards", data_dir / "runtime"]
+    for directory in owned_directories:
+        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+            raise SafetyPackError(
+                f"owned runtime directory が実directoryではないため削除しません: {directory}"
+            )
+    owned_files = [
+        *(data_dir / "guards" / name for name in GUARD_FILES),
+        wrapper_path(data_dir),
+        config_path(data_dir),
+        marker_path(data_dir),
+    ]
+    for path in owned_files:
+        if path.exists() and not path.is_file() and not path.is_symlink():
+            raise SafetyPackError(f"owned runtime path がfileではないため削除しません: {path}")
     structure = marker.get("settings_structure", {})
     if not isinstance(structure, dict):
         structure = {}
@@ -434,7 +454,15 @@ def uninstall(args: argparse.Namespace) -> int:
             backup = backup_settings(settings_path)
             print(f"backup: {backup}")
         atomic_write_json(settings_path, settings)
-    shutil.rmtree(data_dir)
+    for path in owned_files:
+        path.unlink(missing_ok=True)
+    for directory in (data_dir / "guards", data_dir / "runtime", data_dir):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    if data_dir.exists():
+        print(f"kept: installer 以外のファイルが残っています: {data_dir}")
     print("uninstalled: Git Safety Pack")
     return 0
 
