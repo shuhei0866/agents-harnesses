@@ -260,26 +260,42 @@ guard_reset_command_assignments() {
 # 実 shell では prefix 代入が効くのは引数展開の後なので、記録すると実挙動と
 # 逆の判定になる。
 guard_note_assignment_segment() {
-  local segment="$1" token="" name="" value=""
+  local segment="$1" token="" name="" value="" start=0 i=0 count=0
   local -a tokens=()
 
   while IFS= read -r token; do
     tokens[${#tokens[@]}]="$token"
   done < <(guard_shell_tokens "$segment")
 
-  if [ "${#tokens[@]}" -eq 0 ]; then
+  count=${#tokens[@]}
+  if [ "$count" -eq 0 ]; then
     return 0
   fi
 
-  # 代入以外の token が 1 つでもあれば prefix 代入なので記録しない。
-  for token in "${tokens[@]}"; do
-    case "$token" in
+  # `export VAR=value` のような宣言 builtin は、代入だけの segment として扱う。
+  # option や値なしの引数が続く形（`export -f fn` / `export VAR`）は、下の
+  # 代入判定で弾かれる。
+  case "${tokens[0]}" in
+    export|declare|typeset) start=1 ;;
+  esac
+  if [ "$start" -ge "$count" ]; then
+    return 0
+  fi
+
+  # 代入以外の token が 1 つでもあれば command prefix 代入なので記録しない。
+  i="$start"
+  while [ "$i" -lt "$count" ]; do
+    case "${tokens[$i]}" in
       [A-Za-z_]*=*) ;;
       *) return 0 ;;
     esac
+    i=$((i + 1))
   done
 
-  for token in "${tokens[@]}"; do
+  i="$start"
+  while [ "$i" -lt "$count" ]; do
+    token="${tokens[$i]}"
+    i=$((i + 1))
     name="${token%%=*}"
     value="${token#*=}"
     case "$name" in

@@ -131,6 +131,9 @@ assert_silent_allow "\${VAR} 形も通す"
 run_guard "$COMMIT_GUARD" "D=$TMPDIR_TEST; git -C \"\$D/branch_repo\" commit -m x"
 assert_silent_allow "\$VAR/rest 形も通す"
 
+run_guard "$COMMIT_GUARD" "export D=$BRANCH_REPO; git -C \"\$D\" commit -m x"
+assert_silent_allow "export 付きの代入も通す"
+
 echo "commit-guard: 変数形でも止めるべきものは止まる（fail-open していない）"
 run_guard "$COMMIT_GUARD" "git -C $MAIN_REPO commit -m x"
 assert_context_matches "リテラル形の main 直接コミットは止まる" "メインワークツリー"
@@ -140,6 +143,9 @@ assert_context_matches "\$VAR 形の main 直接コミットも止まる" "メ�
 
 run_guard "$COMMIT_GUARD" "D=$TMPDIR_TEST; git -C \"\$D/main_repo\" commit -m x"
 assert_context_matches "\$VAR/rest 形の main 直接コミットも止まる" "メインワークツリー"
+
+run_guard "$COMMIT_GUARD" "export D=$MAIN_REPO; git -C \"\$D\" commit -m x"
+assert_context_matches "export 付きの main 直接コミットも止まる" "メインワークツリー"
 
 echo "commit-guard: 展開できない場合は従来どおり advisory へ倒す"
 run_guard "$COMMIT_GUARD" "git -C \"\$D\" commit -m x"
