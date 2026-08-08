@@ -247,10 +247,15 @@ _guard_git_workflow_from_dir() {
 # bash 3.2 に連想配列が無いため、name と value を並列配列で持つ。
 _GUARD_ASSIGN_NAMES=()
 _GUARD_ASSIGN_VALUES=()
+# 値が使えるかに関わらず、代入された変数名をすべて数えるための控え。
+# 同じ変数が 2 回以上代入されていたら、どの値が有効かは実行順に依存するので
+# 記録ごと落とす判定に使う。
+_GUARD_ASSIGN_SEEN=()
 
 guard_reset_command_assignments() {
   _GUARD_ASSIGN_NAMES=()
   _GUARD_ASSIGN_VALUES=()
+  _GUARD_ASSIGN_SEEN=()
 }
 
 # 代入だけで構成された segment を記録する。segment は実行順に渡す前提で、
@@ -301,9 +306,16 @@ guard_note_assignment_segment() {
     case "$name" in
       *[!A-Za-z0-9_]*) continue ;;
     esac
-    # 値に展開が残るものは連鎖解決になるので記録しない（eval へ近づけない）。
+
+    # 値が使えるかに関わらず、代入されたという事実は先に数える。
+    # ここを value の採否より先に置かないと、`D=/a; D=$X` のように 2 回目が
+    # 記録対象外だったときに 1 回目の古い値が生き残る。
+    _GUARD_ASSIGN_SEEN[${#_GUARD_ASSIGN_SEEN[@]}]="$name"
+
+    # 値に展開や command substitution が残るものは連鎖解決になるので記録しない
+    # （eval へ近づけない）。_SUBST_ は mask 後の置換痕。
     case "$value" in
-      ''|*'$'*|*'`'*) continue ;;
+      ''|*'$'*|*'`'*|*_SUBST_*) continue ;;
     esac
     _GUARD_ASSIGN_NAMES[${#_GUARD_ASSIGN_NAMES[@]}]="$name"
     _GUARD_ASSIGN_VALUES[${#_GUARD_ASSIGN_VALUES[@]}]="$value"
@@ -314,12 +326,50 @@ guard_note_assignment_segment() {
 # 各ガードの入口で 1 度だけ呼び、以降のライブラリ関数は読むだけにする
 # （関数側で reset すると、呼び出し元が積んだ記録を壊すため）。
 guard_collect_command_assignments() {
-  local command="$1" segment=""
+  local command="$1" segment="" masked="" name="" i=0 j=0 count=0 seen_count=0 hits=0
+  local -a keep_names=() keep_values=()
 
   guard_reset_command_assignments
+
+  # command substitution の中の代入は親シェルへ残らないので、外側だけを見る。
+  # segment 分割は `$( )` の内側も割ってしまうため、先に mask を掛ける。
+  masked=$(guard_mask_command_substitutions "$(guard_strip_heredoc_bodies "$command")")
   while IFS= read -r segment; do
     guard_note_assignment_segment "$segment"
-  done <<< "$(guard_split_segments "$(guard_strip_heredoc_bodies "$command")")"
+  done <<< "$(guard_split_segments "$masked")"
+
+  # 同じ変数が 2 回以上代入されていたら、その使用箇所で有効な値は実行順で決まる。
+  # ここでは segment の実行順を持たないので、静的に確定できるもの（コマンド中で
+  # ちょうど 1 回だけ代入された変数）以外は記録ごと落として fail closed に倒す。
+  count=${#_GUARD_ASSIGN_NAMES[@]}
+  seen_count=${#_GUARD_ASSIGN_SEEN[@]}
+  i=0
+  while [ "$i" -lt "$count" ]; do
+    name="${_GUARD_ASSIGN_NAMES[$i]}"
+    hits=0
+    j=0
+    while [ "$j" -lt "$seen_count" ]; do
+      if [ "${_GUARD_ASSIGN_SEEN[$j]}" = "$name" ]; then
+        hits=$((hits + 1))
+      fi
+      j=$((j + 1))
+    done
+    if [ "$hits" -eq 1 ]; then
+      keep_names[${#keep_names[@]}]="$name"
+      keep_values[${#keep_values[@]}]="${_GUARD_ASSIGN_VALUES[$i]}"
+    fi
+    i=$((i + 1))
+  done
+
+  _GUARD_ASSIGN_NAMES=()
+  _GUARD_ASSIGN_VALUES=()
+  i=0
+  count=${#keep_names[@]}
+  while [ "$i" -lt "$count" ]; do
+    _GUARD_ASSIGN_NAMES[$i]="${keep_names[$i]}"
+    _GUARD_ASSIGN_VALUES[$i]="${keep_values[$i]}"
+    i=$((i + 1))
+  done
 }
 
 # 記録済みの代入で先頭の変数参照だけを展開する。

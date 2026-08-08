@@ -16,9 +16,15 @@ GH_GUARD="$SCRIPT_DIR/../gh-guard.sh"
 
 PASS=0
 FAIL=0
-TMPDIR_TEST="$(mktemp -d)"
+TMPDIR_TEST="$(mktemp -d)" || exit 1
+# 削除対象がこのテストの作った fixture であることを marker で確かめてから消す。
+# set -e を使わないので、mktemp が失敗したまま rm -rf へ進む経路を塞ぐ。
+FIXTURE_MARKER=".guard-command-assignments-fixture"
+: > "$TMPDIR_TEST/$FIXTURE_MARKER"
 
 cleanup() {
+  [ -n "$TMPDIR_TEST" ] || return 0
+  [ -f "$TMPDIR_TEST/$FIXTURE_MARKER" ] || return 0
   rm -rf "$TMPDIR_TEST"
 }
 trap cleanup EXIT
@@ -131,6 +137,9 @@ assert_silent_allow "\${VAR} 形も通す"
 run_guard "$COMMIT_GUARD" "D=$TMPDIR_TEST; git -C \"\$D/branch_repo\" commit -m x"
 assert_silent_allow "\$VAR/rest 形も通す"
 
+run_guard "$COMMIT_GUARD" "D=$TMPDIR_TEST; git -C \"\${D}/branch_repo\" commit -m x"
+assert_silent_allow "\${VAR}/rest 形も通す"
+
 run_guard "$COMMIT_GUARD" "export D=$BRANCH_REPO; git -C \"\$D\" commit -m x"
 assert_silent_allow "export 付きの代入も通す"
 
@@ -161,6 +170,21 @@ assert_context_matches "値が空の代入は記録しない" "一意に確認�
 # 記録すると実挙動と逆の判定になる。記録しないことを固定する。
 run_guard "$COMMIT_GUARD" "D=$BRANCH_REPO git -C \"\$D\" commit -m x"
 assert_context_matches "command prefix 代入は展開に使わない" "一意に確認できませんでした"
+
+echo "commit-guard: 実行順に依存する代入は記録ごと落とす"
+# 後続の再代入が先行する使用箇所へ逆流すると、保護対象の repo へのコミットを
+# 別 repo の判定で黙認してしまう。1 コマンド中に 2 回以上代入された変数は、
+# その使用箇所で有効な値を静的に決められないので記録しない。
+run_guard "$COMMIT_GUARD" "D=$MAIN_REPO; git -C \"\$D\" commit -m x; D=$BRANCH_REPO"
+assert_context_matches "後続の再代入がある変数は解決しない" "一意に確認できませんでした"
+
+# 2 回目の代入が記録対象外（値に展開が残る）でも、1 回目の値を生かしてはいけない。
+run_guard "$COMMIT_GUARD" "D=$BRANCH_REPO; X=$MAIN_REPO; D=\$X; git -C \"\$D\" commit -m x"
+assert_context_matches "記録できない再代入でも古い値を残さない" "一意に確認できませんでした"
+
+# command substitution の中の代入は親シェルへ残らない。外側だけを見る。
+run_guard "$COMMIT_GUARD" "echo \"\$(D=$BRANCH_REPO)\"; git -C \"\$D\" commit -m x"
+assert_context_matches "置換の内側の代入は記録しない" "一意に確認できませんでした"
 
 echo "gh-guard: --repo の \$VAR も同じ扱いになる"
 run_guard "$GH_GUARD" "gh pr merge 1 --repo owner/name --merge"
