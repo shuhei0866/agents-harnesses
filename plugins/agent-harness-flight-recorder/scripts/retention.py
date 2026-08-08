@@ -25,6 +25,11 @@ from reporting import (
     _authenticated_query_locked,
     _policy_selection,
 )
+from receipt_automation import (
+    remove_episode_attempts as remove_receipt_attempts,
+    restore_attempts as restore_receipt_attempts,
+    run_lock as receipt_automation_lock,
+)
 from retention_state import load_forgotten, store_forgotten
 from semantic_receipts import semantic_receipt_record_snapshots
 from sync import (
@@ -312,87 +317,103 @@ def purge(
     scope = _scope(root, episode_id, selected, trusted)
     if not apply:
         return scope
-    # Lock order is shared with configure/run: auto-evaluation first, then the
-    # Vault. Purge cannot expose a stale episode to an already-running evaluator.
+    # Global order for purge is background evaluation, Receipt automation,
+    # then Vault. Each runner takes only its own run lock before Vault, so this
+    # order cannot form a cycle and blocks both evaluator types during purge.
     with auto_evaluation_lock(root, blocking=True):
-        with vault_lock(root):
-            # Reauthenticate and resolve scope under the same exclusive lock
-            # used for mutation so a sync/rebuild cannot make the preview stale.
-            scope = _scope(
-                root, episode_id, selected, trusted, locked=True
-            )
-            paths = [item["source_path"] for item in scope["chunks"]]
-            _validate_remote_namespace(root)
-            # Validate every local input before history or derivative mutation.
-            _remove_local_derivatives(root, scope, apply=False)
-            original_forgotten = load_forgotten(root)
-            pending_path = root / PENDING_PATH
-            original_pending = (
-                pending_path.read_bytes() if pending_path.exists() else None
-            )
-            evaluation_snapshots = evaluation_record_snapshots(
-                root, selected, episode_id
-            )
-            semantic_receipt_snapshots = semantic_receipt_record_snapshots(
-                root, selected, episode_id
-            )
-            meaning_card_snapshots = meaning_card_record_snapshots(
-                root, selected, episode_id
-            )
-            attempt_snapshot = remove_episode_attempts(root, episode_id)
-            attempt_committed = False
-            try:
-                _rewrite_history(root, paths)
-                _remove_local_derivatives(root, scope)
-                rebuild_index_locked(root, incremental=False)
-                forgotten = set(original_forgotten)
-                forgotten.discard((selected, episode_id))
-                store_forgotten(root, forgotten)
-                derivative_snapshots = [
-                    *evaluation_snapshots,
-                    *semantic_receipt_snapshots,
-                    *meaning_card_snapshots,
-                ]
-                removed_derivatives: list[tuple[Path, bytes]] = []
+        with receipt_automation_lock(root, blocking=True):
+            with vault_lock(root):
+                # Reauthenticate and resolve scope under the same exclusive lock
+                # used for mutation so a sync/rebuild cannot make the preview stale.
+                scope = _scope(
+                    root, episode_id, selected, trusted, locked=True
+                )
+                paths = [item["source_path"] for item in scope["chunks"]]
+                _validate_remote_namespace(root)
+                # Validate every local input before history or derivative mutation.
+                _remove_local_derivatives(root, scope, apply=False)
+                original_forgotten = load_forgotten(root)
+                pending_path = root / PENDING_PATH
+                original_pending = (
+                    pending_path.read_bytes() if pending_path.exists() else None
+                )
+                evaluation_snapshots = evaluation_record_snapshots(
+                    root, selected, episode_id
+                )
+                semantic_receipt_snapshots = semantic_receipt_record_snapshots(
+                    root, selected, episode_id
+                )
+                meaning_card_snapshots = meaning_card_record_snapshots(
+                    root, selected, episode_id
+                )
+                attempt_snapshot = remove_episode_attempts(root, episode_id)
                 try:
-                    for derivative_path, derivative_bytes in derivative_snapshots:
-                        derivative_path.unlink()
-                        removed_derivatives.append(
-                            (derivative_path, derivative_bytes)
-                        )
-                except OSError as error:
-                    for derivative_path, derivative_bytes in removed_derivatives:
-                        atomic_replace(derivative_path, derivative_bytes)
-                    raise VaultError("derived record storage is unsafe") from error
-                try:
-                    # Keep refs/original until the remote accepts the rewrite.
-                    # A rejection restores the Vault to a retryable state.
-                    _run_git(root, ["push", "--force", "origin", "HEAD:main"])
+                    receipt_attempt_snapshot = remove_receipt_attempts(
+                        root, episode_id
+                    )
                 except VaultError:
-                    _restore_history(root)
-                    import_chunks(root)
-                    rebuild_index_locked(root, incremental=False)
-                    store_forgotten(root, original_forgotten)
-                    if original_pending is None:
-                        try:
-                            pending_path.unlink()
-                        except FileNotFoundError:
-                            pass
-                    else:
-                        atomic_replace(pending_path, original_pending)
-                    for evaluation_path, evaluation_bytes in evaluation_snapshots:
-                        atomic_replace(evaluation_path, evaluation_bytes)
-                    for receipt_path, receipt_bytes in semantic_receipt_snapshots:
-                        atomic_replace(receipt_path, receipt_bytes)
-                    for card_path, card_bytes in meaning_card_snapshots:
-                        atomic_replace(card_path, card_bytes)
-                    _cleanup_original_history(root)
-                    raise
-                _cleanup_original_history(root)
-                attempt_committed = True
-            finally:
-                if not attempt_committed:
                     restore_attempts(root, attempt_snapshot)
+                    raise
+                attempt_committed = False
+                try:
+                    _rewrite_history(root, paths)
+                    _remove_local_derivatives(root, scope)
+                    rebuild_index_locked(root, incremental=False)
+                    forgotten = set(original_forgotten)
+                    forgotten.discard((selected, episode_id))
+                    store_forgotten(root, forgotten)
+                    derivative_snapshots = [
+                        *evaluation_snapshots,
+                        *semantic_receipt_snapshots,
+                        *meaning_card_snapshots,
+                    ]
+                    removed_derivatives: list[tuple[Path, bytes]] = []
+                    try:
+                        for derivative_path, derivative_bytes in derivative_snapshots:
+                            derivative_path.unlink()
+                            removed_derivatives.append(
+                                (derivative_path, derivative_bytes)
+                            )
+                    except OSError as error:
+                        for derivative_path, derivative_bytes in removed_derivatives:
+                            atomic_replace(derivative_path, derivative_bytes)
+                        raise VaultError(
+                            "derived record storage is unsafe"
+                        ) from error
+                    try:
+                        # Keep refs/original until the remote accepts the rewrite.
+                        # A rejection restores the Vault to a retryable state.
+                        _run_git(
+                            root, ["push", "--force", "origin", "HEAD:main"]
+                        )
+                    except VaultError:
+                        _restore_history(root)
+                        import_chunks(root)
+                        rebuild_index_locked(root, incremental=False)
+                        store_forgotten(root, original_forgotten)
+                        if original_pending is None:
+                            try:
+                                pending_path.unlink()
+                            except FileNotFoundError:
+                                pass
+                        else:
+                            atomic_replace(pending_path, original_pending)
+                        for evaluation_path, evaluation_bytes in evaluation_snapshots:
+                            atomic_replace(evaluation_path, evaluation_bytes)
+                        for receipt_path, receipt_bytes in semantic_receipt_snapshots:
+                            atomic_replace(receipt_path, receipt_bytes)
+                        for card_path, card_bytes in meaning_card_snapshots:
+                            atomic_replace(card_path, card_bytes)
+                        _cleanup_original_history(root)
+                        raise
+                    _cleanup_original_history(root)
+                    attempt_committed = True
+                finally:
+                    if not attempt_committed:
+                        restore_attempts(root, attempt_snapshot)
+                        restore_receipt_attempts(
+                            root, receipt_attempt_snapshot
+                        )
     scope["apply"] = True
     return scope
 

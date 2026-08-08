@@ -17,7 +17,14 @@ from typing import Any, Iterator
 
 from chunk_rotation import canonical_json, safe_subdirectory
 from record_event import hash_identifier
-from semantic_receipts import _load_rubric, generate
+from semantic_receipts import (
+    _load_rubric,
+    _prepare_receipt,
+    _store_prepared_receipt,
+    _validate_prepared_record,
+    _validate_prepared_receipt,
+    load_semantic_receipts,
+)
 from evaluation import BUNDLED_EVALUATORS, _executable_identity
 from session_sources import register
 from vault import (
@@ -59,6 +66,11 @@ MAX_HINTS = 100_000
 HINT_COMPACTION_THRESHOLD = 100
 MAX_STATE_BYTES = 32 * 1024 * 1024
 MAX_ATTEMPTS = 100_000
+# A prepared Receipt is capped at 128 KiB; its snapshot duplicates the bounded
+# source IDs and may additionally contain 10,000 evidence digests. Four MiB is
+# a conservative ceiling for that legal envelope. The validator enforces and
+# the provider preflight reserves this same ceiling.
+MAX_PREPARED_ATTEMPT_BYTES = 4 * 1024 * 1024
 FINGERPRINT_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 AUTOMATION_STATES = {"idle", "completed", "attention", "error"}
 DIAGNOSTIC_CODES = {None, "configuration_invalid", "evaluator_failed"}
@@ -311,36 +323,118 @@ def _compact_hints(root: Path, terminal_event_ids: set[str]) -> None:
         os.close(parent_descriptor)
 
 
+def _validate_attempt_item(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise VaultError("receipt automation attempts are invalid")
+    state = value.get("state")
+    fingerprint = value.get("fingerprint")
+    if (
+        state not in {"pending", "prepared", "failed", "completed"}
+        or not isinstance(fingerprint, str)
+        or FINGERPRINT_RE.fullmatch(fingerprint) is None
+    ):
+        raise VaultError("receipt automation attempts are invalid")
+    if state != "prepared":
+        allowed_fields = {"fingerprint", "state"}
+        if state == "completed" and set(value) == {
+            "fingerprint",
+            "state",
+            "event_id",
+            "episode_id",
+        }:
+            event_id = value.get("event_id")
+            episode_id = value.get("episode_id")
+            if (
+                not isinstance(event_id, str)
+                or not event_id
+                or len(event_id) > 256
+                or any(character in event_id for character in "\r\n\0")
+                or not isinstance(episode_id, str)
+                or FINGERPRINT_RE.fullmatch(episode_id) is None
+            ):
+                raise VaultError("receipt automation attempts are invalid")
+            return value
+        if set(value) != allowed_fields:
+            raise VaultError("receipt automation attempts are invalid")
+        return value
+    if set(value) != {
+        "fingerprint",
+        "state",
+        "event_id",
+        "episode_id",
+        "prepared",
+    }:
+        raise VaultError("receipt automation attempts are invalid")
+    event_id = value.get("event_id")
+    episode_id = value.get("episode_id")
+    if (
+        not isinstance(event_id, str)
+        or not event_id
+        or len(event_id) > 256
+        or any(character in event_id for character in "\r\n\0")
+        or not isinstance(episode_id, str)
+        or FINGERPRINT_RE.fullmatch(episode_id) is None
+    ):
+        raise VaultError("receipt automation attempts are invalid")
+    prepared = _validate_prepared_record(value.get("prepared"))
+    if (
+        prepared["result"]["receipt"]["episode_id"] != episode_id
+        or event_id not in prepared["snapshot"]["source_event_ids"]
+        or len(canonical_json(value)) > MAX_PREPARED_ATTEMPT_BYTES
+    ):
+        raise VaultError("receipt automation attempts are invalid")
+    return value
+
+
 def _attempts(root: Path) -> dict[str, dict[str, Any]]:
     value = _read_json_file(root / ATTEMPTS_PATH, {"schema_version": 1, "items": []})
     items = value.get("items") if isinstance(value, dict) else None
     if (
         not isinstance(value, dict)
+        or set(value) != {"schema_version", "items"}
         or value.get("schema_version") != 1
         or not isinstance(items, list)
         or len(items) > MAX_ATTEMPTS
-        or any(
-            not isinstance(item, dict)
-            or set(item) != {"fingerprint", "state"}
-            or item.get("state") not in {"pending", "failed", "completed"}
-            or not isinstance(item.get("fingerprint"), str)
-            or FINGERPRINT_RE.fullmatch(item["fingerprint"]) is None
-            for item in items
-        )
-        or len({item["fingerprint"] for item in items}) != len(items)
     ):
         raise VaultError("receipt automation attempts are invalid")
-    return {item["fingerprint"]: item for item in items}
+    checked = [_validate_attempt_item(item) for item in items]
+    if len({item["fingerprint"] for item in checked}) != len(checked):
+        raise VaultError("receipt automation attempts are invalid")
+    return {item["fingerprint"]: item for item in checked}
+
+
+def _encoded_attempts(attempts: dict[str, dict[str, Any]]) -> bytes:
+    if len(attempts) > MAX_ATTEMPTS:
+        raise VaultError("receipt automation attempts exceed the size limit")
+    checked = [_validate_attempt_item(item) for item in attempts.values()]
+    value = {
+        "schema_version": 1,
+        "items": sorted(checked, key=lambda item: item["fingerprint"]),
+    }
+    data = canonical_json(value) + b"\n"
+    if len(data) > MAX_STATE_BYTES:
+        raise VaultError("receipt automation attempts exceed the size limit")
+    return data
 
 
 def _store_attempts(root: Path, attempts: dict[str, dict[str, Any]]) -> None:
-    if len(attempts) > MAX_ATTEMPTS:
-        raise VaultError("receipt automation attempts exceed the size limit")
-    value = {
-        "schema_version": 1,
-        "items": sorted(attempts.values(), key=lambda item: item["fingerprint"]),
+    data = _encoded_attempts(attempts)
+    atomic_replace(root / ATTEMPTS_PATH, data)
+
+
+def _reserve_prepared_attempt(
+    attempts: dict[str, dict[str, Any]], fingerprint: str
+) -> None:
+    reserved = dict(attempts)
+    reserved[fingerprint] = {
+        "fingerprint": fingerprint,
+        "state": "pending",
     }
-    atomic_replace(root / ATTEMPTS_PATH, canonical_json(value) + b"\n")
+    if (
+        len(_encoded_attempts(reserved)) + MAX_PREPARED_ATTEMPT_BYTES
+        > MAX_STATE_BYTES
+    ):
+        raise VaultError("receipt automation attempts lack prepared capacity")
 
 
 def _write_status(root: Path, value: dict[str, Any]) -> None:
@@ -363,7 +457,7 @@ def record_failure(root: Path, diagnostic_code: str) -> None:
 
 
 @contextlib.contextmanager
-def _run_lock(root: Path) -> Iterator[bool]:
+def run_lock(root: Path, *, blocking: bool) -> Iterator[bool]:
     directory = safe_subdirectory(root, "receipt-automation")
     path = root / LOCK_PATH
     descriptor = os.open(
@@ -384,7 +478,8 @@ def _run_lock(root: Path) -> Iterator[bool]:
             raise VaultError("receipt automation run lock is unsafe")
         os.fchmod(descriptor, 0o600)
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+            fcntl.flock(descriptor, flags)
         except BlockingIOError:
             yield False
             return
@@ -392,6 +487,38 @@ def _run_lock(root: Path) -> Iterator[bool]:
     finally:
         os.close(descriptor)
         directory.chmod(0o700)
+
+
+def remove_episode_attempts(
+    root: Path, episode_id: str
+) -> bytes | None:
+    """Remove identifiable Receipt attempts under caller-held locks."""
+    path = root / ATTEMPTS_PATH
+    if not path.exists() and not path.is_symlink():
+        return None
+    attempts = _attempts(root)
+    snapshot = path.read_bytes()
+    remaining = {
+        fingerprint: item
+        for fingerprint, item in attempts.items()
+        if item.get("episode_id") != episode_id
+    }
+    _store_attempts(root, remaining)
+    return snapshot
+
+
+def restore_attempts(root: Path, snapshot: bytes | None) -> None:
+    """Restore the exact Receipt attempt ledger after failed purge."""
+    path = root / ATTEMPTS_PATH
+    if snapshot is None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    if len(snapshot) > MAX_STATE_BYTES:
+        raise VaultError("receipt automation attempts exceed the size limit")
+    atomic_replace(path, snapshot)
 
 
 def _safe_source(
@@ -592,6 +719,48 @@ def _codex_span(
     return "exact", pairs[0][0] + 1, pairs[0][1] + 1
 
 
+def _classify_episode(
+    event_id: object,
+    hint: dict[str, Any],
+    result: dict[str, Any] | None,
+) -> tuple[str, dict[str, Any] | None]:
+    if not isinstance(event_id, str):
+        return "missing", None
+    if result is None:
+        return "missing", None
+    members = result["members"]
+    harness = hint.get("harness")
+    session_hash = hint.get("session_id_hash")
+    turn_hash = hint.get("turn_id_hash")
+    if (
+        not members
+        or harness not in {"claude-code", "codex"}
+        or not isinstance(session_hash, str)
+        or not any(
+            member[0] == event_id and member[2] == "Stop"
+            for member in members
+        )
+        or any(member[1] != harness for member in members)
+        or any(member[3] != session_hash for member in members)
+        or (
+            harness == "codex"
+            and (
+                not isinstance(turn_hash, str)
+                or any(member[4] != turn_hash for member in members)
+            )
+        )
+    ):
+        return "ambiguous", None
+    return (
+        "exact",
+        {
+            "episode_id": result["episode_id"],
+            "source_event_ids": [member[0] for member in members],
+            "evidence_ids": result["evidence_ids"],
+        },
+    )
+
+
 def _episode_for_event(
     root: Path,
     event_id: object,
@@ -643,39 +812,169 @@ def _episode_for_event(
         }
 
     result = _authenticated_query(root, policy, query)
-    if result is None:
-        return "missing", None
-    members = result["members"]
-    harness = hint.get("harness")
-    session_hash = hint.get("session_id_hash")
-    turn_hash = hint.get("turn_id_hash")
-    if (
-        not members
-        or harness not in {"claude-code", "codex"}
-        or not isinstance(session_hash, str)
-        or not any(
-            member[0] == event_id and member[2] == "Stop"
-            for member in members
-        )
-        or any(member[1] != harness for member in members)
-        or any(member[3] != session_hash for member in members)
-        or (
-            harness == "codex"
-            and (
-                not isinstance(turn_hash, str)
-                or any(member[4] != turn_hash for member in members)
-            )
-        )
-    ):
-        return "ambiguous", None
-    return (
-        "exact",
-        {
-            "episode_id": result["episode_id"],
-            "source_event_ids": [member[0] for member in members],
-            "evidence_ids": result["evidence_ids"],
-        },
+    return _classify_episode(event_id, hint, result)
+
+
+def _authenticated_episode_snapshot(
+    root: Path,
+    policy: str,
+    event_ids: set[str],
+) -> dict[str, dict[str, Any]]:
+    """Authenticate the graph once and snapshot candidate Episodes."""
+    from reporting import (
+        _authenticated_query,
+        _edges_by_episode,
+        _episode_card,
     )
+    from retention_state import load_forgotten
+
+    def query(
+        connection: sqlite3.Connection, stored_policy: dict[str, Any]
+    ) -> dict[str, dict[str, Any]]:
+        members_by_episode: dict[str, list[tuple[Any, ...]]] = {}
+        selected_episode_ids: set[str] = set()
+        for member in connection.execute(
+            "SELECT m.episode_id, e.event_id, e.harness, e.source_event, "
+            "e.session_id_hash, e.turn_id_hash "
+            "FROM episode_members AS m "
+            "JOIN source_events AS e ON e.event_id = m.event_id "
+            "WHERE m.policy_version = ? ORDER BY m.episode_id, m.ordinal",
+            (policy,),
+        ):
+            episode_id = member[0]
+            event = tuple(member[1:])
+            members_by_episode.setdefault(episode_id, []).append(event)
+            if event[0] in event_ids:
+                selected_episode_ids.add(episode_id)
+
+        evidence_by_episode: dict[str, list[str]] = {}
+        for episode_id, evidence_id in connection.execute(
+            "SELECT DISTINCT m.episode_id, d.evidence_id "
+            "FROM deterministic_evidence AS d "
+            "JOIN episode_members AS m ON m.event_id = d.source_event_id "
+            "WHERE m.policy_version = ? "
+            "ORDER BY m.episode_id, d.evidence_id",
+            (policy,),
+        ):
+            evidence_by_episode.setdefault(episode_id, []).append(evidence_id)
+
+        forgotten = load_forgotten(root)
+        edges_by_episode = _edges_by_episode(connection, policy)
+        snapshot: dict[str, dict[str, Any]] = {}
+        for episode_id in sorted(selected_episode_ids):
+            members = members_by_episode[episode_id]
+            card = None
+            if (policy, episode_id) not in forgotten:
+                card, _edges = _episode_card(
+                    root,
+                    connection,
+                    stored_policy,
+                    episode_id,
+                    edges_by_episode,
+                )
+                load_semantic_receipts(
+                    root,
+                    policy,
+                    episode_id,
+                    card["source_event_ids"],
+                    {
+                        item["evidence_id"]
+                        for item in card["deterministic_evidence"]
+                    },
+                )
+            episode_snapshot = {
+                "policy_version": policy,
+                "card": card,
+            }
+            episode = {
+                "episode_id": episode_id,
+                "members": members,
+                "evidence_ids": evidence_by_episode.get(episode_id, []),
+                "episode_snapshot": episode_snapshot,
+            }
+            for member in members:
+                snapshot[member[0]] = episode
+        return snapshot
+
+    return _authenticated_query(root, policy, query)
+
+
+def _episode_from_snapshot(
+    snapshot: dict[str, dict[str, Any]],
+    event_id: object,
+    hint: dict[str, Any],
+) -> tuple[str, dict[str, Any] | None]:
+    if not isinstance(event_id, str):
+        return "missing", None
+    result = snapshot.get(event_id)
+    state, episode = _classify_episode(event_id, hint, result)
+    if state != "exact" or episode is None:
+        return state, episode
+    if result["episode_snapshot"]["card"] is None:
+        return "ambiguous", None
+    episode["episode_snapshot"] = result["episode_snapshot"]
+    return state, episode
+
+
+def _commit_staged_receipts(
+    root: Path,
+    policy: str,
+    staged: list[dict[str, Any]],
+) -> None:
+    from reporting import (
+        _authenticated_query_locked,
+        _edges_by_episode,
+        _episode_card,
+    )
+    from retention_state import load_forgotten
+
+    def query(
+        connection: sqlite3.Connection, stored_policy: dict[str, Any]
+    ) -> None:
+        forgotten = load_forgotten(root)
+        episode_ids = {
+            item["episode_id"] for item in staged
+        }
+        if any((policy, episode_id) in forgotten for episode_id in episode_ids):
+            raise VaultError("episode was forgotten during receipt generation")
+
+        edges_by_episode = _edges_by_episode(connection, policy)
+        inspections: dict[str, dict[str, Any]] = {}
+        for episode_id in sorted(episode_ids):
+            card, _edges = _episode_card(
+                root,
+                connection,
+                stored_policy,
+                episode_id,
+                edges_by_episode,
+            )
+            evidence_ids = {
+                item["evidence_id"]
+                for item in card["deterministic_evidence"]
+            }
+            load_semantic_receipts(
+                root,
+                policy,
+                episode_id,
+                card["source_event_ids"],
+                evidence_ids,
+            )
+            inspections[episode_id] = {
+                "policy_version": policy,
+                "card": card,
+            }
+
+        for item in staged:
+            _validate_prepared_receipt(
+                root,
+                item["prepared"],
+                inspections[item["episode_id"]],
+            )
+        for item in staged:
+            _store_prepared_receipt(root, item["prepared"])
+
+    with vault_lock(root):
+        _authenticated_query_locked(root, policy, query)
 
 
 def _fingerprint(
@@ -765,7 +1064,7 @@ def run(root: Path) -> dict[str, Any]:
     config = load_config(root)
     load_vault_config(root)
     ensure_managed_gitignore(root)
-    with _run_lock(root) as acquired:
+    with run_lock(root, blocking=False) as acquired:
         if not acquired:
             return {
                 "schema_version": 1,
@@ -800,6 +1099,14 @@ def run(root: Path) -> dict[str, Any]:
         }
         measured_cost = 0
         terminal_event_ids: set[str] = set()
+        staged: list[dict[str, Any]] = []
+        staged_fingerprints: set[str] = set()
+        episode_snapshot: dict[str, dict[str, Any]] | None = None
+        hinted_event_ids = {
+            event_id
+            for hint in hints
+            if isinstance((event_id := hint.get("event_id")), str)
+        }
         for hint in hints:
             event_id = hint.get("event_id")
             classification, source, _metadata, prefix = _safe_source(hint, config)
@@ -827,11 +1134,14 @@ def run(root: Path) -> dict[str, Any]:
                 if isinstance(event_id, str):
                     terminal_event_ids.add(event_id)
                 continue
-            episode_state, episode = _episode_for_event(
-                root,
-                hint.get("event_id"),
-                config["policy_version"],
-                hint,
+            if episode_snapshot is None:
+                episode_snapshot = _authenticated_episode_snapshot(
+                    root,
+                    config["policy_version"],
+                    hinted_event_ids,
+                )
+            episode_state, episode = _episode_from_snapshot(
+                episode_snapshot, hint.get("event_id"), hint
             )
             if episode_state != "exact" or episode is None:
                 counts[episode_state] += 1
@@ -853,17 +1163,33 @@ def run(root: Path) -> dict[str, Any]:
             if previous is not None:
                 if previous["state"] == "completed":
                     counts["idempotent_skip"] += 1
+                    if isinstance(event_id, str):
+                        terminal_event_ids.add(event_id)
+                elif previous["state"] == "prepared":
+                    if fingerprint in staged_fingerprints:
+                        counts["attempt_skip"] += 1
+                        continue
+                    if len(staged) >= config["max_receipts_per_run"]:
+                        continue
+                    staged.append(
+                        {
+                            "episode_id": episode["episode_id"],
+                            "event_id": event_id,
+                            "fingerprint": fingerprint,
+                            "prepared": previous["prepared"],
+                        }
+                    )
+                    staged_fingerprints.add(fingerprint)
                 else:
                     counts["attempt_skip"] += 1
-                if isinstance(event_id, str):
-                    terminal_event_ids.add(event_id)
                 continue
             if (
-                counts["generated"] + counts["failed"]
+                len(staged) + counts["failed"]
                 >= config["max_receipts_per_run"]
                 or measured_cost >= config["max_cost_microusd_per_run"]
             ):
                 continue
+            _reserve_prepared_attempt(attempts, fingerprint)
             attempts[fingerprint] = {
                 "fingerprint": fingerprint,
                 "state": "pending",
@@ -871,8 +1197,9 @@ def run(root: Path) -> dict[str, Any]:
             _store_attempts(root, attempts)
             try:
                 source_result = register(root, hint["harness"], source)
-                generated = generate(
+                prepared = _prepare_receipt(
                     root,
+                    episode["episode_snapshot"],
                     episode["episode_id"],
                     source_result["source_ref"],
                     start,
@@ -881,8 +1208,6 @@ def run(root: Path) -> dict[str, Any]:
                     config["model"],
                     Path(config["rubric_path"]),
                     _evaluator_timeout_seconds(evaluator_path),
-                    config["policy_version"],
-                    None,
                     config["max_cost_microusd_per_run"] - measured_cost,
                 )
             except VaultError:
@@ -892,12 +1217,50 @@ def run(root: Path) -> dict[str, Any]:
                 if isinstance(event_id, str):
                     terminal_event_ids.add(event_id)
                 break
-            measured_cost += generated["measured_cost_microusd"]
-            attempts[fingerprint]["state"] = "completed"
+            measured_cost += prepared["result"]["measured_cost_microusd"]
+            attempts[fingerprint] = {
+                "fingerprint": fingerprint,
+                "state": "prepared",
+                "event_id": event_id,
+                "episode_id": episode["episode_id"],
+                "prepared": prepared,
+            }
             _store_attempts(root, attempts)
-            counts["generated"] += 1
-            if isinstance(event_id, str):
-                terminal_event_ids.add(event_id)
+            staged.append(
+                {
+                    "episode_id": episode["episode_id"],
+                    "event_id": event_id,
+                    "fingerprint": fingerprint,
+                    "prepared": prepared,
+                }
+            )
+            staged_fingerprints.add(fingerprint)
+        if staged:
+            try:
+                _commit_staged_receipts(
+                    root, config["policy_version"], staged
+                )
+            except VaultError:
+                counts["failed"] += len(staged)
+            else:
+                for item in staged:
+                    attempts[item["fingerprint"]] = {
+                        "fingerprint": item["fingerprint"],
+                        "state": "completed",
+                        "event_id": item["event_id"],
+                        "episode_id": item["episode_id"],
+                    }
+                    if isinstance(item["event_id"], str):
+                        terminal_event_ids.add(item["event_id"])
+                        for old_fingerprint, old in list(attempts.items()):
+                            if (
+                                old_fingerprint != item["fingerprint"]
+                                and old.get("state") == "prepared"
+                                and old.get("event_id") == item["event_id"]
+                            ):
+                                attempts.pop(old_fingerprint)
+                counts["generated"] += len(staged)
+            _store_attempts(root, attempts)
         if len(hints) >= HINT_COMPACTION_THRESHOLD:
             _compact_hints(root, terminal_event_ids)
         state = (

@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import sys
+import time
 
 
 request = json.load(sys.stdin)
@@ -21,6 +22,16 @@ if counter:
     except (FileNotFoundError, ValueError):
         count = 0
     path.write_text(str(count + 1), encoding="utf-8")
+
+block = os.environ.get("FLIGHT_RECORDER_TEST_AUTO_SEMANTIC_BLOCK")
+if block:
+    control = pathlib.Path(block)
+    control.with_suffix(".ready").write_text("ready\n", encoding="utf-8")
+    deadline = time.monotonic() + 15
+    while not control.with_suffix(".release").exists():
+        if time.monotonic() >= deadline:
+            raise SystemExit(19)
+        time.sleep(0.05)
 
 if os.environ.get("FLIGHT_RECORDER_TEST_AUTO_SEMANTIC_FAIL") == "1":
     raise SystemExit(17)
