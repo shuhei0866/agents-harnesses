@@ -127,22 +127,28 @@ assert_silent_allow() {
   fi
 }
 
-echo "commit-guard: 変数で渡したパスの advisory は実行可能な指示になっている"
+echo "commit-guard: パスを解決できないときの advisory は実行可能な指示になっている"
 run_guard 'git -C "$WT" commit -m x'
-assert_context_matches "変数が解決できない理由を述べる" "変数で渡されたパス"
-assert_context_matches "リテラルのパスを書く選択肢を示す" "リテラルのパス"
+assert_context_matches "変数が解決できない可能性を述べる" "変数（"
+assert_context_matches "リテラルで書く選択肢を示す" "リテラルで書く"
 assert_context_matches "cd してから実行する選択肢を示す" "cd してから実行"
 
 # 従来の文言は「`git -C <path>` で明示してください」と案内していた。指示どおり
 # git -C を使っている入力に対してこれを出すと従いようがないので、出さないことを固定する。
 assert_context_lacks "既に git -C を使っている入力へ git -C を勧め直さない" "\`git -C <path>\` で対象リポジトリを明示"
 
+# リテラルのパスが存在しない場合も同じ分岐に来る。「リテラルで書け」と断定すると
+# 既に書いている利用者に従いようのない指示を出すので、両方の可能性を示す。
+run_guard "git -C $TMPDIR_TEST/does_not_exist commit -m x"
+assert_context_matches "存在しないリテラルパスにも当たる文言になっている" "指定されたパスが存在しない"
+assert_context_lacks "リテラルで書いた利用者に変数だと決めつけない" "変数で渡されたパスは解決できません"
+
 echo "commit-guard: 特定できない理由が違えば案内も分かれる"
-# GIT_DIR の指定は「変数が解決できない」のとは別の理由なので、リテラルのパスを
-# 書けという案内は当たらない。cd を促す側の文言になることを固定する。
+# GIT_DIR の指定は別の理由であり、cd するだけではコマンドローカルの環境変数が
+# 対象を上書きし続けるので解決しない。外すことまで案内する必要がある。
 run_guard 'GIT_DIR=/tmp/example.git git commit -m x'
-assert_context_matches "GIT_DIR 指定では cd を促す" "対象リポジトリへ cd してから実行してください"
-assert_context_lacks "GIT_DIR 指定に変数の説明は出さない" "変数で渡されたパス"
+assert_context_matches "GIT_DIR 指定では環境変数を外すよう促す" "GIT_DIR / GIT_WORK_TREE を外した"
+assert_context_lacks "GIT_DIR 指定にパス解決の説明は出さない" "指定されたパスが存在しない"
 
 echo "commit-guard: 判定の向きは変えていない"
 run_guard "git -C $MAIN_REPO commit -m x"

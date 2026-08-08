@@ -638,11 +638,11 @@ if ! guard_is_trunk_direct; then
     # 「対象リポジトリを明示してください」と一括で案内すると、既に `git -C <path>` を
     # 使っている入力に対して従いようのない指示になる。
     if [ "$ADVISORY_UNKNOWN" -eq 1 ]; then
-      guard_respond "advisory" "コミット衛生ガード" "${ADVISORY_OP} の対象リポジトリを特定できませんでした。GIT_DIR / GIT_WORK_TREE の指定や、ガードが追随できない形で作業ディレクトリが変わっています。対象リポジトリへ cd してから実行してください。"
+      guard_respond "advisory" "コミット衛生ガード" "${ADVISORY_OP} の対象リポジトリを特定できませんでした。GIT_DIR / GIT_WORK_TREE の指定や、ガードが追随できない形での作業ディレクトリの変更があります。cd するだけではコマンドローカルの環境変数が対象を上書きし続けるので、GIT_DIR / GIT_WORK_TREE を外したうえで対象リポジトリへ cd してから実行してください。"
     fi
 
     if [ -z "$ADVISORY_DIR" ]; then
-      guard_respond "advisory" "コミット衛生ガード" "${ADVISORY_OP} の対象リポジトリを特定できませんでした。ガードはコマンド文字列だけを読むため、変数で渡されたパス（\`git -C \"\$VAR\"\` など）は解決できません。リテラルのパスを直接書くか、対象リポジトリへ cd してから実行してください。"
+      guard_respond "advisory" "コミット衛生ガード" "${ADVISORY_OP} の対象リポジトリを特定できませんでした。指定されたパスが存在しないか、変数（\`git -C \"\$VAR\"\` など）で渡されていて中身をガードが知り得ません。ガードはコマンド文字列だけを読むためです。実在するパスをリテラルで書くか、対象リポジトリへ cd してから実行してください。"
     fi
 
     GIT_COMMON_DIR=$(git -C "$ADVISORY_DIR" rev-parse --git-common-dir 2>/dev/null || echo "")
