@@ -143,6 +143,11 @@ assert_silent_allow "\${VAR}/rest 形も通す"
 run_guard "$COMMIT_GUARD" "export D=$BRANCH_REPO; git -C \"\$D\" commit -m x"
 assert_silent_allow "export 付きの代入も通す"
 
+# prefix 代入は引数展開の後に効くので、実 shell の git が見るのは純代入側の値である。
+# prefix を代入として数えない設計が、ここで実挙動と一致していることを固定する。
+run_guard "$COMMIT_GUARD" "D=$BRANCH_REPO; D=$MAIN_REPO git -C \"\$D\" commit -m x"
+assert_silent_allow "prefix 代入は数に入れず、純代入側の値で判定する"
+
 echo "commit-guard: 変数形でも止めるべきものは止まる（fail-open していない）"
 run_guard "$COMMIT_GUARD" "git -C $MAIN_REPO commit -m x"
 assert_context_matches "リテラル形の main 直接コミットは止まる" "メインワークツリー"
