@@ -8,7 +8,14 @@
 #
 # ここでは (1) 変数を渡したときの文言が実行可能な指示になっていること、
 # (2) 文言を変えただけで判定の向きは一切変わっていないこと、の 2 つを固定する。
-set -uo pipefail
+set -euo pipefail
+
+for required_cmd in bash dirname mktemp mkdir rm git jq env grep; do
+  command -v "$required_cmd" >/dev/null 2>&1 || {
+    printf 'required command is unavailable: %s\n' "$required_cmd" >&2
+    exit 1
+  }
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GUARD="$SCRIPT_DIR/../commit-guard.sh"
@@ -47,12 +54,16 @@ mkdir -p "$NEUTRAL"
 
 OUT=""
 STATUS=0
+# ガードの終了コードは assertion の材料なので、set -e に中断させずに保持する。
 run_guard() {
   local cmd="$1"
-  OUT=$(jq -n --arg c "$cmd" --arg cwd "$NEUTRAL" '{tool_input:{command:$c}, cwd:$cwd}' \
+  if OUT=$(jq -n --arg c "$cmd" --arg cwd "$NEUTRAL" '{tool_input:{command:$c}, cwd:$cwd}' \
     | env -u CLAUDE_PROJECT_DIR -u GUARD_SKIP -u GUARD_LEVEL -u GUARD_FORCE_DENY -u GIT_WORKFLOW -u CLAUDE_CLOUD \
-        bash "$GUARD" 2>/dev/null)
-  STATUS=$?
+        bash "$GUARD" 2>/dev/null); then
+    STATUS=0
+  else
+    STATUS=$?
+  fi
 }
 
 context_of() {
