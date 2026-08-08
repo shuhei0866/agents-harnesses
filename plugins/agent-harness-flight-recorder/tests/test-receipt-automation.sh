@@ -819,8 +819,10 @@ test_run_authenticates_graph_only_for_required_stages() {
       --remote "$batch_remote" \
       --recovery-recipient \
       "$(PATH="$FAKE_BIN:$PATH" age-keygen -y "$batch_recovery")" \
-      >/dev/null 2>&1
-    configure_auto 0 10 50000 batch-auth-model >/dev/null 2>&1
+      >/dev/null 2>&1 \
+      || exit 1
+    configure_auto 0 10 50000 batch-auth-model >/dev/null 2>&1 \
+      || exit 1
 
     cp "$FIXTURES/claude-code-auto-session.jsonl" "$exact_claude"
     cp "$FIXTURES/codex-auto-session.jsonl" "$exact_codex"
@@ -1386,6 +1388,62 @@ PY
   fi
 }
 
+test_blocking_run_lock_has_a_retry_bound() {
+  echo "test_blocking_run_lock_has_a_retry_bound:"
+  local err="$TEST_ROOT/blocking-run-lock.err"
+  if PYTHONPATH="$PLUGIN_DIR/scripts" python3 - "$STATE" <<'PY' \
+    2>"$err"
+import os
+import pathlib
+import time
+import sys
+
+import receipt_automation
+from vault import VaultError
+
+root = pathlib.Path(sys.argv[1])
+marker = root.parent / "receipt-lock-held"
+release = root.parent / "receipt-lock-release"
+pid = os.fork()
+if pid == 0:
+    try:
+        with receipt_automation.run_lock(root, blocking=False) as acquired:
+            if not acquired:
+                os._exit(2)
+            marker.write_text("held", encoding="utf-8")
+            deadline = time.monotonic() + 5
+            while not release.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            os._exit(0 if release.exists() else 3)
+    except BaseException:
+        os._exit(4)
+
+try:
+    deadline = time.monotonic() + 5
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert marker.exists(), "lock holder did not start"
+    receipt_automation.MAX_BLOCKING_LOCK_WAIT_SECONDS = 0.05
+    started = time.monotonic()
+    try:
+        with receipt_automation.run_lock(root, blocking=True):
+            raise AssertionError("blocking lock unexpectedly acquired")
+    except VaultError as error:
+        assert "retry" in str(error)
+    assert time.monotonic() - started < 1
+finally:
+    release.write_text("release", encoding="utf-8")
+    _pid, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+PY
+  then
+    pass "purge用blocking lockは上限後にretry可能なエラーを返す"
+  else
+    cat "$err" >&2
+    fail "purge用blocking lockは上限後にretry可能なエラーを返す"
+  fi
+}
+
 test_terminal_hints_are_compacted_before_the_limit() {
   echo "test_terminal_hints_are_compacted_before_the_limit:"
   local hints="$STATE/receipt-automation/hints.jsonl"
@@ -1451,6 +1509,7 @@ if [[ -f "$STATE/receipt-automation/config.json" ]]; then
   test_purge_waits_for_inflight_evaluator_without_resurrection
   test_attempt_capacity_is_reserved_before_provider_call
   test_maximum_legal_prepared_attempt_is_below_four_mib
+  test_blocking_run_lock_has_a_retry_bound
   test_terminal_hints_are_compacted_before_the_limit
 fi
 

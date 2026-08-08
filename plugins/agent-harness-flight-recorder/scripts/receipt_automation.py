@@ -12,6 +12,7 @@ import os
 import re
 import sqlite3
 import stat
+import time
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -71,6 +72,8 @@ MAX_ATTEMPTS = 100_000
 # a conservative ceiling for that legal envelope. The validator enforces and
 # the provider preflight reserves this same ceiling.
 MAX_PREPARED_ATTEMPT_BYTES = 4 * 1024 * 1024
+MAX_BLOCKING_LOCK_WAIT_SECONDS = 30
+LOCK_POLL_SECONDS = 0.05
 FINGERPRINT_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 AUTOMATION_STATES = {"idle", "completed", "attention", "error"}
 DIAGNOSTIC_CODES = {None, "configuration_invalid", "evaluator_failed"}
@@ -477,12 +480,21 @@ def run_lock(root: Path, *, blocking: bool) -> Iterator[bool]:
         ):
             raise VaultError("receipt automation run lock is unsafe")
         os.fchmod(descriptor, 0o600)
-        try:
-            flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
-            fcntl.flock(descriptor, flags)
-        except BlockingIOError:
-            yield False
-            return
+        deadline = time.monotonic() + MAX_BLOCKING_LOCK_WAIT_SECONDS
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if not blocking:
+                    yield False
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise VaultError(
+                        "receipt automation is busy; retry the operation"
+                    )
+                time.sleep(min(LOCK_POLL_SECONDS, remaining))
         yield True
     finally:
         os.close(descriptor)
@@ -831,32 +843,55 @@ def _authenticated_episode_snapshot(
     def query(
         connection: sqlite3.Connection, stored_policy: dict[str, Any]
     ) -> dict[str, dict[str, Any]]:
-        members_by_episode: dict[str, list[tuple[Any, ...]]] = {}
         selected_episode_ids: set[str] = set()
-        for member in connection.execute(
-            "SELECT m.episode_id, e.event_id, e.harness, e.source_event, "
-            "e.session_id_hash, e.turn_id_hash "
-            "FROM episode_members AS m "
-            "JOIN source_events AS e ON e.event_id = m.event_id "
-            "WHERE m.policy_version = ? ORDER BY m.episode_id, m.ordinal",
-            (policy,),
-        ):
-            episode_id = member[0]
-            event = tuple(member[1:])
-            members_by_episode.setdefault(episode_id, []).append(event)
-            if event[0] in event_ids:
-                selected_episode_ids.add(episode_id)
+        selected_events = sorted(event_ids)
+        for offset in range(0, len(selected_events), 500):
+            batch = selected_events[offset : offset + 500]
+            placeholders = ",".join("?" for _item in batch)
+            selected_episode_ids.update(
+                row[0]
+                for row in connection.execute(
+                    "SELECT DISTINCT episode_id FROM episode_members "
+                    f"WHERE policy_version = ? AND event_id IN ({placeholders})",
+                    (policy, *batch),
+                )
+            )
+
+        members_by_episode: dict[str, list[tuple[Any, ...]]] = {}
+        selected_episodes = sorted(selected_episode_ids)
+        for offset in range(0, len(selected_episodes), 500):
+            batch = selected_episodes[offset : offset + 500]
+            placeholders = ",".join("?" for _item in batch)
+            for member in connection.execute(
+                "SELECT m.episode_id, e.event_id, e.harness, e.source_event, "
+                "e.session_id_hash, e.turn_id_hash "
+                "FROM episode_members AS m "
+                "JOIN source_events AS e ON e.event_id = m.event_id "
+                "WHERE m.policy_version = ? "
+                f"AND m.episode_id IN ({placeholders}) "
+                "ORDER BY m.episode_id, m.ordinal",
+                (policy, *batch),
+            ):
+                members_by_episode.setdefault(member[0], []).append(
+                    tuple(member[1:])
+                )
 
         evidence_by_episode: dict[str, list[str]] = {}
-        for episode_id, evidence_id in connection.execute(
-            "SELECT DISTINCT m.episode_id, d.evidence_id "
-            "FROM deterministic_evidence AS d "
-            "JOIN episode_members AS m ON m.event_id = d.source_event_id "
-            "WHERE m.policy_version = ? "
-            "ORDER BY m.episode_id, d.evidence_id",
-            (policy,),
-        ):
-            evidence_by_episode.setdefault(episode_id, []).append(evidence_id)
+        for offset in range(0, len(selected_episodes), 500):
+            batch = selected_episodes[offset : offset + 500]
+            placeholders = ",".join("?" for _item in batch)
+            for episode_id, evidence_id in connection.execute(
+                "SELECT DISTINCT m.episode_id, d.evidence_id "
+                "FROM deterministic_evidence AS d "
+                "JOIN episode_members AS m ON m.event_id = d.source_event_id "
+                "WHERE m.policy_version = ? "
+                f"AND m.episode_id IN ({placeholders}) "
+                "ORDER BY m.episode_id, d.evidence_id",
+                (policy, *batch),
+            ):
+                evidence_by_episode.setdefault(episode_id, []).append(
+                    evidence_id
+                )
 
         forgotten = load_forgotten(root)
         edges_by_episode = _edges_by_episode(connection, policy)

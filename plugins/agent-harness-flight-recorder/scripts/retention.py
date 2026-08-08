@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -410,10 +411,26 @@ def purge(
                     attempt_committed = True
                 finally:
                     if not attempt_committed:
-                        restore_attempts(root, attempt_snapshot)
-                        restore_receipt_attempts(
-                            root, receipt_attempt_snapshot
-                        )
+                        active_error = sys.exc_info()[0] is not None
+                        restore_errors: list[Exception] = []
+                        for restore, snapshot in (
+                            (restore_attempts, attempt_snapshot),
+                            (
+                                restore_receipt_attempts,
+                                receipt_attempt_snapshot,
+                            ),
+                        ):
+                            try:
+                                restore(root, snapshot)
+                            except Exception as error:
+                                restore_errors.append(error)
+                        if restore_errors and not active_error:
+                            error = restore_errors[0]
+                            if isinstance(error, VaultError):
+                                raise error
+                            raise VaultError(
+                                "attempt ledger restoration failed"
+                            ) from error
     scope["apply"] = True
     return scope
 
