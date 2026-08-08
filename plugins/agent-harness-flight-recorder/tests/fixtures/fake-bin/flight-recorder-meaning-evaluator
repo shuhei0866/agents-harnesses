@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Deterministic protocol-v2 evaluator for Meaning Lift contract tests."""
+
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import sys
+
+
+request = json.load(sys.stdin)
+capture = os.environ.get("FLIGHT_RECORDER_TEST_MEANING_CAPTURE")
+if capture:
+    with pathlib.Path(capture).open("a", encoding="utf-8") as stream:
+        stream.write(
+            json.dumps(request, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+
+counter = os.environ.get("FLIGHT_RECORDER_TEST_MEANING_COUNT")
+if counter:
+    path = pathlib.Path(counter)
+    try:
+        count = int(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        count = 0
+    path.write_text(str(count + 1), encoding="utf-8")
+
+evidence_ids = [
+    item["evidence_id"] for item in request["packet"]["evidence"]
+]
+support = evidence_ids[:1]
+intent_summary = "Identify the cause and confirm a narrowly scoped correction."
+if os.environ.get("FLIGHT_RECORDER_TEST_MEANING_ECHO_FRAGMENT") == "1":
+    intent_summary = request["packet"]["evidence"][0]["content"]
+json.dump(
+    {
+        "schema_version": 2,
+        "intent": {
+            "summary": intent_summary,
+            "evidence_references": support,
+        },
+        "deliverable": {
+            "summary": "A repository modification with an explicit check.",
+            "evidence_references": support,
+        },
+        "verification": {
+            "summary": "Checks indicate the scoped modification behaved as intended.",
+            "evidence_references": support,
+        },
+        "outcome": {
+            "state": os.environ.get(
+                "FLIGHT_RECORDER_TEST_MEANING_OUTCOME", "success"
+            ),
+            "summary": "The requested correction reached a successful terminal state.",
+            "evidence_references": support,
+        },
+        "reusable_learning": {
+            "summary": "Prefer a small evidence packet before broader automation.",
+            "evidence_references": support,
+        },
+        "confidence": "high",
+        "measured_cost_microusd": int(
+            os.environ.get("FLIGHT_RECORDER_TEST_MEANING_COST", "7000")
+        ),
+    },
+    sys.stdout,
+    sort_keys=True,
+    separators=(",", ":"),
+)

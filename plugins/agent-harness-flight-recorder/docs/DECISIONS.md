@@ -350,3 +350,35 @@ Accepted decisions remain recorded when later superseded.
   remaining under the Semantic Receipt protocol's 300-second maximum.
   Timeout failures stay fail-closed and their durable attempt reservation still
   prevents automatic recharging.
+
+## D-20260731-26: Measure semantic lift with a transient minimized packet
+
+- Status: accepted
+- Decision: add a manual Meaning Lift pilot that deterministically extracts the
+  first human message and final assistant message from one registered source
+  span, redacts recognized private values, and sends only a bounded transient
+  packet to a fixed five-field evaluator. Compare the result with deterministic
+  metadata using the same questions for intent, deliverable, verification and
+  outcome, reusable learning, and time and API cost. Derive the baseline only
+  from real Evidence Card fields, and score `unknown` outcomes as partial
+  rather than covered.
+- Reason: lifecycle metadata is a strong execution skeleton but cannot explain
+  most task meaning, while the existing Semantic Receipt sends a much larger
+  raw span through a deep contract. Automatic integration is premature until a
+  real task demonstrates that smaller, grounded semantics improve answerable
+  coverage enough to justify model cost and privacy risk.
+- Consequence: the packet is never persisted and tool input/output, thinking,
+  intermediate assistant messages, and code fences never enter it. The model
+  supplies bounded summaries and packet evidence references only; the Recorder
+  supplies source/evaluator hashes, policy, measured micro-USD, latency, and
+  time. Owner-only Meaning Cards are Git-ignored and content-addressed. An
+  identical episode/span/packet/model/evaluator/contract reuses its existing
+  Card rather than paying again. Automatic candidate selection, routing, and
+  external export remain unchanged pending the pilot result. The first
+  corrected real-task pilot increased the comparable score from `0.0` to
+  `3.0/5.0`; deliverable and verification/outcome remained partial because the
+  Card distinguished a completed turn from an unverified real-world outcome,
+  while task time/API cost correctly remained uncovered.
+  Unattended provider calls remained blocked by local CLI authentication, and
+  whole-graph evidence authentication dominated command latency, so automatic
+  paid generation remains disabled.

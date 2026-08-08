@@ -31,7 +31,10 @@ OUTPUT_VERSION = 1
 RECORD_VERSION = 2
 PROTOCOL_VERSION = 1
 BACKGROUND_PROTOCOL_VERSION = 2
-BUNDLED_EVALUATORS = {"flight-recorder-claude-semantic-evaluator"}
+BUNDLED_EVALUATORS = {
+    "flight-recorder-claude-semantic-evaluator",
+    "flight-recorder-claude-meaning-evaluator",
+}
 DEFAULT_RUBRIC = (
     Path(__file__).resolve().parent.parent / "rubrics/on-demand-v1.json"
 )

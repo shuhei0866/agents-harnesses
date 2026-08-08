@@ -94,6 +94,12 @@ GITIGNORE = PRE_RECEIPT_AUTOMATION_GITIGNORE.replace(
     "/semantic-receipts/\n/receipt-automation/\n",
 )
 assert "/receipt-automation/\n" in GITIGNORE
+PRE_MEANING_CARD_GITIGNORE = GITIGNORE
+GITIGNORE = PRE_MEANING_CARD_GITIGNORE.replace(
+    "/receipt-automation/\n",
+    "/receipt-automation/\n/meaning-cards/\n",
+)
+assert "/meaning-cards/\n" in GITIGNORE
 LEGACY_GITIGNORE = """# Local-only Flight Recorder state
 /hash.key
 /events.jsonl
@@ -380,6 +386,8 @@ def ensure_managed_gitignore(root: Path) -> None:
         PRE_EVALUATION_GITIGNORE,
         PRE_AUTO_EVALUATION_GITIGNORE,
         PRE_SEMANTIC_RECEIPT_GITIGNORE,
+        PRE_RECEIPT_AUTOMATION_GITIGNORE,
+        PRE_MEANING_CARD_GITIGNORE,
     ):
         atomic_replace(path, GITIGNORE.encode("utf-8"))
     elif contents != GITIGNORE:
@@ -889,6 +897,29 @@ def parser() -> argparse.ArgumentParser:
     receipt_generate.add_argument("--rubric", required=True, type=Path)
     receipt_generate.add_argument("--timeout", type=int, default=60)
     receipt_generate.add_argument("--json", action="store_true")
+    meaning = commands.add_parser("meaning")
+    meaning_commands = meaning.add_subparsers(
+        dest="meaning_command", required=True
+    )
+    meaning_generate = meaning_commands.add_parser("generate")
+    meaning_generate.add_argument("episode_id")
+    meaning_policy = meaning_generate.add_mutually_exclusive_group()
+    meaning_policy.add_argument("--policy-version")
+    meaning_policy.add_argument(
+        "--policy", "--policy-file", dest="policy", type=Path
+    )
+    meaning_generate.add_argument("--source-ref", required=True)
+    meaning_generate.add_argument(
+        "--span-start-line", required=True, type=int
+    )
+    meaning_generate.add_argument("--span-end-line", required=True, type=int)
+    meaning_generate.add_argument("--evaluator", required=True)
+    meaning_generate.add_argument("--model", required=True)
+    meaning_generate.add_argument(
+        "--max-cost-microusd", required=True, type=int
+    )
+    meaning_generate.add_argument("--timeout", type=int, default=240)
+    meaning_generate.add_argument("--json", action="store_true")
     receipt_auto = commands.add_parser("receipt-auto")
     receipt_auto_commands = receipt_auto.add_subparsers(
         dest="receipt_auto_command", required=True
@@ -962,6 +993,7 @@ def main() -> int:
         "auto-evaluation",
         "source",
         "receipt",
+        "meaning",
         "receipt-auto",
         "forget",
         "purge",
@@ -1082,6 +1114,26 @@ def main() -> int:
                 args.evaluator,
                 args.model,
                 args.rubric,
+                args.timeout,
+                args.policy_version,
+                args.policy,
+            )
+            emit(value, as_json=args.json, human=render_generate(value))
+        elif args.command == "meaning":
+            from meaning_lift import generate, render_generate
+            from reporting import emit
+
+            if args.meaning_command != "generate":
+                raise VaultError("unsupported meaning command")
+            value = generate(
+                root,
+                args.episode_id,
+                args.source_ref,
+                args.span_start_line,
+                args.span_end_line,
+                args.evaluator,
+                args.model,
+                args.max_cost_microusd,
                 args.timeout,
                 args.policy_version,
                 args.policy,
