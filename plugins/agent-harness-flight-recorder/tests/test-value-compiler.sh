@@ -88,6 +88,7 @@ PY
 
 generate_meaning_card() {
   local episode="$1" label="$2"
+  local generated_at="${3:-2026-08-09T01:02:03Z}"
   local source="$TEST_ROOT/$label-session.jsonl"
   local register="$TEST_ROOT/$label-register.json"
   local source_ref
@@ -131,7 +132,7 @@ import sys
 print(json.loads(pathlib.Path(sys.argv[1]).read_text())["source_ref"])
 PY
 )"
-  FLIGHT_RECORDER_NOW="2026-08-09T01:02:03Z" \
+  FLIGHT_RECORDER_NOW="$generated_at" \
     run_cli meaning generate "$episode" \
       --source-ref "$source_ref" --span-start-line 1 --span-end-line 4 \
       --evaluator flight-recorder-meaning-evaluator \
@@ -1792,10 +1793,469 @@ PY
   fi
 }
 
+test_new_anchor_during_provider_invalidates_old_packet() {
+  echo "test_new_anchor_during_provider_invalidates_old_packet:"
+  local started="$TEST_ROOT/value-cycle8-anchor-started"
+  local release="$TEST_ROOT/value-cycle8-anchor-release"
+  local counter="$TEST_ROOT/value-cycle8-anchor-count"
+  local err="$TEST_ROOT/value-cycle8-anchor.err"
+  local episode process index status
+  fresh_blocker_fixture cycle8-anchor-delta || {
+    fail "cycle8 anchor-delta fixtureを構築できる"
+    return
+  }
+  episode="$(PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$STATE" <<'PY'
+import pathlib
+import sys
+
+import value_compiler
+from vault import vault_lock
+
+root = pathlib.Path(sys.argv[1])
+with vault_lock(root):
+    episode, _packet = value_compiler._authenticated_packets(
+        root, "default-v1", None
+    )[0]
+print(episode["episode_id"])
+PY
+)"
+  FLIGHT_RECORDER_TEST_VALUE_STARTED="$started" \
+    FLIGHT_RECORDER_TEST_VALUE_RELEASE="$release" \
+    FLIGHT_RECORDER_TEST_VALUE_COUNT="$counter" \
+    run_cli value compile \
+      --evaluator flight-recorder-value-evaluator \
+      --model value-model-cycle8-anchor-delta \
+      --max-episodes 1 --max-cost-microusd 6000 --timeout 60 --json \
+      >"$TEST_ROOT/value-cycle8-anchor.json" 2>"$err" &
+  process=$!
+  for index in $(seq 1 100); do
+    [[ -e "$started" && -s "$counter" ]] && break
+    sleep 0.05
+  done
+  if [[ ! -e "$started" || ! -s "$counter" ]]; then
+    touch "$release"
+    wait "$process" 2>/dev/null
+    fail "anchor追加前にproviderが開始する"
+    return
+  fi
+  if ! generate_meaning_card \
+      "$episode" cycle8-anchor-v2 "2026-08-09T03:02:03Z"; then
+    touch "$release"
+    wait "$process" 2>/dev/null
+    fail "provider待機中に新anchorを追加できる"
+    return
+  fi
+  touch "$release"
+  wait "$process"
+  status=$?
+  if [[ "$status" -ne 0 ]] && python3 - \
+      "$STATE" "$episode" "$counter" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+assert int(pathlib.Path(sys.argv[3]).read_text()) == 1
+cards = [
+    json.loads(path.read_text())
+    for path in (root / "value-primitive-cards").glob("*.json")
+]
+assert not any(
+    card["episode_id"] == episode
+    and card["provenance"]["evaluator_model"]
+        == "value-model-cycle8-anchor-delta"
+    for card in cards
+)
+attempts = json.loads(
+    (root / "value-compiler" / "attempts.json").read_text()
+)["attempts"]
+selected = [item for item in attempts if item["episode_id"] == episode]
+assert len(selected) == 1
+assert selected[0]["state"] == "failed"
+assert selected[0]["diagnostic_code"] == "input_changed"
+PY
+  then
+    pass "provider中のanchor集合deltaを検知し旧packet Cardを公開しない"
+  else
+    cat "$err" >&2
+    fail "provider中のanchor集合deltaを検知し旧packet Cardを公開しない"
+  fi
+}
+
+test_historical_anchor_cards_coexist_and_stale_is_finite() {
+  echo "test_historical_anchor_cards_coexist_and_stale_is_finite:"
+  local err="$TEST_ROOT/value-cycle8-coexist.err"
+  local first="$TEST_ROOT/value-cycle8-coexist-first.json"
+  local second="$TEST_ROOT/value-cycle8-coexist-second.json"
+  local inspection="$TEST_ROOT/value-cycle8-coexist-inspect.json"
+  local stale="$TEST_ROOT/value-cycle8-coexist-stale.json"
+  local episode old_anchor new_anchor
+  fresh_blocker_fixture cycle8-coexist || {
+    fail "cycle8 coexist fixtureを構築できる"
+    return
+  }
+  if ! run_cli value compile \
+      --evaluator flight-recorder-value-evaluator \
+      --model value-model-cycle8-coexist \
+      --max-episodes 1 --max-cost-microusd 6000 --json \
+      >"$first" 2>"$err"; then
+    fail "anchor v1のValue Cardを作成できる"
+    return
+  fi
+  IFS=$'\t' read -r episode old_anchor < <(python3 - "$STATE" <<'PY'
+import json
+import pathlib
+import sys
+
+cards = [
+    json.loads(path.read_text())
+    for path in (pathlib.Path(sys.argv[1]) / "value-primitive-cards").glob("*.json")
+]
+selected = [
+    card for card in cards
+    if card["provenance"]["evaluator_model"] == "value-model-cycle8-coexist"
+]
+assert len(selected) == 1
+card = selected[0]
+assert len(card["provenance"]["input_anchor_ids"]) == 1
+print(card["episode_id"], card["provenance"]["input_anchor_ids"][0], sep="\t")
+PY
+  )
+  generate_meaning_card \
+    "$episode" cycle8-coexist-v2 "2026-08-09T04:02:03Z" || {
+      fail "anchor v2を追加できる"
+      return
+    }
+  if ! run_cli value compile \
+      --evaluator flight-recorder-value-evaluator \
+      --model value-model-cycle8-coexist \
+      --max-episodes 1 --max-cost-microusd 6000 --json \
+      >"$second" 2>>"$err"; then
+    fail "anchor v2のValue Cardを作成できる"
+    return
+  fi
+  new_anchor="$(python3 - "$STATE" "$episode" "$old_anchor" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+episode, old = sys.argv[2:4]
+cards = [
+    json.loads(path.read_text())
+    for path in (root / "value-primitive-cards").glob("*.json")
+]
+selected = [
+    card for card in cards
+    if card["episode_id"] == episode
+    and card["provenance"]["evaluator_model"] == "value-model-cycle8-coexist"
+]
+assert len(selected) == 2
+anchors = {
+    card["provenance"]["input_anchor_ids"][0]
+    for card in selected
+}
+anchors.remove(old)
+print(anchors.pop())
+PY
+)"
+  if run_cli inspect "$episode" --json >"$inspection" 2>>"$err" \
+    && python3 - "$inspection" "$old_anchor" "$new_anchor" <<'PY'
+import json
+import pathlib
+import sys
+
+inspection = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert inspection["schema_version"] == 5
+cards = inspection["value_primitive_cards"]
+assert len(cards) == 2
+assert {
+    tuple(card["provenance"]["input_anchor_ids"])
+    for card in cards
+} == {(sys.argv[2],), (sys.argv[3],)}
+assert len({card["provenance"]["packet_sha256"] for card in cards}) == 2
+PY
+  then
+    python3 - "$STATE" "$old_anchor" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1]) / "meaning-cards" / (
+    sys.argv[2].removeprefix("sha256:") + ".json"
+)
+path.unlink()
+PY
+    if run_cli inspect "$episode" --json >"$stale" 2>>"$err" \
+      && python3 - "$stale" "$new_anchor" <<'PY'
+import json
+import pathlib
+import sys
+
+cards = json.loads(pathlib.Path(sys.argv[1]).read_text())["value_primitive_cards"]
+assert len(cards) == 1
+assert cards[0]["provenance"]["input_anchor_ids"] == [sys.argv[2]]
+PY
+    then
+      pass "anchor世代別Cardを共存認証し削除済み世代だけstale化する"
+    else
+      cat "$err" >&2
+      fail "anchor世代別Cardを共存認証し削除済み世代だけstale化する"
+    fi
+  else
+    cat "$err" >&2
+    fail "anchor世代別Cardを共存認証し削除済み世代だけstale化する"
+  fi
+}
+
+setup_cycle8_prepared_temp() {
+  local fixture="$1" model="$2"
+  fresh_blocker_fixture "$fixture" || return 1
+  PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$STATE" "$model" <<'PY'
+import pathlib
+import sys
+import time
+
+import value_compiler
+from evaluation import _executable_identity, _invoke
+from vault import vault_lock
+
+root = pathlib.Path(sys.argv[1])
+model = sys.argv[2]
+evaluator_path, evaluator_sha256 = _executable_identity(
+    "flight-recorder-value-evaluator"
+)
+with vault_lock(root):
+    episode, packet = value_compiler._authenticated_packets(
+        root, "default-v1", None
+    )[0]
+request = {
+    "schema_version": 1,
+    "model": model,
+    "packet": packet,
+    "remaining_cost_microusd": 6000,
+}
+started = time.monotonic_ns()
+raw = _invoke(evaluator_path, evaluator_sha256, request, 60)
+latency_ms = max(0, (time.monotonic_ns() - started) // 1_000_000)
+primitives, cost = value_compiler._validate_response(raw, packet, 6000)
+card = value_compiler._build_card(
+    episode, packet, primitives, model, evaluator_path, evaluator_sha256,
+    "default-v1", cost, latency_ms,
+)
+fingerprint = value_compiler._attempt_fingerprint(
+    packet["packet_sha256"], model, evaluator_sha256, "default-v1"
+)
+prepared = {
+    "schema_version": 1,
+    "contract_version": value_compiler.PREPARED_CONTRACT,
+    "fingerprint": fingerprint,
+    "episode_id": episode["episode_id"],
+    "packet_sha256": packet["packet_sha256"],
+    "evaluator_model": model,
+    "evaluator_adapter_sha256": evaluator_sha256,
+    "policy_version": "default-v1",
+    "card": card,
+}
+with vault_lock(root):
+    path = value_compiler._store_prepared(root, prepared)
+    temporary = path.with_name(f".{path.name}.cycle8")
+    path.rename(temporary)
+PY
+}
+
+test_prepared_temp_promotion_fsyncs_directory() {
+  echo "test_prepared_temp_promotion_fsyncs_directory:"
+  setup_cycle8_prepared_temp \
+    cycle8-prepared-fsync value-model-cycle8-prepared-fsync || {
+      fail "cycle8 prepared fsync fixtureを構築できる"
+      return
+    }
+  if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$STATE" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+import value_compiler
+
+root = pathlib.Path(sys.argv[1])
+directory = root / "value-compiler" / "prepared"
+calls = []
+original = os.fsync
+
+
+def tracked(descriptor):
+    if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+        calls.append(descriptor)
+    return original(descriptor)
+
+
+os.fsync = tracked
+try:
+    value_compiler._recover_prepared_temporaries(root)
+    records = value_compiler._stored_prepared_records(root)
+finally:
+    os.fsync = original
+assert len(records) == 1
+assert not list(directory.glob(".*.json.*"))
+assert len(list(directory.glob("*.json"))) == 1
+assert calls, "prepared directory was not fsynced after promotion"
+PY
+  then
+    pass "prepared tempのrename/unlink後にdirectoryをfsyncする"
+  else
+    fail "prepared tempのrename/unlink後にdirectoryをfsyncする"
+  fi
+}
+
+test_unsafe_prepared_directory_has_zero_mutation() {
+  echo "test_unsafe_prepared_directory_has_zero_mutation:"
+  local kind failures=0
+  for kind in mode uid type; do
+    setup_cycle8_prepared_temp \
+      "cycle8-prepared-unsafe-$kind" \
+      "value-model-cycle8-prepared-unsafe-$kind" || {
+        fail "cycle8 unsafe prepared $kind fixtureを構築できる"
+        return
+      }
+    if ! PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+      python3 - "$STATE" "$kind" <<'PY'
+import hashlib
+import os
+import pathlib
+import stat
+import sys
+
+import value_compiler
+from vault import VaultError
+
+root = pathlib.Path(sys.argv[1])
+kind = sys.argv[2]
+directory = root / "value-compiler" / "prepared"
+original_lstat = pathlib.Path.lstat
+if kind == "mode":
+    directory.chmod(0o777)
+elif kind == "type":
+    backup = directory.with_name("prepared-cycle8-backup")
+    directory.rename(backup)
+    directory.write_bytes(b"not-a-directory")
+    directory.chmod(0o600)
+elif kind == "uid":
+    def forged_lstat(path):
+        metadata = original_lstat(path)
+        if path == directory:
+            fields = list(metadata)
+            fields[4] = os.geteuid() + 1
+            return os.stat_result(fields)
+        return metadata
+
+    pathlib.Path.lstat = forged_lstat
+else:
+    raise AssertionError(kind)
+
+
+def snapshot():
+    if kind == "type":
+        backup = directory.with_name("prepared-cycle8-backup")
+        return (
+            stat.S_IMODE(original_lstat(directory).st_mode),
+            hashlib.sha256(directory.read_bytes()).hexdigest(),
+            tuple(
+                (path.name, hashlib.sha256(path.read_bytes()).hexdigest())
+                for path in sorted(backup.iterdir())
+            ),
+        )
+    return (
+        stat.S_IMODE(original_lstat(directory).st_mode),
+        tuple(
+            (path.name, hashlib.sha256(path.read_bytes()).hexdigest())
+            for path in sorted(directory.iterdir())
+        ),
+    )
+
+
+before = snapshot()
+try:
+    value_compiler._recover_prepared_temporaries(root)
+except VaultError:
+    pass
+else:
+    raise AssertionError("unsafe prepared directory was accepted")
+finally:
+    pathlib.Path.lstat = original_lstat
+assert snapshot() == before
+PY
+    then
+      failures=$((failures + 1))
+    fi
+  done
+  if [[ "$failures" -eq 0 ]]; then
+    pass "unsafe prepared directoryをpromotion前に拒否しmutationしない"
+  else
+    fail "unsafe prepared directoryをpromotion前に拒否しmutationしない"
+  fi
+}
+
+test_human_inspect_maps_evidence_ids_to_fields() {
+  echo "test_human_inspect_maps_evidence_ids_to_fields:"
+  local episode human="$TEST_ROOT/value-cycle8-fields.txt"
+  local inspection="$TEST_ROOT/value-cycle8-fields.json"
+  local err="$TEST_ROOT/value-cycle8-fields.err"
+  fresh_blocker_fixture cycle8-fields || {
+    fail "cycle8 evidence-field fixtureを構築できる"
+    return
+  }
+  run_cli value compile \
+    --evaluator flight-recorder-value-evaluator \
+    --model value-model-cycle8-fields \
+    --max-episodes 1 --max-cost-microusd 6000 --json \
+    >/dev/null 2>"$err" || {
+      fail "evidence-field表示用Cardを作成できる"
+      return
+    }
+  episode="$(python3 - "$STATE" <<'PY'
+import json
+import pathlib
+import sys
+
+for path in (pathlib.Path(sys.argv[1]) / "value-primitive-cards").glob("*.json"):
+    value = json.loads(path.read_text())
+    if value["provenance"]["evaluator_model"] == "value-model-cycle8-fields":
+        print(value["episode_id"])
+        break
+PY
+)"
+  if run_cli inspect "$episode" >"$human" 2>"$err" \
+    && run_cli inspect "$episode" --json >"$inspection" 2>>"$err" \
+    && python3 - "$human" "$inspection" <<'PY'
+import json
+import pathlib
+import sys
+
+lines = pathlib.Path(sys.argv[1]).read_text().splitlines()
+card = json.loads(pathlib.Path(sys.argv[2]).read_text())["value_primitive_cards"][0]
+for evidence_id, field in card["provenance"]["input_evidence_fields"].items():
+    assert any(evidence_id in line and field in line for line in lines), (
+        evidence_id, field
+    )
+PY
+  then
+    pass "human inspectでevidence ref hashとfield種別を対応表示する"
+  else
+    cat "$err" >&2
+    fail "human inspectでevidence ref hashとfield種別を対応表示する"
+  fi
+}
+
 main() {
   if [[ "${FLIGHT_RECORDER_TEST_VALUE_BLOCKERS_ONLY:-0}" == "1" \
       || "${FLIGHT_RECORDER_TEST_VALUE_CYCLE6_ONLY:-0}" == "1" \
-      || "${FLIGHT_RECORDER_TEST_VALUE_CYCLE7_ONLY:-0}" == "1" ]]; then
+      || "${FLIGHT_RECORDER_TEST_VALUE_CYCLE7_ONLY:-0}" == "1" \
+      || "${FLIGHT_RECORDER_TEST_VALUE_CYCLE8_ONLY:-0}" == "1" ]]; then
     true
   elif ! build_fixture; then
     fail "Value Compiler fixtureを構築できる"
@@ -1900,6 +2360,34 @@ main() {
         fail "unknown cycle7 test case"
         ;;
     esac
+  elif [[ "${FLIGHT_RECORDER_TEST_VALUE_CYCLE8_ONLY:-0}" == "1" ]]; then
+    case "${FLIGHT_RECORDER_TEST_VALUE_CYCLE8_CASE:-all}" in
+      anchor-delta)
+        test_new_anchor_during_provider_invalidates_old_packet
+        ;;
+      coexist)
+        test_historical_anchor_cards_coexist_and_stale_is_finite
+        ;;
+      prepared-fsync)
+        test_prepared_temp_promotion_fsyncs_directory
+        ;;
+      prepared-unsafe)
+        test_unsafe_prepared_directory_has_zero_mutation
+        ;;
+      human-fields)
+        test_human_inspect_maps_evidence_ids_to_fields
+        ;;
+      all)
+        test_new_anchor_during_provider_invalidates_old_packet
+        test_historical_anchor_cards_coexist_and_stale_is_finite
+        test_prepared_temp_promotion_fsyncs_directory
+        test_unsafe_prepared_directory_has_zero_mutation
+        test_human_inspect_maps_evidence_ids_to_fields
+        ;;
+      *)
+        fail "unknown cycle8 test case"
+        ;;
+    esac
   else
     test_versioned_cards_are_grounded_bounded_and_idempotent
     test_wrong_axis_reference_fails_closed_without_storing_a_card
@@ -1922,6 +2410,11 @@ main() {
     test_batch_failures_continue_and_return_nonzero
     test_one_changed_candidate_does_not_abort_batch
     test_human_inspect_exposes_value_card_evidence
+    test_new_anchor_during_provider_invalidates_old_packet
+    test_historical_anchor_cards_coexist_and_stale_is_finite
+    test_prepared_temp_promotion_fsyncs_directory
+    test_unsafe_prepared_directory_has_zero_mutation
+    test_human_inspect_maps_evidence_ids_to_fields
   fi
   echo
   echo "Result: $PASS passed, $FAIL failed"

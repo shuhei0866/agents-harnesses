@@ -1062,6 +1062,7 @@ def _render_value_primitive_cards(
     for item in cards:
         provenance = item["provenance"]
         anchors = provenance["input_anchor_ids"]
+        evidence_fields = provenance["input_evidence_fields"]
         lines.extend((
             f"  Card {item['value_primitive_card_id']}",
             "    evaluator-model: "
@@ -1071,6 +1072,11 @@ def _render_value_primitive_cards(
             f"{provenance['generation_cost_microusd']}",
             "    input-anchor-ids: "
             + (", ".join(anchors) if anchors else "none"),
+            "    input-evidence-fields:",
+            *(
+                f"      {evidence_id} ({field})"
+                for evidence_id, field in sorted(evidence_fields.items())
+            ),
             "    task-measured-duration-ms: "
             f"{episode_card['measured_duration_ms']['value']} "
             f"({episode_card['measured_duration_ms']['state']})",
@@ -1081,6 +1087,10 @@ def _render_value_primitive_cards(
         ))
         for axis, primitive in item["primitives"].items():
             references = primitive["evidence_references"]
+            rendered_references = [
+                f"{reference} ({evidence_fields[reference]})"
+                for reference in references
+            ]
             lines.extend((
                 f"      {axis}:",
                 f"        state: {primitive['state']}",
@@ -1089,7 +1099,10 @@ def _render_value_primitive_cards(
                 "        summary: "
                 f"{_terminal_text(primitive['summary'])}",
                 "        evidence-references: "
-                + (", ".join(references) if references else "none"),
+                + (
+                    ", ".join(rendered_references)
+                    if rendered_references else "none"
+                ),
             ))
     return lines
 

@@ -29,7 +29,13 @@ from reporting import (
 from retention_state import load_forgotten
 from semantic_receipts import _read_stored_receipt
 from semantic_receipts import _stored_receipts
-from vault import VaultError, atomic_replace, ensure_managed_gitignore, vault_lock
+from vault import (
+    VaultError,
+    atomic_replace,
+    ensure_managed_gitignore,
+    fsync_directory,
+    vault_lock,
+)
 
 
 OUTPUT_VERSION = 1
@@ -1271,34 +1277,75 @@ def _read_prepared(
     return raw, value
 
 
+def _prepared_directory(root: Path) -> Path | None:
+    directory = root / PREPARED_DIRECTORY
+    try:
+        metadata = directory.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise VaultError("Value Compiler prepared storage is unsafe") from error
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o077
+    ):
+        raise VaultError("Value Compiler prepared storage is unsafe")
+    return directory
+
+
+def _read_prepared_temporary(
+    path: Path,
+) -> tuple[bytes, dict[str, Any]]:
+    try:
+        temporary = path.lstat()
+    except OSError as error:
+        raise VaultError(
+            "Value Compiler prepared temporary file is unsafe"
+        ) from error
+    if (
+        not stat.S_ISREG(temporary.st_mode)
+        or temporary.st_uid != os.geteuid()
+        or temporary.st_nlink != 1
+        or stat.S_IMODE(temporary.st_mode) != 0o600
+    ):
+        raise VaultError("Value Compiler prepared temporary file is unsafe")
+    return _read_prepared(path, "sha256:" + path.name[1:65])
+
+
 def _stored_prepared_records(
     root: Path,
 ) -> list[tuple[Path, bytes, dict[str, Any]]]:
-    directory = root / PREPARED_DIRECTORY
-    if not directory.exists() and not directory.is_symlink():
+    """Strictly read targets and complete atomic temps without mutation."""
+    directory = _prepared_directory(root)
+    if directory is None:
         return []
-    if directory.is_symlink():
-        raise VaultError("Value Compiler prepared storage is unsafe")
     try:
-        metadata = directory.lstat()
-        paths = []
-        promoted: list[Path] = []
-        for path in sorted(directory.iterdir()):
+        paths = sorted(directory.iterdir())
+    except OSError as error:
+        raise VaultError("Value Compiler prepared storage is unsafe") from error
+    records = []
+    for path in paths:
+        if ATOMIC_TEMP_RE.fullmatch(path.name) is not None:
+            raw, value = _read_prepared_temporary(path)
+        else:
+            raw, value = _read_prepared(path)
+        records.append((path, raw, value))
+    return records
+
+
+def _recover_prepared_temporaries(root: Path) -> None:
+    """Promote crash-left temps durably; only compile calls this mutator."""
+    directory = _prepared_directory(root)
+    if directory is None:
+        return
+    try:
+        paths = sorted(directory.iterdir())
+        for path in paths:
             if ATOMIC_TEMP_RE.fullmatch(path.name) is None:
-                paths.append(path)
                 continue
-            temporary = path.lstat()
-            if (
-                not stat.S_ISREG(temporary.st_mode)
-                or temporary.st_uid != os.geteuid()
-                or temporary.st_nlink != 1
-                or stat.S_IMODE(temporary.st_mode) != 0o600
-            ):
-                raise VaultError(
-                    "Value Compiler prepared temporary file is unsafe"
-                )
-            fingerprint = "sha256:" + path.name[1:65]
-            _raw, value = _read_prepared(path, fingerprint)
+            _raw, value = _read_prepared_temporary(path)
             target = directory / f"{path.name[1:65]}.json"
             if target.exists() or target.is_symlink():
                 _target_raw, target_value = _read_prepared(target)
@@ -1307,13 +1354,14 @@ def _stored_prepared_records(
                         "stored Value Compiler prepared record conflicts"
                     )
                 path.unlink()
+                fsync_directory(directory)
             else:
                 os.replace(path, target)
-                promoted.append(target)
-        paths.extend(path for path in promoted if path not in paths)
+                fsync_directory(directory)
+    except VaultError:
+        raise
     except OSError as error:
         raise VaultError("Value Compiler prepared storage is unsafe") from error
-    return [(path, *_read_prepared(path)) for path in paths]
 
 
 def _store_prepared(root: Path, value: dict[str, Any]) -> Path:
@@ -1345,6 +1393,76 @@ def prepared_record_snapshots(
     ]
 
 
+def _packet_for_stored_anchor_ids(
+    root: Path,
+    policy_version: str,
+    episode_card: dict[str, Any],
+    anchor_ids: list[str],
+) -> dict[str, Any] | None:
+    meanings = []
+    receipts = []
+    directories: dict[str, Path | None] = {}
+    for name in ("meaning-cards", "semantic-receipts"):
+        directory = root / name
+        try:
+            metadata = directory.lstat()
+        except FileNotFoundError:
+            directories[name] = None
+            continue
+        except OSError as error:
+            raise VaultError("semantic anchor storage is unsafe") from error
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o077
+        ):
+            raise VaultError("semantic anchor storage is unsafe")
+        directories[name] = directory
+    for anchor_id in anchor_ids:
+        filename = anchor_id.removeprefix("sha256:") + ".json"
+        candidates = (
+            ("meaning", directories["meaning-cards"]),
+            ("receipt", directories["semantic-receipts"]),
+        )
+        found = []
+        for kind, directory in candidates:
+            if directory is None:
+                continue
+            path = directory / filename
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise VaultError("stored semantic anchor is unsafe") from error
+            found.append((kind, path))
+        if not found:
+            return None
+        if len(found) != 1:
+            raise VaultError("stored semantic anchor ID is ambiguous")
+        kind, path = found[0]
+        if kind == "meaning":
+            _raw, value = _read_meaning_card_record(path)
+            if value["meaning_card_id"] != anchor_id:
+                raise VaultError("stored semantic anchor ID is invalid")
+            meanings.append(value)
+        else:
+            _raw, value = _read_stored_receipt(path)
+            if value["receipt_id"] != anchor_id:
+                raise VaultError("stored semantic anchor ID is invalid")
+            receipts.append(value)
+    anchors = _anchors_by_episode(
+        policy_version, [episode_card], meanings, receipts
+    ).get(episode_card["episode_id"])
+    if anchors is None:
+        raise VaultError("stored semantic anchors do not bind current Episode")
+    packet = _packet(episode_card, anchors)
+    if packet["anchor_ids"] != anchor_ids:
+        raise VaultError("stored semantic anchor set is invalid")
+    return packet
+
+
 def load_value_primitive_cards(
     root: Path,
     policy_version: str,
@@ -1358,31 +1476,26 @@ def load_value_primitive_cards(
     ]
     if not result:
         return []
-    meanings = stored_meaning_cards(root)
-    receipts = [value for _path, _raw, value in _stored_receipts(root)]
-    anchors = _anchors_by_episode(
-        policy_version,
-        [current_episode_card],
-        meanings,
-        receipts,
-    )
-    current_anchors = anchors.get(episode_id)
-    if current_anchors is None:
-        raise VaultError(
-            "stored Value Primitive Card has no current semantic anchor"
-        )
-    current_packet = _packet(current_episode_card, current_anchors)
-    current_evidence = {
-        item["evidence_id"]: item
-        for item in current_packet["evidence"]
-    }
-    current_fields = {
-        evidence_id: item["field"]
-        for evidence_id, item in current_evidence.items()
-    }
     current_source_event_ids = current_episode_card.get("source_event_ids")
+    authenticated = []
     for value in result:
         provenance = value["provenance"]
+        current_packet = _packet_for_stored_anchor_ids(
+            root,
+            policy_version,
+            current_episode_card,
+            provenance["input_anchor_ids"],
+        )
+        if current_packet is None:
+            continue
+        current_evidence = {
+            item["evidence_id"]: item
+            for item in current_packet["evidence"]
+        }
+        current_fields = {
+            evidence_id: item["field"]
+            for evidence_id, item in current_evidence.items()
+        }
         if (
             value["observations"] != current_packet["observations"]
             or provenance["source_event_ids"] != current_source_event_ids
@@ -1404,8 +1517,9 @@ def load_value_primitive_cards(
                 primitive["evidence_references"],
                 current_evidence,
             )
-    result.sort(key=lambda item: (parse_time(item["provenance"]["generated_at"]), item["value_primitive_card_id"]))
-    return result
+        authenticated.append(value)
+    authenticated.sort(key=lambda item: (parse_time(item["provenance"]["generated_at"]), item["value_primitive_card_id"]))
+    return authenticated
 
 
 def value_primitive_card_record_snapshots(root: Path, policy_version: str, episode_id: str) -> list[tuple[Path, bytes]]:
@@ -1525,6 +1639,7 @@ def _build_anchor_index(
     policy_version: str,
 ) -> dict[str, Any]:
     # These are the only full anchor-directory scans in one compiler batch.
+    directory_entries = _anchor_directory_entries(root)
     meanings = stored_meaning_cards(root)
     receipt_records = _stored_receipts(root)
     records: dict[str, dict[str, Any]] = {}
@@ -1550,19 +1665,85 @@ def _build_anchor_index(
             "raw": raw,
             "value": receipt,
         }
+    current_entries = _anchor_directory_entries(root)
+    if current_entries != directory_entries:
+        raise VaultError("semantic anchor storage changed while indexing")
     return {
+        "root": root,
         "policy_version": policy_version,
         "meanings": meanings,
         "receipts": receipts,
         "records": records,
         "selected": {},
+        "dirty_episode_ids": set(),
+        "directory_entries": current_entries,
     }
+
+
+def _anchor_directory_entries(root: Path) -> dict[str, tuple[Any, ...]]:
+    snapshots: dict[str, tuple[Any, ...]] = {}
+    for name in ("meaning-cards", "semantic-receipts"):
+        directory = root / name
+        try:
+            metadata = directory.lstat()
+        except FileNotFoundError:
+            snapshots[name] = ("missing",)
+            continue
+        except OSError as error:
+            raise VaultError("semantic anchor storage is unsafe") from error
+        if (
+            stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o077
+        ):
+            raise VaultError("semantic anchor storage is unsafe")
+        try:
+            entries = []
+            for path in sorted(directory.iterdir()):
+                item = path.lstat()
+                entries.append((
+                    path.name,
+                    item.st_dev,
+                    item.st_ino,
+                    item.st_mode,
+                    item.st_uid,
+                    item.st_nlink,
+                    item.st_size,
+                    item.st_mtime_ns,
+                    item.st_ctime_ns,
+                ))
+        except OSError as error:
+            raise VaultError("semantic anchor storage is unsafe") from error
+        snapshots[name] = tuple(entries)
+    return snapshots
 
 
 def _refresh_selected_anchor_records(
     index: dict[str, Any],
     episode_ids: set[str],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool]:
+    if _anchor_directory_entries(index["root"]) != index["directory_entries"]:
+        prior_episode_ids = {
+            record["value"]["episode_id"]
+            for record in index["records"].values()
+        }
+        rebuilt = _build_anchor_index(
+            index["root"], index["policy_version"]
+        )
+        dirty_episode_ids = prior_episode_ids | {
+            record["value"]["episode_id"]
+            for record in rebuilt["records"].values()
+        }
+        dirty_episode_ids.difference_update(episode_ids)
+        index.clear()
+        index.update(rebuilt)
+        index["dirty_episode_ids"] = dirty_episode_ids
+        return index["meanings"], index["receipts"], True
+    dirty = index["dirty_episode_ids"] & episode_ids
+    if dirty:
+        index["dirty_episode_ids"].difference_update(dirty)
+        return index["meanings"], index["receipts"], True
     meanings = []
     receipts = []
     for episode_id in sorted(episode_ids):
@@ -1583,7 +1764,7 @@ def _refresh_selected_anchor_records(
                 raise VaultError("value compiler anchor locator is invalid")
             if raw != record["raw"] or current != record["value"]:
                 raise VaultError("value compiler anchor changed during batch")
-    return meanings, receipts
+    return meanings, receipts, False
 
 
 def _authenticated_packets(
@@ -1608,7 +1789,7 @@ def _authenticated_packets(
     if episode_ids is not None:
         anchored_episode_ids &= episode_ids
     if refresh:
-        meanings, receipts = _refresh_selected_anchor_records(
+        meanings, receipts, _rebuilt = _refresh_selected_anchor_records(
             index, anchored_episode_ids
         )
     episodes = _episodes(
@@ -1717,6 +1898,7 @@ def compile_values(
                 _card_generation_key(value): value
                 for _path, _raw, value in existing
             }
+            _recover_prepared_temporaries(root)
             prepared_index = {
                 value["fingerprint"]: (path, value)
                 for path, _raw, value in _stored_prepared_records(root)
@@ -1827,9 +2009,27 @@ def compile_values(
             remaining = maximum_cost_microusd - spent
             with vault_lock(root):
                 try:
-                    _refresh_selected_anchor_records(
-                        anchor_index, {episode["episode_id"]}
+                    _meanings, _receipts, rebuilt = (
+                        _refresh_selected_anchor_records(
+                            anchor_index, {episode["episode_id"]}
+                        )
                     )
+                    if rebuilt:
+                        current_packets = _authenticated_packets(
+                            root,
+                            selected_policy,
+                            trusted,
+                            {episode["episode_id"]},
+                            anchor_index,
+                        )
+                        current = (
+                            current_packets[0]
+                            if current_packets else None
+                        )
+                        if current is None or current[1] != packet:
+                            raise VaultError(
+                                "value compiler input changed before evaluation"
+                            )
                 except VaultError as error:
                     batch_failures.append(str(error))
                     attempt_failure_count += 1

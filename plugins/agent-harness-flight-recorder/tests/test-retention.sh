@@ -533,6 +533,24 @@ for item in attempts:
 PY
 }
 
+prepared_directory_manifest() {
+  python3 - "$1" <<'PY'
+import hashlib
+import pathlib
+import stat
+import sys
+
+directory = pathlib.Path(sys.argv[1]) / "value-compiler" / "prepared"
+for path in sorted(directory.iterdir()):
+    metadata = path.lstat()
+    print(
+        path.name,
+        stat.S_IMODE(metadata.st_mode),
+        hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
+PY
+}
+
 test_forget_preserves_source_and_survives_rebuild() {
   echo "test_forget_preserves_source_and_survives_rebuild:"
   local base="$TEST_ROOT/forget"
@@ -894,9 +912,65 @@ test_invalid_attempt_ledger_blocks_purge_before_rewrite() {
   fi
 }
 
+test_purge_dry_run_does_not_recover_prepared_temp() {
+  echo "test_purge_dry_run_does_not_recover_prepared_temp:"
+  local base="$TEST_ROOT/purge-cycle8-read-only"
+  local state="$base/vault"
+  local db="$state/index/vault.sqlite"
+  local episode unrelated_episode before after attempts_before
+  init_fixture "$base" || {
+    fail "cycle8 read-only purge fixtureを作成できる"
+    return
+  }
+  episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+  unrelated_episode="$(
+    db_value_for_event "$db" "$UNRELATED_EVENT" episode_id
+  )"
+  write_value_artifacts "$state" "$episode" "$unrelated_episode" || {
+    fail "cycle8 read-only用Value preparedを作成できる"
+    return
+  }
+  python3 - "$state" "$episode" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+for path in (root / "value-compiler" / "prepared").glob("*.json"):
+    value = json.loads(path.read_text())
+    if value["episode_id"] == episode:
+        path.rename(path.with_name(f".{path.name}.cycle8-read-only"))
+        break
+else:
+    raise AssertionError("target prepared record not found")
+PY
+  before="$(prepared_directory_manifest "$state")"
+  attempts_before="$(shasum -a 256 "$state/value-compiler/attempts.json")"
+  if run_cli "$state" purge "$episode" \
+      >"$base/preview.txt" 2>"$base/preview.err"; then
+    after="$(prepared_directory_manifest "$state")"
+    if [[ "$before" == "$after" \
+      && "$attempts_before" == "$(
+        shasum -a 256 "$state/value-compiler/attempts.json"
+      )" ]] \
+      && find "$state/value-compiler/prepared" -type f \
+        -name '.*.json.cycle8-read-only' -print -quit | grep -q .; then
+      pass "purge dry-runはcomplete prepared tempを回復・変更しない"
+    else
+      fail "purge dry-runはcomplete prepared tempを回復・変更しない"
+    fi
+  else
+    cat "$base/preview.err" >&2
+    fail "purge dry-runはcomplete prepared tempを回復・変更しない"
+  fi
+}
+
 echo "=== Flight Recorder Retention Tests ==="
 if [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE7_ONLY:-0}" == "1" ]]; then
   test_purge_push_rejection_restores_retryable_local_state
+elif [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE8_ONLY:-0}" == "1" ]]; then
+  test_purge_dry_run_does_not_recover_prepared_temp
 else
   test_forget_preserves_source_and_survives_rebuild
   test_dangling_forget_marker_fails_closed
@@ -904,6 +978,7 @@ else
   test_purge_apply_removes_target_history_and_keeps_unrelated_chunk
   test_purge_push_rejection_restores_retryable_local_state
   test_invalid_attempt_ledger_blocks_purge_before_rewrite
+  test_purge_dry_run_does_not_recover_prepared_temp
 fi
 echo
 echo "Results: $PASS passed, $FAIL failed"
