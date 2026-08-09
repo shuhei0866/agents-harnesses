@@ -35,7 +35,10 @@ from receipt_automation import (
 from retention_state import load_forgotten, store_forgotten
 from semantic_receipts import semantic_receipt_record_snapshots
 from value_compiler import (
+    remove_episode_attempts as remove_value_attempts,
+    restore_attempts as restore_value_attempts,
     run_lock as value_compiler_lock,
+    value_attempt_record_count,
     value_primitive_card_record_snapshots,
 )
 from sync import (
@@ -132,6 +135,11 @@ def _scope(
             "value_primitive_card_record_count": len(
                 value_primitive_card_record_snapshots(
                     root, policy_version, episode_id
+                )
+            ),
+            "value_compiler_attempt_record_count": (
+                value_attempt_record_count(
+                    root, episode_id, policy_version
                 )
             ),
             "limitation": LIMITATION,
@@ -371,13 +379,23 @@ def purge(
                         root, selected, episode_id
                     )
                 )
-                attempt_snapshot = remove_episode_attempts(root, episode_id)
+                value_attempt_snapshot = remove_value_attempts(
+                    root, episode_id, selected
+                )
+                try:
+                    attempt_snapshot = remove_episode_attempts(
+                        root, episode_id
+                    )
+                except VaultError:
+                    restore_value_attempts(root, value_attempt_snapshot)
+                    raise
                 try:
                     receipt_attempt_snapshot = remove_receipt_attempts(
                         root, episode_id
                     )
                 except VaultError:
                     restore_attempts(root, attempt_snapshot)
+                    restore_value_attempts(root, value_attempt_snapshot)
                     raise
                 attempt_committed = False
                 try:
@@ -441,6 +459,10 @@ def purge(
                         active_error = sys.exc_info()[0] is not None
                         restore_errors: list[Exception] = []
                         for restore, snapshot in (
+                            (
+                                restore_value_attempts,
+                                value_attempt_snapshot,
+                            ),
                             (restore_attempts, attempt_snapshot),
                             (
                                 restore_receipt_attempts,
@@ -484,5 +506,7 @@ def render_purge(value: dict[str, Any]) -> str:
         f"{value['meaning_card_record_count']}\n"
         "Local Value Primitive Card records: "
         f"{value['value_primitive_card_record_count']}\n"
+        "Local Value Compiler attempts: "
+        f"{value['value_compiler_attempt_record_count']}\n"
         f"{value['limitation']}\n"
     )

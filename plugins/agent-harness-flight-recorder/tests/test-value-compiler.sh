@@ -498,6 +498,166 @@ PY
   fi
 }
 
+test_killed_provider_leaves_durable_pending_without_recharge() {
+  echo "test_killed_provider_leaves_durable_pending_without_recharge:"
+  local event="75000000-0000-4000-8000-000000000007"
+  local episode started="$TEST_ROOT/value-pending-started"
+  local release="$TEST_ROOT/value-pending-release"
+  local counter="$TEST_ROOT/value-pending-count"
+  local retry="$TEST_ROOT/value-pending-retry.json"
+  local first_err="$TEST_ROOT/value-pending-first.err"
+  local retry_err="$TEST_ROOT/value-pending-retry.err"
+  local process index
+
+  run_cli value compile \
+    --evaluator flight-recorder-value-evaluator --model value-model-pending \
+    --max-episodes 100 --max-cost-microusd 600000 --json \
+    >/dev/null 2>"$first_err" || {
+      fail "pending fixtureをprewarmできる"
+      return
+    }
+  append_event "$event" 7 "2026-08-09T00:00:07Z"
+  run_cli sync >/dev/null 2>&1
+  run_cli rebuild-index >/dev/null 2>&1
+  episode="$(episode_for_event "$event")"
+  generate_meaning_card "$episode" pending || {
+    fail "pending candidateを作成できる"
+    return
+  }
+
+  FLIGHT_RECORDER_TEST_VALUE_STARTED="$started" \
+    FLIGHT_RECORDER_TEST_VALUE_RELEASE="$release" \
+    FLIGHT_RECORDER_TEST_VALUE_COUNT="$counter" \
+    run_cli value compile \
+      --evaluator flight-recorder-value-evaluator --model value-model-pending \
+      --max-episodes 1 --max-cost-microusd 6000 --timeout 60 --json \
+      >/dev/null 2>"$first_err" &
+  process=$!
+  for index in $(seq 1 80); do
+    [[ -e "$started" && -s "$counter" ]] && break
+    sleep 0.05
+  done
+  kill -TERM "$process" 2>/dev/null
+  touch "$release"
+  wait "$process" 2>/dev/null
+
+  if FLIGHT_RECORDER_TEST_VALUE_COUNT="$counter" \
+      run_cli value compile \
+        --evaluator flight-recorder-value-evaluator --model value-model-pending \
+        --max-episodes 1 --max-cost-microusd 6000 --json \
+        >"$retry" 2>"$retry_err" \
+    && python3 - "$counter" "$retry" "$STATE" "$episode" "value-model-pending" <<'PY'
+import json
+import pathlib
+import stat
+import sys
+
+counter, output, state, episode, model = sys.argv[1:]
+assert int(pathlib.Path(counter).read_text()) == 1
+result = json.loads(pathlib.Path(output).read_text())
+assert result.get("attempt_skip_count") == 1 or result["deferred_count"] >= 1
+root = pathlib.Path(state)
+cards = [
+    json.loads(path.read_text())
+    for path in (root / "value-primitive-cards").glob("*.json")
+]
+assert not any(
+    card["episode_id"] == episode
+    and card["provenance"]["evaluator_model"] == model
+    for card in cards
+)
+directory = root / "value-compiler"
+attempts_path = directory / "attempts.json"
+assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+assert stat.S_IMODE(attempts_path.stat().st_mode) == 0o600
+ledger = json.loads(attempts_path.read_text())
+assert set(ledger) == {"schema_version", "attempts"}
+assert ledger["schema_version"] == 1
+assert isinstance(ledger["attempts"], list) and len(ledger["attempts"]) <= 1000
+assert any(
+    item.get("episode_id") == episode and item.get("state") == "pending"
+    for item in ledger["attempts"]
+)
+PY
+  then
+    pass "provider前pending予約はkill後も再課金を防ぐ"
+  else
+    cat "$first_err" "$retry_err" >&2
+    fail "provider前pending予約はkill後も再課金を防ぐ"
+  fi
+}
+
+test_oversized_response_leaves_durable_failure_without_recharge() {
+  echo "test_oversized_response_leaves_durable_failure_without_recharge:"
+  local event="75000000-0000-4000-8000-000000000008"
+  local episode counter="$TEST_ROOT/value-oversized-count"
+  local retry="$TEST_ROOT/value-oversized-retry.json"
+  local first_err="$TEST_ROOT/value-oversized-first.err"
+  local retry_err="$TEST_ROOT/value-oversized-retry.err"
+
+  run_cli value compile \
+    --evaluator flight-recorder-value-evaluator --model value-model-oversized \
+    --max-episodes 100 --max-cost-microusd 600000 --json \
+    >/dev/null 2>"$first_err" || {
+      fail "oversized fixtureをprewarmできる"
+      return
+    }
+  append_event "$event" 8 "2026-08-09T00:00:08Z"
+  run_cli sync >/dev/null 2>&1
+  run_cli rebuild-index >/dev/null 2>&1
+  episode="$(episode_for_event "$event")"
+  generate_meaning_card "$episode" oversized || {
+    fail "oversized candidateを作成できる"
+    return
+  }
+
+  if FLIGHT_RECORDER_TEST_VALUE_OVERSIZED=1 \
+      FLIGHT_RECORDER_TEST_VALUE_COUNT="$counter" \
+      run_cli value compile \
+        --evaluator flight-recorder-value-evaluator --model value-model-oversized \
+        --max-episodes 1 --max-cost-microusd 6000 --json \
+        >/dev/null 2>"$first_err"; then
+    fail "oversized provider responseを拒否する"
+    return
+  fi
+  if FLIGHT_RECORDER_TEST_VALUE_COUNT="$counter" \
+      run_cli value compile \
+        --evaluator flight-recorder-value-evaluator --model value-model-oversized \
+        --max-episodes 1 --max-cost-microusd 6000 --json \
+        >"$retry" 2>"$retry_err" \
+    && python3 - "$counter" "$retry" "$STATE" "$episode" "value-model-oversized" <<'PY'
+import json
+import pathlib
+import sys
+
+counter, output, state, episode, model = sys.argv[1:]
+assert int(pathlib.Path(counter).read_text()) == 1
+result = json.loads(pathlib.Path(output).read_text())
+assert result.get("attempt_skip_count") == 1 or result["deferred_count"] >= 1
+root = pathlib.Path(state)
+cards = [
+    json.loads(path.read_text())
+    for path in (root / "value-primitive-cards").glob("*.json")
+]
+assert not any(
+    card["episode_id"] == episode
+    and card["provenance"]["evaluator_model"] == model
+    for card in cards
+)
+ledger = json.loads((root / "value-compiler" / "attempts.json").read_text())
+assert any(
+    item.get("episode_id") == episode and item.get("state") == "failed"
+    for item in ledger["attempts"]
+)
+PY
+  then
+    pass "oversized失敗予約は同一fingerprintの自動再課金を防ぐ"
+  else
+    cat "$first_err" "$retry_err" >&2
+    fail "oversized失敗予約は同一fingerprintの自動再課金を防ぐ"
+  fi
+}
+
 main() {
   if ! build_fixture; then
     fail "Value Compiler fixtureを構築できる"
@@ -507,11 +667,16 @@ main() {
   fi
   if [[ "${FLIGHT_RECORDER_TEST_VALUE_CONCURRENCY_ONLY:-0}" == "1" ]]; then
     test_concurrent_compile_reuses_reservation_without_blocking_inspect
+  elif [[ "${FLIGHT_RECORDER_TEST_VALUE_ATTEMPTS_ONLY:-0}" == "1" ]]; then
+    test_killed_provider_leaves_durable_pending_without_recharge
+    test_oversized_response_leaves_durable_failure_without_recharge
   else
     test_versioned_cards_are_grounded_bounded_and_idempotent
     test_wrong_axis_reference_fails_closed_without_storing_a_card
     test_forget_and_purge_cover_value_primitive_cards
     test_concurrent_compile_reuses_reservation_without_blocking_inspect
+    test_killed_provider_leaves_durable_pending_without_recharge
+    test_oversized_response_leaves_durable_failure_without_recharge
   fi
   echo
   echo "Result: $PASS passed, $FAIL failed"

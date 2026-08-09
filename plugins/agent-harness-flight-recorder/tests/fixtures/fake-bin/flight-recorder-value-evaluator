@@ -53,7 +53,12 @@ if release:
         raise SystemExit("blocking evaluator release timed out")
 delay = os.environ.get("FLIGHT_RECORDER_TEST_VALUE_SLEEP_SECONDS")
 if delay:
-    time.sleep(float(delay))
+    parent = os.getppid()
+    deadline = time.monotonic() + float(delay)
+    while time.monotonic() < deadline and os.getppid() == parent:
+        time.sleep(0.05)
+    if os.getppid() != parent:
+        raise SystemExit("compile parent exited")
 if os.environ.get("FLIGHT_RECORDER_TEST_VALUE_OVERSIZED") == "1":
     sys.stdout.write("x" * (65 * 1024))
     raise SystemExit(0)

@@ -41,6 +41,9 @@ MAX_COST_MICROUSD = 10_000_000
 MAX_BLOCKING_LOCK_WAIT_SECONDS = 30
 LOCK_POLL_SECONDS = 0.05
 RUN_LOCK_PATH = Path("value-compiler/run.lock")
+ATTEMPTS_PATH = Path("value-compiler/attempts.json")
+MAX_ATTEMPTS = 1_000
+MAX_ATTEMPTS_BYTES = 1024 * 1024
 HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
@@ -105,10 +108,294 @@ OBSERVATION_FIELDS = {
     "measured_duration_ms", "measured_cost_usd", "deterministic_outcomes",
     "deterministic_evidence",
 }
+ATTEMPT_FIELDS = {
+    "fingerprint", "episode_id", "packet_sha256", "evaluator_model",
+    "evaluator_adapter_sha256", "policy_version", "compiler_contract",
+    "state", "updated_at", "value_primitive_card_id", "diagnostic_code",
+}
+ATTEMPT_STATES = {"pending", "failed", "completed"}
+ATTEMPT_DIAGNOSTICS = {
+    "provider_or_validation_failed",
+    "input_changed",
+}
 
 
 def _sha256(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def _attempt_fingerprint(
+    packet_sha256: str,
+    model: str,
+    evaluator_sha256: str,
+    policy_version: str,
+) -> str:
+    return _sha256(
+        canonical_json(
+            {
+                "packet_sha256": packet_sha256,
+                "evaluator_model": model,
+                "evaluator_adapter_sha256": evaluator_sha256,
+                "policy_version": policy_version,
+                "compiler_contract": CARD_CONTRACT,
+            }
+        )
+    )
+
+
+def _validate_attempt(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != ATTEMPT_FIELDS:
+        raise VaultError("Value Compiler attempt ledger is invalid")
+    for field in (
+        "fingerprint", "episode_id", "packet_sha256",
+        "evaluator_adapter_sha256",
+    ):
+        item = value.get(field)
+        if not isinstance(item, str) or HASH_RE.fullmatch(item) is None:
+            raise VaultError("Value Compiler attempt ledger is invalid")
+    for field in ("evaluator_model", "policy_version"):
+        item = value.get(field)
+        if (
+            not isinstance(item, str)
+            or not item
+            or len(item) > 128
+            or any(character in item for character in "\r\n\0")
+        ):
+            raise VaultError("Value Compiler attempt ledger is invalid")
+    if (
+        value.get("compiler_contract") != CARD_CONTRACT
+        or value.get("state") not in ATTEMPT_STATES
+    ):
+        raise VaultError("Value Compiler attempt ledger is invalid")
+    try:
+        parse_time(value.get("updated_at"))
+    except (TypeError, ValueError) as error:
+        raise VaultError("Value Compiler attempt ledger is invalid") from error
+    card_id = value.get("value_primitive_card_id")
+    diagnostic = value.get("diagnostic_code")
+    state = value["state"]
+    if (
+        (card_id is not None and (
+            not isinstance(card_id, str) or HASH_RE.fullmatch(card_id) is None
+        ))
+        or (diagnostic is not None and diagnostic not in ATTEMPT_DIAGNOSTICS)
+        or (state == "pending" and (card_id is not None or diagnostic is not None))
+        or (state == "failed" and (card_id is not None or diagnostic is None))
+        or (state == "completed" and (card_id is None or diagnostic is not None))
+    ):
+        raise VaultError("Value Compiler attempt ledger is invalid")
+    expected = _attempt_fingerprint(
+        value["packet_sha256"],
+        value["evaluator_model"],
+        value["evaluator_adapter_sha256"],
+        value["policy_version"],
+    )
+    if value["fingerprint"] != expected:
+        raise VaultError("Value Compiler attempt fingerprint is invalid")
+    return value
+
+
+def _validate_attempts(value: object) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema_version", "attempts"}
+        or value.get("schema_version") != 1
+        or not isinstance(value.get("attempts"), list)
+        or len(value["attempts"]) > MAX_ATTEMPTS
+    ):
+        raise VaultError("Value Compiler attempt ledger is invalid")
+    attempts = [_validate_attempt(item) for item in value["attempts"]]
+    fingerprints = [item["fingerprint"] for item in attempts]
+    if fingerprints != sorted(set(fingerprints)):
+        raise VaultError("Value Compiler attempt ledger is invalid")
+    return value
+
+
+def _load_attempts_with_raw(root: Path) -> tuple[bytes | None, dict[str, Any]]:
+    directory = root / "value-compiler"
+    if directory.is_symlink():
+        raise VaultError("Value Compiler attempt directory is unsafe")
+    if not directory.exists():
+        return None, {"schema_version": 1, "attempts": []}
+    try:
+        directory_metadata = directory.lstat()
+    except OSError as error:
+        raise VaultError("Value Compiler attempt directory is unsafe") from error
+    if (
+        not stat.S_ISDIR(directory_metadata.st_mode)
+        or directory_metadata.st_uid != os.geteuid()
+        or directory_metadata.st_mode & 0o077
+    ):
+        raise VaultError("Value Compiler attempt directory is unsafe")
+    path = root / ATTEMPTS_PATH
+    if not path.exists() and not path.is_symlink():
+        return None, {"schema_version": 1, "attempts": []}
+    descriptor = -1
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or metadata.st_mode & 0o077
+            or metadata.st_size > MAX_ATTEMPTS_BYTES
+        ):
+            raise VaultError("Value Compiler attempt ledger is unsafe")
+        with os.fdopen(descriptor, "rb", closefd=True) as stream:
+            descriptor = -1
+            raw = stream.read(MAX_ATTEMPTS_BYTES + 1)
+        after = path.lstat()
+        if any(
+            (
+                after.st_dev != metadata.st_dev,
+                after.st_ino != metadata.st_ino,
+                after.st_size != metadata.st_size,
+                after.st_mtime_ns != metadata.st_mtime_ns,
+                after.st_ctime_ns != metadata.st_ctime_ns,
+            )
+        ):
+            raise VaultError("Value Compiler attempt ledger changed while reading")
+        value = _validate_attempts(json.loads(raw))
+    except VaultError:
+        raise
+    except (OSError, ValueError, UnicodeError, RecursionError) as error:
+        raise VaultError("Value Compiler attempt ledger is invalid or unsafe") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return raw, value
+
+
+def _load_attempts(root: Path) -> dict[str, Any]:
+    return _load_attempts_with_raw(root)[1]
+
+
+def _store_attempts(root: Path, value: dict[str, Any]) -> None:
+    validated = _validate_attempts(value)
+    directory = safe_subdirectory(root, "value-compiler")
+    data = canonical_json(validated) + b"\n"
+    if len(data) > MAX_ATTEMPTS_BYTES:
+        raise VaultError("Value Compiler attempt ledger exceeds size limit")
+    atomic_replace(root / ATTEMPTS_PATH, data)
+    directory.chmod(0o700)
+
+
+def _new_attempt(
+    episode_id: str,
+    packet_sha256: str,
+    model: str,
+    evaluator_sha256: str,
+    policy_version: str,
+) -> dict[str, Any]:
+    result = {
+        "fingerprint": _attempt_fingerprint(
+            packet_sha256, model, evaluator_sha256, policy_version
+        ),
+        "episode_id": episode_id,
+        "packet_sha256": packet_sha256,
+        "evaluator_model": model,
+        "evaluator_adapter_sha256": evaluator_sha256,
+        "policy_version": policy_version,
+        "compiler_contract": CARD_CONTRACT,
+        "state": "pending",
+        "updated_at": _evaluated_at(),
+        "value_primitive_card_id": None,
+        "diagnostic_code": None,
+    }
+    return result
+
+
+def _replace_attempt(
+    root: Path,
+    fingerprint: str,
+    state: str,
+    *,
+    card_id: str | None = None,
+    diagnostic_code: str | None = None,
+) -> None:
+    ledger = _load_attempts(root)
+    changed = False
+    attempts = []
+    for item in ledger["attempts"]:
+        if item["fingerprint"] == fingerprint:
+            item = {
+                **item,
+                "state": state,
+                "updated_at": _evaluated_at(),
+                "value_primitive_card_id": card_id,
+                "diagnostic_code": diagnostic_code,
+            }
+            changed = True
+        attempts.append(item)
+    if not changed:
+        raise VaultError("Value Compiler attempt reservation is missing")
+    _store_attempts(
+        root,
+        {"schema_version": 1, "attempts": sorted(
+            attempts, key=lambda item: item["fingerprint"]
+        )},
+    )
+
+
+def value_attempt_record_count(
+    root: Path,
+    episode_id: str,
+    policy_version: str | None = None,
+) -> int:
+    return sum(
+        item["episode_id"] == episode_id
+        and (
+            policy_version is None
+            or item["policy_version"] == policy_version
+        )
+        for item in _load_attempts(root)["attempts"]
+    )
+
+
+def remove_episode_attempts(
+    root: Path,
+    episode_id: str,
+    policy_version: str | None = None,
+) -> bytes | None:
+    """Remove one Episode's attempts under caller-held run/Vault locks."""
+    raw, ledger = _load_attempts_with_raw(root)
+    if raw is None:
+        return None
+    remaining = [
+        item for item in ledger["attempts"]
+        if not (
+            item["episode_id"] == episode_id
+            and (
+                policy_version is None
+                or item["policy_version"] == policy_version
+            )
+        )
+    ]
+    _store_attempts(
+        root,
+        {"schema_version": 1, "attempts": remaining},
+    )
+    return raw
+
+
+def restore_attempts(root: Path, snapshot: bytes | None) -> None:
+    path = root / ATTEMPTS_PATH
+    if snapshot is None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    if len(snapshot) > MAX_ATTEMPTS_BYTES:
+        raise VaultError("Value Compiler attempt snapshot is invalid")
+    try:
+        _validate_attempts(json.loads(snapshot))
+    except (ValueError, UnicodeError, RecursionError) as error:
+        raise VaultError("Value Compiler attempt snapshot is invalid") from error
+    atomic_replace(path, snapshot)
 
 
 def _evidence_id(source: str, anchor_id: str, field: str, content: object) -> str:
@@ -673,6 +960,7 @@ def compile_values(
     selected_policy, trusted = _policy_selection(policy_version, None)
     compiled = []
     reused = []
+    attempt_skip_count = 0
     spent = 0
     with run_lock(root, blocking=True):
         with vault_lock(root):
@@ -681,6 +969,10 @@ def compile_values(
                 root, selected_policy, trusted
             )
             existing = _stored_records(root)
+            attempts = {
+                item["fingerprint"]: item
+                for item in _load_attempts(root)["attempts"]
+            }
             pending = []
             for episode, packet in candidates:
                 matches = [
@@ -693,27 +985,25 @@ def compile_values(
                         selected_policy,
                     )
                 ]
+                fingerprint = _attempt_fingerprint(
+                    packet["packet_sha256"],
+                    selected_model,
+                    evaluator_sha256,
+                    selected_policy,
+                )
                 if matches:
                     reused.append(matches[-1])
+                elif fingerprint in attempts:
+                    attempt_skip_count += 1
                 elif len(pending) < maximum_episodes:
-                    pending.append((episode, packet))
+                    pending.append((episode, packet, fingerprint))
 
         # The batch run lock stays held, but the Vault lock is deliberately
         # released across provider work so inspect/report/sync can proceed.
-        for episode, packet in pending:
+        for episode, packet, fingerprint in pending:
             if spent >= maximum_cost_microusd:
                 break
             remaining = maximum_cost_microusd - spent
-            request = {
-                "schema_version": 1,
-                "model": selected_model,
-                "packet": packet,
-                "remaining_cost_microusd": remaining,
-            }
-            started = time.monotonic_ns()
-            raw = _invoke(evaluator_path, evaluator_sha256, request, timeout_seconds)
-            latency_ms = max(0, (time.monotonic_ns() - started) // 1_000_000)
-            primitives, cost = _validate_response(raw, packet, remaining)
             with vault_lock(root):
                 current = {
                     item[0]["episode_id"]: item
@@ -722,6 +1012,93 @@ def compile_values(
                     )
                 }.get(episode["episode_id"])
                 if current is None or current[1] != packet:
+                    raise VaultError(
+                        "value compiler input changed before evaluation"
+                    )
+                ledger = _load_attempts(root)
+                if any(
+                    item["fingerprint"] == fingerprint
+                    for item in ledger["attempts"]
+                ):
+                    attempt_skip_count += 1
+                    continue
+                if len(ledger["attempts"]) >= MAX_ATTEMPTS:
+                    raise VaultError(
+                        "Value Compiler attempt ledger is at capacity"
+                    )
+                reservation = _new_attempt(
+                    episode["episode_id"],
+                    packet["packet_sha256"],
+                    selected_model,
+                    evaluator_sha256,
+                    selected_policy,
+                )
+                if reservation["fingerprint"] != fingerprint:
+                    raise VaultError(
+                        "Value Compiler attempt fingerprint conflicts"
+                    )
+                _store_attempts(
+                    root,
+                    {
+                        "schema_version": 1,
+                        "attempts": sorted(
+                            [*ledger["attempts"], reservation],
+                            key=lambda item: item["fingerprint"],
+                        ),
+                    },
+                )
+            request = {
+                "schema_version": 1,
+                "model": selected_model,
+                "packet": packet,
+                "remaining_cost_microusd": remaining,
+            }
+            invoking_parent_pid = os.getppid()
+            started = time.monotonic_ns()
+            try:
+                raw = _invoke(
+                    evaluator_path,
+                    evaluator_sha256,
+                    request,
+                    timeout_seconds,
+                )
+                latency_ms = max(
+                    0, (time.monotonic_ns() - started) // 1_000_000
+                )
+                primitives, cost = _validate_response(
+                    raw, packet, remaining
+                )
+            except VaultError:
+                with vault_lock(root):
+                    _replace_attempt(
+                        root,
+                        fingerprint,
+                        "failed",
+                        diagnostic_code="provider_or_validation_failed",
+                    )
+                raise
+            # A shell function launched in the background can be terminated
+            # without forwarding SIGTERM to this child. Treat reparenting as
+            # an interrupted run: keep the durable pending reservation and
+            # never publish a card from an orphaned provider call.
+            if os.getppid() != invoking_parent_pid:
+                raise VaultError(
+                    "value compiler caller exited during evaluation"
+                )
+            with vault_lock(root):
+                current = {
+                    item[0]["episode_id"]: item
+                    for item in _authenticated_packets(
+                        root, selected_policy, trusted
+                    )
+                }.get(episode["episode_id"])
+                if current is None or current[1] != packet:
+                    _replace_attempt(
+                        root,
+                        fingerprint,
+                        "failed",
+                        diagnostic_code="input_changed",
+                    )
                     raise VaultError(
                         "value compiler input changed during evaluation"
                     )
@@ -738,6 +1115,7 @@ def compile_values(
                 ]
                 if matches:
                     reused.append(matches[-1])
+                    card_id = matches[-1]["value_primitive_card_id"]
                 else:
                     card = _build_card(
                         episode,
@@ -752,6 +1130,13 @@ def compile_values(
                     )
                     _store_card(root, card)
                     compiled.append(card)
+                    card_id = card["value_primitive_card_id"]
+                _replace_attempt(
+                    root,
+                    fingerprint,
+                    "completed",
+                    card_id=card_id,
+                )
             spent += cost
     return {
         "schema_version": OUTPUT_VERSION,
@@ -760,6 +1145,7 @@ def compile_values(
         "candidate_count": len(candidates),
         "compiled_count": len(compiled),
         "reused_count": len(reused),
+        "attempt_skip_count": attempt_skip_count,
         "deferred_count": len(candidates) - len(compiled) - len(reused),
         "measured_cost_microusd": spent,
         "compiled_cards": compiled,
