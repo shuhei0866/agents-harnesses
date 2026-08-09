@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import hashlib
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -11,6 +13,7 @@ import stat
 import time
 from pathlib import Path
 from typing import Any
+from typing import Iterator
 
 from chunk_rotation import canonical_json, parse_time, safe_subdirectory
 from evaluation import _evaluated_at, _executable_identity, _invoke, _safe_name
@@ -35,6 +38,9 @@ MAX_RESPONSE_BYTES = 64 * 1024
 MAX_SUMMARY_TEXT = 512
 MAX_EPISODES = 100
 MAX_COST_MICROUSD = 10_000_000
+MAX_BLOCKING_LOCK_WAIT_SECONDS = 30
+LOCK_POLL_SECONDS = 0.05
+RUN_LOCK_PATH = Path("value-compiler/run.lock")
 HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
@@ -537,6 +543,115 @@ def _same_generation(card: dict[str, Any], packet: dict[str, Any], model: str, e
     )
 
 
+@contextlib.contextmanager
+def run_lock(root: Path, *, blocking: bool) -> Iterator[bool]:
+    """Serialize Value Compiler batches without blocking Vault readers."""
+    directory = safe_subdirectory(root, "value-compiler")
+    path = root / RUN_LOCK_PATH
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_CREAT
+            | os.O_RDWR
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+        ):
+            raise VaultError("value compiler run lock is unsafe")
+        os.fchmod(descriptor, 0o600)
+        deadline = time.monotonic() + MAX_BLOCKING_LOCK_WAIT_SECONDS
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if not blocking:
+                    yield False
+                    return
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise VaultError(
+                        "value compiler is busy; retry the operation"
+                    )
+                time.sleep(min(LOCK_POLL_SECONDS, remaining))
+        yield True
+    except VaultError:
+        raise
+    except OSError as error:
+        raise VaultError(
+            "value compiler run lock is unavailable or unsafe"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        directory.chmod(0o700)
+
+
+def _authenticated_packets(
+    root: Path,
+    policy_version: str,
+    trusted: dict[str, Any] | None,
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    episodes = _episodes(root, policy_version, trusted)
+    anchors = _anchors_by_episode(root, policy_version, episodes)
+    return [
+        (episode, _packet(episode, anchors[episode["episode_id"]]))
+        for episode in episodes
+        if episode["episode_id"] in anchors
+    ]
+
+
+def _build_card(
+    episode: dict[str, Any],
+    packet: dict[str, Any],
+    primitives: dict[str, Any],
+    model: str,
+    evaluator_path: Path,
+    evaluator_sha256: str,
+    policy_version: str,
+    cost: int,
+    latency_ms: int,
+) -> dict[str, Any]:
+    without_id = {
+        "schema_version": CARD_VERSION,
+        "contract_version": CARD_CONTRACT,
+        "episode_id": episode["episode_id"],
+        "observations": packet["observations"],
+        "primitives": primitives,
+        "provenance": {
+            "contract_version": CARD_CONTRACT,
+            "packet_sha256": packet["packet_sha256"],
+            "input_anchor_ids": packet["anchor_ids"],
+            "input_evidence_ids": sorted(
+                item["evidence_id"] for item in packet["evidence"]
+            ),
+            "input_evidence_fields": {
+                item["evidence_id"]: item["field"]
+                for item in packet["evidence"]
+            },
+            "evaluator_model": model,
+            "evaluator_adapter": evaluator_path.name,
+            "evaluator_adapter_sha256": evaluator_sha256,
+            "policy_version": policy_version,
+            "source_event_ids": episode["source_event_ids"],
+            "generated_at": _evaluated_at(),
+            "generation_cost_microusd": cost,
+            "latency_ms": latency_ms,
+        },
+    }
+    return {
+        **without_id,
+        "value_primitive_card_id": _sha256(canonical_json(without_id)),
+    }
+
+
 def compile_values(
     root: Path,
     evaluator: str,
@@ -556,26 +671,38 @@ def compile_values(
     selected_model = _safe_name(model, "value evaluator model")
     evaluator_path, evaluator_sha256 = _executable_identity(selected_evaluator)
     selected_policy, trusted = _policy_selection(policy_version, None)
-    ensure_managed_gitignore(root)
     compiled = []
     reused = []
     spent = 0
-    with vault_lock(root):
-        episodes = _episodes(root, selected_policy, trusted)
-        anchors = _anchors_by_episode(root, selected_policy, episodes)
-        candidates = [item for item in episodes if item["episode_id"] in anchors]
-        existing = _stored_records(root)
-        for episode in candidates:
-            packet = _packet(episode, anchors[episode["episode_id"]])
-            matches = [
-                value for _path, _raw, value in existing
-                if _same_generation(value, packet, selected_model, evaluator_sha256, selected_policy)
-            ]
-            if matches:
-                reused.append(matches[-1])
-                continue
-            if len(compiled) >= maximum_episodes or spent >= maximum_cost_microusd:
-                continue
+    with run_lock(root, blocking=True):
+        with vault_lock(root):
+            ensure_managed_gitignore(root)
+            candidates = _authenticated_packets(
+                root, selected_policy, trusted
+            )
+            existing = _stored_records(root)
+            pending = []
+            for episode, packet in candidates:
+                matches = [
+                    value for _path, _raw, value in existing
+                    if _same_generation(
+                        value,
+                        packet,
+                        selected_model,
+                        evaluator_sha256,
+                        selected_policy,
+                    )
+                ]
+                if matches:
+                    reused.append(matches[-1])
+                elif len(pending) < maximum_episodes:
+                    pending.append((episode, packet))
+
+        # The batch run lock stays held, but the Vault lock is deliberately
+        # released across provider work so inspect/report/sync can proceed.
+        for episode, packet in pending:
+            if spent >= maximum_cost_microusd:
+                break
             remaining = maximum_cost_microusd - spent
             request = {
                 "schema_version": 1,
@@ -587,35 +714,44 @@ def compile_values(
             raw = _invoke(evaluator_path, evaluator_sha256, request, timeout_seconds)
             latency_ms = max(0, (time.monotonic_ns() - started) // 1_000_000)
             primitives, cost = _validate_response(raw, packet, remaining)
-            without_id = {
-                "schema_version": CARD_VERSION,
-                "contract_version": CARD_CONTRACT,
-                "episode_id": episode["episode_id"],
-                "observations": packet["observations"],
-                "primitives": primitives,
-                "provenance": {
-                    "contract_version": CARD_CONTRACT,
-                    "packet_sha256": packet["packet_sha256"],
-                    "input_anchor_ids": packet["anchor_ids"],
-                    "input_evidence_ids": sorted(item["evidence_id"] for item in packet["evidence"]),
-                    "input_evidence_fields": {
-                        item["evidence_id"]: item["field"]
-                        for item in packet["evidence"]
-                    },
-                    "evaluator_model": selected_model,
-                    "evaluator_adapter": evaluator_path.name,
-                    "evaluator_adapter_sha256": evaluator_sha256,
-                    "policy_version": selected_policy,
-                    "source_event_ids": episode["source_event_ids"],
-                    "generated_at": _evaluated_at(),
-                    "generation_cost_microusd": cost,
-                    "latency_ms": latency_ms,
-                },
-            }
-            card = {**without_id, "value_primitive_card_id": _sha256(canonical_json(without_id))}
-            _store_card(root, card)
-            existing.append((Path(), b"", card))
-            compiled.append(card)
+            with vault_lock(root):
+                current = {
+                    item[0]["episode_id"]: item
+                    for item in _authenticated_packets(
+                        root, selected_policy, trusted
+                    )
+                }.get(episode["episode_id"])
+                if current is None or current[1] != packet:
+                    raise VaultError(
+                        "value compiler input changed during evaluation"
+                    )
+                existing = _stored_records(root)
+                matches = [
+                    value for _path, _raw, value in existing
+                    if _same_generation(
+                        value,
+                        packet,
+                        selected_model,
+                        evaluator_sha256,
+                        selected_policy,
+                    )
+                ]
+                if matches:
+                    reused.append(matches[-1])
+                else:
+                    card = _build_card(
+                        episode,
+                        packet,
+                        primitives,
+                        selected_model,
+                        evaluator_path,
+                        evaluator_sha256,
+                        selected_policy,
+                        cost,
+                        latency_ms,
+                    )
+                    _store_card(root, card)
+                    compiled.append(card)
             spent += cost
     return {
         "schema_version": OUTPUT_VERSION,

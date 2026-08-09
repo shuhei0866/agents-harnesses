@@ -306,6 +306,7 @@ assert "/value-primitive-cards/\n" in (pathlib.Path(state_path) / ".gitignore").
 
 inspection = json.loads(pathlib.Path(inspect_path).read_text())
 human = pathlib.Path(human_path).read_text()
+assert inspection["schema_version"] == 5
 cards = inspection["value_primitive_cards"]
 assert len(cards) == 1 and cards[0] == selected
 assert "goal_achievement" in human
@@ -394,6 +395,109 @@ PY
   fi
 }
 
+test_concurrent_compile_reuses_reservation_without_blocking_inspect() {
+  echo "test_concurrent_compile_reuses_reservation_without_blocking_inspect:"
+  local event="75000000-0000-4000-8000-000000000006"
+  local episode started="$TEST_ROOT/value-concurrent-started"
+  local release="$TEST_ROOT/value-concurrent-release"
+  local counter="$TEST_ROOT/value-concurrent-count"
+  local first="$TEST_ROOT/value-concurrent-first.json"
+  local second="$TEST_ROOT/value-concurrent-second.json"
+  local inspected="$TEST_ROOT/value-concurrent-inspect.json"
+  local first_err="$TEST_ROOT/value-concurrent-first.err"
+  local second_err="$TEST_ROOT/value-concurrent-second.err"
+  local inspect_err="$TEST_ROOT/value-concurrent-inspect.err"
+  local first_pid second_pid inspect_pid index inspect_finished=0
+
+  # Prewarm every current candidate for this model, then add exactly one new
+  # fingerprint so both concurrent runs contend for the same provider work.
+  if ! run_cli value compile \
+      --evaluator flight-recorder-value-evaluator --model value-model-concurrent \
+      --max-episodes 100 --max-cost-microusd 600000 --json \
+      >/dev/null 2>"$first_err"; then
+    cat "$first_err" >&2
+    fail "concurrency fixtureをprewarmできる"
+    return
+  fi
+  append_event "$event" 6 "2026-08-09T00:00:06Z"
+  run_cli sync >/dev/null 2>&1
+  run_cli rebuild-index >/dev/null 2>&1
+  episode="$(episode_for_event "$event")"
+  if ! generate_meaning_card "$episode" concurrent; then
+    fail "concurrency候補を作成できる"
+    return
+  fi
+
+  FLIGHT_RECORDER_TEST_VALUE_STARTED="$started" \
+    FLIGHT_RECORDER_TEST_VALUE_RELEASE="$release" \
+    FLIGHT_RECORDER_TEST_VALUE_COUNT="$counter" \
+    run_cli value compile \
+      --evaluator flight-recorder-value-evaluator --model value-model-concurrent \
+      --max-episodes 1 --max-cost-microusd 6000 --json \
+      >"$first" 2>"$first_err" &
+  first_pid=$!
+  for index in $(seq 1 50); do
+    [[ -e "$started" ]] && break
+    sleep 0.05
+  done
+  if [[ ! -e "$started" ]]; then
+    touch "$release"
+    wait "$first_pid" 2>/dev/null
+    fail "blocking providerが開始した"
+    return
+  fi
+
+  FLIGHT_RECORDER_TEST_VALUE_COUNT="$counter" \
+    run_cli value compile \
+      --evaluator flight-recorder-value-evaluator --model value-model-concurrent \
+      --max-episodes 1 --max-cost-microusd 6000 --json \
+      >"$second" 2>"$second_err" &
+  second_pid=$!
+  run_cli inspect "$episode" --json >"$inspected" 2>"$inspect_err" &
+  inspect_pid=$!
+  for index in $(seq 1 60); do
+    if ! kill -0 "$inspect_pid" 2>/dev/null; then
+      wait "$inspect_pid"
+      inspect_finished=1
+      break
+    fi
+    sleep 0.05
+  done
+
+  # Always release the fake provider before assertions so Red cannot strand
+  # either compile process.
+  touch "$release"
+  wait "$first_pid"
+  local first_status=$?
+  wait "$second_pid"
+  local second_status=$?
+  if [[ "$inspect_finished" -eq 0 ]]; then
+    wait "$inspect_pid"
+  fi
+  if [[ "$first_status" -eq 0 && "$second_status" -eq 0 \
+      && "$inspect_finished" -eq 1 ]] \
+    && python3 - "$first" "$second" "$inspected" "$counter" "$episode" <<'PY'
+import json
+import pathlib
+import sys
+
+first, second, inspected, counter, episode = sys.argv[1:]
+outputs = [json.loads(pathlib.Path(path).read_text()) for path in (first, second)]
+inspection = json.loads(pathlib.Path(inspected).read_text())
+assert int(pathlib.Path(counter).read_text()) == 1
+assert sum(item["compiled_count"] for item in outputs) == 1
+assert sum(item["reused_count"] for item in outputs) >= 1
+assert inspection["schema_version"] == 5
+assert inspection["card"]["episode_id"] == episode
+PY
+  then
+    pass "同一fingerprintはprovider 1回でreuseし、provider待機中もinspectできる"
+  else
+    cat "$first_err" "$second_err" "$inspect_err" >&2
+    fail "同一fingerprintはprovider 1回でreuseし、provider待機中もinspectできる"
+  fi
+}
+
 main() {
   if ! build_fixture; then
     fail "Value Compiler fixtureを構築できる"
@@ -401,9 +505,14 @@ main() {
     echo "Result: $PASS passed, $FAIL failed"
     exit 1
   fi
-  test_versioned_cards_are_grounded_bounded_and_idempotent
-  test_wrong_axis_reference_fails_closed_without_storing_a_card
-  test_forget_and_purge_cover_value_primitive_cards
+  if [[ "${FLIGHT_RECORDER_TEST_VALUE_CONCURRENCY_ONLY:-0}" == "1" ]]; then
+    test_concurrent_compile_reuses_reservation_without_blocking_inspect
+  else
+    test_versioned_cards_are_grounded_bounded_and_idempotent
+    test_wrong_axis_reference_fails_closed_without_storing_a_card
+    test_forget_and_purge_cover_value_primitive_cards
+    test_concurrent_compile_reuses_reservation_without_blocking_inspect
+  fi
   echo
   echo "Result: $PASS passed, $FAIL failed"
   [[ "$FAIL" -eq 0 ]]

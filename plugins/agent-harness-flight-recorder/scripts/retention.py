@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import contextlib
 import os
 import re
 import subprocess
@@ -33,7 +34,10 @@ from receipt_automation import (
 )
 from retention_state import load_forgotten, store_forgotten
 from semantic_receipts import semantic_receipt_record_snapshots
-from value_compiler import value_primitive_card_record_snapshots
+from value_compiler import (
+    run_lock as value_compiler_lock,
+    value_primitive_card_record_snapshots,
+)
 from sync import (
     CHUNK_PATH_RE,
     PENDING_PATH,
@@ -50,6 +54,15 @@ LIMITATION = (
     "Best-effort purge cannot guarantee deletion from independent or "
     "uncontrolled remote clones, provider caches, or backups."
 )
+
+
+@contextlib.contextmanager
+def _purge_evaluator_locks(root: Path):
+    # Value Compiler takes its own run lock before Vault. Purge uses the same
+    # order, then preserves the established auto-evaluation/Receipt order.
+    with value_compiler_lock(root, blocking=True):
+        with auto_evaluation_lock(root, blocking=True):
+            yield
 
 
 def _selection(
@@ -327,7 +340,7 @@ def purge(
     # Global order for purge is background evaluation, Receipt automation,
     # then Vault. Each runner takes only its own run lock before Vault, so this
     # order cannot form a cycle and blocks both evaluator types during purge.
-    with auto_evaluation_lock(root, blocking=True):
+    with _purge_evaluator_locks(root):
         with receipt_automation_lock(root, blocking=True):
             with vault_lock(root):
                 # Reauthenticate and resolve scope under the same exclusive lock

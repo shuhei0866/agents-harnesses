@@ -106,6 +106,12 @@ GITIGNORE = PRE_VALUE_PRIMITIVE_CARD_GITIGNORE.replace(
     "/meaning-cards/\n/value-primitive-cards/\n",
 )
 assert "/value-primitive-cards/\n" in GITIGNORE
+PRE_VALUE_COMPILER_GITIGNORE = GITIGNORE
+GITIGNORE = PRE_VALUE_COMPILER_GITIGNORE.replace(
+    "/value-primitive-cards/\n",
+    "/value-primitive-cards/\n/value-compiler/\n",
+)
+assert "/value-compiler/\n" in GITIGNORE
 LEGACY_GITIGNORE = """# Local-only Flight Recorder state
 /hash.key
 /events.jsonl
@@ -395,6 +401,7 @@ def ensure_managed_gitignore(root: Path) -> None:
         PRE_RECEIPT_AUTOMATION_GITIGNORE,
         PRE_MEANING_CARD_GITIGNORE,
         PRE_VALUE_PRIMITIVE_CARD_GITIGNORE,
+        PRE_VALUE_COMPILER_GITIGNORE,
     ):
         atomic_replace(path, GITIGNORE.encode("utf-8"))
     elif contents != GITIGNORE:

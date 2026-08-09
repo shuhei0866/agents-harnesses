@@ -7,6 +7,12 @@ import json
 import os
 import pathlib
 import sys
+import time
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - tests run on POSIX
+    fcntl = None
 
 
 request = json.load(sys.stdin)
@@ -20,11 +26,37 @@ if capture:
 counter = os.environ.get("FLIGHT_RECORDER_TEST_VALUE_COUNT")
 if counter:
     path = pathlib.Path(counter)
-    try:
-        count = int(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, ValueError):
-        count = 0
-    path.write_text(str(count + 1), encoding="utf-8")
+    with path.open("a+", encoding="utf-8") as stream:
+        if fcntl is not None:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.seek(0)
+        try:
+            count = int(stream.read())
+        except ValueError:
+            count = 0
+        stream.seek(0)
+        stream.truncate()
+        stream.write(str(count + 1))
+        stream.flush()
+        if fcntl is not None:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+started = os.environ.get("FLIGHT_RECORDER_TEST_VALUE_STARTED")
+release = os.environ.get("FLIGHT_RECORDER_TEST_VALUE_RELEASE")
+if started:
+    pathlib.Path(started).touch()
+if release:
+    deadline = time.monotonic() + 10
+    while not pathlib.Path(release).exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if not pathlib.Path(release).exists():
+        raise SystemExit("blocking evaluator release timed out")
+delay = os.environ.get("FLIGHT_RECORDER_TEST_VALUE_SLEEP_SECONDS")
+if delay:
+    time.sleep(float(delay))
+if os.environ.get("FLIGHT_RECORDER_TEST_VALUE_OVERSIZED") == "1":
+    sys.stdout.write("x" * (65 * 1024))
+    raise SystemExit(0)
 
 
 def evidence_items(value: object) -> list[dict[str, object]]:
