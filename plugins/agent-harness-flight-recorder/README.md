@@ -493,11 +493,22 @@ axis-specific allowlist and forces unsupported axes to `unknown`.
 Validated `value-primitive-card-v1` records are content-addressed under the
 owner-only, Git-ignored `value-primitive-cards/` directory. Repeating the same
 Episode/anchor/model/evaluator/policy input reuses the existing card without a
-provider call. `inspect` exposes matching cards separately from deterministic
-facts and Semantic Receipts. Episode work cost remains in `observations`, while
-the Value Compiler call's micro-USD is recorded separately as generation cost.
-`forget` hides the Episode without deleting cards; only `purge --apply`
-physically removes matching cards.
+provider call. A durable owner-only attempt ledger prevents duplicate paid
+work, and a validated provider result is written to a bounded prepared record
+before final Episode reauthentication. A later run can publish that result
+without another provider call after an interrupted or conflicting run. Any
+measured generation cost is charged to the batch budget as soon as the provider
+response validates, even when a changed input prevents publication.
+
+`inspect` exposes each independently authenticated card generation separately
+from deterministic facts and Semantic Receipts. Its human view includes the
+model, generation time and cost, anchor IDs, original task measurements, and
+all eight state/basis/confidence/summary/evidence vectors. Episode work cost
+remains in `observations`; it is never confused with Value generation cost.
+`forget` hides the Episode without deleting cards. Only `purge --apply`
+physically removes matching cards, prepared results, and attempts; purge
+rollback snapshots are byte-exact and can temporarily use memory proportional
+to the affected local artifacts.
 
 ### Unconscious Semantic Receipts
 

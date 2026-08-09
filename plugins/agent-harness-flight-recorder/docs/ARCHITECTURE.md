@@ -464,6 +464,45 @@ questions without claiming that fluent prose proves business value. The pilot
 remains outside the scheduler and automatic Receipt worker until real-task
 results justify that integration.
 
+### Value Compiler v0
+
+Value Compiler is a local derived layer over authenticated Episode Evidence
+Cards and versioned Meaning Card / Semantic Receipt anchors. Candidate
+discovery scans the owner-only anchor stores once per bounded batch, then
+materializes and reauthenticates only candidate Episode IDs. Provider work runs
+outside the Vault lock while a separate run lock serializes paid batches.
+
+The transient `value-compiler-packet-v1` contains deterministic Episode
+observations and bounded typed anchor evidence. It does not read registered raw
+session sources or persist their paths or bodies. The evaluator returns eight
+independent primitives; Recorder policy validates axis-specific references and
+direction, forces unsupported axes to `unknown`, and keeps observed task facts
+separate from inferred value claims. No personal weighting or scalar score is
+part of v0.
+
+`value-primitive-card-v1` is content-addressed and Git-ignored. Each Card binds
+to its exact anchor IDs, evidence IDs and fields, packet hash, source event IDs,
+model, evaluator executable hash, policy, measured generation cost, and
+latency. Older and newer semantic generations coexist and are authenticated
+against their own content-addressed anchors. An anchor directory change during
+provider work forces a targeted packet rebuild; a changed candidate is failed
+without aborting unrelated candidates.
+
+Paid work uses a two-stage owner-only protocol. A fingerprint reservation is
+durable before invocation. After a valid response, measured cost is immediately
+debited from the batch budget and a bounded prepared Card is atomically stored
+before final reauthentication. Prepared temporary files are recovered only by
+the compiler, with directory safety checks and directory fsync; reporting and
+retention snapshots remain read-only. Publication removes the reservation and
+prepared record, leaving the Card as the idempotency SSOT.
+
+Forget makes the Episode and derived Cards invisible. Purge removes Cards,
+prepared results, and attempts together with the source scope. Once history
+rewrite begins, every local or push failure enters one common best-effort
+rollback that restores Git refs, indexed state, local artifacts, modes, and
+attempt ledgers. Byte-exact rollback can temporarily consume memory
+proportional to the affected local files.
+
 ## Retention and deletion
 
 Privacy-safe encrypted events are retained until the owner deletes them. Normal
@@ -522,6 +561,14 @@ this limitation clearly.
 - recorder-measured cost and latency provenance;
 - owner-only, content-addressed Meaning Cards with paid-call idempotency;
 - manual real-task validation before automatic integration.
+
+### R1.5: Value Compiler v0
+
+- bounded eight-axis value primitive compilation from authenticated anchors;
+- deterministic observations separated from inferred claims and `unknown`;
+- owner-only Cards, attempts, and recoverable prepared provider results;
+- versioned anchor coexistence, detailed inspect output, and purge rollback;
+- explicit positive provider budgets before any real or unattended execution.
 
 ### Later
 

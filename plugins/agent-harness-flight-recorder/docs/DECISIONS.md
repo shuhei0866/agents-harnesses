@@ -382,3 +382,29 @@ Accepted decisions remain recorded when later superseded.
   Unattended provider calls remained blocked by local CLI authentication, and
   whole-graph evidence authentication dominated command latency, so automatic
   paid generation remains disabled.
+
+## D-20260809-27: Compile shared value primitives before personal weighting
+
+- Status: accepted
+- Decision: derive a versioned eight-axis `value-primitive-card-v1` from
+  authenticated Episode observations and existing Meaning Card / Semantic
+  Receipt anchors. Keep deterministic observations separate from model
+  inference, require typed axis-specific evidence, preserve `unknown`, and do
+  not add a scalar or personal value field in v0. Process only explicit bounded
+  batches with positive episode and micro-USD limits.
+- Reason: the Recorder can now describe what happened and what a task meant,
+  but repeated manual value ratings would reintroduce the friction the
+  background system is intended to remove. Shared primitives create a
+  re-derivable layer that a future private Personal Value Function can fold
+  differently without rewriting the evidence record.
+- Consequence: Cards and paid-work state remain owner-only and Git-ignored.
+  Candidate discovery is anchor-first; each semantic generation remains
+  independently authenticated and can coexist. A durable attempt reservation
+  prevents duplicate calls, a bounded prepared stage recovers validated paid
+  results across interruption, and measured cost consumes the batch budget
+  before publication. Inspect shows the full vector, evidence type, provenance,
+  original task measurements, and generation cost. Forget hides the layer;
+  purge deletes it under the same byte-exact rollback boundary. Real provider
+  execution and any unattended schedule remain disabled until the owner gives
+  a positive budget and a 10--20 Episode pilot can compare these abstractions
+  with felt value.
