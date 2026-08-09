@@ -53,7 +53,7 @@ event = {
     "model": "fixture-worker-model",
     "permission_mode": None,
     "tool": "Bash",
-    "metrics": {"duration_ms": 1000 + int(task_digit), "retry_count": 0},
+    "metrics": {"duration_ms": 1000 + int(task_digit, 16), "retry_count": 0},
     "outcome": {"status": "success", "exit_code": 0},
     "relationship_context": {
         "task_id_hash": "sha256:" + task_digit * 24,
@@ -658,6 +658,166 @@ PY
   fi
 }
 
+test_directional_grounding_rejects_positive_from_unknown_outcome() {
+  echo "test_directional_grounding_rejects_positive_from_unknown_outcome:"
+  local event="75000000-0000-4000-8000-00000000000a"
+  local episode err="$TEST_ROOT/value-directional.err"
+  run_cli value compile \
+    --evaluator flight-recorder-value-evaluator --model value-model-directional \
+    --max-episodes 100 --max-cost-microusd 600000 --json \
+    >/dev/null 2>"$err" || {
+      fail "directional fixtureをprewarmできる"
+      return
+    }
+  append_event "$event" a "2026-08-09T00:00:10Z"
+  run_cli sync >/dev/null 2>&1
+  run_cli rebuild-index >/dev/null 2>&1
+  episode="$(episode_for_event "$event")"
+  FLIGHT_RECORDER_TEST_MEANING_OUTCOME=unknown \
+    generate_meaning_card "$episode" directional || {
+      fail "unknown outcome candidateを作成できる"
+      return
+    }
+  if FLIGHT_RECORDER_TEST_VALUE_FORCE_UNKNOWN_GOAL_POSITIVE=1 \
+    run_cli value compile \
+      --evaluator flight-recorder-value-evaluator --model value-model-directional \
+      --max-episodes 1 --max-cost-microusd 6000 --json \
+      >/dev/null 2>"$err"; then
+    fail "unknown outcomeからpositive/high goalを導出しない"
+    return
+  fi
+  if python3 - "$STATE" "$episode" "value-model-directional" <<'PY'
+import json
+import pathlib
+import sys
+
+state, episode, model = sys.argv[1:]
+root = pathlib.Path(state)
+cards = [json.loads(path.read_text()) for path in (root / "value-primitive-cards").glob("*.json")]
+assert not any(
+    item["episode_id"] == episode
+    and item["provenance"]["evaluator_model"] == model
+    for item in cards
+)
+ledger = json.loads((root / "value-compiler" / "attempts.json").read_text())
+assert any(
+    item["episode_id"] == episode and item["state"] == "failed"
+    for item in ledger["attempts"]
+)
+PY
+  then
+    pass "unknown outcomeはpositive goalの方向根拠にならない"
+  else
+    cat "$err" >&2
+    fail "unknown outcomeはpositive goalの方向根拠にならない"
+  fi
+}
+
+test_malformed_evaluator_fails_cleanly_and_closes_attempt() {
+  echo "test_malformed_evaluator_fails_cleanly_and_closes_attempt:"
+  local event="75000000-0000-4000-8000-00000000000b"
+  local episode err="$TEST_ROOT/value-malformed.err"
+  run_cli value compile \
+    --evaluator flight-recorder-value-evaluator --model value-model-malformed \
+    --max-episodes 100 --max-cost-microusd 600000 --json \
+    >/dev/null 2>"$err" || {
+      fail "malformed fixtureをprewarmできる"
+      return
+    }
+  append_event "$event" b "2026-08-09T00:00:11Z"
+  run_cli sync >/dev/null 2>&1
+  run_cli rebuild-index >/dev/null 2>&1
+  episode="$(episode_for_event "$event")"
+  generate_meaning_card "$episode" malformed || {
+    fail "malformed candidateを作成できる"
+    return
+  }
+  if FLIGHT_RECORDER_TEST_VALUE_MALFORMED_STATE=1 \
+      run_cli value compile \
+        --evaluator flight-recorder-value-evaluator --model value-model-malformed \
+        --max-episodes 1 --max-cost-microusd 6000 --json \
+        >/dev/null 2>"$err"; then
+    fail "unhashable stateを拒否する"
+    return
+  fi
+  if ! grep -Eq "Traceback|TypeError" "$err" \
+    && grep -qi "value evaluator\|invalid" "$err" \
+    && python3 - "$STATE" "$episode" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+ledger = json.loads((root / "value-compiler" / "attempts.json").read_text())
+matches = [item for item in ledger["attempts"] if item["episode_id"] == episode]
+assert matches and all(item["state"] == "failed" for item in matches)
+PY
+  then
+    pass "malformed responseはVaultError化しpendingをfailedへ閉じる"
+  else
+    cat "$err" >&2
+    fail "malformed responseはVaultError化しpendingをfailedへ閉じる"
+  fi
+}
+
+test_rehashed_observation_tamper_fails_current_binding() {
+  echo "test_rehashed_observation_tamper_fails_current_binding:"
+  local episode err="$TEST_ROOT/value-tamper.err"
+  episode="$(episode_for_event 75000000-0000-4000-8000-000000000002)"
+  run_cli value compile \
+    --evaluator flight-recorder-value-evaluator --model value-model-tamper \
+    --max-episodes 100 --max-cost-microusd 600000 --json \
+    >/dev/null 2>"$err" || {
+      fail "tamper fixtureをprewarmできる"
+      return
+    }
+  if ! python3 - "$STATE" "$episode" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+directory = root / "value-primitive-cards"
+selected = None
+for path in directory.glob("*.json"):
+    card = json.loads(path.read_text())
+    if (
+        card["episode_id"] == episode
+        and card["provenance"]["evaluator_model"] == "value-model-tamper"
+    ):
+        selected = (path, card)
+        break
+assert selected is not None
+path, card = selected
+card["observations"]["measured_duration_ms"]["value"] = -1
+without_id = {
+    key: value for key, value in card.items()
+    if key != "value_primitive_card_id"
+}
+canonical = json.dumps(without_id, sort_keys=True, separators=(",", ":")).encode()
+card["value_primitive_card_id"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
+target = directory / f"{card['value_primitive_card_id'].removeprefix('sha256:')}.json"
+target.write_text(json.dumps(card, sort_keys=True, separators=(",", ":")) + "\n")
+target.chmod(0o600)
+path.unlink()
+PY
+  then
+    fail "tamper対象カードを改変できる"
+    return
+  fi
+  if run_cli inspect "$episode" --json >/dev/null 2>"$err"; then
+    fail "再hash済みobservation改変をcurrent dataとして受理しない"
+  elif grep -q "Traceback" "$err"; then
+    cat "$err" >&2
+    fail "tamper拒否を有限エラーで返す"
+  else
+    pass "再hash済みobservation改変もcurrent bindingで拒否する"
+  fi
+}
+
 main() {
   if ! build_fixture; then
     fail "Value Compiler fixtureを構築できる"
@@ -670,6 +830,26 @@ main() {
   elif [[ "${FLIGHT_RECORDER_TEST_VALUE_ATTEMPTS_ONLY:-0}" == "1" ]]; then
     test_killed_provider_leaves_durable_pending_without_recharge
     test_oversized_response_leaves_durable_failure_without_recharge
+  elif [[ "${FLIGHT_RECORDER_TEST_VALUE_REVIEW_ONLY:-0}" == "1" ]]; then
+    case "${FLIGHT_RECORDER_TEST_VALUE_REVIEW_CASE:-all}" in
+      directional)
+        test_directional_grounding_rejects_positive_from_unknown_outcome
+        ;;
+      malformed)
+        test_malformed_evaluator_fails_cleanly_and_closes_attempt
+        ;;
+      tamper)
+        test_rehashed_observation_tamper_fails_current_binding
+        ;;
+      all)
+        test_directional_grounding_rejects_positive_from_unknown_outcome
+        test_malformed_evaluator_fails_cleanly_and_closes_attempt
+        test_rehashed_observation_tamper_fails_current_binding
+        ;;
+      *)
+        fail "unknown review test case"
+        ;;
+    esac
   else
     test_versioned_cards_are_grounded_bounded_and_idempotent
     test_wrong_axis_reference_fails_closed_without_storing_a_card
@@ -677,6 +857,9 @@ main() {
     test_concurrent_compile_reuses_reservation_without_blocking_inspect
     test_killed_provider_leaves_durable_pending_without_recharge
     test_oversized_response_leaves_durable_failure_without_recharge
+    test_directional_grounding_rejects_positive_from_unknown_outcome
+    test_malformed_evaluator_fails_cleanly_and_closes_attempt
+    test_rehashed_observation_tamper_fails_current_binding
   fi
   echo
   echo "Result: $PASS passed, $FAIL failed"

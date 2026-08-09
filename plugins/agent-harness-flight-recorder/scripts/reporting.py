@@ -626,7 +626,7 @@ def inspect_episode(
                 },
             ),
             "value_primitive_cards": load_value_primitive_cards(
-                root, policy_version, episode_id
+                root, policy_version, episode_id, card
             ),
         }
 

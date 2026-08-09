@@ -7,6 +7,7 @@ import hashlib
 import contextlib
 import fcntl
 import json
+import math
 import os
 import re
 import stat
@@ -118,6 +119,22 @@ ATTEMPT_DIAGNOSTICS = {
     "provider_or_validation_failed",
     "input_changed",
 }
+MEASUREMENT_FIELDS = {
+    "value", "state", "aggregation", "known_event_count",
+    "total_event_count",
+}
+MEASUREMENT_STATES = {"missing", "partial", "complete"}
+OUTCOME_FIELDS = {
+    "success", "failure", "unknown", "not_recorded", "evidence",
+}
+OUTCOME_EVIDENCE_FIELDS = {"event_id", "status", "exit_code"}
+DETERMINISTIC_OBSERVATION_FIELDS = {
+    "evidence_id", "evidence_type", "state",
+}
+DETERMINISTIC_STATES = {
+    "success", "failure", "unknown", "missing", "present",
+}
+MAX_OBSERVATION_EVIDENCE = 10_000
 
 
 def _sha256(value: bytes) -> str:
@@ -162,9 +179,11 @@ def _validate_attempt(value: object) -> dict[str, Any]:
             or any(character in item for character in "\r\n\0")
         ):
             raise VaultError("Value Compiler attempt ledger is invalid")
+    state = value.get("state")
     if (
         value.get("compiler_contract") != CARD_CONTRACT
-        or value.get("state") not in ATTEMPT_STATES
+        or not isinstance(state, str)
+        or state not in ATTEMPT_STATES
     ):
         raise VaultError("Value Compiler attempt ledger is invalid")
     try:
@@ -173,7 +192,6 @@ def _validate_attempt(value: object) -> dict[str, Any]:
         raise VaultError("Value Compiler attempt ledger is invalid") from error
     card_id = value.get("value_primitive_card_id")
     diagnostic = value.get("diagnostic_code")
-    state = value["state"]
     if (
         (card_id is not None and (
             not isinstance(card_id, str) or HASH_RE.fullmatch(card_id) is None
@@ -192,6 +210,132 @@ def _validate_attempt(value: object) -> dict[str, Any]:
     )
     if value["fingerprint"] != expected:
         raise VaultError("Value Compiler attempt fingerprint is invalid")
+    return value
+
+
+def _validate_measurement(value: object, description: str) -> None:
+    if not isinstance(value, dict) or set(value) != MEASUREMENT_FIELDS:
+        raise VaultError(f"stored {description} observation is invalid")
+    state = value.get("state")
+    known = value.get("known_event_count")
+    total = value.get("total_event_count")
+    measured = value.get("value")
+    if (
+        not isinstance(state, str)
+        or state not in MEASUREMENT_STATES
+        or value.get("aggregation") != "sum_of_recorded_values"
+        or isinstance(known, bool)
+        or not isinstance(known, int)
+        or isinstance(total, bool)
+        or not isinstance(total, int)
+        or not 0 <= known <= total <= MAX_OBSERVATION_EVIDENCE
+        or total < 1
+    ):
+        raise VaultError(f"stored {description} observation is invalid")
+    expected_state = (
+        "missing" if known == 0
+        else "complete" if known == total
+        else "partial"
+    )
+    if state != expected_state:
+        raise VaultError(f"stored {description} observation is invalid")
+    if known == 0:
+        if measured is not None:
+            raise VaultError(f"stored {description} observation is invalid")
+    else:
+        try:
+            finite = (
+                not isinstance(measured, bool)
+                and isinstance(measured, (int, float))
+                and math.isfinite(measured)
+                and measured >= 0
+            )
+        except (OverflowError, TypeError, ValueError):
+            finite = False
+        if not finite:
+            raise VaultError(f"stored {description} observation is invalid")
+
+
+def _validate_observations(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != OBSERVATION_FIELDS:
+        raise VaultError("stored Value Primitive Card observations are invalid")
+    _validate_measurement(value["measured_duration_ms"], "duration")
+    _validate_measurement(value["measured_cost_usd"], "cost")
+    outcomes = value.get("deterministic_outcomes")
+    if not isinstance(outcomes, dict) or set(outcomes) != OUTCOME_FIELDS:
+        raise VaultError("stored outcome observations are invalid")
+    counts = []
+    for field in ("success", "failure", "unknown", "not_recorded"):
+        item = outcomes.get(field)
+        if (
+            isinstance(item, bool)
+            or not isinstance(item, int)
+            or not 0 <= item <= MAX_OBSERVATION_EVIDENCE
+        ):
+            raise VaultError("stored outcome observations are invalid")
+        counts.append(item)
+    total = value["measured_duration_ms"]["total_event_count"]
+    if sum(counts) != total:
+        raise VaultError("stored outcome observations are invalid")
+    outcome_evidence = outcomes.get("evidence")
+    if (
+        not isinstance(outcome_evidence, list)
+        or len(outcome_evidence) > MAX_OBSERVATION_EVIDENCE
+    ):
+        raise VaultError("stored outcome observations are invalid")
+    observed_counts = {"success": 0, "failure": 0, "unknown": 0}
+    event_ids = []
+    for item in outcome_evidence:
+        if (
+            not isinstance(item, dict)
+            or set(item) != OUTCOME_EVIDENCE_FIELDS
+            or not isinstance(item.get("event_id"), str)
+            or UUID_RE.fullmatch(item["event_id"]) is None
+            or not isinstance(item.get("status"), str)
+            or item["status"] not in observed_counts
+        ):
+            raise VaultError("stored outcome observations are invalid")
+        exit_code = item.get("exit_code")
+        if (
+            exit_code is not None
+            and (
+                isinstance(exit_code, bool)
+                or not isinstance(exit_code, int)
+                or not 0 <= exit_code <= 255
+            )
+        ):
+            raise VaultError("stored outcome observations are invalid")
+        observed_counts[item["status"]] += 1
+        event_ids.append(item["event_id"])
+    if (
+        event_ids != list(dict.fromkeys(event_ids))
+        or any(outcomes[name] != count for name, count in observed_counts.items())
+    ):
+        raise VaultError("stored outcome observations are invalid")
+    deterministic = value.get("deterministic_evidence")
+    if (
+        not isinstance(deterministic, list)
+        or len(deterministic) > MAX_OBSERVATION_EVIDENCE
+    ):
+        raise VaultError("stored deterministic observations are invalid")
+    evidence_ids = []
+    for item in deterministic:
+        if (
+            not isinstance(item, dict)
+            or set(item) != DETERMINISTIC_OBSERVATION_FIELDS
+            or not isinstance(item.get("evidence_id"), str)
+            or HASH_RE.fullmatch(item["evidence_id"]) is None
+            or not isinstance(item.get("evidence_type"), str)
+            or not item["evidence_type"]
+            or len(item["evidence_type"]) > 128
+            or any(character in item["evidence_type"] for character in "\r\n\0")
+            or not isinstance(item.get("state"), str)
+            or item["state"] not in DETERMINISTIC_STATES
+        ):
+            raise VaultError("stored deterministic observations are invalid")
+        evidence_ids.append(item["evidence_id"])
+    if evidence_ids != list(dict.fromkeys(evidence_ids)):
+        raise VaultError("stored deterministic observations are invalid")
     return value
 
 
@@ -575,6 +719,70 @@ def _checked_summary(value: object) -> str:
     return value
 
 
+def _directional_state(item: dict[str, Any]) -> str | None:
+    field = item["field"]
+    content = item["content"]
+    if field == "meaning.outcome":
+        raw = content.get("state") if isinstance(content, dict) else None
+        return {
+            "success": "positive",
+            "failure": "negative",
+            "mixed": "mixed",
+        }.get(raw)
+    if field == "receipt.result.outcome":
+        return {
+            "success": "positive",
+            "failure": "negative",
+            "mixed": "mixed",
+        }.get(content)
+    if field in {
+        "receipt.assessment.goal_achievement",
+        "receipt.assessment.quality",
+    }:
+        raw = content.get("state") if isinstance(content, dict) else None
+        return {
+            "supported": "positive",
+            "unsupported": "negative",
+        }.get(raw)
+    return None
+
+
+def _validate_directional_grounding(
+    axis: str,
+    state: str,
+    references: list[str],
+    evidence: dict[str, dict[str, Any]],
+) -> None:
+    if state == "unknown":
+        return
+    directional_fields = {
+        "goal_achievement": {
+            "meaning.outcome",
+            "receipt.result.outcome",
+            "receipt.assessment.goal_achievement",
+        },
+        "deliverable_quality": {"receipt.assessment.quality"},
+    }
+    fields = directional_fields.get(axis)
+    if fields is None:
+        return
+    available = [
+        item for item in evidence.values() if item["field"] in fields
+    ]
+    cited = [evidence[reference] for reference in references]
+    cited_directional = [item for item in cited if item["field"] in fields]
+    # Goal claims always require explicit outcome direction. A structured
+    # quality criterion, when present, is authoritative; bounded Meaning text
+    # remains supplementary rather than overriding that direction.
+    direction_required = axis == "goal_achievement" or bool(available)
+    if direction_required and not any(
+        _directional_state(item) == state for item in cited_directional
+    ):
+        raise VaultError(
+            f"value evaluator {axis.replace('_', ' ')} direction is invalid"
+        )
+
+
 def _validate_response(raw: bytes, packet: dict[str, Any], budget: int) -> tuple[dict[str, Any], int]:
     if len(raw) > MAX_RESPONSE_BYTES:
         raise VaultError("value evaluator response is too large")
@@ -604,16 +812,21 @@ def _validate_response(raw: bytes, packet: dict[str, Any], budget: int) -> tuple
         state = item["state"]
         refs = item["evidence_references"]
         if (
-            state not in STATES
+            not isinstance(state, str)
+            or state not in STATES
+            or not isinstance(item["confidence"], str)
             or item["confidence"] not in CONFIDENCE
             or not isinstance(refs, list)
-            or refs != sorted(set(refs))
+            or any(not isinstance(ref, str) for ref in refs)
+            or len(refs) != len(set(refs))
+            or refs != sorted(refs)
             or any(ref not in evidence for ref in refs)
         ):
             raise VaultError("value evaluator evidence is invalid")
         allowed = AXIS_EVIDENCE_FIELDS[axis]
         if any(evidence[ref]["field"] not in allowed for ref in refs):
             raise VaultError("value evaluator evidence is not allowed for axis")
+        _validate_directional_grounding(axis, state, refs, evidence)
         if state == "unknown":
             if refs:
                 raise VaultError("unknown value primitive must not cite evidence")
@@ -643,10 +856,9 @@ def _validate_card(value: object) -> dict[str, Any]:
         value.get("contract_version") != CARD_CONTRACT
         or not isinstance(value.get("primitives"), dict)
         or set(value["primitives"]) != set(AXES)
-        or not isinstance(value.get("observations"), dict)
-        or set(value["observations"]) != OBSERVATION_FIELDS
     ):
         raise VaultError("stored Value Primitive Card is invalid")
+    _validate_observations(value.get("observations"))
     if not isinstance(value.get("episode_id"), str) or HASH_RE.fullmatch(value["episode_id"]) is None:
         raise VaultError("stored Value Primitive Card is invalid")
     card_id = value.get("value_primitive_card_id")
@@ -665,12 +877,14 @@ def _validate_card(value: object) -> dict[str, Any]:
         provenance.get("contract_version") != CARD_CONTRACT
         or not isinstance(input_ids, list)
         or not input_ids
-        or input_ids != sorted(set(input_ids))
         or any(not isinstance(item, str) or HASH_RE.fullmatch(item) is None for item in input_ids)
+        or len(input_ids) != len(set(input_ids))
+        or input_ids != sorted(input_ids)
         or not isinstance(anchor_ids, list)
         or not anchor_ids
-        or anchor_ids != sorted(set(anchor_ids))
         or any(not isinstance(item, str) or HASH_RE.fullmatch(item) is None for item in anchor_ids)
+        or len(anchor_ids) != len(set(anchor_ids))
+        or anchor_ids != sorted(anchor_ids)
         or not isinstance(input_fields, dict)
         or set(input_fields) != set(input_ids)
         or any(
@@ -697,8 +911,8 @@ def _validate_card(value: object) -> dict[str, Any]:
     if (
         not isinstance(source_events, list)
         or not source_events
-        or source_events != list(dict.fromkeys(source_events))
         or any(not isinstance(item, str) or UUID_RE.fullmatch(item) is None for item in source_events)
+        or len(source_events) != len(set(source_events))
     ):
         raise VaultError("stored Value Primitive Card provenance is invalid")
     try:
@@ -721,11 +935,16 @@ def _validate_card(value: object) -> dict[str, Any]:
         state = primitive["state"]
         basis = primitive["basis"]
         if (
-            state not in STATES
+            not isinstance(state, str)
+            or state not in STATES
+            or not isinstance(basis, str)
             or basis not in {"inferred", "unknown"}
+            or not isinstance(primitive["confidence"], str)
             or primitive["confidence"] not in CONFIDENCE
             or not isinstance(refs, list)
-            or refs != sorted(set(refs))
+            or any(not isinstance(ref, str) for ref in refs)
+            or len(refs) != len(set(refs))
+            or refs != sorted(refs)
             or not set(refs).issubset(input_ids)
             or any(input_fields[ref] not in AXIS_EVIDENCE_FIELDS[axis] for ref in refs)
             or (state == "unknown" and (basis != "unknown" or refs))
@@ -787,11 +1006,27 @@ def _stored_records(root: Path) -> list[tuple[Path, bytes, dict[str, Any]]]:
     return [(path, *_read_card(path)) for path in paths]
 
 
-def load_value_primitive_cards(root: Path, policy_version: str, episode_id: str) -> list[dict[str, Any]]:
+def load_value_primitive_cards(
+    root: Path,
+    policy_version: str,
+    episode_id: str,
+    current_episode_card: dict[str, Any],
+) -> list[dict[str, Any]]:
     result = [
         value for _path, _raw, value in _stored_records(root)
         if value["episode_id"] == episode_id and value["provenance"]["policy_version"] == policy_version
     ]
+    current_observations = _observations(current_episode_card)
+    current_source_event_ids = current_episode_card.get("source_event_ids")
+    for value in result:
+        if (
+            value["observations"] != current_observations
+            or value["provenance"]["source_event_ids"]
+            != current_source_event_ids
+        ):
+            raise VaultError(
+                "stored Value Primitive Card does not match current Episode"
+            )
     result.sort(key=lambda item: (parse_time(item["provenance"]["generated_at"]), item["value_primitive_card_id"]))
     return result
 
@@ -961,6 +1196,7 @@ def compile_values(
     compiled = []
     reused = []
     attempt_skip_count = 0
+    attempt_failure_count = 0
     spent = 0
     with run_lock(root, blocking=True):
         with vault_lock(root):
@@ -1076,7 +1312,10 @@ def compile_values(
                         "failed",
                         diagnostic_code="provider_or_validation_failed",
                     )
-                raise
+                if maximum_episodes == 1:
+                    raise
+                attempt_failure_count += 1
+                continue
             # A shell function launched in the background can be terminated
             # without forwarding SIGTERM to this child. Treat reparenting as
             # an interrupted run: keep the durable pending reservation and
@@ -1146,6 +1385,7 @@ def compile_values(
         "compiled_count": len(compiled),
         "reused_count": len(reused),
         "attempt_skip_count": attempt_skip_count,
+        "attempt_failure_count": attempt_failure_count,
         "deferred_count": len(candidates) - len(compiled) - len(reused),
         "measured_cost_microusd": spent,
         "compiled_cards": compiled,

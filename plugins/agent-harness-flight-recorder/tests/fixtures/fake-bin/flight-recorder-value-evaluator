@@ -97,6 +97,19 @@ support = {
     "deliverable_quality": support_for("meaning.verification", "quality"),
     "learning": support_for("meaning.reusable_learning", "reusable_learning"),
 }
+unknown_goal_outcome = any(
+    item.get("field") == "meaning.outcome"
+    and isinstance(item.get("content"), dict)
+    and item["content"].get("state") == "unknown"
+    for item in available
+)
+if (
+    unknown_goal_outcome
+    and os.environ.get(
+        "FLIGHT_RECORDER_TEST_VALUE_FORCE_UNKNOWN_GOAL_POSITIVE"
+    ) != "1"
+):
+    support["goal_achievement"] = []
 if os.environ.get("FLIGHT_RECORDER_TEST_VALUE_WRONG_AXIS_REFERENCE") == "1":
     support["learning"] = support["goal_achievement"]
 
@@ -124,6 +137,11 @@ for name, state in states.items():
         "confidence": "low" if unknown else "high",
         "evidence_references": [] if unknown else references,
     }
+
+if os.environ.get("FLIGHT_RECORDER_TEST_VALUE_MALFORMED_STATE") == "1":
+    primitives["goal_achievement"]["state"] = []
+if os.environ.get("FLIGHT_RECORDER_TEST_VALUE_MALFORMED_REFS") == "1":
+    primitives["goal_achievement"]["evidence_references"] = [[]]
 
 json.dump(
     {
