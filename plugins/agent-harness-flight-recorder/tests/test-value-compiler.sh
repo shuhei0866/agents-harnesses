@@ -2251,11 +2251,167 @@ PY
   fi
 }
 
+test_input_changed_provider_cost_consumes_batch_budget() {
+  echo "test_input_changed_provider_cost_consumes_batch_budget:"
+  local budget state_name started_dir release_dir counter capture err process
+  local first_episode first_anchor second_episode second_anchor index status
+  local failures=0
+  for budget in 6000 12000; do
+    state_name="cycle9-spend-$budget"
+    fresh_blocker_fixture "$state_name" || {
+      fail "cycle9 spend $budget fixtureを構築できる"
+      return
+    }
+    started_dir="$TEST_ROOT/value-cycle9-$budget-started"
+    release_dir="$TEST_ROOT/value-cycle9-$budget-release"
+    counter="$TEST_ROOT/value-cycle9-$budget-count"
+    capture="$TEST_ROOT/value-cycle9-$budget-capture.jsonl"
+    err="$TEST_ROOT/value-cycle9-$budget.err"
+    IFS=$'\t' read -r \
+      first_episode first_anchor second_episode second_anchor < <(
+      PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+        python3 - "$STATE" <<'PY'
+import pathlib
+import sys
+
+import value_compiler
+from vault import vault_lock
+
+root = pathlib.Path(sys.argv[1])
+with vault_lock(root):
+    index = value_compiler._build_anchor_index(root, "default-v1")
+    candidates = value_compiler._authenticated_packets(
+        root, "default-v1", None, anchor_index=index
+    )
+assert len(candidates) >= 2
+values = []
+for episode, packet in candidates[:2]:
+    anchor_id = packet["anchor_ids"][0]
+    values.extend((episode["episode_id"], str(index["records"][anchor_id]["path"])))
+print(*values, sep="\t")
+PY
+    )
+    FLIGHT_RECORDER_TEST_VALUE_STARTED_DIR="$started_dir" \
+      FLIGHT_RECORDER_TEST_VALUE_RELEASE_DIR="$release_dir" \
+      FLIGHT_RECORDER_TEST_VALUE_COUNT="$counter" \
+      FLIGHT_RECORDER_TEST_VALUE_CAPTURE="$capture" \
+      run_cli value compile \
+        --evaluator flight-recorder-value-evaluator \
+        --model "value-model-cycle9-spend-$budget" \
+        --max-episodes 2 --max-cost-microusd "$budget" \
+        --timeout 60 --json \
+        >"$TEST_ROOT/value-cycle9-$budget.json" 2>"$err" &
+    process=$!
+    for index in $(seq 1 100); do
+      [[ -e "$started_dir/1" ]] && break
+      sleep 0.05
+    done
+    if [[ ! -e "$started_dir/1" ]]; then
+      mkdir -p "$release_dir"
+      touch "$release_dir/1" "$release_dir/2"
+      wait "$process" 2>/dev/null
+      failures=$((failures + 1))
+      continue
+    fi
+    python3 - "$first_anchor" "$release_dir/1" <<'PY'
+import pathlib
+import sys
+
+pathlib.Path(sys.argv[1]).unlink()
+release = pathlib.Path(sys.argv[2])
+release.parent.mkdir(parents=True, exist_ok=True)
+release.touch()
+PY
+    if [[ "$budget" -eq 12000 ]]; then
+      for index in $(seq 1 100); do
+        [[ -e "$started_dir/2" ]] && break
+        ! kill -0 "$process" 2>/dev/null && break
+        sleep 0.05
+      done
+      if [[ -e "$started_dir/2" ]]; then
+        python3 - "$second_anchor" "$release_dir/2" <<'PY'
+import pathlib
+import sys
+
+pathlib.Path(sys.argv[1]).unlink()
+pathlib.Path(sys.argv[2]).touch()
+PY
+      else
+        failures=$((failures + 1))
+      fi
+    else
+      for index in $(seq 1 60); do
+        [[ -e "$started_dir/2" ]] && break
+        ! kill -0 "$process" 2>/dev/null && break
+        sleep 0.05
+      done
+      # Release an incorrect second charge so a Red run cannot block cleanup.
+      if [[ -e "$started_dir/2" ]]; then
+        touch "$release_dir/2"
+      fi
+    fi
+    wait "$process"
+    status=$?
+    if [[ "$status" -eq 0 ]] || ! python3 - \
+        "$STATE" "$budget" "$counter" "$capture" \
+        "$first_episode" "$second_episode" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+budget = int(sys.argv[2])
+counter = int(pathlib.Path(sys.argv[3]).read_text())
+requests = [
+    json.loads(line)
+    for line in pathlib.Path(sys.argv[4]).read_text().splitlines()
+    if line
+]
+episodes = sys.argv[5:7]
+expected_count = 1 if budget == 6000 else 2
+assert counter == expected_count
+assert len(requests) == expected_count
+assert [item["remaining_cost_microusd"] for item in requests] == (
+    [6000] if budget == 6000 else [12000, 6000]
+)
+model = f"value-model-cycle9-spend-{budget}"
+cards = [
+    json.loads(path.read_text())
+    for path in (root / "value-primitive-cards").glob("*.json")
+]
+assert not any(
+    card["provenance"]["evaluator_model"] == model for card in cards
+)
+attempts = json.loads(
+    (root / "value-compiler" / "attempts.json").read_text()
+)["attempts"]
+failed = [item for item in attempts if item["evaluator_model"] == model]
+assert len(failed) == expected_count
+assert {item["episode_id"] for item in failed} == set(episodes[:expected_count])
+assert all(
+    item["state"] == "failed"
+    and item["diagnostic_code"] == "input_changed"
+    for item in failed
+)
+PY
+    then
+      cat "$err" >&2
+      failures=$((failures + 1))
+    fi
+  done
+  if [[ "$failures" -eq 0 ]]; then
+    pass "公開失敗でもprovider実支出を即時budget消費しremainingを単調減少させる"
+  else
+    fail "公開失敗でもprovider実支出を即時budget消費しremainingを単調減少させる"
+  fi
+}
+
 main() {
   if [[ "${FLIGHT_RECORDER_TEST_VALUE_BLOCKERS_ONLY:-0}" == "1" \
       || "${FLIGHT_RECORDER_TEST_VALUE_CYCLE6_ONLY:-0}" == "1" \
       || "${FLIGHT_RECORDER_TEST_VALUE_CYCLE7_ONLY:-0}" == "1" \
-      || "${FLIGHT_RECORDER_TEST_VALUE_CYCLE8_ONLY:-0}" == "1" ]]; then
+      || "${FLIGHT_RECORDER_TEST_VALUE_CYCLE8_ONLY:-0}" == "1" \
+      || "${FLIGHT_RECORDER_TEST_VALUE_CYCLE9_ONLY:-0}" == "1" ]]; then
     true
   elif ! build_fixture; then
     fail "Value Compiler fixtureを構築できる"
@@ -2388,6 +2544,8 @@ main() {
         fail "unknown cycle8 test case"
         ;;
     esac
+  elif [[ "${FLIGHT_RECORDER_TEST_VALUE_CYCLE9_ONLY:-0}" == "1" ]]; then
+    test_input_changed_provider_cost_consumes_batch_budget
   else
     test_versioned_cards_are_grounded_bounded_and_idempotent
     test_wrong_axis_reference_fails_closed_without_storing_a_card
@@ -2415,6 +2573,7 @@ main() {
     test_prepared_temp_promotion_fsyncs_directory
     test_unsafe_prepared_directory_has_zero_mutation
     test_human_inspect_maps_evidence_ids_to_fields
+    test_input_changed_provider_cost_consumes_batch_budget
   fi
   echo
   echo "Result: $PASS passed, $FAIL failed"

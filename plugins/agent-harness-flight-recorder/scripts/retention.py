@@ -6,12 +6,12 @@ import json
 import contextlib
 import os
 import re
+import stat
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
-from chunk_rotation import atomic_replace, canonical_json
+from chunk_rotation import atomic_replace, canonical_json, fsync_directory
 from background_evaluation import (
     remove_episode_attempts,
     restore_attempts,
@@ -32,7 +32,7 @@ from receipt_automation import (
     restore_attempts as restore_receipt_attempts,
     run_lock as receipt_automation_lock,
 )
-from retention_state import load_forgotten, store_forgotten
+from retention_state import FORGET_PATH, load_forgotten, store_forgotten
 from semantic_receipts import semantic_receipt_record_snapshots
 from value_compiler import (
     prepared_record_snapshots,
@@ -47,7 +47,6 @@ from sync import (
     PENDING_PATH,
     RECEIPT_PATH,
     git,
-    import_chunks,
     load_pending,
     text_output,
 )
@@ -281,6 +280,159 @@ def _cleanup_original_history(root: Path) -> None:
     _run_git(root, ["gc", "--prune=now"])
 
 
+def _ref_snapshot(root: Path, *, require_main: bool = True) -> dict[str, str]:
+    output = text_output(
+        git(root, ["for-each-ref", "--format=%(refname) %(objectname)"])
+    )
+    result: dict[str, str] = {}
+    for line in output.splitlines():
+        try:
+            ref, object_id = line.split(" ", 1)
+        except ValueError as error:
+            raise VaultError("Git history purge failed") from error
+        if (
+            re.fullmatch(r"refs/[A-Za-z0-9._/-]+", ref) is None
+            or re.fullmatch(r"[0-9a-f]{40,64}", object_id) is None
+            or ref in result
+        ):
+            raise VaultError("Git history purge failed")
+        result[ref] = object_id
+    if require_main and "refs/heads/main" not in result:
+        raise VaultError("Git history purge failed")
+    return result
+
+
+def _remote_main_oid(root: Path) -> str:
+    output = text_output(
+        git(root, ["ls-remote", "--refs", "origin", "refs/heads/main"])
+    ).splitlines()
+    if len(output) != 1 or "\t" not in output[0]:
+        raise VaultError("Git history purge failed")
+    object_id, ref = output[0].split("\t", 1)
+    if (
+        ref != "refs/heads/main"
+        or re.fullmatch(r"[0-9a-f]{40,64}", object_id) is None
+    ):
+        raise VaultError("Git history purge failed")
+    return object_id
+
+
+def _local_file_snapshots(
+    paths: list[Path],
+) -> list[tuple[Path, bytes | None, int | None]]:
+    snapshots = []
+    for path in sorted(set(paths)):
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            snapshots.append((path, None, None))
+            continue
+        except OSError as error:
+            raise VaultError("purge rollback input is unsafe") from error
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+        ):
+            raise VaultError("purge rollback input is unsafe")
+        try:
+            raw = path.read_bytes()
+        except OSError as error:
+            raise VaultError("purge rollback input is unsafe") from error
+        snapshots.append((path, raw, stat.S_IMODE(metadata.st_mode)))
+    return snapshots
+
+
+def _restore_local_file_snapshots(
+    snapshots: list[tuple[Path, bytes | None, int | None]],
+) -> list[Exception]:
+    errors: list[Exception] = []
+    for path, raw, mode in snapshots:
+        try:
+            if raw is None:
+                path.unlink()
+                fsync_directory(path.parent)
+                continue
+            assert mode is not None
+            atomic_replace(path, raw)
+            path.chmod(mode)
+        except FileNotFoundError:
+            if raw is not None:
+                errors.append(
+                    VaultError("purge rollback target disappeared")
+                )
+        except Exception as error:
+            errors.append(error)
+    return errors
+
+
+def _restore_ref_snapshot(root: Path, snapshot: dict[str, str]) -> None:
+    current = _ref_snapshot(root, require_main=False)
+    for ref in sorted(current.keys() - snapshot.keys()):
+        _run_git(root, ["update-ref", "-d", ref])
+    for ref, object_id in sorted(snapshot.items()):
+        _run_git(root, ["update-ref", ref, object_id])
+    _run_git(root, ["reset", "--hard", snapshot["refs/heads/main"]])
+
+
+def _rollback_purge_state(
+    root: Path,
+    *,
+    refs: dict[str, str],
+    remote_main_oid: str,
+    files: list[tuple[Path, bytes | None, int | None]],
+    value_attempts: bytes | None,
+    evaluation_attempts: bytes | None,
+    receipt_attempts: bytes | None,
+) -> list[Exception]:
+    """Best-effort restoration of every state mutated after rewrite begins."""
+    errors: list[Exception] = []
+
+    # filter-branch may have stopped at any point. Restore its original refs
+    # first when available, then reconcile the complete ref namespace to the
+    # exact pre-transaction snapshot.
+    try:
+        if _original_refs(root):
+            _restore_history(root)
+        _restore_ref_snapshot(root, refs)
+    except Exception as error:
+        errors.append(error)
+
+    errors.extend(_restore_local_file_snapshots(files))
+
+    for restore, snapshot in (
+        (restore_value_attempts, value_attempts),
+        (restore_attempts, evaluation_attempts),
+        (restore_receipt_attempts, receipt_attempts),
+    ):
+        try:
+            restore(root, snapshot)
+        except Exception as error:
+            errors.append(error)
+
+    try:
+        if _remote_main_oid(root) != remote_main_oid:
+            _run_git(
+                root,
+                [
+                    "push",
+                    "--force",
+                    "origin",
+                    f"{remote_main_oid}:refs/heads/main",
+                ],
+            )
+    except Exception as error:
+        errors.append(error)
+
+    # Exact ref restoration already removes refs/original. Cleanup still
+    # expires rewrite reflogs and unreachable objects before returning.
+    try:
+        _cleanup_original_history(root)
+    except Exception as error:
+        errors.append(error)
+    return errors
+
+
 def _remove_local_derivatives(
     root: Path, scope: dict[str, Any], *, apply: bool = True
 ) -> None:
@@ -367,10 +519,6 @@ def purge(
                 # Validate every local input before history or derivative mutation.
                 _remove_local_derivatives(root, scope, apply=False)
                 original_forgotten = load_forgotten(root)
-                pending_path = root / PENDING_PATH
-                original_pending = (
-                    pending_path.read_bytes() if pending_path.exists() else None
-                )
                 evaluation_snapshots = evaluation_record_snapshots(
                     root, selected, episode_id
                 )
@@ -388,6 +536,32 @@ def purge(
                 value_prepared_snapshots = prepared_record_snapshots(
                     root, selected, episode_id
                 )
+                derivative_snapshots = [
+                    *evaluation_snapshots,
+                    *semantic_receipt_snapshots,
+                    *meaning_card_snapshots,
+                    *value_primitive_card_snapshots,
+                    *value_prepared_snapshots,
+                ]
+                rollback_paths = [
+                    root / item[key]
+                    for item in scope["chunks"]
+                    for key in ("source_path", "cache_path")
+                ]
+                rollback_paths.extend(
+                    (
+                        root / RECEIPT_PATH,
+                        root / PENDING_PATH,
+                        root / DATABASE_PATH,
+                        root / FORGET_PATH,
+                    )
+                )
+                rollback_paths.extend(
+                    path for path, _raw in derivative_snapshots
+                )
+                local_snapshots = _local_file_snapshots(rollback_paths)
+                original_refs = _ref_snapshot(root)
+                original_remote_main = _remote_main_oid(root)
                 value_attempt_snapshot = remove_value_attempts(
                     root, episode_id, selected
                 )
@@ -406,7 +580,6 @@ def purge(
                     restore_attempts(root, attempt_snapshot)
                     restore_value_attempts(root, value_attempt_snapshot)
                     raise
-                attempt_committed = False
                 try:
                     _rewrite_history(root, paths)
                     _remove_local_derivatives(root, scope)
@@ -414,84 +587,36 @@ def purge(
                     forgotten = set(original_forgotten)
                     forgotten.discard((selected, episode_id))
                     store_forgotten(root, forgotten)
-                    derivative_snapshots = [
-                        *evaluation_snapshots,
-                        *semantic_receipt_snapshots,
-                        *meaning_card_snapshots,
-                        *value_primitive_card_snapshots,
-                        *value_prepared_snapshots,
-                    ]
-                    removed_derivatives: list[tuple[Path, bytes]] = []
                     try:
-                        for derivative_path, derivative_bytes in derivative_snapshots:
+                        for derivative_path, _derivative_bytes in derivative_snapshots:
                             derivative_path.unlink()
-                            removed_derivatives.append(
-                                (derivative_path, derivative_bytes)
-                            )
                     except OSError as error:
-                        for derivative_path, derivative_bytes in removed_derivatives:
-                            atomic_replace(derivative_path, derivative_bytes)
                         raise VaultError(
                             "derived record storage is unsafe"
                         ) from error
-                    try:
-                        # Keep refs/original until the remote accepts the rewrite.
-                        # A rejection restores the Vault to a retryable state.
-                        _run_git(
-                            root, ["push", "--force", "origin", "HEAD:main"]
-                        )
-                    except VaultError:
-                        _restore_history(root)
-                        import_chunks(root)
-                        rebuild_index_locked(root, incremental=False)
-                        store_forgotten(root, original_forgotten)
-                        if original_pending is None:
-                            try:
-                                pending_path.unlink()
-                            except FileNotFoundError:
-                                pass
-                        else:
-                            atomic_replace(pending_path, original_pending)
-                        for evaluation_path, evaluation_bytes in evaluation_snapshots:
-                            atomic_replace(evaluation_path, evaluation_bytes)
-                        for receipt_path, receipt_bytes in semantic_receipt_snapshots:
-                            atomic_replace(receipt_path, receipt_bytes)
-                        for card_path, card_bytes in meaning_card_snapshots:
-                            atomic_replace(card_path, card_bytes)
-                        for card_path, card_bytes in value_primitive_card_snapshots:
-                            atomic_replace(card_path, card_bytes)
-                        for prepared_path, prepared_bytes in value_prepared_snapshots:
-                            atomic_replace(prepared_path, prepared_bytes)
-                        _cleanup_original_history(root)
-                        raise
+                    # Keep refs/original until the remote accepts the rewrite.
+                    # Any failure from rewrite onward runs the same complete
+                    # rollback, including failures before this push.
+                    _run_git(
+                        root, ["push", "--force", "origin", "HEAD:main"]
+                    )
                     _cleanup_original_history(root)
-                    attempt_committed = True
-                finally:
-                    if not attempt_committed:
-                        active_error = sys.exc_info()[0] is not None
-                        restore_errors: list[Exception] = []
-                        for restore, snapshot in (
-                            (
-                                restore_value_attempts,
-                                value_attempt_snapshot,
-                            ),
-                            (restore_attempts, attempt_snapshot),
-                            (
-                                restore_receipt_attempts,
-                                receipt_attempt_snapshot,
-                            ),
-                        ):
-                            try:
-                                restore(root, snapshot)
-                            except Exception as error:
-                                restore_errors.append(error)
-                        if restore_errors and not active_error:
-                            error = restore_errors[0]
-                            if isinstance(error, VaultError):
-                                raise error
-                            raise VaultError(
-                                "attempt ledger restoration failed"
-                            ) from error
+                except Exception as error:
+                    rollback_errors = _rollback_purge_state(
+                        root,
+                        refs=original_refs,
+                        remote_main_oid=original_remote_main,
+                        files=local_snapshots,
+                        value_attempts=value_attempt_snapshot,
+                        evaluation_attempts=attempt_snapshot,
+                        receipt_attempts=receipt_attempt_snapshot,
+                    )
+                    if rollback_errors and hasattr(error, "add_note"):
+                        error.add_note(
+                            "purge rollback encountered "
+                            f"{len(rollback_errors)} restoration failure(s)"
+                        )
+                    raise
     scope["apply"] = True
     return scope
 

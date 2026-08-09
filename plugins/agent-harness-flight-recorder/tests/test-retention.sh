@@ -551,6 +551,46 @@ for path in sorted(directory.iterdir()):
 PY
 }
 
+materialize_prepared_receipts() {
+  PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$1" <<'PY'
+import json
+import pathlib
+import sys
+
+from semantic_receipts import _store_prepared_receipt
+
+root = pathlib.Path(sys.argv[1])
+ledger = json.loads(
+    (root / "receipt-automation" / "attempts.json").read_text()
+)
+for item in ledger["items"]:
+    _store_prepared_receipt(root, item["prepared"])
+PY
+}
+
+vault_byte_snapshot() {
+  python3 - "$1" <<'PY'
+import hashlib
+import os
+import pathlib
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+for path in sorted(root.rglob("*")):
+    relative = path.relative_to(root)
+    if ".git" in relative.parts or path.name.endswith(".lock"):
+        continue
+    metadata = path.lstat()
+    mode = stat.S_IMODE(metadata.st_mode)
+    if stat.S_ISREG(metadata.st_mode):
+        print("F", relative, mode, hashlib.sha256(path.read_bytes()).hexdigest())
+    elif stat.S_ISLNK(metadata.st_mode):
+        print("L", relative, mode, os.readlink(path))
+PY
+}
+
 test_forget_preserves_source_and_survives_rebuild() {
   echo "test_forget_preserves_source_and_survives_rebuild:"
   local base="$TEST_ROOT/forget"
@@ -966,11 +1006,141 @@ PY
   fi
 }
 
+test_purge_unlink_failure_restores_complete_local_state() {
+  echo "test_purge_unlink_failure_restores_complete_local_state:"
+  local base="$TEST_ROOT/purge-cycle9-unlink-failure"
+  local state="$base/vault" remote="$base/remote.git"
+  local db="$state/index/vault.sqlite"
+  local episode unrelated_episode target_path target_card
+  local before_files before_head before_remote before_refs
+  init_fixture "$base" || {
+    fail "cycle9 purge rollback fixtureを作成できる"
+    return
+  }
+  episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+  unrelated_episode="$(
+    db_value_for_event "$db" "$UNRELATED_EVENT" episode_id
+  )"
+  write_attempt_ledger "$state" "$episode" "$unrelated_episode"
+  write_receipt_attempt_ledger \
+    "$state" "$episode" "$unrelated_episode" || {
+      fail "cycle9 receipt attempt fixtureを作成できる"
+      return
+    }
+  run_cli "$state" evaluate "$episode" \
+    --evaluator flight-recorder-evaluator \
+    --model evaluator-cycle9-rollback --json >/dev/null 2>&1 || {
+      fail "cycle9 evaluation fixtureを作成できる"
+      return
+    }
+  write_value_artifacts "$state" "$episode" "$unrelated_episode" || {
+    fail "cycle9 Value artifacts fixtureを作成できる"
+    return
+  }
+  materialize_prepared_receipts "$state" || {
+    fail "cycle9 stored Receipt fixtureを作成できる"
+    return
+  }
+  # Preserve an unrelated forgotten marker and a valid pending-sync record so
+  # rollback must restore both absence/presence and exact bytes.
+  run_cli "$state" forget "$unrelated_episode" >/dev/null 2>&1 || {
+    fail "cycle9 forgotten-state fixtureを作成できる"
+    return
+  }
+  target_path="$(db_value_for_event "$db" "$TARGET_EVENT" source_path)"
+  mkdir -p "$state/queue"
+  chmod 700 "$state/queue"
+  python3 - "$state/queue/pending-sync.json" "$target_path" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+value = {
+    "schema_version": 1,
+    "artifact_paths": [sys.argv[2]],
+    "fixture_sentinel": "cycle9-byte-exact",
+}
+path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+path.chmod(0o600)
+PY
+  target_card="$(python3 - "$state" "$episode" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+for path in (root / "value-primitive-cards").glob("*.json"):
+    value = json.loads(path.read_text())
+    if value["episode_id"] == sys.argv[2]:
+        print(path)
+        break
+else:
+    raise AssertionError("target Value Card not found")
+PY
+)"
+  before_files="$(vault_byte_snapshot "$state")"
+  before_head="$(git -C "$state" rev-parse HEAD)"
+  before_remote="$(git --git-dir="$remote" rev-parse main)"
+  before_refs="$(
+    git -C "$state" for-each-ref --format='%(refname) %(objectname)'
+  )"
+
+  if ! PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$state" "$episode" "$target_card" <<'PY'
+import pathlib
+import sys
+
+import retention
+from vault import VaultError
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+target = pathlib.Path(sys.argv[3])
+original = pathlib.Path.unlink
+
+
+def injected(path, *args, **kwargs):
+    if path == target:
+        raise OSError("fixture Value artifact unlink failure")
+    return original(path, *args, **kwargs)
+
+
+pathlib.Path.unlink = injected
+try:
+    try:
+        retention.purge(root, episode, None, None, apply=True)
+    except VaultError:
+        pass
+    else:
+        raise AssertionError("injected purge unexpectedly succeeded")
+finally:
+    pathlib.Path.unlink = original
+PY
+  then
+    fail "cycle9 unlink failureを注入できる"
+    return
+  fi
+
+  if [[ "$before_remote" == "$(git --git-dir="$remote" rev-parse main)" \
+    && "$before_head" == "$(git -C "$state" rev-parse HEAD)" \
+    && "$before_refs" == "$(
+      git -C "$state" for-each-ref --format='%(refname) %(objectname)'
+    )" \
+    && "$before_files" == "$(vault_byte_snapshot "$state")" ]]; then
+    pass "push前unlink失敗でhistoryと全local stateをbyte-exact復元する"
+  else
+    fail "push前unlink失敗でhistoryと全local stateをbyte-exact復元する"
+  fi
+}
+
 echo "=== Flight Recorder Retention Tests ==="
 if [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE7_ONLY:-0}" == "1" ]]; then
   test_purge_push_rejection_restores_retryable_local_state
 elif [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE8_ONLY:-0}" == "1" ]]; then
   test_purge_dry_run_does_not_recover_prepared_temp
+elif [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE9_ONLY:-0}" == "1" ]]; then
+  test_purge_unlink_failure_restores_complete_local_state
 else
   test_forget_preserves_source_and_survives_rebuild
   test_dangling_forget_marker_fails_closed
@@ -979,6 +1149,7 @@ else
   test_purge_push_rejection_restores_retryable_local_state
   test_invalid_attempt_ledger_blocks_purge_before_rewrite
   test_purge_dry_run_does_not_recover_prepared_temp
+  test_purge_unlink_failure_restores_complete_local_state
 fi
 echo
 echo "Results: $PASS passed, $FAIL failed"

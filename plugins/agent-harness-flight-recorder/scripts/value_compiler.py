@@ -2087,6 +2087,10 @@ def compile_values(
                 primitives, cost = _validate_response(
                     raw, packet, remaining
                 )
+                # The provider charge is incurred once a valid response has
+                # been accepted, regardless of whether a later authentication
+                # check permits publishing the derived Card.
+                spent += cost
             except VaultError as error:
                 with vault_lock(root):
                     _replace_attempt(
@@ -2189,7 +2193,6 @@ def compile_values(
                     )
                 prepared_path.unlink()
                 _remove_attempt(root, fingerprint)
-            spent += cost
     if batch_failures:
         raise VaultError(
             "value compiler batch failed for "

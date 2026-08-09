@@ -50,16 +50,34 @@ if (
 ):
     raise SystemExit("fixture provider failure")
 
+started_directory = os.environ.get("FLIGHT_RECORDER_TEST_VALUE_STARTED_DIR")
+release_directory = os.environ.get("FLIGHT_RECORDER_TEST_VALUE_RELEASE_DIR")
 started = os.environ.get("FLIGHT_RECORDER_TEST_VALUE_STARTED")
 release = os.environ.get("FLIGHT_RECORDER_TEST_VALUE_RELEASE")
-if started:
-    pathlib.Path(started).touch()
-if release:
+if started_directory or release_directory:
+    if not started_directory or not release_directory:
+        raise SystemExit("per-call blocking evaluator directories are incomplete")
+    started_root = pathlib.Path(started_directory)
+    release_root = pathlib.Path(release_directory)
+    started_root.mkdir(parents=True, exist_ok=True)
+    release_root.mkdir(parents=True, exist_ok=True)
+    started_path = started_root / str(call_number)
+    release_path = release_root / str(call_number)
+    started_path.touch()
     deadline = time.monotonic() + 10
-    while not pathlib.Path(release).exists() and time.monotonic() < deadline:
+    while not release_path.exists() and time.monotonic() < deadline:
         time.sleep(0.05)
-    if not pathlib.Path(release).exists():
+    if not release_path.exists():
         raise SystemExit("blocking evaluator release timed out")
+else:
+    if started:
+        pathlib.Path(started).touch()
+    if release:
+        deadline = time.monotonic() + 10
+        while not pathlib.Path(release).exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if not pathlib.Path(release).exists():
+            raise SystemExit("blocking evaluator release timed out")
 delay = os.environ.get("FLIGHT_RECORDER_TEST_VALUE_SLEEP_SECONDS")
 if delay:
     parent = os.getppid()
