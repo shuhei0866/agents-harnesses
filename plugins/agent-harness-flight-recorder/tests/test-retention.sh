@@ -1937,6 +1937,145 @@ PY
   fi
 }
 
+git_state_snapshot() {
+  local state="$1"
+  {
+    if git -C "$state" symbolic-ref -q HEAD; then
+      true
+    else
+      echo DETACHED
+    fi
+    git -C "$state" rev-parse HEAD
+    git -C "$state" for-each-ref \
+      --format='%(refname) %(objectname)' | LC_ALL=C sort
+    git -C "$state" status --porcelain=v1 --untracked-files=all
+  }
+}
+
+test_purge_preflight_requires_synced_main_head() {
+  echo "test_purge_preflight_requires_synced_main_head:"
+  local kind base state remote db episode unrelated old_oid third_oid
+  local before_git before_files before_remote result failures=0
+  for kind in remote-ahead detached other-branch; do
+    base="$TEST_ROOT/purge-cycle13-$kind"
+    state="$base/vault"
+    remote="$base/remote.git"
+    db="$state/index/vault.sqlite"
+    result="$base/result.json"
+    init_fixture "$base" || {
+      fail "cycle13 $kind fixtureを作成できる"
+      return
+    }
+    episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+    unrelated="$(db_value_for_event "$db" "$UNRELATED_EVENT" episode_id)"
+    write_attempt_ledger "$state" "$episode" "$unrelated"
+    write_receipt_attempt_ledger "$state" "$episode" "$unrelated" || {
+      fail "cycle13 $kind receipt ledgerを作成できる"
+      return
+    }
+    write_value_artifacts "$state" "$episode" "$unrelated" || {
+      fail "cycle13 $kind Value artifactsを作成できる"
+      return
+    }
+    materialize_prepared_receipts "$state" || {
+      fail "cycle13 $kind stored receiptsを作成できる"
+      return
+    }
+    old_oid="$(git --git-dir="$remote" rev-parse main)"
+    case "$kind" in
+      remote-ahead)
+        third_oid="$(python3 - "$remote" "$old_oid" <<'PY'
+import subprocess
+import sys
+
+remote, parent = sys.argv[1:]
+tree = subprocess.run(
+    ["git", f"--git-dir={remote}", "rev-parse", f"{parent}^{{tree}}"],
+    check=True,
+    stdout=subprocess.PIPE,
+).stdout.decode().strip()
+print(subprocess.run(
+    ["git", f"--git-dir={remote}", "commit-tree", tree, "-p", parent],
+    input=b"fixture remote-ahead preflight\n",
+    check=True,
+    stdout=subprocess.PIPE,
+).stdout.decode().strip())
+PY
+)"
+        git --git-dir="$remote" update-ref refs/heads/main "$third_oid"
+        ;;
+      detached)
+        git -C "$state" checkout --detach -q
+        ;;
+      other-branch)
+        git -C "$state" checkout -q -b fixture-other
+        ;;
+    esac
+    before_git="$(git_state_snapshot "$state")"
+    before_files="$(vault_byte_snapshot "$state")"
+    before_remote="$(git --git-dir="$remote" rev-parse main)"
+    PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+      python3 - "$state" "$episode" "$result" <<'PY'
+import json
+import pathlib
+import sys
+
+import retention
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+result = pathlib.Path(sys.argv[3])
+original = retention._run_git
+pushes = []
+
+
+def tracked(root, arguments, *, env=None):
+    if arguments and arguments[0] == "push":
+        pushes.append(arguments)
+    return original(root, arguments, env=env)
+
+
+retention._run_git = tracked
+try:
+    retention.purge(root, episode, None, None, apply=True)
+except Exception as error:
+    result.write_text(json.dumps({
+        "success": False,
+        "error": str(error),
+        "pushes": pushes,
+    }))
+else:
+    result.write_text(json.dumps({
+        "success": True,
+        "error": "",
+        "pushes": pushes,
+    }))
+PY
+    if ! python3 - "$result" <<'PY'
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert value["success"] is False
+assert "sync required" in value["error"].lower()
+assert value["pushes"] == []
+PY
+    then
+      failures=$((failures + 1))
+    elif [[ "$before_git" != "$(git_state_snapshot "$state")" \
+      || "$before_files" != "$(vault_byte_snapshot "$state")" \
+      || "$before_remote" != "$(git --git-dir="$remote" rev-parse main)" ]]; then
+      failures=$((failures + 1))
+    fi
+  done
+  if [[ "$failures" -eq 0 ]]; then
+    pass "purge preflightはsynced main以外をpushゼロ・mutationゼロで拒否する"
+  else
+    fail "purge preflightはsynced main以外をpushゼロ・mutationゼロで拒否する"
+  fi
+}
+
 echo "=== Flight Recorder Retention Tests ==="
 if [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE7_ONLY:-0}" == "1" ]]; then
   test_purge_push_rejection_restores_retryable_local_state
@@ -2012,6 +2151,8 @@ elif [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE12_ONLY:-0}" == "1" ]]; then
       fail "unknown cycle12 test case"
       ;;
   esac
+elif [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE13_ONLY:-0}" == "1" ]]; then
+  test_purge_preflight_requires_synced_main_head
 else
   test_forget_preserves_source_and_survives_rebuild
   test_dangling_forget_marker_fails_closed
@@ -2032,6 +2173,7 @@ else
   test_pre_push_crash_marker_pushes_new_with_lease
   test_normal_push_lease_rejects_third_party_race
   test_rollback_remote_restore_uses_new_oid_lease_only
+  test_purge_preflight_requires_synced_main_head
 fi
 echo
 echo "Results: $PASS passed, $FAIL failed"

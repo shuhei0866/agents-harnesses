@@ -441,6 +441,32 @@ def _remote_main_oid(root: Path) -> str:
     return object_id
 
 
+def _require_synced_main(root: Path) -> str:
+    try:
+        symbolic_head = text_output(
+            git(root, ["symbolic-ref", "--quiet", "HEAD"])
+        ).strip()
+        head_oid = text_output(git(root, ["rev-parse", "HEAD"])).strip()
+        main_oid = text_output(
+            git(
+                root,
+                ["show-ref", "--verify", "--hash", "refs/heads/main"],
+            )
+        ).strip()
+        remote_oid = _remote_main_oid(root)
+    except VaultError as error:
+        raise VaultError("purge sync required before apply") from error
+    if (
+        symbolic_head != "refs/heads/main"
+        or GIT_OBJECT_ID_RE.fullmatch(head_oid) is None
+        or GIT_OBJECT_ID_RE.fullmatch(main_oid) is None
+        or head_oid != main_oid
+        or main_oid != remote_oid
+    ):
+        raise VaultError("purge sync required before apply")
+    return main_oid
+
+
 def _push_main_with_lease(
     root: Path,
     *,
@@ -752,6 +778,7 @@ def purge(
                 )
                 if recovered is not None:
                     return recovered
+                _require_synced_main(root)
                 # Reauthenticate and resolve scope under the same exclusive lock
                 # used for mutation so a sync/rebuild cannot make the preview stale.
                 scope = _scope(
