@@ -156,6 +156,11 @@ paths = sorted((root / "devices").rglob("*.jsonl.age"))
 paths += sorted((root / "cache" / "imported").rglob("*.jsonl"))
 paths += sorted((root / "evaluations").glob("*.json"))
 paths += sorted((root / "meaning-cards").glob("*.json"))
+paths += sorted((root / "value-primitive-cards").glob("*.json"))
+paths += sorted((root / "value-compiler" / "prepared").glob("*.json"))
+attempts = root / "value-compiler" / "attempts.json"
+if attempts.exists():
+    paths.append(attempts)
 paths.append(root / "index" / "imported-chunks.json")
 for path in paths:
     print(path.relative_to(root), hashlib.sha256(path.read_bytes()).hexdigest())
@@ -390,6 +395,144 @@ directory.chmod(0o700)
 PY
 }
 
+write_value_artifacts() {
+  local state="$1" target_episode="$2" unrelated_episode="$3"
+  generate_meaning_card "$state" "$target_episode" value-retention-target \
+    || return 1
+  generate_meaning_card \
+    "$state" "$unrelated_episode" value-retention-unrelated || return 1
+  FLIGHT_RECORDER_TEST_VALUE_COST=6000 \
+    run_cli "$state" value compile \
+      --evaluator flight-recorder-value-evaluator \
+      --model value-retention-stored \
+      --max-episodes 2 --max-cost-microusd 12000 --json \
+      >/dev/null 2>&1 || return 1
+  PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$state" "$target_episode" "$unrelated_episode" <<'PY'
+import pathlib
+import sys
+import time
+
+import value_compiler
+from evaluation import _executable_identity, _invoke
+from vault import vault_lock
+
+root = pathlib.Path(sys.argv[1])
+episode_ids = set(sys.argv[2:4])
+model = "value-retention-prepared"
+evaluator_path, evaluator_sha256 = _executable_identity(
+    "flight-recorder-value-evaluator"
+)
+with vault_lock(root):
+    packets = value_compiler._authenticated_packets(
+        root, "default-v1", None, episode_ids
+    )
+assert {episode["episode_id"] for episode, _packet in packets} == episode_ids
+prepared_records = []
+attempts = []
+for episode, packet in packets:
+    request = {
+        "schema_version": 1,
+        "model": model,
+        "packet": packet,
+        "remaining_cost_microusd": 6000,
+    }
+    started = time.monotonic_ns()
+    raw = _invoke(evaluator_path, evaluator_sha256, request, 60)
+    latency_ms = max(0, (time.monotonic_ns() - started) // 1_000_000)
+    primitives, cost = value_compiler._validate_response(raw, packet, 6000)
+    card = value_compiler._build_card(
+        episode,
+        packet,
+        primitives,
+        model,
+        evaluator_path,
+        evaluator_sha256,
+        "default-v1",
+        cost,
+        latency_ms,
+    )
+    fingerprint = value_compiler._attempt_fingerprint(
+        packet["packet_sha256"], model, evaluator_sha256, "default-v1"
+    )
+    prepared_records.append({
+        "schema_version": 1,
+        "contract_version": value_compiler.PREPARED_CONTRACT,
+        "fingerprint": fingerprint,
+        "episode_id": episode["episode_id"],
+        "packet_sha256": packet["packet_sha256"],
+        "evaluator_model": model,
+        "evaluator_adapter_sha256": evaluator_sha256,
+        "policy_version": "default-v1",
+        "card": card,
+    })
+    attempt = value_compiler._new_attempt(
+        episode["episode_id"],
+        packet["packet_sha256"],
+        model,
+        evaluator_sha256,
+        "default-v1",
+    )
+    attempt["state"] = "prepared"
+    attempts.append(attempt)
+with vault_lock(root):
+    for prepared in prepared_records:
+        value_compiler._store_prepared(root, prepared)
+    value_compiler._store_attempts(
+        root,
+        {
+            "schema_version": 1,
+            "attempts": sorted(
+                attempts, key=lambda item: item["fingerprint"]
+            ),
+        },
+    )
+PY
+}
+
+value_artifact_manifest() {
+  python3 - "$1" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+paths = sorted((root / "value-primitive-cards").glob("*.json"))
+paths += sorted((root / "value-compiler" / "prepared").glob("*.json"))
+paths.append(root / "value-compiler" / "attempts.json")
+for path in paths:
+    print(path.relative_to(root), hashlib.sha256(path.read_bytes()).hexdigest())
+PY
+}
+
+value_episode_manifest() {
+  python3 - "$1" "$2" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+for label, directory in (
+    ("card", root / "value-primitive-cards"),
+    ("prepared", root / "value-compiler" / "prepared"),
+):
+    for path in sorted(directory.glob("*.json")):
+        value = json.loads(path.read_text())
+        if value["episode_id"] == episode:
+            print(label, path.name, hashlib.sha256(path.read_bytes()).hexdigest())
+attempts = json.loads(
+    (root / "value-compiler" / "attempts.json").read_text()
+)["attempts"]
+for item in attempts:
+    if item["episode_id"] == episode:
+        canonical = json.dumps(item, sort_keys=True, separators=(",", ":")).encode()
+        print("attempt", item["fingerprint"], hashlib.sha256(canonical).hexdigest())
+PY
+}
+
 test_forget_preserves_source_and_survives_rebuild() {
   echo "test_forget_preserves_source_and_survives_rebuild:"
   local base="$TEST_ROOT/forget"
@@ -593,7 +736,7 @@ test_purge_push_rejection_restores_retryable_local_state() {
   local remote="$base/remote.git" db="$state/index/vault.sqlite"
   local episode unrelated_episode target_path target_cache
   local before_head before_remote before_source before_files before_attempts
-  local before_receipt_attempts
+  local before_receipt_attempts before_value before_unrelated_value
   init_fixture "$base" || {
     fail "push rejection fixtureを作成できる"
     return
@@ -614,8 +757,8 @@ test_purge_push_rejection_restores_retryable_local_state() {
       fail "push rejection対象episodeのevaluationを作成できる"
       return
     }
-  generate_meaning_card "$state" "$episode" purge-rejection || {
-    fail "push rejection対象episodeのMeaning Cardを作成できる"
+  write_value_artifacts "$state" "$episode" "$unrelated_episode" || {
+    fail "push rejection用Value Card・prepared・attemptを作成できる"
     return
   }
   target_path="$(db_value_for_event "$db" "$TARGET_EVENT" source_path)"
@@ -629,6 +772,10 @@ test_purge_push_rejection_restores_retryable_local_state() {
   )"
   before_receipt_attempts="$(
     shasum -a 256 "$state/receipt-automation/attempts.json"
+  )"
+  before_value="$(value_artifact_manifest "$state")"
+  before_unrelated_value="$(
+    value_episode_manifest "$state" "$unrelated_episode"
   )"
 
   git --git-dir="$remote" config receive.denyNonFastForwards true
@@ -648,6 +795,7 @@ test_purge_push_rejection_restores_retryable_local_state() {
     || "$before_receipt_attempts" != "$(
       shasum -a 256 "$state/receipt-automation/attempts.json"
     )" \
+    || "$before_value" != "$(value_artifact_manifest "$state")" \
     || ! -f "$state/$target_path" \
     || ! -f "$state/$target_cache" \
     || "$(meaning_card_count "$state" "$episode")" != "1" ]] \
@@ -665,11 +813,14 @@ test_purge_push_rejection_restores_retryable_local_state() {
       && ! -e "$state/$target_cache" \
       && "$(evaluation_count "$state")" == "0" \
       && "$(meaning_card_count "$state" "$episode")" == "0" ]] \
+    && [[ "$before_unrelated_value" == "$(
+      value_episode_manifest "$state" "$unrelated_episode"
+    )" ]] \
     && ! git --git-dir="$remote" cat-file -e \
       "main:$target_path" 2>/dev/null \
     && python3 - "$state/auto-evaluation/attempts.json" \
       "$state/receipt-automation/attempts.json" \
-      "$episode" "$unrelated_episode" <<'PY'
+      "$state" "$episode" "$unrelated_episode" <<'PY'
 import json
 import pathlib
 import sys
@@ -678,15 +829,31 @@ evaluation_items = json.loads(pathlib.Path(sys.argv[1]).read_text())["attempts"]
 evaluation_episodes = {item["episode_id"] for item in evaluation_items}
 receipt_items = json.loads(pathlib.Path(sys.argv[2]).read_text())["items"]
 receipt_episodes = {item.get("episode_id") for item in receipt_items}
-assert sys.argv[3] not in evaluation_episodes
-assert evaluation_episodes == {sys.argv[4]}
-assert sys.argv[3] not in receipt_episodes
-assert receipt_episodes == {sys.argv[4]}
+root = pathlib.Path(sys.argv[3])
+target, unrelated = sys.argv[4:6]
+assert target not in evaluation_episodes
+assert evaluation_episodes == {unrelated}
+assert target not in receipt_episodes
+assert receipt_episodes == {unrelated}
+cards = [
+    json.loads(path.read_text())
+    for path in (root / "value-primitive-cards").glob("*.json")
+]
+prepared = [
+    json.loads(path.read_text())
+    for path in (root / "value-compiler" / "prepared").glob("*.json")
+]
+attempts = json.loads(
+    (root / "value-compiler" / "attempts.json").read_text()
+)["attempts"]
+assert cards and {item["episode_id"] for item in cards} == {unrelated}
+assert prepared and {item["episode_id"] for item in prepared} == {unrelated}
+assert attempts and {item["episode_id"] for item in attempts} == {unrelated}
 PY
   then
-    pass "push拒否時はprepared attemptも復元し成功時だけ対象を除く"
+    pass "push拒否時はValue artifactsもbyte-exact復元し成功時だけ対象を除く"
   else
-    fail "push拒否時はprepared attemptも復元し成功時だけ対象を除く"
+    fail "push拒否時はValue artifactsもbyte-exact復元し成功時だけ対象を除く"
   fi
 }
 
@@ -728,12 +895,16 @@ test_invalid_attempt_ledger_blocks_purge_before_rewrite() {
 }
 
 echo "=== Flight Recorder Retention Tests ==="
-test_forget_preserves_source_and_survives_rebuild
-test_dangling_forget_marker_fails_closed
-test_purge_dry_run_previews_scope_without_rewriting_history
-test_purge_apply_removes_target_history_and_keeps_unrelated_chunk
-test_purge_push_rejection_restores_retryable_local_state
-test_invalid_attempt_ledger_blocks_purge_before_rewrite
+if [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE7_ONLY:-0}" == "1" ]]; then
+  test_purge_push_rejection_restores_retryable_local_state
+else
+  test_forget_preserves_source_and_survives_rebuild
+  test_dangling_forget_marker_fails_closed
+  test_purge_dry_run_previews_scope_without_rewriting_history
+  test_purge_apply_removes_target_history_and_keeps_unrelated_chunk
+  test_purge_push_rejection_restores_retryable_local_state
+  test_invalid_attempt_ledger_blocks_purge_before_rewrite
+fi
 echo
 echo "Results: $PASS passed, $FAIL failed"
 [[ "$FAIL" -eq 0 ]]

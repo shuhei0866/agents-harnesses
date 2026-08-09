@@ -1607,9 +1607,195 @@ PY
   fi
 }
 
+test_one_changed_candidate_does_not_abort_batch() {
+  echo "test_one_changed_candidate_does_not_abort_batch:"
+  local started="$TEST_ROOT/value-cycle7-changed-started"
+  local release="$TEST_ROOT/value-cycle7-changed-release"
+  local counter="$TEST_ROOT/value-cycle7-changed-count"
+  local output="$TEST_ROOT/value-cycle7-changed.json"
+  local err="$TEST_ROOT/value-cycle7-changed.err"
+  local target_episode other_episode anchor_path process index status
+  fresh_blocker_fixture cycle7-changed || {
+    fail "cycle7 changed-input fixtureを構築できる"
+    return
+  }
+  IFS=$'\t' read -r target_episode other_episode anchor_path < <(
+    PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+      python3 - "$STATE" <<'PY'
+import pathlib
+import sys
+
+import value_compiler
+from vault import vault_lock
+
+root = pathlib.Path(sys.argv[1])
+with vault_lock(root):
+    index = value_compiler._build_anchor_index(root, "default-v1")
+    candidates = value_compiler._authenticated_packets(
+        root, "default-v1", None, anchor_index=index
+    )
+assert len(candidates) >= 2
+target, other = candidates[:2]
+anchor_id = target[1]["anchor_ids"][0]
+print(
+    target[0]["episode_id"],
+    other[0]["episode_id"],
+    index["records"][anchor_id]["path"],
+    sep="\t",
+)
+PY
+  )
+  if [[ -z "$target_episode" || -z "$other_episode" || ! -f "$anchor_path" ]]; then
+    fail "変更対象candidateを特定できる"
+    return
+  fi
+
+  FLIGHT_RECORDER_TEST_VALUE_STARTED="$started" \
+    FLIGHT_RECORDER_TEST_VALUE_RELEASE="$release" \
+    FLIGHT_RECORDER_TEST_VALUE_COUNT="$counter" \
+    run_cli value compile \
+      --evaluator flight-recorder-value-evaluator \
+      --model value-model-cycle7-changed \
+      --max-episodes 2 --max-cost-microusd 12000 --timeout 60 --json \
+      >"$output" 2>"$err" &
+  process=$!
+  for index in $(seq 1 100); do
+    [[ -e "$started" && -s "$counter" ]] && break
+    sleep 0.05
+  done
+  if [[ ! -e "$started" || ! -s "$counter" ]]; then
+    touch "$release"
+    wait "$process" 2>/dev/null
+    fail "変更競合前にproviderが開始する"
+    return
+  fi
+  python3 - "$anchor_path" "$release" <<'PY'
+import pathlib
+import sys
+
+pathlib.Path(sys.argv[1]).unlink()
+pathlib.Path(sys.argv[2]).touch()
+PY
+  wait "$process"
+  status=$?
+
+  if [[ "$status" -ne 0 ]] && python3 - \
+      "$STATE" "$counter" "$target_episode" "$other_episode" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+assert int(pathlib.Path(sys.argv[2]).read_text()) == 2
+target, other = sys.argv[3:5]
+cards = [
+    json.loads(path.read_text())
+    for path in (root / "value-primitive-cards").glob("*.json")
+]
+selected = [
+    card for card in cards
+    if card["provenance"]["evaluator_model"] == "value-model-cycle7-changed"
+]
+assert not any(card["episode_id"] == target for card in selected)
+assert sum(card["episode_id"] == other for card in selected) == 1
+attempts = json.loads(
+    (root / "value-compiler" / "attempts.json").read_text()
+)["attempts"]
+failed = [item for item in attempts if item["episode_id"] == target]
+assert len(failed) == 1
+assert failed[0]["state"] == "failed"
+assert failed[0]["diagnostic_code"] == "input_changed"
+PY
+  then
+    pass "1 candidateのinput変更だけを失敗にし他candidateを保存する"
+  else
+    cat "$err" >&2
+    fail "1 candidateのinput変更だけを失敗にし他candidateを保存する"
+  fi
+}
+
+test_human_inspect_exposes_value_card_evidence() {
+  echo "test_human_inspect_exposes_value_card_evidence:"
+  local human="$TEST_ROOT/value-cycle7-inspect.txt"
+  local err="$TEST_ROOT/value-cycle7-inspect.err"
+  local episode
+  fresh_blocker_fixture cycle7-inspect || {
+    fail "cycle7 inspect fixtureを構築できる"
+    return
+  }
+  if ! run_cli value compile \
+      --evaluator flight-recorder-value-evaluator \
+      --model value-model-cycle7-inspect \
+      --max-episodes 1 --max-cost-microusd 6000 --json \
+      >/dev/null 2>"$err"; then
+    fail "human inspect用Value Cardを作成できる"
+    return
+  fi
+  episode="$(python3 - "$STATE" <<'PY'
+import json
+import pathlib
+import sys
+
+for path in (pathlib.Path(sys.argv[1]) / "value-primitive-cards").glob("*.json"):
+    card = json.loads(path.read_text())
+    if card["provenance"]["evaluator_model"] == "value-model-cycle7-inspect":
+        print(card["episode_id"])
+        break
+else:
+    raise AssertionError("inspect card not found")
+PY
+)"
+  if run_cli inspect "$episode" >"$human" 2>"$err" \
+    && run_cli inspect "$episode" --json >"$TEST_ROOT/value-cycle7-inspect.json" 2>>"$err" \
+    && python3 - \
+      "$STATE" "$episode" "$human" "$TEST_ROOT/value-cycle7-inspect.json" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+human = pathlib.Path(sys.argv[3]).read_text()
+inspection = json.loads(pathlib.Path(sys.argv[4]).read_text())
+assert inspection["schema_version"] == 5
+cards = inspection["value_primitive_cards"]
+assert len(cards) == 1
+card = cards[0]
+assert card["episode_id"] == episode
+provenance = card["provenance"]
+for required in (
+    provenance["evaluator_model"],
+    provenance["generated_at"],
+    str(provenance["generation_cost_microusd"]),
+    *provenance["input_anchor_ids"],
+):
+    assert required in human, required
+for axis, primitive in card["primitives"].items():
+    assert axis in human
+    for required in (
+        primitive["state"],
+        primitive["basis"],
+        primitive["confidence"],
+        primitive["summary"],
+        *primitive["evidence_references"],
+    ):
+        assert required in human, (axis, required)
+episode_card = inspection["card"]
+assert str(episode_card["measured_duration_ms"]["value"]) in human
+assert str(episode_card["measured_cost_usd"]["value"]) in human
+PY
+  then
+    pass "human inspectでValue Cardの由来・8軸根拠・元task実測値を読める"
+  else
+    cat "$err" >&2
+    fail "human inspectでValue Cardの由来・8軸根拠・元task実測値を読める"
+  fi
+}
+
 main() {
   if [[ "${FLIGHT_RECORDER_TEST_VALUE_BLOCKERS_ONLY:-0}" == "1" \
-      || "${FLIGHT_RECORDER_TEST_VALUE_CYCLE6_ONLY:-0}" == "1" ]]; then
+      || "${FLIGHT_RECORDER_TEST_VALUE_CYCLE6_ONLY:-0}" == "1" \
+      || "${FLIGHT_RECORDER_TEST_VALUE_CYCLE7_ONLY:-0}" == "1" ]]; then
     true
   elif ! build_fixture; then
     fail "Value Compiler fixtureを構築できる"
@@ -1698,6 +1884,22 @@ main() {
         fail "unknown cycle6 test case"
         ;;
     esac
+  elif [[ "${FLIGHT_RECORDER_TEST_VALUE_CYCLE7_ONLY:-0}" == "1" ]]; then
+    case "${FLIGHT_RECORDER_TEST_VALUE_CYCLE7_CASE:-all}" in
+      changed-input)
+        test_one_changed_candidate_does_not_abort_batch
+        ;;
+      human-inspect)
+        test_human_inspect_exposes_value_card_evidence
+        ;;
+      all)
+        test_one_changed_candidate_does_not_abort_batch
+        test_human_inspect_exposes_value_card_evidence
+        ;;
+      *)
+        fail "unknown cycle7 test case"
+        ;;
+    esac
   else
     test_versioned_cards_are_grounded_bounded_and_idempotent
     test_wrong_axis_reference_fails_closed_without_storing_a_card
@@ -1718,6 +1920,8 @@ main() {
     test_complete_prepared_atomic_temp_recovers_pending_attempt
     test_invalid_prepared_temps_never_leave_silent_pending
     test_batch_failures_continue_and_return_nonzero
+    test_one_changed_candidate_does_not_abort_batch
+    test_human_inspect_exposes_value_card_evidence
   fi
   echo
   echo "Result: $PASS passed, $FAIL failed"

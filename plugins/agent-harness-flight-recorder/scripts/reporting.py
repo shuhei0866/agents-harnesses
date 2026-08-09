@@ -1054,6 +1054,46 @@ def render_report(value: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _render_value_primitive_cards(
+    cards: list[dict[str, Any]],
+    episode_card: dict[str, Any],
+) -> list[str]:
+    lines: list[str] = []
+    for item in cards:
+        provenance = item["provenance"]
+        anchors = provenance["input_anchor_ids"]
+        lines.extend((
+            f"  Card {item['value_primitive_card_id']}",
+            "    evaluator-model: "
+            f"{_terminal_text(provenance['evaluator_model'])}",
+            f"    generated-at: {provenance['generated_at']}",
+            "    generation-cost-microusd: "
+            f"{provenance['generation_cost_microusd']}",
+            "    input-anchor-ids: "
+            + (", ".join(anchors) if anchors else "none"),
+            "    task-measured-duration-ms: "
+            f"{episode_card['measured_duration_ms']['value']} "
+            f"({episode_card['measured_duration_ms']['state']})",
+            "    task-measured-cost-usd: "
+            f"{episode_card['measured_cost_usd']['value']} "
+            f"({episode_card['measured_cost_usd']['state']})",
+            "    primitives:",
+        ))
+        for axis, primitive in item["primitives"].items():
+            references = primitive["evidence_references"]
+            lines.extend((
+                f"      {axis}:",
+                f"        state: {primitive['state']}",
+                f"        basis: {primitive['basis']}",
+                f"        confidence: {primitive['confidence']}",
+                "        summary: "
+                f"{_terminal_text(primitive['summary'])}",
+                "        evidence-references: "
+                + (", ".join(references) if references else "none"),
+            ))
+    return lines
+
+
 def render_inspect(value: dict[str, Any]) -> str:
     card = value["card"]
     lines = [
@@ -1135,15 +1175,8 @@ def render_inspect(value: dict[str, Any]) -> str:
             for item in value["semantic_receipts"]
         ),
         "Value primitive cards:",
-        *(
-            f"  {item['value_primitive_card_id']} "
-            f"generation-cost-microusd="
-            f"{item['provenance']['generation_cost_microusd']} "
-            + " ".join(
-                f"{name}={primitive['state']}"
-                for name, primitive in item["primitives"].items()
-            )
-            for item in value["value_primitive_cards"]
+        *_render_value_primitive_cards(
+            value["value_primitive_cards"], card
         ),
         "Supporting relationship edges:",
     ]
