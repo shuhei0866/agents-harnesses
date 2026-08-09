@@ -421,8 +421,8 @@ reinterpret the original local session without overwriting earlier results.
 `flight-recorder inspect <episode-id>` returns matching records in the
 top-level `semantic_receipts` array and labels them as model-derived in human
 output; it does not promote their task or outcome into deterministic Card
-fields. Inspect output is version 4 while the embedded Card and report output
-remain version 3.
+fields. Inspect output is version 5 after adding the separate Value Primitive
+Card projection, while the embedded Card and report output remain version 3.
 
 ### Meaning Lift pilot
 
@@ -467,6 +467,37 @@ justify that expansion.
 
 The first real-task result and its provider/authentication limitations are
 recorded in [`docs/MEANING_LIFT_PILOT.md`](docs/MEANING_LIFT_PILOT.md).
+
+### Value Compiler v0
+
+Compile bounded shared value primitives only for authenticated Episodes that
+already have a validated Meaning Card or Semantic Receipt anchor:
+
+```bash
+scripts/flight-recorder value compile \
+  --evaluator VALUE_ADAPTER \
+  --model MODEL_ID \
+  --max-episodes 10 \
+  --max-cost-microusd 50000
+```
+
+The command requires all four provider and budget choices explicitly. Its
+packet contains only anchor summaries, recorder-generated evidence IDs, and
+deterministic Episode observations; it never opens a registered session source
+or includes its path or raw body. The evaluator returns eight independent
+axes: goal achievement, deliverable quality, risk reduction, learning, reuse
+potential, decision leverage, attention saved, and rework. There is no scalar
+score or personal-value field. Flight Recorder validates references against an
+axis-specific allowlist and forces unsupported axes to `unknown`.
+
+Validated `value-primitive-card-v1` records are content-addressed under the
+owner-only, Git-ignored `value-primitive-cards/` directory. Repeating the same
+Episode/anchor/model/evaluator/policy input reuses the existing card without a
+provider call. `inspect` exposes matching cards separately from deterministic
+facts and Semantic Receipts. Episode work cost remains in `observations`, while
+the Value Compiler call's micro-USD is recorded separately as generation cost.
+`forget` hides the Episode without deleting cards; only `purge --apply`
+physically removes matching cards.
 
 ### Unconscious Semantic Receipts
 

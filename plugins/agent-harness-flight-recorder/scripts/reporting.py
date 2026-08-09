@@ -52,7 +52,7 @@ from retention_state import load_forgotten
 
 
 OUTPUT_VERSION = 3
-INSPECT_OUTPUT_VERSION = 4
+INSPECT_OUTPUT_VERSION = 5
 STATUS_OUTPUT_VERSION = 4
 DEFAULT_POLICY_VERSION = "default-v1"
 EPISODE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -607,6 +607,7 @@ def inspect_episode(
             root, connection, policy, episode_id, edges_by_episode
         )
         from semantic_receipts import load_semantic_receipts
+        from value_compiler import load_value_primitive_cards
 
         return {
             "schema_version": INSPECT_OUTPUT_VERSION,
@@ -623,6 +624,9 @@ def inspect_episode(
                     item["evidence_id"]
                     for item in card["deterministic_evidence"]
                 },
+            ),
+            "value_primitive_cards": load_value_primitive_cards(
+                root, policy_version, episode_id
             ),
         }
 
@@ -1130,6 +1134,17 @@ def render_inspect(value: dict[str, Any]) -> str:
             f"rubric={_terminal_text(item['provenance']['rubric_version'])}"
             for item in value["semantic_receipts"]
         ),
+        "Value primitive cards:",
+        *(
+            f"  {item['value_primitive_card_id']} "
+            f"generation-cost-microusd="
+            f"{item['provenance']['generation_cost_microusd']} "
+            + " ".join(
+                f"{name}={primitive['state']}"
+                for name, primitive in item["primitives"].items()
+            )
+            for item in value["value_primitive_cards"]
+        ),
         "Supporting relationship edges:",
     ]
     if not card["deterministic_evidence"]:
@@ -1139,6 +1154,8 @@ def render_inspect(value: dict[str, Any]) -> str:
             lines.index("Model-derived semantic receipts:"), "  none"
         )
     if not value["semantic_receipts"]:
+        lines.insert(lines.index("Value primitive cards:"), "  none")
+    if not value["value_primitive_cards"]:
         lines.insert(lines.index("Supporting relationship edges:"), "  none")
     if value["supporting_edges"]:
         for edge in value["supporting_edges"]:

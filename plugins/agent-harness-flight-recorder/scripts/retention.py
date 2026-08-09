@@ -33,6 +33,7 @@ from receipt_automation import (
 )
 from retention_state import load_forgotten, store_forgotten
 from semantic_receipts import semantic_receipt_record_snapshots
+from value_compiler import value_primitive_card_record_snapshots
 from sync import (
     CHUNK_PATH_RE,
     PENDING_PATH,
@@ -112,6 +113,11 @@ def _scope(
             ),
             "meaning_card_record_count": len(
                 meaning_card_record_snapshots(
+                    root, policy_version, episode_id
+                )
+            ),
+            "value_primitive_card_record_count": len(
+                value_primitive_card_record_snapshots(
                     root, policy_version, episode_id
                 )
             ),
@@ -347,6 +353,11 @@ def purge(
                 meaning_card_snapshots = meaning_card_record_snapshots(
                     root, selected, episode_id
                 )
+                value_primitive_card_snapshots = (
+                    value_primitive_card_record_snapshots(
+                        root, selected, episode_id
+                    )
+                )
                 attempt_snapshot = remove_episode_attempts(root, episode_id)
                 try:
                     receipt_attempt_snapshot = remove_receipt_attempts(
@@ -367,6 +378,7 @@ def purge(
                         *evaluation_snapshots,
                         *semantic_receipt_snapshots,
                         *meaning_card_snapshots,
+                        *value_primitive_card_snapshots,
                     ]
                     removed_derivatives: list[tuple[Path, bytes]] = []
                     try:
@@ -404,6 +416,8 @@ def purge(
                         for receipt_path, receipt_bytes in semantic_receipt_snapshots:
                             atomic_replace(receipt_path, receipt_bytes)
                         for card_path, card_bytes in meaning_card_snapshots:
+                            atomic_replace(card_path, card_bytes)
+                        for card_path, card_bytes in value_primitive_card_snapshots:
                             atomic_replace(card_path, card_bytes)
                         _cleanup_original_history(root)
                         raise
@@ -455,5 +469,7 @@ def render_purge(value: dict[str, Any]) -> str:
         f"{value['semantic_receipt_record_count']}\n"
         "Local Meaning Card records: "
         f"{value['meaning_card_record_count']}\n"
+        "Local Value Primitive Card records: "
+        f"{value['value_primitive_card_record_count']}\n"
         f"{value['limitation']}\n"
     )
