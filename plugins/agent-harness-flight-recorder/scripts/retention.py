@@ -441,6 +441,30 @@ def _remote_main_oid(root: Path) -> str:
     return object_id
 
 
+def _push_main_with_lease(
+    root: Path,
+    *,
+    expected_remote_oid: str,
+    new_oid: str,
+) -> None:
+    if (
+        GIT_OBJECT_ID_RE.fullmatch(expected_remote_oid) is None
+        or GIT_OBJECT_ID_RE.fullmatch(new_oid) is None
+    ):
+        raise VaultError("Git history purge lease is invalid")
+    _run_git(
+        root,
+        [
+            "push",
+            f"--force-with-lease=refs/heads/main:{expected_remote_oid}",
+            "origin",
+            f"{new_oid}:refs/heads/main",
+        ],
+    )
+    if _remote_main_oid(root) != new_oid:
+        raise VaultError("Git history purge lease did not converge")
+
+
 def _cleanup_only_result(marker: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": OUTPUT_VERSION,
@@ -489,10 +513,25 @@ def _resume_purge_recovery(
             ) from error
         return _cleanup_only_result(marker)
     if remote_oid == marker["old_remote_oid"]:
-        if local_oid != marker["old_remote_oid"]:
+        if local_oid == marker["old_remote_oid"]:
+            _clear_purge_recovery(root, marker)
+            return None
+        if local_oid != marker["new_rewritten_oid"]:
             raise VaultError("purge recovery local history diverged")
-        _clear_purge_recovery(root, marker)
-        return None
+        _push_main_with_lease(
+            root,
+            expected_remote_oid=marker["old_remote_oid"],
+            new_oid=marker["new_rewritten_oid"],
+        )
+        try:
+            _cleanup_original_history(root)
+            _clear_purge_recovery(root, marker)
+        except Exception as error:
+            raise VaultError(
+                "remote rewrite applied; local cleanup incomplete; "
+                "retry required"
+            ) from error
+        return _cleanup_only_result(marker)
     raise VaultError("purge recovery remote history diverged")
 
 
@@ -548,6 +587,8 @@ def _restore_local_file_snapshots(
 def _restore_ref_snapshot(root: Path, snapshot: dict[str, str]) -> None:
     current = _ref_snapshot(root, require_main=False)
     for ref in sorted(current.keys() - snapshot.keys()):
+        if ref.startswith("refs/original/"):
+            continue
         _run_git(root, ["update-ref", "-d", ref])
     for ref, object_id in sorted(snapshot.items()):
         _run_git(root, ["update-ref", ref, object_id])
@@ -559,6 +600,7 @@ def _rollback_purge_state(
     *,
     refs: dict[str, str],
     remote_main_oid: str,
+    rewritten_remote_oid: str | None = None,
     files: list[tuple[Path, bytes | None, int | None]],
     value_attempts: bytes | None,
     evaluation_attempts: bytes | None,
@@ -603,20 +645,20 @@ def _rollback_purge_state(
     remote_restored = False
     try:
         current_remote = _remote_main_oid(root)
-        if current_remote != remote_main_oid:
-            _run_git(
+        if current_remote == remote_main_oid:
+            remote_restored = True
+        elif (
+            rewritten_remote_oid is not None
+            and current_remote == rewritten_remote_oid
+        ):
+            _push_main_with_lease(
                 root,
-                [
-                    "push",
-                    "--force",
-                    "origin",
-                    f"{remote_main_oid}:refs/heads/main",
-                ],
+                expected_remote_oid=rewritten_remote_oid,
+                new_oid=remote_main_oid,
             )
-            current_remote = _remote_main_oid(root)
-        if current_remote != remote_main_oid:
-            raise VaultError("remote purge rollback did not converge")
-        remote_restored = True
+            remote_restored = True
+        else:
+            raise VaultError("remote purge rollback history diverged")
     except Exception as error:
         errors.append(error)
 
@@ -782,6 +824,7 @@ def purge(
                     restore_attempts(root, attempt_snapshot)
                     restore_value_attempts(root, value_attempt_snapshot)
                     raise
+                rewritten_oid: str | None = None
                 try:
                     _rewrite_history(root, paths)
                     _remove_local_derivatives(root, scope)
@@ -810,14 +853,17 @@ def purge(
                         "new_rewritten_oid": rewritten_oid,
                     }
                     _store_purge_recovery(root, recovery_marker)
-                    _run_git(
-                        root, ["push", "--force", "origin", "HEAD:main"]
+                    _push_main_with_lease(
+                        root,
+                        expected_remote_oid=original_remote_main,
+                        new_oid=rewritten_oid,
                     )
                 except Exception as error:
                     rollback_errors = _rollback_purge_state(
                         root,
                         refs=original_refs,
                         remote_main_oid=original_remote_main,
+                        rewritten_remote_oid=rewritten_oid,
                         files=local_snapshots,
                         value_attempts=value_attempt_snapshot,
                         evaluation_attempts=attempt_snapshot,

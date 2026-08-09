@@ -504,10 +504,16 @@ modes, and attempt ledgers. Immediately before force-push, the Recorder stores
 an owner-only, local `index/purge-recovery.json` marker containing only the old
 and rewritten Git object IDs plus Episode and policy identity. A successful
 push is the commit point: later local history cleanup is never allowed to undo
-the accepted remote rewrite. If cleanup fails or the process exits, the next
-matching `purge --apply` validates the marker and completes cleanup before
-trying to resolve the now-deleted Episode scope. Byte-exact pre-push rollback
-can temporarily consume memory proportional to the affected local files.
+the accepted remote rewrite. Every purge push uses the marker's expected old
+object ID as a force-with-lease; rollback only replaces the known rewritten ID,
+so an unrelated remote update is never overwritten. Once the marker is durable,
+a process exit before push, during push, or during cleanup is recoverable by the
+next matching `purge --apply`, which validates the marker and resumes before
+trying to resolve the now-deleted Episode scope. Ordinary Python and command
+errors from history rewrite onward enter rollback. An abrupt process or power
+loss between rewrite start and durable marker storage remains best-effort in
+v0. Byte-exact pre-push rollback can temporarily consume memory proportional
+to the affected local files.
 
 ## Retention and deletion
 

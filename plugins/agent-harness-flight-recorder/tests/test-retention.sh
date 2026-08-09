@@ -1663,6 +1663,280 @@ test_unsafe_cleanup_markers_fail_before_mutation() {
   fi
 }
 
+test_pre_push_crash_marker_pushes_new_with_lease() {
+  echo "test_pre_push_crash_marker_pushes_new_with_lease:"
+  local base="$TEST_ROOT/purge-cycle12-pre-push"
+  local state="$base/vault" remote="$base/remote.git"
+  local db="$state/index/vault.sqlite"
+  local episode old_oid new_oid marker="$state/index/purge-recovery.json"
+  local status calls="$base/push-calls.json"
+  init_fixture "$base" || {
+    fail "cycle12 pre-push crash fixtureを作成できる"
+    return
+  }
+  episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+  old_oid="$(git --git-dir="$remote" rev-parse main)"
+  PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$state" "$episode" "$marker" <<'PY'
+import pathlib
+import sys
+
+import retention
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+marker = pathlib.Path(sys.argv[3])
+original = retention._run_git
+
+
+def crash_before_push(root, arguments, *, env=None):
+    if arguments and arguments[0] == "push":
+        assert marker.is_file(), "push attempted before marker durability"
+        raise SystemExit(76)
+    return original(root, arguments, env=env)
+
+
+retention._run_git = crash_before_push
+retention.purge(root, episode, None, None, apply=True)
+PY
+  status=$?
+  new_oid="$(git -C "$state" rev-parse HEAD)"
+  if [[ "$status" -ne 76 || ! -f "$marker" \
+    || "$(git --git-dir="$remote" rev-parse main)" != "$old_oid" \
+    || "$new_oid" == "$old_oid" ]]; then
+    fail "push直前crashでmarker/local=new/remote=oldを保持する"
+    return
+  fi
+  if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$state" "$episode" "$calls" "$old_oid" <<'PY'
+import json
+import pathlib
+import sys
+
+import retention
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+output = pathlib.Path(sys.argv[3])
+old_oid = sys.argv[4]
+calls = []
+original = retention._run_git
+
+
+def checked(root, arguments, *, env=None):
+    if arguments and arguments[0] == "push":
+        calls.append(arguments)
+        assert f"--force-with-lease=refs/heads/main:{old_oid}" in arguments
+        assert "--force" not in arguments
+    return original(root, arguments, env=env)
+
+
+retention._run_git = checked
+result = retention.purge(root, episode, None, None, apply=True)
+assert result.get("cleanup_only") is True
+output.write_text(json.dumps(calls))
+PY
+  then
+    if [[ ! -e "$marker" \
+      && "$(git --git-dir="$remote" rev-parse main)" == "$new_oid" ]] \
+      && python3 - "$calls" <<'PY'
+import json
+import pathlib
+import sys
+
+calls = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert len(calls) == 1
+assert all("--force" not in call for call in calls)
+PY
+    then
+      pass "pre-push crash markerをold leaseでpushしcleanup-only完了する"
+    else
+      fail "pre-push crash markerをold leaseでpushしcleanup-only完了する"
+    fi
+  else
+    fail "pre-push crash markerをold leaseでpushしcleanup-only完了する"
+  fi
+}
+
+test_normal_push_lease_rejects_third_party_race() {
+  echo "test_normal_push_lease_rejects_third_party_race:"
+  local base="$TEST_ROOT/purge-cycle12-third-race"
+  local state="$base/vault" remote="$base/remote.git"
+  local db="$state/index/vault.sqlite"
+  local episode old_oid third_oid result="$base/result.json"
+  init_fixture "$base" || {
+    fail "cycle12 third-party race fixtureを作成できる"
+    return
+  }
+  episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+  old_oid="$(git --git-dir="$remote" rev-parse main)"
+  third_oid="$(python3 - "$remote" "$old_oid" <<'PY'
+import subprocess
+import sys
+
+remote, parent = sys.argv[1:]
+tree = subprocess.run(
+    ["git", f"--git-dir={remote}", "rev-parse", f"{parent}^{{tree}}"],
+    check=True,
+    stdout=subprocess.PIPE,
+).stdout.decode().strip()
+print(subprocess.run(
+    ["git", f"--git-dir={remote}", "commit-tree", tree, "-p", parent],
+    input=b"fixture third-party update\n",
+    check=True,
+    stdout=subprocess.PIPE,
+).stdout.decode().strip())
+PY
+)"
+  PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - \
+      "$state" "$episode" "$remote" "$third_oid" "$old_oid" "$result" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+
+import retention
+from vault import VaultError
+
+root = pathlib.Path(sys.argv[1])
+episode, remote, third_oid, old_oid = sys.argv[2:6]
+output = pathlib.Path(sys.argv[6])
+original = retention._run_git
+calls = []
+moved = False
+
+
+def raced(root, arguments, *, env=None):
+    global moved
+    if arguments and arguments[0] == "push":
+        calls.append(arguments)
+        if not moved:
+            subprocess.run(
+                ["git", f"--git-dir={remote}", "update-ref", "refs/heads/main", third_oid],
+                check=True,
+            )
+            moved = True
+    return original(root, arguments, env=env)
+
+
+retention._run_git = raced
+try:
+    retention.purge(root, episode, None, None, apply=True)
+except VaultError as error:
+    output.write_text(json.dumps({"error": str(error), "calls": calls}))
+else:
+    raise AssertionError("third-party race unexpectedly succeeded")
+PY
+  if python3 - "$state" "$remote" "$old_oid" "$third_oid" "$result" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+
+root = pathlib.Path(sys.argv[1])
+remote, old_oid, third_oid = sys.argv[2:5]
+result = json.loads(pathlib.Path(sys.argv[5]).read_text())
+
+
+def git(*arguments):
+    return subprocess.run(
+        ["git", *arguments], check=True, stdout=subprocess.PIPE
+    ).stdout.decode().strip()
+
+
+assert git(f"--git-dir={remote}", "rev-parse", "main") == third_oid
+assert git("-C", str(root), "rev-parse", "HEAD") == old_oid
+refs = git(
+    "-C", str(root), "for-each-ref", "--format=%(refname)", "refs/original/"
+).splitlines()
+assert refs, "rollback recovery material was cleaned after remote race"
+calls = result["calls"]
+assert calls
+first = calls[0]
+assert f"--force-with-lease=refs/heads/main:{old_oid}" in first
+assert all("--force" not in call for call in calls)
+assert "rollback incomplete" in result["error"].lower()
+PY
+  then
+    pass "normal push leaseはthird-party remoteを上書きせずrollback材料を保持する"
+  else
+    fail "normal push leaseはthird-party remoteを上書きせずrollback材料を保持する"
+  fi
+}
+
+test_rollback_remote_restore_uses_new_oid_lease_only() {
+  echo "test_rollback_remote_restore_uses_new_oid_lease_only:"
+  if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$TEST_ROOT" <<'PY'
+import pathlib
+import sys
+
+import retention
+
+root = pathlib.Path(sys.argv[1])
+old = "a" * 40
+new = "b" * 40
+third = "c" * 40
+
+
+def exercise(initial):
+    current = initial
+    calls = []
+    cleanup = []
+    retention._original_refs = lambda _root: []
+    retention._restore_ref_snapshot = lambda _root, _refs: None
+    retention._restore_local_file_snapshots = lambda _files: []
+    retention.restore_value_attempts = lambda _root, _snapshot: None
+    retention.restore_attempts = lambda _root, _snapshot: None
+    retention.restore_receipt_attempts = lambda _root, _snapshot: None
+    retention._remote_main_oid = lambda _root: current
+
+    def run_git(_root, arguments, *, env=None):
+        nonlocal current
+        calls.append(arguments)
+        expected = f"--force-with-lease=refs/heads/main:{new}"
+        if expected in arguments and initial == new:
+            current = old
+
+    retention._run_git = run_git
+    retention._cleanup_original_history = lambda _root: cleanup.append(True)
+    errors = retention._rollback_purge_state(
+        root,
+        refs={"refs/heads/main": old},
+        remote_main_oid=old,
+        rewritten_remote_oid=new,
+        files=[],
+        value_attempts=None,
+        evaluation_attempts=None,
+        receipt_attempts=None,
+    )
+    return current, calls, cleanup, errors
+
+
+current, calls, cleanup, errors = exercise(new)
+assert current == old and not errors and cleanup
+assert len(calls) == 1
+assert f"--force-with-lease=refs/heads/main:{new}" in calls[0]
+assert "--force" not in calls[0]
+assert f"{old}:refs/heads/main" in calls[0]
+
+current, calls, cleanup, errors = exercise(old)
+assert current == old and calls == [] and not errors and cleanup
+
+current, calls, cleanup, errors = exercise(third)
+assert current == third
+assert calls == []
+assert errors
+assert cleanup == []
+PY
+  then
+    pass "rollbackはknown newだけをlease付きでoldへ戻しthirdを変更しない"
+  else
+    fail "rollbackはknown newだけをlease付きでoldへ戻しthirdを変更しない"
+  fi
+}
+
 echo "=== Flight Recorder Retention Tests ==="
 if [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE7_ONLY:-0}" == "1" ]]; then
   test_purge_push_rejection_restores_retryable_local_state
@@ -1718,6 +1992,26 @@ elif [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE11_ONLY:-0}" == "1" ]]; then
       fail "unknown cycle11 test case"
       ;;
   esac
+elif [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE12_ONLY:-0}" == "1" ]]; then
+  case "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE12_CASE:-all}" in
+    resume-push)
+      test_pre_push_crash_marker_pushes_new_with_lease
+      ;;
+    third-race)
+      test_normal_push_lease_rejects_third_party_race
+      ;;
+    rollback-lease)
+      test_rollback_remote_restore_uses_new_oid_lease_only
+      ;;
+    all)
+      test_pre_push_crash_marker_pushes_new_with_lease
+      test_normal_push_lease_rejects_third_party_race
+      test_rollback_remote_restore_uses_new_oid_lease_only
+      ;;
+    *)
+      fail "unknown cycle12 test case"
+      ;;
+  esac
 else
   test_forget_preserves_source_and_survives_rebuild
   test_dangling_forget_marker_fails_closed
@@ -1735,6 +2029,9 @@ else
   test_crash_after_push_recovers_cleanup_only
   test_push_pending_marker_with_old_remote_resumes_normal_purge
   test_unsafe_cleanup_markers_fail_before_mutation
+  test_pre_push_crash_marker_pushes_new_with_lease
+  test_normal_push_lease_rejects_third_party_race
+  test_rollback_remote_restore_uses_new_oid_lease_only
 fi
 echo
 echo "Results: $PASS passed, $FAIL failed"
