@@ -1134,6 +1134,269 @@ PY
   fi
 }
 
+test_rollback_attempts_exact_refs_after_restore_history_failure() {
+  echo "test_rollback_attempts_exact_refs_after_restore_history_failure:"
+  if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$TEST_ROOT" <<'PY'
+import pathlib
+import sys
+
+import retention
+
+root = pathlib.Path(sys.argv[1])
+events = []
+retention._original_refs = lambda _root: ["refs/original/refs/heads/main"]
+
+
+def broken_restore_history(_root):
+    events.append("restore-history")
+    raise RuntimeError("fixture restore-history failure")
+
+
+def restore_refs(_root, _snapshot):
+    events.append("restore-refs")
+
+
+def restore_files(_snapshots):
+    events.append("restore-files")
+    return []
+
+
+def restore_value(_root, _snapshot):
+    events.append("restore-value-attempts")
+
+
+def restore_evaluation(_root, _snapshot):
+    events.append("restore-evaluation-attempts")
+
+
+def restore_receipt(_root, _snapshot):
+    events.append("restore-receipt-attempts")
+
+
+retention._restore_history = broken_restore_history
+retention._restore_ref_snapshot = restore_refs
+retention._restore_local_file_snapshots = restore_files
+retention.restore_value_attempts = restore_value
+retention.restore_attempts = restore_evaluation
+retention.restore_receipt_attempts = restore_receipt
+retention._remote_main_oid = lambda _root: "a" * 40
+retention._cleanup_original_history = lambda _root: events.append("cleanup")
+errors = retention._rollback_purge_state(
+    root,
+    refs={"refs/heads/main": "a" * 40},
+    remote_main_oid="a" * 40,
+    files=[],
+    value_attempts=b"value",
+    evaluation_attempts=b"evaluation",
+    receipt_attempts=b"receipt",
+)
+assert errors
+assert events[:2] == ["restore-history", "restore-refs"], events
+assert {
+    "restore-files",
+    "restore-value-attempts",
+    "restore-evaluation-attempts",
+    "restore-receipt-attempts",
+}.issubset(events)
+PY
+  then
+    pass "_restore_history失敗後もexact refsと全artifact/ledger復元を試す"
+  else
+    fail "_restore_history失敗後もexact refsと全artifact/ledger復元を試す"
+  fi
+}
+
+test_incomplete_ref_rollback_preserves_original_history() {
+  echo "test_incomplete_ref_rollback_preserves_original_history:"
+  if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$TEST_ROOT" <<'PY'
+import pathlib
+import sys
+
+import retention
+
+root = pathlib.Path(sys.argv[1])
+events = []
+retention._original_refs = lambda _root: []
+
+
+def broken_refs(_root, _snapshot):
+    events.append("restore-refs")
+    raise RuntimeError("fixture exact refs failure")
+
+
+retention._restore_ref_snapshot = broken_refs
+retention._restore_local_file_snapshots = lambda _snapshots: []
+retention.restore_value_attempts = lambda _root, _snapshot: None
+retention.restore_attempts = lambda _root, _snapshot: None
+retention.restore_receipt_attempts = lambda _root, _snapshot: None
+retention._remote_main_oid = lambda _root: "a" * 40
+retention._cleanup_original_history = lambda _root: events.append("cleanup")
+errors = retention._rollback_purge_state(
+    root,
+    refs={"refs/heads/main": "a" * 40},
+    remote_main_oid="a" * 40,
+    files=[],
+    value_attempts=None,
+    evaluation_attempts=None,
+    receipt_attempts=None,
+)
+assert errors
+assert "restore-refs" in events
+assert "cleanup" not in events, events
+PY
+  then
+    pass "exact refs/remote復元失敗時はrefs/originalをcleanupしない"
+  else
+    fail "exact refs/remote復元失敗時はrefs/originalをcleanupしない"
+  fi
+}
+
+test_cli_reports_incomplete_rollback_with_original_context() {
+  echo "test_cli_reports_incomplete_rollback_with_original_context:"
+  local base="$TEST_ROOT/purge-cycle10-incomplete"
+  local state="$base/vault"
+  local db="$state/index/vault.sqlite"
+  local episode err="$base/incomplete.err" status
+  init_fixture "$base" || {
+    fail "cycle10 incomplete rollback fixtureを作成できる"
+    return
+  }
+  episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+  PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$state" "$episode" 2>"$err" <<'PY'
+import pathlib
+import sys
+
+import retention
+from vault import VaultError
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+original_remove = retention._remove_local_derivatives
+
+
+def fail_after_rewrite(root, scope, *, apply=True):
+    if apply:
+        raise VaultError("fixture original mutation failure")
+    return original_remove(root, scope, apply=apply)
+
+
+retention._remove_local_derivatives = fail_after_rewrite
+retention._restore_history = lambda _root: (_ for _ in ()).throw(
+    VaultError("fixture restore history failure")
+)
+retention._restore_ref_snapshot = lambda _root, _snapshot: (
+    (_ for _ in ()).throw(VaultError("fixture exact refs failure"))
+)
+try:
+    retention.purge(root, episode, None, None, apply=True)
+except VaultError as error:
+    print(f"flight-recorder: {error}", file=sys.stderr)
+    raise SystemExit(1)
+raise AssertionError("injected rollback unexpectedly succeeded")
+PY
+  status=$?
+  if [[ "$status" -ne 0 ]] \
+    && grep -Eiq 'rollback incomplete|rollback.*incomplete' "$err" \
+    && grep -Fq 'fixture original mutation failure' "$err" \
+    && ! grep -q 'Traceback' "$err"; then
+    pass "rollback incompleteを元例外文脈付きでCLIへ有限表示する"
+  else
+    fail "rollback incompleteを元例外文脈付きでCLIへ有限表示する"
+  fi
+}
+
+test_post_push_cleanup_failure_keeps_remote_commit_point() {
+  echo "test_post_push_cleanup_failure_keeps_remote_commit_point:"
+  local base="$TEST_ROOT/purge-cycle10-post-push"
+  local state="$base/vault" remote="$base/remote.git"
+  local db="$state/index/vault.sqlite"
+  local episode original_remote result="$base/result.json"
+  init_fixture "$base" || {
+    fail "cycle10 post-push fixtureを作成できる"
+    return
+  }
+  episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+  original_remote="$(git --git-dir="$remote" rev-parse main)"
+  PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$state" "$episode" "$result" <<'PY'
+import json
+import pathlib
+import sys
+
+import retention
+from vault import VaultError
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+result = pathlib.Path(sys.argv[3])
+rollback_calls = 0
+original_rollback = retention._rollback_purge_state
+
+
+def counted_rollback(*args, **kwargs):
+    global rollback_calls
+    rollback_calls += 1
+    return original_rollback(*args, **kwargs)
+
+
+def broken_cleanup(_root):
+    raise VaultError("fixture cleanup failure")
+
+
+retention._rollback_purge_state = counted_rollback
+retention._cleanup_original_history = broken_cleanup
+try:
+    retention.purge(root, episode, None, None, apply=True)
+except VaultError as error:
+    result.write_text(json.dumps({
+        "error": str(error),
+        "rollback_calls": rollback_calls,
+    }))
+else:
+    raise AssertionError("cleanup failure unexpectedly succeeded")
+PY
+  if python3 - "$state" "$remote" "$original_remote" "$result" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+
+root = pathlib.Path(sys.argv[1])
+remote = pathlib.Path(sys.argv[2])
+original_remote = sys.argv[3]
+result = json.loads(pathlib.Path(sys.argv[4]).read_text())
+
+
+def git(*arguments):
+    return subprocess.run(
+        ["git", *arguments], check=True, stdout=subprocess.PIPE
+    ).stdout.decode().strip()
+
+
+remote_oid = git(f"--git-dir={remote}", "rev-parse", "main")
+local_oid = git("-C", str(root), "rev-parse", "HEAD")
+refs = git(
+    "-C", str(root), "for-each-ref", "--format=%(refname)",
+    "refs/original/",
+).splitlines()
+assert remote_oid != original_remote
+assert remote_oid == local_oid
+assert refs, "post-push cleanup retry material was removed"
+assert result["rollback_calls"] == 0
+message = result["error"].lower()
+assert "remote rewrite applied" in message
+assert "local cleanup incomplete" in message
+PY
+  then
+    pass "push成功後cleanup失敗はremote commitを維持しretry材料を残す"
+  else
+    fail "push成功後cleanup失敗はremote commitを維持しretry材料を残す"
+  fi
+}
+
 echo "=== Flight Recorder Retention Tests ==="
 if [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE7_ONLY:-0}" == "1" ]]; then
   test_purge_push_rejection_restores_retryable_local_state
@@ -1141,6 +1404,30 @@ elif [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE8_ONLY:-0}" == "1" ]]; then
   test_purge_dry_run_does_not_recover_prepared_temp
 elif [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE9_ONLY:-0}" == "1" ]]; then
   test_purge_unlink_failure_restores_complete_local_state
+elif [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE10_ONLY:-0}" == "1" ]]; then
+  case "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE10_CASE:-all}" in
+    ordering)
+      test_rollback_attempts_exact_refs_after_restore_history_failure
+      ;;
+    preserve)
+      test_incomplete_ref_rollback_preserves_original_history
+      ;;
+    visibility)
+      test_cli_reports_incomplete_rollback_with_original_context
+      ;;
+    commit-point)
+      test_post_push_cleanup_failure_keeps_remote_commit_point
+      ;;
+    all)
+      test_rollback_attempts_exact_refs_after_restore_history_failure
+      test_incomplete_ref_rollback_preserves_original_history
+      test_cli_reports_incomplete_rollback_with_original_context
+      test_post_push_cleanup_failure_keeps_remote_commit_point
+      ;;
+    *)
+      fail "unknown cycle10 test case"
+      ;;
+  esac
 else
   test_forget_preserves_source_and_survives_rebuild
   test_dangling_forget_marker_fails_closed
@@ -1150,6 +1437,10 @@ else
   test_invalid_attempt_ledger_blocks_purge_before_rewrite
   test_purge_dry_run_does_not_recover_prepared_temp
   test_purge_unlink_failure_restores_complete_local_state
+  test_rollback_attempts_exact_refs_after_restore_history_failure
+  test_incomplete_ref_rollback_preserves_original_history
+  test_cli_reports_incomplete_rollback_with_original_context
+  test_post_push_cleanup_failure_keeps_remote_commit_point
 fi
 echo
 echo "Results: $PASS passed, $FAIL failed"

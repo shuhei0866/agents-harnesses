@@ -392,9 +392,20 @@ def _rollback_purge_state(
     # first when available, then reconcile the complete ref namespace to the
     # exact pre-transaction snapshot.
     try:
-        if _original_refs(root):
+        legacy_refs = _original_refs(root)
+    except Exception as error:
+        errors.append(error)
+        legacy_refs = []
+    if legacy_refs:
+        try:
             _restore_history(root)
+        except Exception as error:
+            errors.append(error)
+
+    exact_refs_restored = False
+    try:
         _restore_ref_snapshot(root, refs)
+        exact_refs_restored = True
     except Exception as error:
         errors.append(error)
 
@@ -410,8 +421,10 @@ def _rollback_purge_state(
         except Exception as error:
             errors.append(error)
 
+    remote_restored = False
     try:
-        if _remote_main_oid(root) != remote_main_oid:
+        current_remote = _remote_main_oid(root)
+        if current_remote != remote_main_oid:
             _run_git(
                 root,
                 [
@@ -421,15 +434,20 @@ def _rollback_purge_state(
                     f"{remote_main_oid}:refs/heads/main",
                 ],
             )
+            current_remote = _remote_main_oid(root)
+        if current_remote != remote_main_oid:
+            raise VaultError("remote purge rollback did not converge")
+        remote_restored = True
     except Exception as error:
         errors.append(error)
 
-    # Exact ref restoration already removes refs/original. Cleanup still
-    # expires rewrite reflogs and unreachable objects before returning.
-    try:
-        _cleanup_original_history(root)
-    except Exception as error:
-        errors.append(error)
+    # Never discard refs/original while either exact local refs or the remote
+    # still need recovery material.
+    if exact_refs_restored and remote_restored:
+        try:
+            _cleanup_original_history(root)
+        except Exception as error:
+            errors.append(error)
     return errors
 
 
@@ -600,7 +618,6 @@ def purge(
                     _run_git(
                         root, ["push", "--force", "origin", "HEAD:main"]
                     )
-                    _cleanup_original_history(root)
                 except Exception as error:
                     rollback_errors = _rollback_purge_state(
                         root,
@@ -611,12 +628,22 @@ def purge(
                         evaluation_attempts=attempt_snapshot,
                         receipt_attempts=receipt_attempt_snapshot,
                     )
-                    if rollback_errors and hasattr(error, "add_note"):
-                        error.add_note(
-                            "purge rollback encountered "
-                            f"{len(rollback_errors)} restoration failure(s)"
-                        )
+                    if rollback_errors:
+                        raise VaultError(
+                            "purge failed and rollback incomplete: "
+                            f"{error}"
+                        ) from error
                     raise
+                # A successful remote update is the commit point. Never undo
+                # the accepted rewrite because local pruning subsequently
+                # failed; retain refs/original as retry material instead.
+                try:
+                    _cleanup_original_history(root)
+                except Exception as error:
+                    raise VaultError(
+                        "remote rewrite applied; local cleanup incomplete; "
+                        "retry required"
+                    ) from error
     scope["apply"] = True
     return scope
 
