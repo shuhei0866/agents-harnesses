@@ -35,6 +35,7 @@ from receipt_automation import (
 from retention_state import load_forgotten, store_forgotten
 from semantic_receipts import semantic_receipt_record_snapshots
 from value_compiler import (
+    prepared_record_snapshots,
     remove_episode_attempts as remove_value_attempts,
     restore_attempts as restore_value_attempts,
     run_lock as value_compiler_lock,
@@ -134,6 +135,11 @@ def _scope(
             ),
             "value_primitive_card_record_count": len(
                 value_primitive_card_record_snapshots(
+                    root, policy_version, episode_id
+                )
+            ),
+            "value_compiler_prepared_record_count": len(
+                prepared_record_snapshots(
                     root, policy_version, episode_id
                 )
             ),
@@ -345,9 +351,9 @@ def purge(
     scope = _scope(root, episode_id, selected, trusted)
     if not apply:
         return scope
-    # Global order for purge is background evaluation, Receipt automation,
-    # then Vault. Each runner takes only its own run lock before Vault, so this
-    # order cannot form a cycle and blocks both evaluator types during purge.
+    # Global order for purge is Value Compiler, background evaluation,
+    # Receipt automation, then Vault. Each runner takes only its own run lock
+    # before Vault, so this cannot form a cycle and blocks all evaluators.
     with _purge_evaluator_locks(root):
         with receipt_automation_lock(root, blocking=True):
             with vault_lock(root):
@@ -378,6 +384,9 @@ def purge(
                     value_primitive_card_record_snapshots(
                         root, selected, episode_id
                     )
+                )
+                value_prepared_snapshots = prepared_record_snapshots(
+                    root, selected, episode_id
                 )
                 value_attempt_snapshot = remove_value_attempts(
                     root, episode_id, selected
@@ -410,6 +419,7 @@ def purge(
                         *semantic_receipt_snapshots,
                         *meaning_card_snapshots,
                         *value_primitive_card_snapshots,
+                        *value_prepared_snapshots,
                     ]
                     removed_derivatives: list[tuple[Path, bytes]] = []
                     try:
@@ -450,6 +460,8 @@ def purge(
                             atomic_replace(card_path, card_bytes)
                         for card_path, card_bytes in value_primitive_card_snapshots:
                             atomic_replace(card_path, card_bytes)
+                        for prepared_path, prepared_bytes in value_prepared_snapshots:
+                            atomic_replace(prepared_path, prepared_bytes)
                         _cleanup_original_history(root)
                         raise
                     _cleanup_original_history(root)
@@ -506,6 +518,8 @@ def render_purge(value: dict[str, Any]) -> str:
         f"{value['meaning_card_record_count']}\n"
         "Local Value Primitive Card records: "
         f"{value['value_primitive_card_record_count']}\n"
+        "Local Value Compiler prepared records: "
+        f"{value['value_compiler_prepared_record_count']}\n"
         "Local Value Compiler attempts: "
         f"{value['value_compiler_attempt_record_count']}\n"
         f"{value['limitation']}\n"
