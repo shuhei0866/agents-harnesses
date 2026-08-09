@@ -24,6 +24,7 @@ if capture:
         )
 
 counter = os.environ.get("FLIGHT_RECORDER_TEST_VALUE_COUNT")
+call_number = 1
 if counter:
     path = pathlib.Path(counter)
     with path.open("a+", encoding="utf-8") as stream:
@@ -34,12 +35,20 @@ if counter:
             count = int(stream.read())
         except ValueError:
             count = 0
+        call_number = count + 1
         stream.seek(0)
         stream.truncate()
         stream.write(str(count + 1))
         stream.flush()
         if fcntl is not None:
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+fail_call = os.environ.get("FLIGHT_RECORDER_TEST_VALUE_FAIL_CALL")
+if (
+    os.environ.get("FLIGHT_RECORDER_TEST_VALUE_FAIL_ALL") == "1"
+    or (fail_call is not None and call_number == int(fail_call))
+):
+    raise SystemExit("fixture provider failure")
 
 started = os.environ.get("FLIGHT_RECORDER_TEST_VALUE_STARTED")
 release = os.environ.get("FLIGHT_RECORDER_TEST_VALUE_RELEASE")

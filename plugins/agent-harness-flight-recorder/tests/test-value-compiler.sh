@@ -1157,8 +1157,459 @@ PY
   fi
 }
 
+test_reauthentication_scans_anchors_once_per_batch() {
+  echo "test_reauthentication_scans_anchors_once_per_batch:"
+  fresh_blocker_fixture cycle6-performance || {
+    fail "cycle6 performance fixtureを構築できる"
+    return
+  }
+  if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$STATE" <<'PY'
+import pathlib
+import sys
+
+import value_compiler
+
+root = pathlib.Path(sys.argv[1])
+counts = {"meaning": 0, "receipt": 0, "episode": 0, "edges": 0}
+original_meaning = value_compiler.stored_meaning_cards
+original_receipts = value_compiler._stored_receipts
+original_episode = value_compiler._episode_card
+original_edges = value_compiler._edges_by_episode
+
+
+def meanings(*args, **kwargs):
+    counts["meaning"] += 1
+    return original_meaning(*args, **kwargs)
+
+
+def receipts(*args, **kwargs):
+    counts["receipt"] += 1
+    return original_receipts(*args, **kwargs)
+
+
+def episode(*args, **kwargs):
+    counts["episode"] += 1
+    return original_episode(*args, **kwargs)
+
+
+def edges(*args, **kwargs):
+    counts["edges"] += 1
+    return original_edges(*args, **kwargs)
+
+
+value_compiler.stored_meaning_cards = meanings
+value_compiler._stored_receipts = receipts
+value_compiler._episode_card = episode
+value_compiler._edges_by_episode = edges
+result = value_compiler.compile_values(
+    root,
+    "flight-recorder-value-evaluator",
+    "value-model-cycle6-performance",
+    3,
+    18000,
+    60,
+)
+assert result["candidate_count"] == 3
+assert result["compiled_count"] == 3
+assert counts["meaning"] == 1, counts
+assert counts["receipt"] == 1, counts
+assert counts["episode"] <= 2 * result["candidate_count"], counts
+assert counts["edges"] <= 1, counts
+PY
+  then
+    pass "再認証はanchor全scanを繰返さず対象candidateだけ読む"
+  else
+    fail "再認証はanchor全scanを繰返さず対象candidateだけ読む"
+  fi
+}
+
+test_rehashed_semantic_tamper_rebuilds_current_packet() {
+  echo "test_rehashed_semantic_tamper_rebuilds_current_packet:"
+  local episode err="$TEST_ROOT/value-cycle6-tamper.err"
+  fresh_blocker_fixture cycle6-tamper || {
+    fail "cycle6 tamper fixtureを構築できる"
+    return
+  }
+  episode="$(episode_for_event 75000000-0000-4000-8000-000000000002)"
+  run_cli value compile \
+    --evaluator flight-recorder-value-evaluator --model value-model-cycle6-tamper \
+    --max-episodes 100 --max-cost-microusd 600000 --json \
+    >/dev/null 2>"$err" || {
+      fail "cycle6 tamper fixtureをprewarmできる"
+      return
+    }
+  if ! python3 - "$STATE" "$episode" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+directory = root / "value-primitive-cards"
+for path in directory.glob("*.json"):
+    card = json.loads(path.read_text())
+    if (
+        card["episode_id"] == episode
+        and card["provenance"]["evaluator_model"] == "value-model-cycle6-tamper"
+    ):
+        break
+else:
+    raise AssertionError("target card not found")
+goal = card["primitives"]["goal_achievement"]
+goal["state"] = "negative"
+reference = goal["evidence_references"][0]
+card["provenance"]["input_evidence_fields"][reference] = (
+    "receipt.result.outcome"
+)
+card["provenance"]["packet_sha256"] = "sha256:" + "f" * 64
+without_id = {
+    key: value for key, value in card.items()
+    if key != "value_primitive_card_id"
+}
+canonical = json.dumps(without_id, sort_keys=True, separators=(",", ":")).encode()
+card["value_primitive_card_id"] = "sha256:" + hashlib.sha256(canonical).hexdigest()
+target = directory / f"{card['value_primitive_card_id'].removeprefix('sha256:')}.json"
+target.write_text(json.dumps(card, sort_keys=True, separators=(",", ":")) + "\n")
+target.chmod(0o600)
+path.unlink()
+PY
+  then
+    fail "cycle6 semantic tamper setupが失敗した"
+    return
+  fi
+  if run_cli inspect "$episode" --json >/dev/null 2>"$err"; then
+    fail "再hash済みprimitive/evidence/packet改変を拒否する"
+  elif grep -q "Traceback" "$err"; then
+    fail "semantic tamperを有限エラーで拒否する"
+  else
+    pass "current anchorsからpacketを再構成し意味論改変を拒否する"
+  fi
+}
+
+test_unhashable_attempt_diagnostic_is_vault_error() {
+  echo "test_unhashable_attempt_diagnostic_is_vault_error:"
+  local episode err="$TEST_ROOT/value-cycle6-attempt.err"
+  fresh_blocker_fixture cycle6-attempt || {
+    fail "cycle6 attempt fixtureを構築できる"
+    return
+  }
+  episode="$(episode_for_event 75000000-0000-4000-8000-000000000001)"
+  PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$STATE" "$episode" <<'PY'
+import json
+import pathlib
+import sys
+
+import value_compiler
+
+root = pathlib.Path(sys.argv[1])
+attempt = value_compiler._new_attempt(
+    sys.argv[2],
+    "sha256:" + "a" * 64,
+    "value-model-cycle6-attempt",
+    "sha256:" + "b" * 64,
+    "default-v1",
+)
+attempt["state"] = "failed"
+attempt["diagnostic_code"] = []
+directory = root / "value-compiler"
+directory.mkdir(mode=0o700, exist_ok=True)
+path = directory / "attempts.json"
+path.write_text(json.dumps({"schema_version": 1, "attempts": [attempt]}))
+path.chmod(0o600)
+PY
+  if run_cli value compile \
+      --evaluator flight-recorder-value-evaluator --model value-model-cycle6-attempt \
+      --max-episodes 1 --max-cost-microusd 6000 --json \
+      >/dev/null 2>"$err"; then
+    fail "unhashable diagnosticを拒否する"
+  elif grep -Eq "Traceback|TypeError" "$err"; then
+    cat "$err" >&2
+    fail "unhashable diagnosticをVaultError化する"
+  else
+    pass "unhashable diagnosticをtracebackなしで拒否する"
+  fi
+}
+
+test_batch_failures_continue_and_return_nonzero() {
+  echo "test_batch_failures_continue_and_return_nonzero:"
+  local all_count="$TEST_ROOT/value-cycle6-all-count"
+  local one_count="$TEST_ROOT/value-cycle6-one-count"
+  local partial_count="$TEST_ROOT/value-cycle6-partial-count"
+  local all_err="$TEST_ROOT/value-cycle6-all.err"
+  local partial_err="$TEST_ROOT/value-cycle6-partial.err"
+  local all_status one_status partial_status
+  fresh_blocker_fixture cycle6-batch || {
+    fail "cycle6 batch fixtureを構築できる"
+    return
+  }
+  FLIGHT_RECORDER_TEST_VALUE_FAIL_ALL=1 \
+    FLIGHT_RECORDER_TEST_VALUE_COUNT="$all_count" \
+    run_cli value compile \
+      --evaluator flight-recorder-value-evaluator --model value-model-cycle6-all \
+      --max-episodes 2 --max-cost-microusd 12000 --json \
+      >"$TEST_ROOT/value-cycle6-all.json" 2>"$all_err"
+  all_status=$?
+  FLIGHT_RECORDER_TEST_VALUE_FAIL_ALL=1 \
+    FLIGHT_RECORDER_TEST_VALUE_COUNT="$one_count" \
+    run_cli value compile \
+      --evaluator flight-recorder-value-evaluator --model value-model-cycle6-one \
+      --max-episodes 1 --max-cost-microusd 6000 --json \
+      >"$TEST_ROOT/value-cycle6-one.json" 2>>"$all_err"
+  one_status=$?
+  FLIGHT_RECORDER_TEST_VALUE_FAIL_CALL=1 \
+    FLIGHT_RECORDER_TEST_VALUE_COUNT="$partial_count" \
+    run_cli value compile \
+      --evaluator flight-recorder-value-evaluator --model value-model-cycle6-partial \
+      --max-episodes 2 --max-cost-microusd 12000 --json \
+      >"$TEST_ROOT/value-cycle6-partial.json" 2>"$partial_err"
+  partial_status=$?
+  if python3 - \
+      "$STATE" "$all_count" "$one_count" "$partial_count" \
+      "$all_status" "$one_status" "$partial_status" <<'PY'
+import json
+import pathlib
+import sys
+
+(
+    state, all_count, one_count, partial_count,
+    all_status, one_status, partial_status,
+) = sys.argv[1:]
+assert int(all_status) != 0
+assert int(one_status) != 0
+assert int(partial_status) != 0
+assert int(pathlib.Path(all_count).read_text()) == 2
+assert int(pathlib.Path(one_count).read_text()) == 1
+assert int(pathlib.Path(partial_count).read_text()) == 2
+root = pathlib.Path(state)
+cards = [
+    json.loads(path.read_text())
+    for path in (root / "value-primitive-cards").glob("*.json")
+]
+assert not any(
+    item["provenance"]["evaluator_model"] == "value-model-cycle6-all"
+    for item in cards
+)
+assert not any(
+    item["provenance"]["evaluator_model"] == "value-model-cycle6-one"
+    for item in cards
+)
+assert sum(
+    item["provenance"]["evaluator_model"] == "value-model-cycle6-partial"
+    for item in cards
+) == 1
+ledger = json.loads((root / "value-compiler" / "attempts.json").read_text())
+assert sum(
+    item["evaluator_model"] == "value-model-cycle6-all"
+    and item["state"] == "failed"
+    for item in ledger["attempts"]
+) == 2
+assert sum(
+    item["evaluator_model"] == "value-model-cycle6-partial"
+    and item["state"] == "failed"
+    for item in ledger["attempts"]
+) == 1
+PY
+  then
+    pass "batchは失敗後も継続しpartial card保持とnonzeroを両立する"
+  else
+    cat "$all_err" "$partial_err" >&2
+    fail "batchは失敗後も継続しpartial card保持とnonzeroを両立する"
+  fi
+}
+
+test_complete_prepared_atomic_temp_recovers_pending_attempt() {
+  echo "test_complete_prepared_atomic_temp_recovers_pending_attempt:"
+  local counter="$TEST_ROOT/value-cycle6-prepared-temp-count"
+  fresh_blocker_fixture cycle6-prepared-temp || {
+    fail "cycle6 prepared temp fixtureを構築できる"
+    return
+  }
+  if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    FLIGHT_RECORDER_TEST_VALUE_COUNT="$counter" \
+    python3 - "$STATE" "$counter" <<'PY'
+import json
+import pathlib
+import time
+import sys
+
+import value_compiler
+from evaluation import _executable_identity, _invoke
+from vault import vault_lock
+
+root = pathlib.Path(sys.argv[1])
+counter = pathlib.Path(sys.argv[2])
+model = "value-model-cycle6-prepared-temp"
+evaluator_path, evaluator_sha256 = _executable_identity(
+    "flight-recorder-value-evaluator"
+)
+with vault_lock(root):
+    episode, packet = value_compiler._authenticated_packets(
+        root, "default-v1", None
+    )[0]
+request = {
+    "schema_version": 1,
+    "model": model,
+    "packet": packet,
+    "remaining_cost_microusd": 6000,
+}
+started = time.monotonic_ns()
+raw = _invoke(evaluator_path, evaluator_sha256, request, 60)
+latency = max(0, (time.monotonic_ns() - started) // 1_000_000)
+primitives, cost = value_compiler._validate_response(raw, packet, 6000)
+card = value_compiler._build_card(
+    episode,
+    packet,
+    primitives,
+    model,
+    evaluator_path,
+    evaluator_sha256,
+    "default-v1",
+    cost,
+    latency,
+)
+fingerprint = value_compiler._attempt_fingerprint(
+    packet["packet_sha256"], model, evaluator_sha256, "default-v1"
+)
+prepared = {
+    "schema_version": 1,
+    "contract_version": value_compiler.PREPARED_CONTRACT,
+    "fingerprint": fingerprint,
+    "episode_id": episode["episode_id"],
+    "packet_sha256": packet["packet_sha256"],
+    "evaluator_model": model,
+    "evaluator_adapter_sha256": evaluator_sha256,
+    "policy_version": "default-v1",
+    "card": card,
+}
+attempt = value_compiler._new_attempt(
+    episode["episode_id"],
+    packet["packet_sha256"],
+    model,
+    evaluator_sha256,
+    "default-v1",
+)
+with vault_lock(root):
+    path = value_compiler._store_prepared(root, prepared)
+    value_compiler._store_attempts(
+        root, {"schema_version": 1, "attempts": [attempt]}
+    )
+    temporary = path.with_name(f".{path.name}.fixture")
+    path.rename(temporary)
+
+result = value_compiler.compile_values(
+    root,
+    "flight-recorder-value-evaluator",
+    model,
+    1,
+    6000,
+    60,
+)
+assert int(counter.read_text()) == 1
+assert result["compiled_count"] == 1
+assert not temporary.exists()
+cards = [
+    json.loads(path.read_text())
+    for path in (root / "value-primitive-cards").glob("*.json")
+]
+assert any(
+    item["episode_id"] == episode["episode_id"]
+    and item["provenance"]["evaluator_model"] == model
+    for item in cards
+)
+PY
+  then
+    pass "完全prepared tempとpending attemptをproviderなしでfinalizeする"
+  else
+    fail "完全prepared tempとpending attemptをproviderなしでfinalizeする"
+  fi
+}
+
+setup_invalid_prepared_temp() {
+  local kind="$1"
+  fresh_blocker_fixture "cycle6-prepared-$kind" || return 1
+  PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$STATE" "$kind" <<'PY'
+import pathlib
+import sys
+
+import value_compiler
+from evaluation import _executable_identity
+from vault import vault_lock
+
+root = pathlib.Path(sys.argv[1])
+kind = sys.argv[2]
+model = f"value-model-cycle6-prepared-{kind}"
+_path, evaluator_sha256 = _executable_identity(
+    "flight-recorder-value-evaluator"
+)
+with vault_lock(root):
+    episode, packet = value_compiler._authenticated_packets(
+        root, "default-v1", None
+    )[0]
+    attempt = value_compiler._new_attempt(
+        episode["episode_id"],
+        packet["packet_sha256"],
+        model,
+        evaluator_sha256,
+        "default-v1",
+    )
+    value_compiler._store_attempts(
+        root, {"schema_version": 1, "attempts": [attempt]}
+    )
+directory = root / "value-compiler" / "prepared"
+directory.mkdir(mode=0o700, exist_ok=True)
+temp = directory / f".{attempt['fingerprint'].removeprefix('sha256:')}.json.fixture"
+if kind == "oversize":
+    temp.write_bytes(b"x" * (value_compiler.MAX_PREPARED_BYTES + 1))
+else:
+    temp.write_text("{}\n")
+temp.chmod(0o644 if kind == "unsafe" else 0o600)
+PY
+}
+
+test_invalid_prepared_temps_never_leave_silent_pending() {
+  echo "test_invalid_prepared_temps_never_leave_silent_pending:"
+  local kind status pending temp_count failures=0
+  for kind in incomplete oversize unsafe; do
+    setup_invalid_prepared_temp "$kind" || {
+      fail "invalid prepared $kind fixtureを構築できる"
+      return
+    }
+    run_cli value compile \
+      --evaluator flight-recorder-value-evaluator \
+      --model "value-model-cycle6-prepared-$kind" \
+      --max-episodes 1 --max-cost-microusd 6000 --json \
+      >/dev/null 2>"$TEST_ROOT/value-cycle6-prepared-$kind.err"
+    status=$?
+    pending="$(python3 - "$STATE" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1]) / "value-compiler" / "attempts.json"
+value = json.loads(path.read_text())
+print(sum(item["state"] == "pending" for item in value["attempts"]))
+PY
+)"
+    temp_count="$(find "$STATE/value-compiler/prepared" -type f \
+      -name '.*.json.*' | wc -l | tr -d ' ')"
+    if [[ "$status" -eq 0 && "$pending" -gt 0 && "$temp_count" -gt 0 ]]; then
+      failures=$((failures + 1))
+    fi
+  done
+  if [[ "$failures" -eq 0 ]]; then
+    pass "不完全・oversize・unsafe prepared tempを黙って永久pendingにしない"
+  else
+    fail "不完全・oversize・unsafe prepared tempを黙って永久pendingにしない"
+  fi
+}
+
 main() {
-  if [[ "${FLIGHT_RECORDER_TEST_VALUE_BLOCKERS_ONLY:-0}" == "1" ]]; then
+  if [[ "${FLIGHT_RECORDER_TEST_VALUE_BLOCKERS_ONLY:-0}" == "1" \
+      || "${FLIGHT_RECORDER_TEST_VALUE_CYCLE6_ONLY:-0}" == "1" ]]; then
     true
   elif ! build_fixture; then
     fail "Value Compiler fixtureを構築できる"
@@ -1215,6 +1666,38 @@ main() {
         fail "unknown blocker test case"
         ;;
     esac
+  elif [[ "${FLIGHT_RECORDER_TEST_VALUE_CYCLE6_ONLY:-0}" == "1" ]]; then
+    case "${FLIGHT_RECORDER_TEST_VALUE_CYCLE6_CASE:-all}" in
+      performance)
+        test_reauthentication_scans_anchors_once_per_batch
+        ;;
+      semantic-tamper)
+        test_rehashed_semantic_tamper_rebuilds_current_packet
+        ;;
+      attempt-shape)
+        test_unhashable_attempt_diagnostic_is_vault_error
+        ;;
+      prepared-temp)
+        test_complete_prepared_atomic_temp_recovers_pending_attempt
+        ;;
+      prepared-invalid)
+        test_invalid_prepared_temps_never_leave_silent_pending
+        ;;
+      batch-failure)
+        test_batch_failures_continue_and_return_nonzero
+        ;;
+      all)
+        test_reauthentication_scans_anchors_once_per_batch
+        test_rehashed_semantic_tamper_rebuilds_current_packet
+        test_unhashable_attempt_diagnostic_is_vault_error
+        test_complete_prepared_atomic_temp_recovers_pending_attempt
+        test_invalid_prepared_temps_never_leave_silent_pending
+        test_batch_failures_continue_and_return_nonzero
+        ;;
+      *)
+        fail "unknown cycle6 test case"
+        ;;
+    esac
   else
     test_versioned_cards_are_grounded_bounded_and_idempotent
     test_wrong_axis_reference_fails_closed_without_storing_a_card
@@ -1229,6 +1712,12 @@ main() {
     test_valid_provider_result_is_prepared_before_final_auth
     test_completed_attempts_are_cleaned_before_capacity_check
     test_card_storage_ignores_only_strict_atomic_temps
+    test_reauthentication_scans_anchors_once_per_batch
+    test_rehashed_semantic_tamper_rebuilds_current_packet
+    test_unhashable_attempt_diagnostic_is_vault_error
+    test_complete_prepared_atomic_temp_recovers_pending_attempt
+    test_invalid_prepared_temps_never_leave_silent_pending
+    test_batch_failures_continue_and_return_nonzero
   fi
   echo
   echo "Result: $PASS passed, $FAIL failed"

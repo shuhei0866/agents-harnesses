@@ -18,6 +18,7 @@ from typing import Iterator
 
 from chunk_rotation import canonical_json, parse_time, safe_subdirectory
 from evaluation import _evaluated_at, _executable_identity, _invoke, _safe_name
+from meaning_lift import _read_card_record as _read_meaning_card_record
 from meaning_lift import _stored_cards as stored_meaning_cards
 from reporting import (
     _authenticated_query_locked,
@@ -26,6 +27,7 @@ from reporting import (
     _policy_selection,
 )
 from retention_state import load_forgotten
+from semantic_receipts import _read_stored_receipt
 from semantic_receipts import _stored_receipts
 from vault import VaultError, atomic_replace, ensure_managed_gitignore, vault_lock
 
@@ -208,7 +210,10 @@ def _validate_attempt(value: object) -> dict[str, Any]:
         (card_id is not None and (
             not isinstance(card_id, str) or HASH_RE.fullmatch(card_id) is None
         ))
-        or (diagnostic is not None and diagnostic not in ATTEMPT_DIAGNOSTICS)
+        or (diagnostic is not None and (
+            not isinstance(diagnostic, str)
+            or diagnostic not in ATTEMPT_DIAGNOSTICS
+        ))
         or (state in {"pending", "prepared"} and (
             card_id is not None or diagnostic is not None
         ))
@@ -512,6 +517,23 @@ def _remove_attempt(root: Path, fingerprint: str) -> None:
     )
 
 
+def _fail_attempt_if_present(
+    root: Path,
+    fingerprint: str,
+    diagnostic_code: str,
+) -> None:
+    if any(
+        item["fingerprint"] == fingerprint
+        for item in _load_attempts(root)["attempts"]
+    ):
+        _replace_attempt(
+            root,
+            fingerprint,
+            "failed",
+            diagnostic_code=diagnostic_code,
+        )
+
+
 def _prune_completed_attempts(root: Path) -> dict[str, Any]:
     ledger = _load_attempts(root)
     remaining = [
@@ -666,6 +688,49 @@ def _observations(card: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _edges_for_episode_ids(
+    connection: Any,
+    policy_version: str,
+    episode_ids: set[str],
+) -> dict[str, list[dict[str, Any]]]:
+    if not episode_ids:
+        return {}
+    placeholders = ",".join("?" for _item in episode_ids)
+    query = f"""
+        SELECT left_member.episode_id, edge.left_event_id,
+               edge.right_event_id, edge.score, edge.decision,
+               edge.evidence_json
+        FROM relationship_edges AS edge
+        JOIN episode_members AS left_member
+          ON left_member.policy_version = edge.policy_version
+         AND left_member.event_id = edge.left_event_id
+        JOIN episode_members AS right_member
+          ON right_member.policy_version = edge.policy_version
+         AND right_member.event_id = edge.right_event_id
+         AND right_member.episode_id = left_member.episode_id
+        WHERE edge.policy_version = ? AND edge.decision = 'link'
+          AND left_member.episode_id IN ({placeholders})
+        ORDER BY left_member.episode_id, edge.left_event_id,
+                 edge.right_event_id
+    """
+    result: dict[str, list[dict[str, Any]]] = {}
+    for episode_id, left, right, score, decision, encoded in connection.execute(
+        query, (policy_version, *sorted(episode_ids))
+    ):
+        try:
+            evidence = json.loads(encoded)
+        except (TypeError, json.JSONDecodeError) as error:
+            raise VaultError("relationship evidence is invalid") from error
+        result.setdefault(episode_id, []).append({
+            "left_event_id": left,
+            "right_event_id": right,
+            "score": score,
+            "decision": decision,
+            "evidence": evidence,
+        })
+    return result
+
+
 def _episodes(
     root: Path,
     policy_version: str,
@@ -675,7 +740,9 @@ def _episodes(
     forgotten = load_forgotten(root)
 
     def query(connection: Any, policy: dict[str, Any]) -> list[dict[str, Any]]:
-        edges = _edges_by_episode(connection, policy_version)
+        edges = _edges_for_episode_ids(
+            connection, policy_version, episode_ids
+        )
         result = []
         for episode_id in sorted(episode_ids):
             if (policy_version, episode_id) in forgotten:
@@ -1066,6 +1133,14 @@ def _stored_records(root: Path) -> list[tuple[Path, bytes, dict[str, Any]]]:
         raise VaultError("Value Primitive Card storage is unsafe")
     try:
         metadata = directory.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o077
+        ):
+            raise VaultError(
+                "Value Compiler prepared storage is unsafe"
+            )
         paths = []
         for path in sorted(directory.iterdir()):
             if ATOMIC_TEMP_RE.fullmatch(path.name) is None:
@@ -1132,8 +1207,17 @@ def _validate_prepared(value: object) -> dict[str, Any]:
     return value
 
 
-def _read_prepared(path: Path) -> tuple[bytes, dict[str, Any]]:
-    if path.is_symlink() or CARD_FILE_RE.fullmatch(path.name) is None:
+def _read_prepared(
+    path: Path,
+    expected_fingerprint: str | None = None,
+) -> tuple[bytes, dict[str, Any]]:
+    is_target = CARD_FILE_RE.fullmatch(path.name) is not None
+    is_temporary = ATOMIC_TEMP_RE.fullmatch(path.name) is not None
+    if (
+        path.is_symlink()
+        or (expected_fingerprint is None and not is_target)
+        or (expected_fingerprint is not None and not is_temporary)
+    ):
         raise VaultError("stored Value Compiler prepared record is unsafe")
     descriptor = -1
     try:
@@ -1175,7 +1259,14 @@ def _read_prepared(path: Path) -> tuple[bytes, dict[str, Any]]:
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-    if path.stem != value["fingerprint"].removeprefix("sha256:"):
+    if expected_fingerprint is None and (
+        path.stem != value["fingerprint"].removeprefix("sha256:")
+    ):
+        raise VaultError("stored Value Compiler prepared filename is invalid")
+    if expected_fingerprint is not None and (
+        value["fingerprint"] != expected_fingerprint
+        or path.name[1:65] != expected_fingerprint.removeprefix("sha256:")
+    ):
         raise VaultError("stored Value Compiler prepared filename is invalid")
     return raw, value
 
@@ -1191,6 +1282,7 @@ def _stored_prepared_records(
     try:
         metadata = directory.lstat()
         paths = []
+        promoted: list[Path] = []
         for path in sorted(directory.iterdir()):
             if ATOMIC_TEMP_RE.fullmatch(path.name) is None:
                 paths.append(path)
@@ -1205,14 +1297,22 @@ def _stored_prepared_records(
                 raise VaultError(
                     "Value Compiler prepared temporary file is unsafe"
                 )
+            fingerprint = "sha256:" + path.name[1:65]
+            _raw, value = _read_prepared(path, fingerprint)
+            target = directory / f"{path.name[1:65]}.json"
+            if target.exists() or target.is_symlink():
+                _target_raw, target_value = _read_prepared(target)
+                if target_value != value:
+                    raise VaultError(
+                        "stored Value Compiler prepared record conflicts"
+                    )
+                path.unlink()
+            else:
+                os.replace(path, target)
+                promoted.append(target)
+        paths.extend(path for path in promoted if path not in paths)
     except OSError as error:
         raise VaultError("Value Compiler prepared storage is unsafe") from error
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
-        or metadata.st_mode & 0o077
-    ):
-        raise VaultError("Value Compiler prepared storage is unsafe")
     return [(path, *_read_prepared(path)) for path in paths]
 
 
@@ -1253,18 +1353,56 @@ def load_value_primitive_cards(
 ) -> list[dict[str, Any]]:
     result = [
         value for _path, _raw, value in _stored_records(root)
-        if value["episode_id"] == episode_id and value["provenance"]["policy_version"] == policy_version
+        if value["episode_id"] == episode_id
+        and value["provenance"]["policy_version"] == policy_version
     ]
-    current_observations = _observations(current_episode_card)
+    if not result:
+        return []
+    meanings = stored_meaning_cards(root)
+    receipts = [value for _path, _raw, value in _stored_receipts(root)]
+    anchors = _anchors_by_episode(
+        policy_version,
+        [current_episode_card],
+        meanings,
+        receipts,
+    )
+    current_anchors = anchors.get(episode_id)
+    if current_anchors is None:
+        raise VaultError(
+            "stored Value Primitive Card has no current semantic anchor"
+        )
+    current_packet = _packet(current_episode_card, current_anchors)
+    current_evidence = {
+        item["evidence_id"]: item
+        for item in current_packet["evidence"]
+    }
+    current_fields = {
+        evidence_id: item["field"]
+        for evidence_id, item in current_evidence.items()
+    }
     current_source_event_ids = current_episode_card.get("source_event_ids")
     for value in result:
+        provenance = value["provenance"]
         if (
-            value["observations"] != current_observations
-            or value["provenance"]["source_event_ids"]
-            != current_source_event_ids
+            value["observations"] != current_packet["observations"]
+            or provenance["source_event_ids"] != current_source_event_ids
+            or provenance["packet_sha256"]
+            != current_packet["packet_sha256"]
+            or provenance["input_anchor_ids"]
+            != current_packet["anchor_ids"]
+            or provenance["input_evidence_ids"]
+            != sorted(current_evidence)
+            or provenance["input_evidence_fields"] != current_fields
         ):
             raise VaultError(
-                "stored Value Primitive Card does not match current Episode"
+                "stored Value Primitive Card does not match current packet"
+            )
+        for axis, primitive in value["primitives"].items():
+            _validate_directional_grounding(
+                axis,
+                primitive["state"],
+                primitive["evidence_references"],
+                current_evidence,
             )
     result.sort(key=lambda item: (parse_time(item["provenance"]["generated_at"]), item["value_primitive_card_id"]))
     return result
@@ -1382,14 +1520,86 @@ def run_lock(root: Path, *, blocking: bool) -> Iterator[bool]:
         directory.chmod(0o700)
 
 
+def _build_anchor_index(
+    root: Path,
+    policy_version: str,
+) -> dict[str, Any]:
+    # These are the only full anchor-directory scans in one compiler batch.
+    meanings = stored_meaning_cards(root)
+    receipt_records = _stored_receipts(root)
+    records: dict[str, dict[str, Any]] = {}
+    for meaning in meanings:
+        path = root / "meaning-cards" / (
+            meaning["meaning_card_id"].removeprefix("sha256:") + ".json"
+        )
+        raw, current = _read_meaning_card_record(path)
+        if current != meaning:
+            raise VaultError("Meaning Card changed while indexing")
+        records[meaning["meaning_card_id"]] = {
+            "kind": "meaning",
+            "path": path,
+            "raw": raw,
+            "value": current,
+        }
+    receipts = []
+    for path, raw, receipt in receipt_records:
+        receipts.append(receipt)
+        records[receipt["receipt_id"]] = {
+            "kind": "receipt",
+            "path": path,
+            "raw": raw,
+            "value": receipt,
+        }
+    return {
+        "policy_version": policy_version,
+        "meanings": meanings,
+        "receipts": receipts,
+        "records": records,
+        "selected": {},
+    }
+
+
+def _refresh_selected_anchor_records(
+    index: dict[str, Any],
+    episode_ids: set[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    meanings = []
+    receipts = []
+    for episode_id in sorted(episode_ids):
+        selected = index["selected"].get(episode_id)
+        if not selected:
+            raise VaultError("value compiler anchor locator is missing")
+        for anchor_id in selected:
+            record = index["records"].get(anchor_id)
+            if record is None:
+                raise VaultError("value compiler anchor locator is invalid")
+            if record["kind"] == "meaning":
+                raw, current = _read_meaning_card_record(record["path"])
+                meanings.append(current)
+            elif record["kind"] == "receipt":
+                raw, current = _read_stored_receipt(record["path"])
+                receipts.append(current)
+            else:
+                raise VaultError("value compiler anchor locator is invalid")
+            if raw != record["raw"] or current != record["value"]:
+                raise VaultError("value compiler anchor changed during batch")
+    return meanings, receipts
+
+
 def _authenticated_packets(
     root: Path,
     policy_version: str,
     trusted: dict[str, Any] | None,
     episode_ids: set[str] | None = None,
+    anchor_index: dict[str, Any] | None = None,
+    *,
+    refresh: bool = False,
 ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
-    meanings = stored_meaning_cards(root)
-    receipts = [value for _path, _raw, value in _stored_receipts(root)]
+    index = anchor_index or _build_anchor_index(root, policy_version)
+    if index.get("policy_version") != policy_version:
+        raise VaultError("value compiler anchor locator policy conflicts")
+    meanings = index["meanings"]
+    receipts = index["receipts"]
     anchored_episode_ids = {
         item["episode_id"]
         for item in [*meanings, *receipts]
@@ -1397,12 +1607,25 @@ def _authenticated_packets(
     }
     if episode_ids is not None:
         anchored_episode_ids &= episode_ids
+    if refresh:
+        meanings, receipts = _refresh_selected_anchor_records(
+            index, anchored_episode_ids
+        )
     episodes = _episodes(
         root, policy_version, trusted, anchored_episode_ids
     )
     anchors = _anchors_by_episode(
         policy_version, episodes, meanings, receipts
     )
+    for episode_id, selected in anchors.items():
+        index["selected"][episode_id] = sorted(
+            item
+            for item in (
+                selected.get("meaning", {}).get("meaning_card_id"),
+                selected.get("receipt", {}).get("receipt_id"),
+            )
+            if item is not None
+        )
     return [
         (episode, _packet(episode, anchors[episode["episode_id"]]))
         for episode in episodes
@@ -1477,12 +1700,17 @@ def compile_values(
     reused = []
     attempt_skip_count = 0
     attempt_failure_count = 0
+    batch_failures: list[str] = []
     spent = 0
     with run_lock(root, blocking=True):
         with vault_lock(root):
             ensure_managed_gitignore(root)
+            anchor_index = _build_anchor_index(root, selected_policy)
             candidates = _authenticated_packets(
-                root, selected_policy, trusted
+                root,
+                selected_policy,
+                trusted,
+                anchor_index=anchor_index,
             )
             existing = _stored_records(root)
             card_index = {
@@ -1498,7 +1726,7 @@ def compile_values(
                 item["fingerprint"]: item
                 for item in ledger["attempts"]
             }
-            pending = []
+            pending_candidates = []
             ready = []
             for episode, packet in candidates:
                 generation_key = _generation_key(
@@ -1532,23 +1760,48 @@ def compile_values(
                     ready.append((episode, packet, fingerprint, *prepared))
                 elif fingerprint in attempts:
                     attempt_skip_count += 1
-                elif len(pending) < maximum_episodes:
-                    pending.append((episode, packet, fingerprint))
+                else:
+                    pending_candidates.append(
+                        (episode, packet, fingerprint)
+                    )
+            ready = ready[:maximum_episodes]
+            pending = pending_candidates[
+                :max(0, maximum_episodes - len(ready))
+            ]
 
         # Finalize durable provider results before considering new paid work.
         for episode, packet, fingerprint, prepared_path, prepared in ready:
             with vault_lock(root):
-                current_packets = _authenticated_packets(
-                    root,
-                    selected_policy,
-                    trusted,
-                    {episode["episode_id"]},
-                )
+                try:
+                    current_packets = _authenticated_packets(
+                        root,
+                        selected_policy,
+                        trusted,
+                        {episode["episode_id"]},
+                        anchor_index,
+                        refresh=True,
+                    )
+                except VaultError as error:
+                    _fail_attempt_if_present(
+                        root,
+                        fingerprint,
+                        "input_changed",
+                    )
+                    batch_failures.append(str(error))
+                    attempt_failure_count += 1
+                    continue
                 current = current_packets[0] if current_packets else None
                 if current is None or current[1] != packet:
-                    raise VaultError(
+                    _fail_attempt_if_present(
+                        root,
+                        fingerprint,
+                        "input_changed",
+                    )
+                    batch_failures.append(
                         "value compiler prepared input changed"
                     )
+                    attempt_failure_count += 1
+                    continue
                 _raw, current_prepared = _read_prepared(prepared_path)
                 if current_prepared != prepared:
                     raise VaultError(
@@ -1573,19 +1826,14 @@ def compile_values(
                 break
             remaining = maximum_cost_microusd - spent
             with vault_lock(root):
-                current = {
-                    item[0]["episode_id"]: item
-                    for item in _authenticated_packets(
-                        root,
-                        selected_policy,
-                        trusted,
-                        {episode["episode_id"]},
+                try:
+                    _refresh_selected_anchor_records(
+                        anchor_index, {episode["episode_id"]}
                     )
-                }.get(episode["episode_id"])
-                if current is None or current[1] != packet:
-                    raise VaultError(
-                        "value compiler input changed before evaluation"
-                    )
+                except VaultError as error:
+                    batch_failures.append(str(error))
+                    attempt_failure_count += 1
+                    continue
                 ledger = _load_attempts(root)
                 if any(
                     item["fingerprint"] == fingerprint
@@ -1639,7 +1887,7 @@ def compile_values(
                 primitives, cost = _validate_response(
                     raw, packet, remaining
                 )
-            except VaultError:
+            except VaultError as error:
                 with vault_lock(root):
                     _replace_attempt(
                         root,
@@ -1647,8 +1895,7 @@ def compile_values(
                         "failed",
                         diagnostic_code="provider_or_validation_failed",
                     )
-                if maximum_episodes == 1:
-                    raise
+                batch_failures.append(str(error))
                 attempt_failure_count += 1
                 continue
             with vault_lock(root):
@@ -1686,19 +1933,41 @@ def compile_values(
                     "value compiler caller exited during evaluation"
                 )
             with vault_lock(root):
-                current = {
-                    item[0]["episode_id"]: item
-                    for item in _authenticated_packets(
+                try:
+                    current_packets = _authenticated_packets(
                         root,
                         selected_policy,
                         trusted,
                         {episode["episode_id"]},
+                        anchor_index,
+                        refresh=True,
                     )
+                except VaultError as error:
+                    _replace_attempt(
+                        root,
+                        fingerprint,
+                        "failed",
+                        diagnostic_code="input_changed",
+                    )
+                    batch_failures.append(str(error))
+                    attempt_failure_count += 1
+                    continue
+                current = {
+                    item[0]["episode_id"]: item
+                    for item in current_packets
                 }.get(episode["episode_id"])
                 if current is None or current[1] != packet:
-                    raise VaultError(
+                    _replace_attempt(
+                        root,
+                        fingerprint,
+                        "failed",
+                        diagnostic_code="input_changed",
+                    )
+                    batch_failures.append(
                         "value compiler input changed during evaluation"
                     )
+                    attempt_failure_count += 1
+                    continue
                 generation_key = _generation_key(
                     episode["episode_id"],
                     packet["packet_sha256"],
@@ -1721,6 +1990,11 @@ def compile_values(
                 prepared_path.unlink()
                 _remove_attempt(root, fingerprint)
             spent += cost
+    if batch_failures:
+        raise VaultError(
+            "value compiler batch failed for "
+            f"{len(batch_failures)} candidate(s): {batch_failures[0]}"
+        )
     return {
         "schema_version": OUTPUT_VERSION,
         "command": "value compile",
