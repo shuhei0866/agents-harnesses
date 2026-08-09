@@ -497,11 +497,17 @@ retention snapshots remain read-only. Publication removes the reservation and
 prepared record, leaving the Card as the idempotency SSOT.
 
 Forget makes the Episode and derived Cards invisible. Purge removes Cards,
-prepared results, and attempts together with the source scope. Once history
-rewrite begins, every local or push failure enters one common best-effort
-rollback that restores Git refs, indexed state, local artifacts, modes, and
-attempt ledgers. Byte-exact rollback can temporarily consume memory
-proportional to the affected local files.
+prepared results, and attempts together with the source scope. Failures before
+the force-push commit point, including a rejected push, enter one common
+best-effort rollback that restores Git refs, indexed state, local artifacts,
+modes, and attempt ledgers. Immediately before force-push, the Recorder stores
+an owner-only, local `index/purge-recovery.json` marker containing only the old
+and rewritten Git object IDs plus Episode and policy identity. A successful
+push is the commit point: later local history cleanup is never allowed to undo
+the accepted remote rewrite. If cleanup fails or the process exits, the next
+matching `purge --apply` validates the marker and completes cleanup before
+trying to resolve the now-deleted Episode scope. Byte-exact pre-push rollback
+can temporarily consume memory proportional to the affected local files.
 
 ## Retention and deletion
 

@@ -57,6 +57,130 @@ LIMITATION = (
     "Best-effort purge cannot guarantee deletion from independent or "
     "uncontrolled remote clones, provider caches, or backups."
 )
+PURGE_RECOVERY_PATH = Path("index/purge-recovery.json")
+PURGE_RECOVERY_CONTRACT = "purge-cleanup-recovery-v1"
+MAX_PURGE_RECOVERY_BYTES = 4096
+GIT_OBJECT_ID_RE = re.compile(r"^[0-9a-f]{40,64}$")
+
+
+def _purge_recovery_directory(root: Path) -> Path:
+    directory = root / "index"
+    try:
+        metadata = directory.lstat()
+    except OSError as error:
+        raise VaultError("purge recovery directory is unsafe") from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise VaultError("purge recovery directory is unsafe")
+    return directory
+
+
+def _validate_purge_recovery(value: object) -> dict[str, Any]:
+    fields = {
+        "schema_version",
+        "contract_version",
+        "state",
+        "episode_id",
+        "policy_version",
+        "old_remote_oid",
+        "new_rewritten_oid",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise VaultError("purge recovery marker is invalid")
+    policy_version = value["policy_version"]
+    if (
+        isinstance(value["schema_version"], bool)
+        or not isinstance(value["schema_version"], int)
+        or value["schema_version"] != 1
+        or value["contract_version"] != PURGE_RECOVERY_CONTRACT
+        or value["state"] != "push_pending"
+        or not isinstance(value["episode_id"], str)
+        or EPISODE_ID_RE.fullmatch(value["episode_id"]) is None
+        or not isinstance(policy_version, str)
+        or not policy_version
+        or len(policy_version) > 128
+        or any(
+            character
+            not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+            for character in policy_version
+        )
+        or not isinstance(value["old_remote_oid"], str)
+        or GIT_OBJECT_ID_RE.fullmatch(value["old_remote_oid"]) is None
+        or not isinstance(value["new_rewritten_oid"], str)
+        or GIT_OBJECT_ID_RE.fullmatch(value["new_rewritten_oid"]) is None
+        or value["old_remote_oid"] == value["new_rewritten_oid"]
+    ):
+        raise VaultError("purge recovery marker is invalid")
+    return value
+
+
+def _load_purge_recovery(root: Path) -> dict[str, Any] | None:
+    _purge_recovery_directory(root)
+    path = root / PURGE_RECOVERY_PATH
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise VaultError("purge recovery marker is unsafe") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size > MAX_PURGE_RECOVERY_BYTES
+        ):
+            raise VaultError("purge recovery marker is unsafe")
+        chunks = []
+        remaining = MAX_PURGE_RECOVERY_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 4096))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > MAX_PURGE_RECOVERY_BYTES:
+            raise VaultError("purge recovery marker is unsafe")
+    except OSError as error:
+        raise VaultError("purge recovery marker is unsafe") from error
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(raw)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise VaultError("purge recovery marker is invalid") from error
+    return _validate_purge_recovery(value)
+
+
+def _store_purge_recovery(root: Path, value: dict[str, Any]) -> None:
+    expected = _validate_purge_recovery(value)
+    _purge_recovery_directory(root)
+    path = root / PURGE_RECOVERY_PATH
+    atomic_replace(path, canonical_json(expected) + b"\n")
+    current = _load_purge_recovery(root)
+    if current != expected:
+        raise VaultError("purge recovery marker changed while storing")
+
+
+def _clear_purge_recovery(
+    root: Path, expected: dict[str, Any]
+) -> None:
+    if _load_purge_recovery(root) != expected:
+        raise VaultError("purge recovery marker changed")
+    path = root / PURGE_RECOVERY_PATH
+    try:
+        path.unlink()
+        fsync_directory(path.parent)
+    except OSError as error:
+        raise VaultError("purge recovery marker cannot be removed") from error
 
 
 @contextlib.contextmanager
@@ -317,6 +441,61 @@ def _remote_main_oid(root: Path) -> str:
     return object_id
 
 
+def _cleanup_only_result(marker: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": OUTPUT_VERSION,
+        "command": "purge",
+        "episode_id": marker["episode_id"],
+        "policy_version": marker["policy_version"],
+        "apply": True,
+        "cleanup_only": True,
+        "chunks": [],
+        "evaluation_record_count": 0,
+        "semantic_receipt_record_count": 0,
+        "meaning_card_record_count": 0,
+        "value_primitive_card_record_count": 0,
+        "value_compiler_prepared_record_count": 0,
+        "value_compiler_attempt_record_count": 0,
+        "limitation": LIMITATION,
+    }
+
+
+def _resume_purge_recovery(
+    root: Path,
+    episode_id: str,
+    policy_version: str,
+) -> dict[str, Any] | None:
+    marker = _load_purge_recovery(root)
+    if marker is None:
+        return None
+    if (
+        marker["episode_id"] != episode_id
+        or marker["policy_version"] != policy_version
+    ):
+        raise VaultError("purge recovery marker does not match request")
+    _validate_remote_namespace(root)
+    remote_oid = _remote_main_oid(root)
+    local_oid = _ref_snapshot(root)["refs/heads/main"]
+    if remote_oid == marker["new_rewritten_oid"]:
+        if local_oid != marker["new_rewritten_oid"]:
+            raise VaultError("purge recovery local history diverged")
+        try:
+            _cleanup_original_history(root)
+            _clear_purge_recovery(root, marker)
+        except Exception as error:
+            raise VaultError(
+                "remote rewrite applied; local cleanup incomplete; "
+                "retry required"
+            ) from error
+        return _cleanup_only_result(marker)
+    if remote_oid == marker["old_remote_oid"]:
+        if local_oid != marker["old_remote_oid"]:
+            raise VaultError("purge recovery local history diverged")
+        _clear_purge_recovery(root, marker)
+        return None
+    raise VaultError("purge recovery remote history diverged")
+
+
 def _local_file_snapshots(
     paths: list[Path],
 ) -> list[tuple[Path, bytes | None, int | None]]:
@@ -518,15 +697,19 @@ def purge(
     apply: bool,
 ) -> dict[str, Any]:
     selected, trusted = _selection(episode_id, policy_version, policy_path)
-    scope = _scope(root, episode_id, selected, trusted)
     if not apply:
-        return scope
+        return _scope(root, episode_id, selected, trusted)
     # Global order for purge is Value Compiler, background evaluation,
     # Receipt automation, then Vault. Each runner takes only its own run lock
     # before Vault, so this cannot form a cycle and blocks all evaluators.
     with _purge_evaluator_locks(root):
         with receipt_automation_lock(root, blocking=True):
             with vault_lock(root):
+                recovered = _resume_purge_recovery(
+                    root, episode_id, selected
+                )
+                if recovered is not None:
+                    return recovered
                 # Reauthenticate and resolve scope under the same exclusive lock
                 # used for mutation so a sync/rebuild cannot make the preview stale.
                 scope = _scope(
@@ -572,6 +755,7 @@ def purge(
                         root / PENDING_PATH,
                         root / DATABASE_PATH,
                         root / FORGET_PATH,
+                        root / PURGE_RECOVERY_PATH,
                     )
                 )
                 rollback_paths.extend(
@@ -615,6 +799,17 @@ def purge(
                     # Keep refs/original until the remote accepts the rewrite.
                     # Any failure from rewrite onward runs the same complete
                     # rollback, including failures before this push.
+                    rewritten_oid = _ref_snapshot(root)["refs/heads/main"]
+                    recovery_marker = {
+                        "schema_version": 1,
+                        "contract_version": PURGE_RECOVERY_CONTRACT,
+                        "state": "push_pending",
+                        "episode_id": episode_id,
+                        "policy_version": selected,
+                        "old_remote_oid": original_remote_main,
+                        "new_rewritten_oid": rewritten_oid,
+                    }
+                    _store_purge_recovery(root, recovery_marker)
                     _run_git(
                         root, ["push", "--force", "origin", "HEAD:main"]
                     )
@@ -639,6 +834,7 @@ def purge(
                 # failed; retain refs/original as retry material instead.
                 try:
                     _cleanup_original_history(root)
+                    _clear_purge_recovery(root, recovery_marker)
                 except Exception as error:
                     raise VaultError(
                         "remote rewrite applied; local cleanup incomplete; "
@@ -656,6 +852,12 @@ def render_forget(value: dict[str, Any]) -> str:
 
 
 def render_purge(value: dict[str, Any]) -> str:
+    if value.get("cleanup_only") is True:
+        return (
+            "Recovered committed purge cleanup for episode "
+            f"{value['episode_id']} under policy "
+            f"{value['policy_version']}.\n"
+        )
     mode = "Applied" if value["apply"] else "Dry run"
     paths = "\n".join(
         f"- {item['source_path']}" for item in value["chunks"]

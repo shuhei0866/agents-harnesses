@@ -591,6 +591,31 @@ for path in sorted(root.rglob("*")):
 PY
 }
 
+write_purge_recovery_marker() {
+  local state="$1" episode="$2" old_oid="$3" new_oid="$4"
+  mkdir -p "$state/index"
+  chmod 700 "$state/index"
+  python3 - \
+    "$state/index/purge-recovery.json" "$episode" "$old_oid" "$new_oid" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+value = {
+    "schema_version": 1,
+    "contract_version": "purge-cleanup-recovery-v1",
+    "state": "push_pending",
+    "episode_id": sys.argv[2],
+    "policy_version": "default-v1",
+    "old_remote_oid": sys.argv[3],
+    "new_rewritten_oid": sys.argv[4],
+}
+path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+path.chmod(0o600)
+PY
+}
+
 test_forget_preserves_source_and_survives_rebuild() {
   echo "test_forget_preserves_source_and_survives_rebuild:"
   local base="$TEST_ROOT/forget"
@@ -1397,6 +1422,247 @@ PY
   fi
 }
 
+test_cleanup_failure_marker_recovers_before_scope() {
+  echo "test_cleanup_failure_marker_recovers_before_scope:"
+  local base="$TEST_ROOT/purge-cycle11-cleanup"
+  local state="$base/vault" remote="$base/remote.git"
+  local db="$state/index/vault.sqlite"
+  local episode old_oid new_oid marker="$state/index/purge-recovery.json"
+  init_fixture "$base" || {
+    fail "cycle11 cleanup marker fixtureを作成できる"
+    return
+  }
+  episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+  old_oid="$(git --git-dir="$remote" rev-parse main)"
+  if ! PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$state" "$episode" "$marker" <<'PY'
+import json
+import pathlib
+import stat
+import sys
+
+import retention
+from vault import VaultError
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+marker = pathlib.Path(sys.argv[3])
+original_run_git = retention._run_git
+
+
+def validate_marker_before_push():
+    metadata = marker.lstat()
+    assert stat.S_ISREG(metadata.st_mode)
+    assert stat.S_IMODE(metadata.st_mode) == 0o600
+    assert metadata.st_uid == __import__("os").geteuid()
+    assert metadata.st_nlink == 1
+    value = json.loads(marker.read_text())
+    assert value == {
+        "schema_version": 1,
+        "contract_version": "purge-cleanup-recovery-v1",
+        "state": "push_pending",
+        "episode_id": episode,
+        "policy_version": "default-v1",
+        "old_remote_oid": value["old_remote_oid"],
+        "new_rewritten_oid": value["new_rewritten_oid"],
+    }
+    assert value["new_rewritten_oid"] == retention._ref_snapshot(root)["refs/heads/main"]
+
+
+def checked_run_git(root, arguments, *, env=None):
+    if arguments[:3] == ["push", "--force", "origin"]:
+        validate_marker_before_push()
+    return original_run_git(root, arguments, env=env)
+
+
+retention._run_git = checked_run_git
+retention._cleanup_original_history = lambda _root: (
+    (_ for _ in ()).throw(VaultError("fixture cleanup failure"))
+)
+try:
+    retention.purge(root, episode, None, None, apply=True)
+except VaultError as error:
+    assert "remote rewrite applied" in str(error).lower()
+else:
+    raise AssertionError("cleanup failure unexpectedly succeeded")
+PY
+  then
+    fail "push前marker保存とcleanup failureを注入できる"
+    return
+  fi
+  if ! python3 - "$marker" "$episode" "$old_oid" <<'PY'
+import json
+import pathlib
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+metadata = path.lstat()
+assert stat.S_ISREG(metadata.st_mode)
+assert stat.S_IMODE(metadata.st_mode) == 0o600
+assert metadata.st_nlink == 1
+value = json.loads(path.read_text())
+assert value["episode_id"] == sys.argv[2]
+assert value["old_remote_oid"] == sys.argv[3]
+assert value["state"] == "push_pending"
+PY
+  then
+    fail "cleanup failure後にstrict durable markerが残る"
+    return
+  fi
+  new_oid="$(git --git-dir="$remote" rev-parse main)"
+  if [[ "$new_oid" == "$old_oid" ]]; then
+    fail "cleanup failure前のremote rewriteがcommit済みである"
+    return
+  fi
+  if run_cli "$state" purge "$episode" --apply \
+      >"$base/retry.out" 2>"$base/retry.err" \
+    && [[ "$(git --git-dir="$remote" rev-parse main)" == "$new_oid" \
+      && ! -e "$marker" ]] \
+    && [[ -z "$(
+      git -C "$state" for-each-ref --format='%(refname)' refs/original/
+    )" ]]; then
+    pass "cleanup失敗後の再applyはscope前にcleanup-only回復する"
+  else
+    fail "cleanup失敗後の再applyはscope前にcleanup-only回復する"
+  fi
+}
+
+test_crash_after_push_recovers_cleanup_only() {
+  echo "test_crash_after_push_recovers_cleanup_only:"
+  local base="$TEST_ROOT/purge-cycle11-crash"
+  local state="$base/vault" remote="$base/remote.git"
+  local db="$state/index/vault.sqlite"
+  local episode old_oid new_oid marker="$state/index/purge-recovery.json"
+  local status
+  init_fixture "$base" || {
+    fail "cycle11 crash marker fixtureを作成できる"
+    return
+  }
+  episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+  old_oid="$(git --git-dir="$remote" rev-parse main)"
+  PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$state" "$episode" "$marker" <<'PY'
+import pathlib
+import sys
+
+import retention
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+marker = pathlib.Path(sys.argv[3])
+original_run_git = retention._run_git
+
+
+def checked_run_git(root, arguments, *, env=None):
+    if arguments[:3] == ["push", "--force", "origin"]:
+        assert marker.is_file(), "push occurred before durable marker"
+    return original_run_git(root, arguments, env=env)
+
+
+retention._run_git = checked_run_git
+retention._cleanup_original_history = lambda _root: (_ for _ in ()).throw(
+    SystemExit(75)
+)
+retention.purge(root, episode, None, None, apply=True)
+PY
+  status=$?
+  new_oid="$(git --git-dir="$remote" rev-parse main)"
+  if [[ "$status" -eq 75 && "$new_oid" != "$old_oid" && -f "$marker" ]] \
+    && run_cli "$state" purge "$episode" --apply \
+      >"$base/retry.out" 2>"$base/retry.err" \
+    && [[ "$(git --git-dir="$remote" rev-parse main)" == "$new_oid" \
+      && ! -e "$marker" ]]; then
+    pass "push後process crashのmarkerをcleanup-onlyで回収する"
+  else
+    fail "push後process crashのmarkerをcleanup-onlyで回収する"
+  fi
+}
+
+test_push_pending_marker_with_old_remote_resumes_normal_purge() {
+  echo "test_push_pending_marker_with_old_remote_resumes_normal_purge:"
+  local base="$TEST_ROOT/purge-cycle11-old-remote"
+  local state="$base/vault" remote="$base/remote.git"
+  local db="$state/index/vault.sqlite"
+  local episode old_oid marker="$state/index/purge-recovery.json"
+  init_fixture "$base" || {
+    fail "cycle11 old-remote marker fixtureを作成できる"
+    return
+  }
+  episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+  old_oid="$(git --git-dir="$remote" rev-parse main)"
+  write_purge_recovery_marker \
+    "$state" "$episode" "$old_oid" "$(printf 'b%.0s' {1..40})"
+  if run_cli "$state" purge "$episode" --apply \
+      >"$base/apply.out" 2>"$base/apply.err" \
+    && [[ ! -e "$marker" \
+      && "$(git --git-dir="$remote" rev-parse main)" != "$old_oid" ]]; then
+    pass "remote==oldのpush_pending markerをclearしnormal purgeを続行する"
+  else
+    fail "remote==oldのpush_pending markerをclearしnormal purgeを続行する"
+  fi
+}
+
+test_unsafe_cleanup_markers_fail_before_mutation() {
+  echo "test_unsafe_cleanup_markers_fail_before_mutation:"
+  local kind base state remote db episode marker old_oid new_oid
+  local before_files before_head before_remote failures=0 status
+  for kind in malformed symlink hardlink mode remote-diverged; do
+    base="$TEST_ROOT/purge-cycle11-unsafe-$kind"
+    state="$base/vault"
+    remote="$base/remote.git"
+    db="$state/index/vault.sqlite"
+    marker="$state/index/purge-recovery.json"
+    init_fixture "$base" || {
+      fail "cycle11 unsafe $kind fixtureを作成できる"
+      return
+    }
+    episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+    old_oid="$(git --git-dir="$remote" rev-parse main)"
+    new_oid="$(printf 'b%.0s' {1..40})"
+    if [[ "$kind" == "remote-diverged" ]]; then
+      write_purge_recovery_marker \
+        "$state" "$episode" "$(printf 'a%.0s' {1..40})" "$new_oid"
+    else
+      write_purge_recovery_marker "$state" "$episode" "$old_oid" "$new_oid"
+    fi
+    case "$kind" in
+      malformed)
+        printf '%s\n' '{"schema_version":1,"broken":true}' >"$marker"
+        chmod 600 "$marker"
+        ;;
+      symlink)
+        mv "$marker" "$state/index/purge-recovery-target.json"
+        ln -s purge-recovery-target.json "$marker"
+        ;;
+      hardlink)
+        ln "$marker" "$state/index/purge-recovery-hardlink.json"
+        ;;
+      mode)
+        chmod 644 "$marker"
+        ;;
+    esac
+    before_files="$(vault_byte_snapshot "$state")"
+    before_head="$(git -C "$state" rev-parse HEAD)"
+    before_remote="$(git --git-dir="$remote" rev-parse main)"
+    run_cli "$state" purge "$episode" --apply \
+      >"$base/apply.out" 2>"$base/apply.err"
+    status=$?
+    if [[ "$status" -eq 0 \
+      || "$before_head" != "$(git -C "$state" rev-parse HEAD)" \
+      || "$before_remote" != "$(git --git-dir="$remote" rev-parse main)" \
+      || "$before_files" != "$(vault_byte_snapshot "$state")" \
+      || $(grep -c 'Traceback' "$base/apply.err") -ne 0 ]]; then
+      failures=$((failures + 1))
+    fi
+  done
+  if [[ "$failures" -eq 0 ]]; then
+    pass "malformed/unsafe/diverged cleanup markerをmutation前に拒否する"
+  else
+    fail "malformed/unsafe/diverged cleanup markerをmutation前に拒否する"
+  fi
+}
+
 echo "=== Flight Recorder Retention Tests ==="
 if [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE7_ONLY:-0}" == "1" ]]; then
   test_purge_push_rejection_restores_retryable_local_state
@@ -1428,6 +1694,30 @@ elif [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE10_ONLY:-0}" == "1" ]]; then
       fail "unknown cycle10 test case"
       ;;
   esac
+elif [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE11_ONLY:-0}" == "1" ]]; then
+  case "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE11_CASE:-all}" in
+    cleanup)
+      test_cleanup_failure_marker_recovers_before_scope
+      ;;
+    crash)
+      test_crash_after_push_recovers_cleanup_only
+      ;;
+    old-remote)
+      test_push_pending_marker_with_old_remote_resumes_normal_purge
+      ;;
+    unsafe)
+      test_unsafe_cleanup_markers_fail_before_mutation
+      ;;
+    all)
+      test_cleanup_failure_marker_recovers_before_scope
+      test_crash_after_push_recovers_cleanup_only
+      test_push_pending_marker_with_old_remote_resumes_normal_purge
+      test_unsafe_cleanup_markers_fail_before_mutation
+      ;;
+    *)
+      fail "unknown cycle11 test case"
+      ;;
+  esac
 else
   test_forget_preserves_source_and_survives_rebuild
   test_dangling_forget_marker_fails_closed
@@ -1441,6 +1731,10 @@ else
   test_incomplete_ref_rollback_preserves_original_history
   test_cli_reports_incomplete_rollback_with_original_context
   test_post_push_cleanup_failure_keeps_remote_commit_point
+  test_cleanup_failure_marker_recovers_before_scope
+  test_crash_after_push_recovers_cleanup_only
+  test_push_pending_marker_with_old_remote_resumes_normal_purge
+  test_unsafe_cleanup_markers_fail_before_mutation
 fi
 echo
 echo "Results: $PASS passed, $FAIL failed"
