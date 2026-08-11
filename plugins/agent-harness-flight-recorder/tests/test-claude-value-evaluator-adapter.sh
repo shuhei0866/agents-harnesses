@@ -507,6 +507,7 @@ axes = {
     "attention_saved",
     "rework",
 }
+
 assert set(value) == {"schema_version", "primitives", "measured_cost_microusd"}
 assert value["schema_version"] == 1
 assert value["measured_cost_microusd"] == 12346
@@ -578,6 +579,36 @@ PY
     cat "$error" >&2
     fail "Value packetをsafe/tool-less/nonpersistentな8軸schema呼出しへ変換する"
     fail "basisなしprovider fields・専用signalなしunknown・実測costだけを返す"
+  fi
+}
+
+test_system_prompt_states_exact_24_character_copy_boundary() {
+  echo "test_system_prompt_states_exact_24_character_copy_boundary:"
+  local capture="$TEST_ROOT/capture-prompt-copy-boundary"
+  local output="$TEST_ROOT/prompt-copy-boundary.out"
+  local error="$TEST_ROOT/prompt-copy-boundary.err"
+  write_request "$REQUEST"
+  if run_adapter value-valid "$capture" "$REQUEST" \
+      >"$output" 2>"$error" \
+    && [[ ! -s "$error" ]] \
+    && python3 - "$capture/argv.json" <<'PY'
+import json
+import pathlib
+import sys
+
+argv = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+index = argv.index("--system-prompt")
+prompt = argv[index + 1].casefold()
+assert (
+    "never copy any exact contiguous sequence of 24 or more characters "
+    "from evidence prose."
+) in prompt
+PY
+  then
+    pass "system promptにevidence proseのexact contiguous 24+文字copy禁止を明示する"
+  else
+    cat "$error" >&2
+    fail "system promptにevidence proseのexact contiguous 24+文字copy禁止を明示する"
   fi
 }
 
@@ -669,6 +700,7 @@ test_value_compile_timeout_layers_enclose_inner_provider
 test_shared_helper_tamper_fails_before_provider_and_binds_fingerprint
 test_verified_helper_bytes_are_the_only_executed_source
 test_value_packet_becomes_safe_axis_grounded_call
+test_system_prompt_states_exact_24_character_copy_boundary
 test_short_enum_tokens_do_not_trigger_raw_prose_copy_rule
 test_deliverable_quality_matches_compiler_evidence_allowlist
 test_request_bounds_fail_before_provider

@@ -102,7 +102,9 @@ SYSTEM_PROMPT = (
     "preferences, weights, ROI, aggregate scores, or observed facts. Use only "
     "the evidence references allowed for that axis; report unknown when the "
     "dedicated evidence is insufficient. Paraphrase without copying raw packet "
-    "text, paths, secrets, identifiers, hashes, UUIDs, or email addresses."
+    "text: never copy any exact contiguous sequence of 24 or more characters "
+    "from evidence prose. Never reproduce paths, secrets, identifiers, hashes, "
+    "UUIDs, or email addresses."
 )
 
 
