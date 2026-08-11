@@ -408,3 +408,27 @@ Accepted decisions remain recorded when later superseded.
   execution and any unattended schedule remain disabled until the owner gives
   a positive budget and a 10--20 Episode pilot can compare these abstractions
   with felt value.
+
+## D-20260811-28: Classify comparable Session Atlas cohorts before comparison
+
+- Status: accepted
+- Decision: represent comparability with two independent layers: deterministic
+  structural facets for authenticated Episodes and a finite semantic
+  `domain / activity / deliverable_kind` overlay for Episodes with a current
+  Meaning Card or Semantic Receipt. Construct cohorts at query time from
+  explicit facet matches. Do not store a global cluster, hidden distance, rank,
+  or scalar, and do not treat two `unknown` values as a match.
+- Reason: the first Value pilot placed an identity-merge implementation and a
+  Git pull/repair operation beside each other even though their work was not
+  comparable. Classifying ten Receipt-anchored Episodes separated those tasks
+  and produced two repeated exact cohorts without forcing every Episode into a
+  group.
+- Consequence: model, harness, outcome, verification, duration, cost, retries,
+  and Value remain comparison columns inside a cohort rather than cohort keys.
+  A manually authorized positive-budget pilot ran on 2026-08-11; unattended
+  provider execution remains disabled. Its analyst-guided labels are
+  provisional and were not stored as production Atlas Cards.
+  Production-wide classification waits for a bounded authenticated-index hot
+  path, then deterministic Atlas projection, then semantic background
+  classification. The pilot and rollout order are recorded in
+  `SESSION_ATLAS_PILOT.md` and GitHub issues #49, #51, and #50.

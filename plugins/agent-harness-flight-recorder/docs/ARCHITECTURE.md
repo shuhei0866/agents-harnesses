@@ -584,6 +584,9 @@ this limitation clearly.
 
 ### Later
 
+- authenticated evidence-index seals for bounded hot-path reads;
+- deterministic Session Atlas facets and query-time cohort construction;
+- bounded semantic taxonomy for Episodes with current anchors;
 - selected, privacy-reviewed episode export;
 - aggregate signals and incentive design;
 - context-aware model and skill routing.

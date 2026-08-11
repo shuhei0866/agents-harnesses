@@ -512,6 +512,14 @@ physically removes matching cards, prepared results, and attempts; purge
 rollback snapshots are byte-exact and can temporarily use memory proportional
 to the affected local artifacts.
 
+The first classification pilot is recorded in
+[`docs/SESSION_ATLAS_PILOT.md`](docs/SESSION_ATLAS_PILOT.md). It assigns
+independent `domain`, `activity`, and `deliverable_kind` facets before comparing
+sessions. Model, harness, outcome, duration, cost, and Value remain comparison
+columns inside an explicit cohort rather than classification inputs. Production
+backfill and background classification stay disabled until authenticated
+hot-path reads are bounded.
+
 ### Unconscious Semantic Receipts
 
 Opt in once to automatic session matching for both harnesses:
