@@ -450,10 +450,22 @@ def _validate_response(
             source_fragments.add(candidate)
         try:
             decoded = json.loads(line)
-        except (ValueError, UnicodeError, RecursionError):
+        except json.JSONDecodeError:
             continue
+        except (UnicodeError, RecursionError) as error:
+            raise VaultError(
+                "semantic evaluator source content is invalid"
+            ) from error
+        try:
+            nested_strings = strings(decoded)
+        except RecursionError as error:
+            raise VaultError(
+                "semantic evaluator source content is invalid"
+            ) from error
         source_fragments.update(
-            text for text in strings(decoded) if len(text.strip()) >= 32
+            text.strip()
+            for text in nested_strings
+            if len(text.strip()) >= 32
         )
     if any(
         fragment in response_text

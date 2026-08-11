@@ -1487,10 +1487,105 @@ PY
   fi
 }
 
+test_recursive_privacy_failure_closes_attempt() {
+  echo "test_recursive_privacy_failure_closes_attempt:"
+  local STATE="$TEST_ROOT/recursive-privacy-vault"
+  local CLAUDE_ROOT="$TEST_ROOT/recursive-privacy-claude"
+  local CODEX_ROOT="$TEST_ROOT/recursive-privacy-codex"
+  local remote="$TEST_ROOT/recursive-privacy-remote.git"
+  local recovery="$TEST_ROOT/recursive-privacy-recovery.agekey"
+  local source="$CLAUDE_ROOT/claude-auto-session.jsonl"
+  local capture="$TEST_ROOT/recursive-privacy-capture"
+  local output="$TEST_ROOT/recursive-privacy.json"
+  local error="$TEST_ROOT/recursive-privacy.err"
+  mkdir -p "$CLAUDE_ROOT" "$CODEX_ROOT" "$capture/bin"
+  git init -q --bare "$remote"
+  git -C "$remote" symbolic-ref HEAD refs/heads/main
+  PATH="$FAKE_BIN:$PATH" age-keygen -o "$recovery" >/dev/null 2>&1
+  if ! run_cli init \
+      --remote "$remote" \
+      --recovery-recipient \
+      "$(PATH="$FAKE_BIN:$PATH" age-keygen -y "$recovery")" \
+      >/dev/null 2>&1; then
+    fail "再帰超過attempt fixtureを初期化する"
+    return
+  fi
+  if ! PATH="$FAKE_CLAUDE_BIN:$FAKE_BIN:$PATH" \
+      FLIGHT_RECORDER_STATE_DIR="$STATE" \
+      "$CLI" receipt-auto configure \
+        --claude-code-root "$CLAUDE_ROOT" \
+        --codex-root "$CODEX_ROOT" \
+        --evaluator flight-recorder-claude-semantic-evaluator \
+        --model claude-sonnet-fixture \
+        --rubric "$RUBRIC" \
+        --policy-version default-v1 \
+        --quiescence-seconds 0 \
+        --max-receipts-per-run 1 \
+        --max-cost-microusd-per-run 50000 \
+        --json >/dev/null 2>"$TEST_ROOT/recursive-privacy-config.err"; then
+    fail "再帰超過attempt fixtureを構成する"
+    return
+  fi
+  cp "$FAKE_CLAUDE_BIN/claude" "$capture/bin/claude"
+  python3 - "$FIXTURES/claude-code-auto-session.jsonl" "$source" <<'PY'
+import pathlib
+import sys
+
+fixture, destination = map(pathlib.Path, sys.argv[1:])
+lines = fixture.read_text(encoding="utf-8").splitlines()
+deep_object = '{"padding":' * 2000 + '"PRIVATE"' + '}' * 2000
+# Keep every top-level row an object so Claude span discovery remains exact.
+# The privacy validator must still reject the deeply nested selected row.
+lines.insert(4, deep_object)
+destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+  record_stop claude-code claude-auto-session "" "$source"
+  run_cli sync >/dev/null 2>&1
+  run_cli rebuild-index >/dev/null 2>&1
+  if PATH="$FAKE_CLAUDE_BIN:$PATH" \
+      FLIGHT_RECORDER_TEST_HARNESS=1 \
+      FLIGHT_RECORDER_TEST_CLAUDE_EXECUTABLE="$capture/bin/claude" \
+      FLIGHT_RECORDER_TEST_CLAUDE_CAPTURE_DIR="$capture" \
+      FLIGHT_RECORDER_TEST_CLAUDE_MODE=valid \
+      run_cli receipt-auto run --json >"$output" 2>"$error" \
+    && python3 - "$output" "$STATE" <<'PY'
+import json
+import pathlib
+import sys
+
+output_path = pathlib.Path(sys.argv[1])
+root = pathlib.Path(sys.argv[2])
+value = json.loads(output_path.read_text(encoding="utf-8"))
+attempts = json.loads(
+    (root / "receipt-automation/attempts.json").read_text(encoding="utf-8")
+)["items"]
+assert value["failed_count"] == 1
+assert value["generated_count"] == 0
+assert len(attempts) == 1
+assert attempts[0]["state"] == "failed"
+assert not any(item["state"] == "pending" for item in attempts)
+assert not list((root / "semantic-receipts").glob("*.json"))
+PY
+  then
+    pass "再帰超過をfailed attemptへ閉じ永久pendingを残さない"
+  else
+    cat "$output" >&2
+    cat "$error" >&2
+    fail "再帰超過をfailed attemptへ閉じ永久pendingを残さない"
+  fi
+}
+
 echo "=== Flight Recorder Automatic Semantic Receipt Tests ==="
 if ! init_fixture; then
   echo "fixture setup failed" >&2
   exit 1
+fi
+if [[ "${FLIGHT_RECORDER_TEST_RECURSIVE_PRIVACY_ONLY:-0}" == "1" ]]; then
+  test_recursive_privacy_failure_closes_attempt
+  echo
+  echo "Results: $PASS passed, $FAIL failed"
+  [[ "$FAIL" -eq 0 ]]
+  exit
 fi
 test_configure_is_strict_atomic_and_content_free
 if [[ -f "$STATE/receipt-automation/config.json" ]]; then
@@ -1511,6 +1606,7 @@ if [[ -f "$STATE/receipt-automation/config.json" ]]; then
   test_maximum_legal_prepared_attempt_is_below_four_mib
   test_blocking_run_lock_has_a_retry_bound
   test_terminal_hints_are_compacted_before_the_limit
+  test_recursive_privacy_failure_closes_attempt
 fi
 
 echo

@@ -175,6 +175,64 @@ if mode == "unsafe-execution-model":
     semantic["execution"]["model"] = "Claude Sonnet 4.6"
 if mode == "echo-source":
     semantic["result"]["summary"] = "RAW_SOURCE_CANARY_iam178"
+if mode == "nested-jsonl-copy":
+    nested_strings = []
+
+    def strings(value):
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, dict):
+            return [
+                item for nested in value.values() for item in strings(nested)
+            ]
+        if isinstance(value, list):
+            return [item for nested in value for item in strings(nested)]
+        return []
+
+    for line in request.get("source", {}).get("content", "").splitlines():
+        try:
+            nested_strings.extend(strings(json.loads(line)))
+        except json.JSONDecodeError:
+            continue
+    copied = [item for item in nested_strings if len(item.strip()) >= 32]
+    if not copied:
+        raise SystemExit(91)
+    semantic["result"]["summary"] = copied[0]
+if mode.startswith("trimmed-jsonl-"):
+    target_prefix = {
+        "trimmed-jsonl-dict-copy": "D",
+        "trimmed-jsonl-list-copy": "L",
+        "trimmed-jsonl-primitive-copy": "P",
+        "trimmed-jsonl-short-copy": "S",
+    }.get(mode)
+    if target_prefix is None:
+        raise SystemExit(92)
+
+    def strings(value):
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, dict):
+            return [
+                item for nested in value.values() for item in strings(nested)
+            ]
+        if isinstance(value, list):
+            return [item for nested in value for item in strings(nested)]
+        return []
+
+    candidates = []
+    for line in request.get("source", {}).get("content", "").splitlines():
+        try:
+            candidates.extend(strings(json.loads(line)))
+        except json.JSONDecodeError:
+            continue
+    selected = [
+        item.strip()
+        for item in candidates
+        if item.strip().startswith(target_prefix)
+    ]
+    if len(selected) != 1:
+        raise SystemExit(93)
+    semantic["result"]["summary"] = selected[0]
 
 total_cost_usd: object = 0.012345000001
 if mode == "over-budget":
