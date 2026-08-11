@@ -1225,6 +1225,264 @@ PY
   fi
 }
 
+test_ten_candidate_batch_authenticates_graph_constant_times() {
+  echo "test_ten_candidate_batch_authenticates_graph_constant_times:"
+  local metrics="$TEST_ROOT/value-pilot-auth-metrics.json"
+  local event digit label second
+  fresh_blocker_fixture pilot-graph-auth || {
+    fail "pilot graph auth fixtureを構築できる"
+    return
+  }
+  generate_meaning_card \
+    "$(episode_for_event 75000000-0000-4000-8000-000000000004)" \
+    pilot-four || {
+      fail "pilot 4番目candidateを作成できる"
+      return
+    }
+  for digit in 5 6 7 8 9 a; do
+    case "$digit" in
+      a) second=10 ;;
+      *) second="0$digit" ;;
+    esac
+    event="75000000-0000-4000-8000-00000000000$digit"
+    append_event "$event" "$digit" "2026-08-09T00:00:${second}Z"
+  done
+  run_cli sync >/dev/null 2>&1
+  run_cli rebuild-index >/dev/null 2>&1
+  for digit in 5 6 7 8 9 a; do
+    event="75000000-0000-4000-8000-00000000000$digit"
+    label="pilot-$digit"
+    generate_meaning_card "$(episode_for_event "$event")" "$label" || {
+      fail "pilot $digit candidateを作成できる"
+      return
+    }
+  done
+
+  if ! PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+      python3 - "$STATE" "$metrics" <<'PY'
+import fcntl
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+import reporting
+import value_compiler
+from vault import VaultError
+
+root = pathlib.Path(sys.argv[1])
+metrics_path = pathlib.Path(sys.argv[2])
+original_auth = value_compiler._authenticated_query_locked
+original_reporting_auth = reporting._authenticated_query_locked
+original_invoke = value_compiler._invoke
+auth_calls = 0
+provider_calls = 0
+lock_failures = 0
+
+
+def counted_auth(*args, **kwargs):
+    global auth_calls
+    auth_calls += 1
+    return original_auth(*args, **kwargs)
+
+
+lock_probe = """
+import fcntl
+import os
+import pathlib
+import sys
+root = pathlib.Path(sys.argv[1])
+path = root.parent / f'.{root.name}.lock'
+descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+try:
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+finally:
+    os.close(descriptor)
+"""
+
+
+def unlocked_invoke(*args, **kwargs):
+    global provider_calls, lock_failures
+    provider_calls += 1
+    probe = subprocess.run(
+        [sys.executable, "-c", lock_probe, str(root)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=3,
+        check=False,
+    )
+    if probe.returncode != 0:
+        lock_failures += 1
+    return original_invoke(*args, **kwargs)
+
+
+value_compiler._authenticated_query_locked = counted_auth
+reporting._authenticated_query_locked = counted_auth
+value_compiler._invoke = unlocked_invoke
+try:
+    success = value_compiler.compile_values(
+        root,
+        "flight-recorder-value-evaluator",
+        "value-model-pilot-success",
+        10,
+        60000,
+        60,
+    )
+finally:
+    value_compiler._authenticated_query_locked = original_auth
+    reporting._authenticated_query_locked = original_reporting_auth
+success_auth_calls = auth_calls
+success_provider_calls = provider_calls
+success_lock_failures = lock_failures
+
+
+auth_calls = 0
+
+
+def reject_final_auth(*args, **kwargs):
+    global auth_calls
+    auth_calls += 1
+    if auth_calls >= 2:
+        raise VaultError("fixture graph changed before final authentication")
+    return original_auth(*args, **kwargs)
+
+
+value_compiler._authenticated_query_locked = reject_final_auth
+reporting._authenticated_query_locked = reject_final_auth
+try:
+    value_compiler.compile_values(
+        root,
+        "flight-recorder-value-evaluator",
+        "value-model-pilot-prepared",
+        10,
+        60000,
+        60,
+    )
+except VaultError:
+    final_auth_failed = True
+else:
+    final_auth_failed = False
+finally:
+    value_compiler._authenticated_query_locked = original_auth
+    reporting._authenticated_query_locked = original_reporting_auth
+failure_auth_calls = auth_calls
+failure_provider_calls = provider_calls - success_provider_calls
+prepared_directory = root / "value-compiler" / "prepared"
+prepared_after_failure = len(list(prepared_directory.glob("*.json")))
+cards_after_failure = [
+    json.loads(path.read_text())
+    for path in (root / "value-primitive-cards").glob("*.json")
+    if json.loads(path.read_text())["provenance"]["evaluator_model"]
+    == "value-model-pilot-prepared"
+]
+
+
+auth_calls = 0
+provider_before_retry = provider_calls
+value_compiler._authenticated_query_locked = counted_auth
+reporting._authenticated_query_locked = counted_auth
+try:
+    retry = value_compiler.compile_values(
+        root,
+        "flight-recorder-value-evaluator",
+        "value-model-pilot-prepared",
+        10,
+        60000,
+        60,
+    )
+finally:
+    value_compiler._authenticated_query_locked = original_auth
+    reporting._authenticated_query_locked = original_reporting_auth
+    value_compiler._invoke = original_invoke
+
+metrics = {
+    "success": {
+        "candidate_count": success["candidate_count"],
+        "compiled_count": success["compiled_count"],
+        "auth_calls": success_auth_calls,
+        "provider_calls": success_provider_calls,
+        "lock_failures": success_lock_failures,
+    },
+    "failed_final_auth": {
+        "raised": final_auth_failed,
+        "auth_calls": failure_auth_calls,
+        "provider_calls": failure_provider_calls,
+        "prepared_count": prepared_after_failure,
+        "published_count": len(cards_after_failure),
+    },
+    "prepared_retry": {
+        "auth_calls": auth_calls,
+        "provider_calls": provider_calls - provider_before_retry,
+        "compiled_count": retry["compiled_count"],
+        "prepared_count": len(list(prepared_directory.glob("*.json"))),
+    },
+}
+metrics_path.write_text(
+    json.dumps(metrics, sort_keys=True, separators=(",", ":")),
+    encoding="utf-8",
+)
+PY
+  then
+    fail "pilot graph auth計測を完走する"
+    return
+  fi
+
+  if python3 - "$metrics" <<'PY'
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text())
+item = value["success"]
+assert item["candidate_count"] == 10
+assert item["compiled_count"] == 10
+assert item["provider_calls"] == 10
+assert item["lock_failures"] == 0
+assert item["auth_calls"] <= 2, item
+PY
+  then
+    pass "10 candidate成功batchのfull graph authを最大2回にしprovider中lockを解放する"
+  else
+    fail "10 candidate成功batchのfull graph authを最大2回にしprovider中lockを解放する"
+  fi
+
+  if python3 - "$metrics" <<'PY'
+import json
+import pathlib
+import sys
+
+item = json.loads(pathlib.Path(sys.argv[1]).read_text())["failed_final_auth"]
+assert item["raised"] is True
+assert item["provider_calls"] == 10
+assert item["auth_calls"] <= 2, item
+assert item["prepared_count"] == 10
+assert item["published_count"] == 0
+PY
+  then
+    pass "anchor/index/forget相当の最終auth競合でpublishせず全provider結果をprepared保持する"
+  else
+    fail "anchor/index/forget相当の最終auth競合でpublishせず全provider結果をprepared保持する"
+  fi
+
+  if python3 - "$metrics" <<'PY'
+import json
+import pathlib
+import sys
+
+item = json.loads(pathlib.Path(sys.argv[1]).read_text())["prepared_retry"]
+assert item["provider_calls"] == 0
+assert item["auth_calls"] <= 2, item
+assert item["compiled_count"] == 10
+assert item["prepared_count"] == 0
+PY
+  then
+    pass "prepared再開もfull graph auth最大2回で再課金せずfinalizeする"
+  else
+    fail "prepared再開もfull graph auth最大2回で再課金せずfinalizeする"
+  fi
+}
+
 test_rehashed_semantic_tamper_rebuilds_current_packet() {
   echo "test_rehashed_semantic_tamper_rebuilds_current_packet:"
   local episode err="$TEST_ROOT/value-cycle6-tamper.err"
@@ -2411,7 +2669,8 @@ main() {
       || "${FLIGHT_RECORDER_TEST_VALUE_CYCLE6_ONLY:-0}" == "1" \
       || "${FLIGHT_RECORDER_TEST_VALUE_CYCLE7_ONLY:-0}" == "1" \
       || "${FLIGHT_RECORDER_TEST_VALUE_CYCLE8_ONLY:-0}" == "1" \
-      || "${FLIGHT_RECORDER_TEST_VALUE_CYCLE9_ONLY:-0}" == "1" ]]; then
+      || "${FLIGHT_RECORDER_TEST_VALUE_CYCLE9_ONLY:-0}" == "1" \
+      || "${FLIGHT_RECORDER_TEST_VALUE_PILOT_PERF_ONLY:-0}" == "1" ]]; then
     true
   elif ! build_fixture; then
     fail "Value Compiler fixtureを構築できる"
@@ -2546,6 +2805,8 @@ main() {
     esac
   elif [[ "${FLIGHT_RECORDER_TEST_VALUE_CYCLE9_ONLY:-0}" == "1" ]]; then
     test_input_changed_provider_cost_consumes_batch_budget
+  elif [[ "${FLIGHT_RECORDER_TEST_VALUE_PILOT_PERF_ONLY:-0}" == "1" ]]; then
+    test_ten_candidate_batch_authenticates_graph_constant_times
   else
     test_versioned_cards_are_grounded_bounded_and_idempotent
     test_wrong_axis_reference_fails_closed_without_storing_a_card
@@ -2574,6 +2835,7 @@ main() {
     test_unsafe_prepared_directory_has_zero_mutation
     test_human_inspect_maps_evidence_ids_to_fields
     test_input_changed_provider_cost_consumes_batch_budget
+    test_ten_candidate_batch_authenticates_graph_constant_times
   fi
   echo
   echo "Result: $PASS passed, $FAIL failed"

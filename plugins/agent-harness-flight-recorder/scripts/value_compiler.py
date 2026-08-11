@@ -1951,55 +1951,11 @@ def compile_values(
                 :max(0, maximum_episodes - len(ready))
             ]
 
-        # Finalize durable provider results before considering new paid work.
-        for episode, packet, fingerprint, prepared_path, prepared in ready:
-            with vault_lock(root):
-                try:
-                    current_packets = _authenticated_packets(
-                        root,
-                        selected_policy,
-                        trusted,
-                        {episode["episode_id"]},
-                        anchor_index,
-                        refresh=True,
-                    )
-                except VaultError as error:
-                    _fail_attempt_if_present(
-                        root,
-                        fingerprint,
-                        "input_changed",
-                    )
-                    batch_failures.append(str(error))
-                    attempt_failure_count += 1
-                    continue
-                current = current_packets[0] if current_packets else None
-                if current is None or current[1] != packet:
-                    _fail_attempt_if_present(
-                        root,
-                        fingerprint,
-                        "input_changed",
-                    )
-                    batch_failures.append(
-                        "value compiler prepared input changed"
-                    )
-                    attempt_failure_count += 1
-                    continue
-                _raw, current_prepared = _read_prepared(prepared_path)
-                if current_prepared != prepared:
-                    raise VaultError(
-                        "Value Compiler prepared record changed"
-                    )
-                card = prepared["card"]
-                _store_card(root, card)
-                prepared_path.unlink()
-                current_attempts = {
-                    item["fingerprint"]
-                    for item in _load_attempts(root)["attempts"]
-                }
-                if fingerprint in current_attempts:
-                    _remove_attempt(root, fingerprint)
-                card_index[_card_generation_key(card)] = card
-                compiled.append(card)
+        # Existing prepared results and newly accepted provider results share
+        # one final authenticated snapshot. This keeps expensive full-graph
+        # verification constant per batch while retaining a durable boundary
+        # before any Card is published.
+        staged = list(ready)
 
         # The batch run lock stays held, but the Vault lock is deliberately
         # released across provider work so inspect/report/sync can proceed.
@@ -2008,32 +1964,6 @@ def compile_values(
                 break
             remaining = maximum_cost_microusd - spent
             with vault_lock(root):
-                try:
-                    _meanings, _receipts, rebuilt = (
-                        _refresh_selected_anchor_records(
-                            anchor_index, {episode["episode_id"]}
-                        )
-                    )
-                    if rebuilt:
-                        current_packets = _authenticated_packets(
-                            root,
-                            selected_policy,
-                            trusted,
-                            {episode["episode_id"]},
-                            anchor_index,
-                        )
-                        current = (
-                            current_packets[0]
-                            if current_packets else None
-                        )
-                        if current is None or current[1] != packet:
-                            raise VaultError(
-                                "value compiler input changed before evaluation"
-                            )
-                except VaultError as error:
-                    batch_failures.append(str(error))
-                    attempt_failure_count += 1
-                    continue
                 ledger = _load_attempts(root)
                 if any(
                     item["fingerprint"] == fingerprint
@@ -2127,6 +2057,15 @@ def compile_values(
                 }
                 prepared_path = _store_prepared(root, prepared)
                 _replace_attempt(root, fingerprint, "prepared")
+                staged.append(
+                    (
+                        episode,
+                        packet,
+                        fingerprint,
+                        prepared_path,
+                        prepared,
+                    )
+                )
             # A shell function launched in the background can be terminated
             # without forwarding SIGTERM to this child. Preserve any valid,
             # paid provider result first, but never publish a Card from an
@@ -2136,63 +2075,71 @@ def compile_values(
                 raise VaultError(
                     "value compiler caller exited during evaluation"
                 )
+
+        if staged:
             with vault_lock(root):
-                try:
-                    current_packets = _authenticated_packets(
-                        root,
-                        selected_policy,
-                        trusted,
-                        {episode["episode_id"]},
-                        anchor_index,
-                        refresh=True,
-                    )
-                except VaultError as error:
-                    _replace_attempt(
-                        root,
-                        fingerprint,
-                        "failed",
-                        diagnostic_code="input_changed",
-                    )
-                    batch_failures.append(str(error))
-                    attempt_failure_count += 1
-                    continue
-                current = {
+                current_packets = _authenticated_packets(
+                    root,
+                    selected_policy,
+                    trusted,
+                    {
+                        episode["episode_id"]
+                        for episode, _packet, _fingerprint,
+                        _path, _prepared in staged
+                    },
+                    anchor_index,
+                    refresh=True,
+                )
+                current_by_episode = {
                     item[0]["episode_id"]: item
                     for item in current_packets
-                }.get(episode["episode_id"])
-                if current is None or current[1] != packet:
-                    _replace_attempt(
-                        root,
-                        fingerprint,
-                        "failed",
-                        diagnostic_code="input_changed",
+                }
+                for (
+                    episode,
+                    packet,
+                    fingerprint,
+                    prepared_path,
+                    prepared,
+                ) in staged:
+                    current = current_by_episode.get(episode["episode_id"])
+                    if current is None or current[1] != packet:
+                        _fail_attempt_if_present(
+                            root,
+                            fingerprint,
+                            "input_changed",
+                        )
+                        batch_failures.append(
+                            "value compiler input changed during evaluation"
+                        )
+                        attempt_failure_count += 1
+                        continue
+                    _raw, current_prepared = _read_prepared(prepared_path)
+                    if current_prepared != prepared:
+                        raise VaultError(
+                            "Value Compiler prepared record changed"
+                        )
+                    card = prepared["card"]
+                    generation_key = _generation_key(
+                        episode["episode_id"],
+                        packet["packet_sha256"],
+                        selected_model,
+                        evaluator_sha256,
+                        selected_policy,
                     )
-                    batch_failures.append(
-                        "value compiler input changed during evaluation"
-                    )
-                    attempt_failure_count += 1
-                    continue
-                generation_key = _generation_key(
-                    episode["episode_id"],
-                    packet["packet_sha256"],
-                    selected_model,
-                    evaluator_sha256,
-                    selected_policy,
-                )
-                existing_card = card_index.get(generation_key)
-                if existing_card is not None:
-                    reused.append(existing_card)
-                else:
-                    _store_card(root, card)
-                    compiled.append(card)
-                    card_index[generation_key] = card
-                _raw, current_prepared = _read_prepared(prepared_path)
-                if current_prepared != prepared:
-                    raise VaultError(
-                        "Value Compiler prepared record changed"
-                    )
-                prepared_path.unlink()
-                _remove_attempt(root, fingerprint)
+                    existing_card = card_index.get(generation_key)
+                    if existing_card is not None:
+                        reused.append(existing_card)
+                    else:
+                        _store_card(root, card)
+                        compiled.append(card)
+                        card_index[generation_key] = card
+                    prepared_path.unlink()
+                    current_attempts = {
+                        item["fingerprint"]
+                        for item in _load_attempts(root)["attempts"]
+                    }
+                    if fingerprint in current_attempts:
+                        _remove_attempt(root, fingerprint)
     if batch_failures:
         raise VaultError(
             "value compiler batch failed for "
