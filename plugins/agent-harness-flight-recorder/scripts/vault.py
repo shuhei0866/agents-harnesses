@@ -945,7 +945,7 @@ def parser() -> argparse.ArgumentParser:
     value_compile.add_argument(
         "--max-cost-microusd", required=True, type=int
     )
-    value_compile.add_argument("--timeout", type=int, default=60)
+    value_compile.add_argument("--timeout", type=int, default=240)
     value_compile.add_argument("--policy-version")
     value_compile.add_argument("--json", action="store_true")
     receipt_auto = commands.add_parser("receipt-auto")

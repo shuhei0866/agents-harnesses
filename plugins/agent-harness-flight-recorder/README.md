@@ -475,13 +475,15 @@ already have a validated Meaning Card or Semantic Receipt anchor:
 
 ```bash
 scripts/flight-recorder value compile \
-  --evaluator VALUE_ADAPTER \
-  --model MODEL_ID \
+  --evaluator flight-recorder-claude-value-evaluator \
+  --model claude-sonnet-4-6 \
   --max-episodes 10 \
-  --max-cost-microusd 50000
+  --max-cost-microusd 500000
 ```
 
 The command requires all four provider and budget choices explicitly. Its
+bundled Claude adapter uses a 240-second outer timeout around the bounded
+180-second provider call; custom evaluators can override `--timeout`. Its
 packet contains only anchor summaries, recorder-generated evidence IDs, and
 deterministic Episode observations; it never opens a registered session source
 or includes its path or raw body. The evaluator returns eight independent
