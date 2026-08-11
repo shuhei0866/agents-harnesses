@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Deterministic Value Compiler evaluator for contract tests."""
+
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import sys
+import time
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - tests run on POSIX
+    fcntl = None
+
+
+request = json.load(sys.stdin)
+capture = os.environ.get("FLIGHT_RECORDER_TEST_VALUE_CAPTURE")
+if capture:
+    with pathlib.Path(capture).open("a", encoding="utf-8") as stream:
+        stream.write(
+            json.dumps(request, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+
+counter = os.environ.get("FLIGHT_RECORDER_TEST_VALUE_COUNT")
+call_number = 1
+if counter:
+    path = pathlib.Path(counter)
+    with path.open("a+", encoding="utf-8") as stream:
+        if fcntl is not None:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        stream.seek(0)
+        try:
+            count = int(stream.read())
+        except ValueError:
+            count = 0
+        call_number = count + 1
+        stream.seek(0)
+        stream.truncate()
+        stream.write(str(count + 1))
+        stream.flush()
+        if fcntl is not None:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+fail_call = os.environ.get("FLIGHT_RECORDER_TEST_VALUE_FAIL_CALL")
+if (
+    os.environ.get("FLIGHT_RECORDER_TEST_VALUE_FAIL_ALL") == "1"
+    or (fail_call is not None and call_number == int(fail_call))
+):
+    raise SystemExit("fixture provider failure")
+
+started_directory = os.environ.get("FLIGHT_RECORDER_TEST_VALUE_STARTED_DIR")
+release_directory = os.environ.get("FLIGHT_RECORDER_TEST_VALUE_RELEASE_DIR")
+started = os.environ.get("FLIGHT_RECORDER_TEST_VALUE_STARTED")
+release = os.environ.get("FLIGHT_RECORDER_TEST_VALUE_RELEASE")
+if started_directory or release_directory:
+    if not started_directory or not release_directory:
+        raise SystemExit("per-call blocking evaluator directories are incomplete")
+    started_root = pathlib.Path(started_directory)
+    release_root = pathlib.Path(release_directory)
+    started_root.mkdir(parents=True, exist_ok=True)
+    release_root.mkdir(parents=True, exist_ok=True)
+    started_path = started_root / str(call_number)
+    release_path = release_root / str(call_number)
+    started_path.touch()
+    deadline = time.monotonic() + 10
+    while not release_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if not release_path.exists():
+        raise SystemExit("blocking evaluator release timed out")
+else:
+    if started:
+        pathlib.Path(started).touch()
+    if release:
+        deadline = time.monotonic() + 10
+        while not pathlib.Path(release).exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if not pathlib.Path(release).exists():
+            raise SystemExit("blocking evaluator release timed out")
+delay = os.environ.get("FLIGHT_RECORDER_TEST_VALUE_SLEEP_SECONDS")
+if delay:
+    parent = os.getppid()
+    deadline = time.monotonic() + float(delay)
+    while time.monotonic() < deadline and os.getppid() == parent:
+        time.sleep(0.05)
+    if os.getppid() != parent:
+        raise SystemExit("compile parent exited")
+if os.environ.get("FLIGHT_RECORDER_TEST_VALUE_OVERSIZED") == "1":
+    sys.stdout.write("x" * (65 * 1024))
+    raise SystemExit(0)
+
+
+def evidence_items(value: object) -> list[dict[str, object]]:
+    result: list[dict[str, object]] = []
+    if isinstance(value, dict):
+        item = value.get("evidence_id")
+        if isinstance(item, str) and item.startswith("sha256:"):
+            result.append(value)
+        for nested in value.values():
+            result.extend(evidence_items(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            result.extend(evidence_items(nested))
+    unique: dict[str, dict[str, object]] = {}
+    for item in result:
+        unique.setdefault(str(item["evidence_id"]), item)
+    return list(unique.values())
+
+
+available = evidence_items(request.get("packet"))
+
+
+def support_for(*needles: str) -> list[str]:
+    for item in available:
+        serialized = json.dumps(item, sort_keys=True).lower()
+        if any(needle in serialized for needle in needles):
+            return [str(item["evidence_id"])]
+    return []
+
+
+support = {
+    "goal_achievement": support_for("meaning.outcome", "goal_achievement"),
+    "deliverable_quality": support_for("meaning.verification", "quality"),
+    "learning": support_for("meaning.reusable_learning", "reusable_learning"),
+}
+unknown_goal_outcome = any(
+    item.get("field") == "meaning.outcome"
+    and isinstance(item.get("content"), dict)
+    and item["content"].get("state") == "unknown"
+    for item in available
+)
+if (
+    unknown_goal_outcome
+    and os.environ.get(
+        "FLIGHT_RECORDER_TEST_VALUE_FORCE_UNKNOWN_GOAL_POSITIVE"
+    ) != "1"
+):
+    support["goal_achievement"] = []
+if os.environ.get("FLIGHT_RECORDER_TEST_VALUE_WRONG_AXIS_REFERENCE") == "1":
+    support["learning"] = support["goal_achievement"]
+
+states = {
+    "goal_achievement": "positive",
+    "deliverable_quality": "positive",
+    "learning": "positive",
+    "risk_reduction": "unknown",
+    "reuse_potential": "unknown",
+    "decision_leverage": "unknown",
+    "attention_saved": "unknown",
+    "rework": "unknown",
+}
+primitives = {}
+for name, state in states.items():
+    references = support.get(name, [])
+    unknown = state == "unknown" or not references
+    primitives[name] = {
+        "state": "unknown" if unknown else state,
+        "summary": (
+            "No grounded signal is available for this value dimension."
+            if unknown
+            else f"Grounded evidence supports the {name.replace('_', ' ')} signal."
+        ),
+        "confidence": "low" if unknown else "high",
+        "evidence_references": [] if unknown else references,
+    }
+
+if os.environ.get("FLIGHT_RECORDER_TEST_VALUE_MALFORMED_STATE") == "1":
+    primitives["goal_achievement"]["state"] = []
+if os.environ.get("FLIGHT_RECORDER_TEST_VALUE_MALFORMED_REFS") == "1":
+    primitives["goal_achievement"]["evidence_references"] = [[]]
+
+json.dump(
+    {
+        "schema_version": 1,
+        "primitives": primitives,
+        "measured_cost_microusd": int(
+            os.environ.get("FLIGHT_RECORDER_TEST_VALUE_COST", "6000")
+        ),
+    },
+    sys.stdout,
+    sort_keys=True,
+    separators=(",", ":"),
+)

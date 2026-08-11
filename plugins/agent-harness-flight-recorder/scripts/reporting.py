@@ -52,7 +52,7 @@ from retention_state import load_forgotten
 
 
 OUTPUT_VERSION = 3
-INSPECT_OUTPUT_VERSION = 4
+INSPECT_OUTPUT_VERSION = 5
 STATUS_OUTPUT_VERSION = 4
 DEFAULT_POLICY_VERSION = "default-v1"
 EPISODE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -607,6 +607,7 @@ def inspect_episode(
             root, connection, policy, episode_id, edges_by_episode
         )
         from semantic_receipts import load_semantic_receipts
+        from value_compiler import load_value_primitive_cards
 
         return {
             "schema_version": INSPECT_OUTPUT_VERSION,
@@ -623,6 +624,9 @@ def inspect_episode(
                     item["evidence_id"]
                     for item in card["deterministic_evidence"]
                 },
+            ),
+            "value_primitive_cards": load_value_primitive_cards(
+                root, policy_version, episode_id, card
             ),
         }
 
@@ -1050,6 +1054,59 @@ def render_report(value: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _render_value_primitive_cards(
+    cards: list[dict[str, Any]],
+    episode_card: dict[str, Any],
+) -> list[str]:
+    lines: list[str] = []
+    for item in cards:
+        provenance = item["provenance"]
+        anchors = provenance["input_anchor_ids"]
+        evidence_fields = provenance["input_evidence_fields"]
+        lines.extend((
+            f"  Card {item['value_primitive_card_id']}",
+            "    evaluator-model: "
+            f"{_terminal_text(provenance['evaluator_model'])}",
+            f"    generated-at: {provenance['generated_at']}",
+            "    generation-cost-microusd: "
+            f"{provenance['generation_cost_microusd']}",
+            "    input-anchor-ids: "
+            + (", ".join(anchors) if anchors else "none"),
+            "    input-evidence-fields:",
+            *(
+                f"      {evidence_id} ({field})"
+                for evidence_id, field in sorted(evidence_fields.items())
+            ),
+            "    task-measured-duration-ms: "
+            f"{episode_card['measured_duration_ms']['value']} "
+            f"({episode_card['measured_duration_ms']['state']})",
+            "    task-measured-cost-usd: "
+            f"{episode_card['measured_cost_usd']['value']} "
+            f"({episode_card['measured_cost_usd']['state']})",
+            "    primitives:",
+        ))
+        for axis, primitive in item["primitives"].items():
+            references = primitive["evidence_references"]
+            rendered_references = [
+                f"{reference} ({evidence_fields[reference]})"
+                for reference in references
+            ]
+            lines.extend((
+                f"      {axis}:",
+                f"        state: {primitive['state']}",
+                f"        basis: {primitive['basis']}",
+                f"        confidence: {primitive['confidence']}",
+                "        summary: "
+                f"{_terminal_text(primitive['summary'])}",
+                "        evidence-references: "
+                + (
+                    ", ".join(rendered_references)
+                    if rendered_references else "none"
+                ),
+            ))
+    return lines
+
+
 def render_inspect(value: dict[str, Any]) -> str:
     card = value["card"]
     lines = [
@@ -1130,6 +1187,10 @@ def render_inspect(value: dict[str, Any]) -> str:
             f"rubric={_terminal_text(item['provenance']['rubric_version'])}"
             for item in value["semantic_receipts"]
         ),
+        "Value primitive cards:",
+        *_render_value_primitive_cards(
+            value["value_primitive_cards"], card
+        ),
         "Supporting relationship edges:",
     ]
     if not card["deterministic_evidence"]:
@@ -1139,6 +1200,8 @@ def render_inspect(value: dict[str, Any]) -> str:
             lines.index("Model-derived semantic receipts:"), "  none"
         )
     if not value["semantic_receipts"]:
+        lines.insert(lines.index("Value primitive cards:"), "  none")
+    if not value["value_primitive_cards"]:
         lines.insert(lines.index("Supporting relationship edges:"), "  none")
     if value["supporting_edges"]:
         for edge in value["supporting_edges"]:

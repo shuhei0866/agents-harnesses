@@ -156,6 +156,11 @@ paths = sorted((root / "devices").rglob("*.jsonl.age"))
 paths += sorted((root / "cache" / "imported").rglob("*.jsonl"))
 paths += sorted((root / "evaluations").glob("*.json"))
 paths += sorted((root / "meaning-cards").glob("*.json"))
+paths += sorted((root / "value-primitive-cards").glob("*.json"))
+paths += sorted((root / "value-compiler" / "prepared").glob("*.json"))
+attempts = root / "value-compiler" / "attempts.json"
+if attempts.exists():
+    paths.append(attempts)
 paths.append(root / "index" / "imported-chunks.json")
 for path in paths:
     print(path.relative_to(root), hashlib.sha256(path.read_bytes()).hexdigest())
@@ -390,6 +395,227 @@ directory.chmod(0o700)
 PY
 }
 
+write_value_artifacts() {
+  local state="$1" target_episode="$2" unrelated_episode="$3"
+  generate_meaning_card "$state" "$target_episode" value-retention-target \
+    || return 1
+  generate_meaning_card \
+    "$state" "$unrelated_episode" value-retention-unrelated || return 1
+  FLIGHT_RECORDER_TEST_VALUE_COST=6000 \
+    run_cli "$state" value compile \
+      --evaluator flight-recorder-value-evaluator \
+      --model value-retention-stored \
+      --max-episodes 2 --max-cost-microusd 12000 --json \
+      >/dev/null 2>&1 || return 1
+  PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$state" "$target_episode" "$unrelated_episode" <<'PY'
+import pathlib
+import sys
+import time
+
+import value_compiler
+from evaluation import _executable_identity, _invoke
+from vault import vault_lock
+
+root = pathlib.Path(sys.argv[1])
+episode_ids = set(sys.argv[2:4])
+model = "value-retention-prepared"
+evaluator_path, evaluator_sha256 = _executable_identity(
+    "flight-recorder-value-evaluator"
+)
+with vault_lock(root):
+    packets = value_compiler._authenticated_packets(
+        root, "default-v1", None, episode_ids
+    )
+assert {episode["episode_id"] for episode, _packet in packets} == episode_ids
+prepared_records = []
+attempts = []
+for episode, packet in packets:
+    request = {
+        "schema_version": 1,
+        "model": model,
+        "packet": packet,
+        "remaining_cost_microusd": 6000,
+    }
+    started = time.monotonic_ns()
+    raw = _invoke(evaluator_path, evaluator_sha256, request, 60)
+    latency_ms = max(0, (time.monotonic_ns() - started) // 1_000_000)
+    primitives, cost = value_compiler._validate_response(raw, packet, 6000)
+    card = value_compiler._build_card(
+        episode,
+        packet,
+        primitives,
+        model,
+        evaluator_path,
+        evaluator_sha256,
+        "default-v1",
+        cost,
+        latency_ms,
+    )
+    fingerprint = value_compiler._attempt_fingerprint(
+        packet["packet_sha256"], model, evaluator_sha256, "default-v1"
+    )
+    prepared_records.append({
+        "schema_version": 1,
+        "contract_version": value_compiler.PREPARED_CONTRACT,
+        "fingerprint": fingerprint,
+        "episode_id": episode["episode_id"],
+        "packet_sha256": packet["packet_sha256"],
+        "evaluator_model": model,
+        "evaluator_adapter_sha256": evaluator_sha256,
+        "policy_version": "default-v1",
+        "card": card,
+    })
+    attempt = value_compiler._new_attempt(
+        episode["episode_id"],
+        packet["packet_sha256"],
+        model,
+        evaluator_sha256,
+        "default-v1",
+    )
+    attempt["state"] = "prepared"
+    attempts.append(attempt)
+with vault_lock(root):
+    for prepared in prepared_records:
+        value_compiler._store_prepared(root, prepared)
+    value_compiler._store_attempts(
+        root,
+        {
+            "schema_version": 1,
+            "attempts": sorted(
+                attempts, key=lambda item: item["fingerprint"]
+            ),
+        },
+    )
+PY
+}
+
+value_artifact_manifest() {
+  python3 - "$1" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+paths = sorted((root / "value-primitive-cards").glob("*.json"))
+paths += sorted((root / "value-compiler" / "prepared").glob("*.json"))
+paths.append(root / "value-compiler" / "attempts.json")
+for path in paths:
+    print(path.relative_to(root), hashlib.sha256(path.read_bytes()).hexdigest())
+PY
+}
+
+value_episode_manifest() {
+  python3 - "$1" "$2" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+for label, directory in (
+    ("card", root / "value-primitive-cards"),
+    ("prepared", root / "value-compiler" / "prepared"),
+):
+    for path in sorted(directory.glob("*.json")):
+        value = json.loads(path.read_text())
+        if value["episode_id"] == episode:
+            print(label, path.name, hashlib.sha256(path.read_bytes()).hexdigest())
+attempts = json.loads(
+    (root / "value-compiler" / "attempts.json").read_text()
+)["attempts"]
+for item in attempts:
+    if item["episode_id"] == episode:
+        canonical = json.dumps(item, sort_keys=True, separators=(",", ":")).encode()
+        print("attempt", item["fingerprint"], hashlib.sha256(canonical).hexdigest())
+PY
+}
+
+prepared_directory_manifest() {
+  python3 - "$1" <<'PY'
+import hashlib
+import pathlib
+import stat
+import sys
+
+directory = pathlib.Path(sys.argv[1]) / "value-compiler" / "prepared"
+for path in sorted(directory.iterdir()):
+    metadata = path.lstat()
+    print(
+        path.name,
+        stat.S_IMODE(metadata.st_mode),
+        hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
+PY
+}
+
+materialize_prepared_receipts() {
+  PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$1" <<'PY'
+import json
+import pathlib
+import sys
+
+from semantic_receipts import _store_prepared_receipt
+
+root = pathlib.Path(sys.argv[1])
+ledger = json.loads(
+    (root / "receipt-automation" / "attempts.json").read_text()
+)
+for item in ledger["items"]:
+    _store_prepared_receipt(root, item["prepared"])
+PY
+}
+
+vault_byte_snapshot() {
+  python3 - "$1" <<'PY'
+import hashlib
+import os
+import pathlib
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+for path in sorted(root.rglob("*")):
+    relative = path.relative_to(root)
+    if ".git" in relative.parts or path.name.endswith(".lock"):
+        continue
+    metadata = path.lstat()
+    mode = stat.S_IMODE(metadata.st_mode)
+    if stat.S_ISREG(metadata.st_mode):
+        print("F", relative, mode, hashlib.sha256(path.read_bytes()).hexdigest())
+    elif stat.S_ISLNK(metadata.st_mode):
+        print("L", relative, mode, os.readlink(path))
+PY
+}
+
+write_purge_recovery_marker() {
+  local state="$1" episode="$2" old_oid="$3" new_oid="$4"
+  mkdir -p "$state/index"
+  chmod 700 "$state/index"
+  python3 - \
+    "$state/index/purge-recovery.json" "$episode" "$old_oid" "$new_oid" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+value = {
+    "schema_version": 1,
+    "contract_version": "purge-cleanup-recovery-v1",
+    "state": "push_pending",
+    "episode_id": sys.argv[2],
+    "policy_version": "default-v1",
+    "old_remote_oid": sys.argv[3],
+    "new_rewritten_oid": sys.argv[4],
+}
+path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+path.chmod(0o600)
+PY
+}
+
 test_forget_preserves_source_and_survives_rebuild() {
   echo "test_forget_preserves_source_and_survives_rebuild:"
   local base="$TEST_ROOT/forget"
@@ -593,7 +819,7 @@ test_purge_push_rejection_restores_retryable_local_state() {
   local remote="$base/remote.git" db="$state/index/vault.sqlite"
   local episode unrelated_episode target_path target_cache
   local before_head before_remote before_source before_files before_attempts
-  local before_receipt_attempts
+  local before_receipt_attempts before_value before_unrelated_value
   init_fixture "$base" || {
     fail "push rejection fixtureを作成できる"
     return
@@ -614,8 +840,8 @@ test_purge_push_rejection_restores_retryable_local_state() {
       fail "push rejection対象episodeのevaluationを作成できる"
       return
     }
-  generate_meaning_card "$state" "$episode" purge-rejection || {
-    fail "push rejection対象episodeのMeaning Cardを作成できる"
+  write_value_artifacts "$state" "$episode" "$unrelated_episode" || {
+    fail "push rejection用Value Card・prepared・attemptを作成できる"
     return
   }
   target_path="$(db_value_for_event "$db" "$TARGET_EVENT" source_path)"
@@ -629,6 +855,10 @@ test_purge_push_rejection_restores_retryable_local_state() {
   )"
   before_receipt_attempts="$(
     shasum -a 256 "$state/receipt-automation/attempts.json"
+  )"
+  before_value="$(value_artifact_manifest "$state")"
+  before_unrelated_value="$(
+    value_episode_manifest "$state" "$unrelated_episode"
   )"
 
   git --git-dir="$remote" config receive.denyNonFastForwards true
@@ -648,6 +878,7 @@ test_purge_push_rejection_restores_retryable_local_state() {
     || "$before_receipt_attempts" != "$(
       shasum -a 256 "$state/receipt-automation/attempts.json"
     )" \
+    || "$before_value" != "$(value_artifact_manifest "$state")" \
     || ! -f "$state/$target_path" \
     || ! -f "$state/$target_cache" \
     || "$(meaning_card_count "$state" "$episode")" != "1" ]] \
@@ -665,11 +896,14 @@ test_purge_push_rejection_restores_retryable_local_state() {
       && ! -e "$state/$target_cache" \
       && "$(evaluation_count "$state")" == "0" \
       && "$(meaning_card_count "$state" "$episode")" == "0" ]] \
+    && [[ "$before_unrelated_value" == "$(
+      value_episode_manifest "$state" "$unrelated_episode"
+    )" ]] \
     && ! git --git-dir="$remote" cat-file -e \
       "main:$target_path" 2>/dev/null \
     && python3 - "$state/auto-evaluation/attempts.json" \
       "$state/receipt-automation/attempts.json" \
-      "$episode" "$unrelated_episode" <<'PY'
+      "$state" "$episode" "$unrelated_episode" <<'PY'
 import json
 import pathlib
 import sys
@@ -678,15 +912,31 @@ evaluation_items = json.loads(pathlib.Path(sys.argv[1]).read_text())["attempts"]
 evaluation_episodes = {item["episode_id"] for item in evaluation_items}
 receipt_items = json.loads(pathlib.Path(sys.argv[2]).read_text())["items"]
 receipt_episodes = {item.get("episode_id") for item in receipt_items}
-assert sys.argv[3] not in evaluation_episodes
-assert evaluation_episodes == {sys.argv[4]}
-assert sys.argv[3] not in receipt_episodes
-assert receipt_episodes == {sys.argv[4]}
+root = pathlib.Path(sys.argv[3])
+target, unrelated = sys.argv[4:6]
+assert target not in evaluation_episodes
+assert evaluation_episodes == {unrelated}
+assert target not in receipt_episodes
+assert receipt_episodes == {unrelated}
+cards = [
+    json.loads(path.read_text())
+    for path in (root / "value-primitive-cards").glob("*.json")
+]
+prepared = [
+    json.loads(path.read_text())
+    for path in (root / "value-compiler" / "prepared").glob("*.json")
+]
+attempts = json.loads(
+    (root / "value-compiler" / "attempts.json").read_text()
+)["attempts"]
+assert cards and {item["episode_id"] for item in cards} == {unrelated}
+assert prepared and {item["episode_id"] for item in prepared} == {unrelated}
+assert attempts and {item["episode_id"] for item in attempts} == {unrelated}
 PY
   then
-    pass "push拒否時はprepared attemptも復元し成功時だけ対象を除く"
+    pass "push拒否時はValue artifactsもbyte-exact復元し成功時だけ対象を除く"
   else
-    fail "push拒否時はprepared attemptも復元し成功時だけ対象を除く"
+    fail "push拒否時はValue artifactsもbyte-exact復元し成功時だけ対象を除く"
   fi
 }
 
@@ -727,13 +977,1204 @@ test_invalid_attempt_ledger_blocks_purge_before_rewrite() {
   fi
 }
 
+test_purge_dry_run_does_not_recover_prepared_temp() {
+  echo "test_purge_dry_run_does_not_recover_prepared_temp:"
+  local base="$TEST_ROOT/purge-cycle8-read-only"
+  local state="$base/vault"
+  local db="$state/index/vault.sqlite"
+  local episode unrelated_episode before after attempts_before
+  init_fixture "$base" || {
+    fail "cycle8 read-only purge fixtureを作成できる"
+    return
+  }
+  episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+  unrelated_episode="$(
+    db_value_for_event "$db" "$UNRELATED_EVENT" episode_id
+  )"
+  write_value_artifacts "$state" "$episode" "$unrelated_episode" || {
+    fail "cycle8 read-only用Value preparedを作成できる"
+    return
+  }
+  python3 - "$state" "$episode" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+for path in (root / "value-compiler" / "prepared").glob("*.json"):
+    value = json.loads(path.read_text())
+    if value["episode_id"] == episode:
+        path.rename(path.with_name(f".{path.name}.cycle8-read-only"))
+        break
+else:
+    raise AssertionError("target prepared record not found")
+PY
+  before="$(prepared_directory_manifest "$state")"
+  attempts_before="$(shasum -a 256 "$state/value-compiler/attempts.json")"
+  if run_cli "$state" purge "$episode" \
+      >"$base/preview.txt" 2>"$base/preview.err"; then
+    after="$(prepared_directory_manifest "$state")"
+    if [[ "$before" == "$after" \
+      && "$attempts_before" == "$(
+        shasum -a 256 "$state/value-compiler/attempts.json"
+      )" ]] \
+      && find "$state/value-compiler/prepared" -type f \
+        -name '.*.json.cycle8-read-only' -print -quit | grep -q .; then
+      pass "purge dry-runはcomplete prepared tempを回復・変更しない"
+    else
+      fail "purge dry-runはcomplete prepared tempを回復・変更しない"
+    fi
+  else
+    cat "$base/preview.err" >&2
+    fail "purge dry-runはcomplete prepared tempを回復・変更しない"
+  fi
+}
+
+test_purge_unlink_failure_restores_complete_local_state() {
+  echo "test_purge_unlink_failure_restores_complete_local_state:"
+  local base="$TEST_ROOT/purge-cycle9-unlink-failure"
+  local state="$base/vault" remote="$base/remote.git"
+  local db="$state/index/vault.sqlite"
+  local episode unrelated_episode target_path target_card
+  local before_files before_head before_remote before_refs
+  init_fixture "$base" || {
+    fail "cycle9 purge rollback fixtureを作成できる"
+    return
+  }
+  episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+  unrelated_episode="$(
+    db_value_for_event "$db" "$UNRELATED_EVENT" episode_id
+  )"
+  write_attempt_ledger "$state" "$episode" "$unrelated_episode"
+  write_receipt_attempt_ledger \
+    "$state" "$episode" "$unrelated_episode" || {
+      fail "cycle9 receipt attempt fixtureを作成できる"
+      return
+    }
+  run_cli "$state" evaluate "$episode" \
+    --evaluator flight-recorder-evaluator \
+    --model evaluator-cycle9-rollback --json >/dev/null 2>&1 || {
+      fail "cycle9 evaluation fixtureを作成できる"
+      return
+    }
+  write_value_artifacts "$state" "$episode" "$unrelated_episode" || {
+    fail "cycle9 Value artifacts fixtureを作成できる"
+    return
+  }
+  materialize_prepared_receipts "$state" || {
+    fail "cycle9 stored Receipt fixtureを作成できる"
+    return
+  }
+  # Preserve an unrelated forgotten marker and a valid pending-sync record so
+  # rollback must restore both absence/presence and exact bytes.
+  run_cli "$state" forget "$unrelated_episode" >/dev/null 2>&1 || {
+    fail "cycle9 forgotten-state fixtureを作成できる"
+    return
+  }
+  target_path="$(db_value_for_event "$db" "$TARGET_EVENT" source_path)"
+  mkdir -p "$state/queue"
+  chmod 700 "$state/queue"
+  python3 - "$state/queue/pending-sync.json" "$target_path" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+value = {
+    "schema_version": 1,
+    "artifact_paths": [sys.argv[2]],
+    "fixture_sentinel": "cycle9-byte-exact",
+}
+path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+path.chmod(0o600)
+PY
+  target_card="$(python3 - "$state" "$episode" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+for path in (root / "value-primitive-cards").glob("*.json"):
+    value = json.loads(path.read_text())
+    if value["episode_id"] == sys.argv[2]:
+        print(path)
+        break
+else:
+    raise AssertionError("target Value Card not found")
+PY
+)"
+  before_files="$(vault_byte_snapshot "$state")"
+  before_head="$(git -C "$state" rev-parse HEAD)"
+  before_remote="$(git --git-dir="$remote" rev-parse main)"
+  before_refs="$(
+    git -C "$state" for-each-ref --format='%(refname) %(objectname)'
+  )"
+
+  if ! PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$state" "$episode" "$target_card" <<'PY'
+import pathlib
+import sys
+
+import retention
+from vault import VaultError
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+target = pathlib.Path(sys.argv[3])
+original = pathlib.Path.unlink
+
+
+def injected(path, *args, **kwargs):
+    if path == target:
+        raise OSError("fixture Value artifact unlink failure")
+    return original(path, *args, **kwargs)
+
+
+pathlib.Path.unlink = injected
+try:
+    try:
+        retention.purge(root, episode, None, None, apply=True)
+    except VaultError:
+        pass
+    else:
+        raise AssertionError("injected purge unexpectedly succeeded")
+finally:
+    pathlib.Path.unlink = original
+PY
+  then
+    fail "cycle9 unlink failureを注入できる"
+    return
+  fi
+
+  if [[ "$before_remote" == "$(git --git-dir="$remote" rev-parse main)" \
+    && "$before_head" == "$(git -C "$state" rev-parse HEAD)" \
+    && "$before_refs" == "$(
+      git -C "$state" for-each-ref --format='%(refname) %(objectname)'
+    )" \
+    && "$before_files" == "$(vault_byte_snapshot "$state")" ]]; then
+    pass "push前unlink失敗でhistoryと全local stateをbyte-exact復元する"
+  else
+    fail "push前unlink失敗でhistoryと全local stateをbyte-exact復元する"
+  fi
+}
+
+test_rollback_attempts_exact_refs_after_restore_history_failure() {
+  echo "test_rollback_attempts_exact_refs_after_restore_history_failure:"
+  if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$TEST_ROOT" <<'PY'
+import pathlib
+import sys
+
+import retention
+
+root = pathlib.Path(sys.argv[1])
+events = []
+retention._original_refs = lambda _root: ["refs/original/refs/heads/main"]
+
+
+def broken_restore_history(_root):
+    events.append("restore-history")
+    raise RuntimeError("fixture restore-history failure")
+
+
+def restore_refs(_root, _snapshot):
+    events.append("restore-refs")
+
+
+def restore_files(_snapshots):
+    events.append("restore-files")
+    return []
+
+
+def restore_value(_root, _snapshot):
+    events.append("restore-value-attempts")
+
+
+def restore_evaluation(_root, _snapshot):
+    events.append("restore-evaluation-attempts")
+
+
+def restore_receipt(_root, _snapshot):
+    events.append("restore-receipt-attempts")
+
+
+retention._restore_history = broken_restore_history
+retention._restore_ref_snapshot = restore_refs
+retention._restore_local_file_snapshots = restore_files
+retention.restore_value_attempts = restore_value
+retention.restore_attempts = restore_evaluation
+retention.restore_receipt_attempts = restore_receipt
+retention._remote_main_oid = lambda _root: "a" * 40
+retention._cleanup_original_history = lambda _root: events.append("cleanup")
+errors = retention._rollback_purge_state(
+    root,
+    refs={"refs/heads/main": "a" * 40},
+    remote_main_oid="a" * 40,
+    files=[],
+    value_attempts=b"value",
+    evaluation_attempts=b"evaluation",
+    receipt_attempts=b"receipt",
+)
+assert errors
+assert events[:2] == ["restore-history", "restore-refs"], events
+assert {
+    "restore-files",
+    "restore-value-attempts",
+    "restore-evaluation-attempts",
+    "restore-receipt-attempts",
+}.issubset(events)
+PY
+  then
+    pass "_restore_history失敗後もexact refsと全artifact/ledger復元を試す"
+  else
+    fail "_restore_history失敗後もexact refsと全artifact/ledger復元を試す"
+  fi
+}
+
+test_incomplete_ref_rollback_preserves_original_history() {
+  echo "test_incomplete_ref_rollback_preserves_original_history:"
+  if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$TEST_ROOT" <<'PY'
+import pathlib
+import sys
+
+import retention
+
+root = pathlib.Path(sys.argv[1])
+events = []
+retention._original_refs = lambda _root: []
+
+
+def broken_refs(_root, _snapshot):
+    events.append("restore-refs")
+    raise RuntimeError("fixture exact refs failure")
+
+
+retention._restore_ref_snapshot = broken_refs
+retention._restore_local_file_snapshots = lambda _snapshots: []
+retention.restore_value_attempts = lambda _root, _snapshot: None
+retention.restore_attempts = lambda _root, _snapshot: None
+retention.restore_receipt_attempts = lambda _root, _snapshot: None
+retention._remote_main_oid = lambda _root: "a" * 40
+retention._cleanup_original_history = lambda _root: events.append("cleanup")
+errors = retention._rollback_purge_state(
+    root,
+    refs={"refs/heads/main": "a" * 40},
+    remote_main_oid="a" * 40,
+    files=[],
+    value_attempts=None,
+    evaluation_attempts=None,
+    receipt_attempts=None,
+)
+assert errors
+assert "restore-refs" in events
+assert "cleanup" not in events, events
+PY
+  then
+    pass "exact refs/remote復元失敗時はrefs/originalをcleanupしない"
+  else
+    fail "exact refs/remote復元失敗時はrefs/originalをcleanupしない"
+  fi
+}
+
+test_cli_reports_incomplete_rollback_with_original_context() {
+  echo "test_cli_reports_incomplete_rollback_with_original_context:"
+  local base="$TEST_ROOT/purge-cycle10-incomplete"
+  local state="$base/vault"
+  local db="$state/index/vault.sqlite"
+  local episode err="$base/incomplete.err" status
+  init_fixture "$base" || {
+    fail "cycle10 incomplete rollback fixtureを作成できる"
+    return
+  }
+  episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+  PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$state" "$episode" 2>"$err" <<'PY'
+import pathlib
+import sys
+
+import retention
+from vault import VaultError
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+original_remove = retention._remove_local_derivatives
+
+
+def fail_after_rewrite(root, scope, *, apply=True):
+    if apply:
+        raise VaultError("fixture original mutation failure")
+    return original_remove(root, scope, apply=apply)
+
+
+retention._remove_local_derivatives = fail_after_rewrite
+retention._restore_history = lambda _root: (_ for _ in ()).throw(
+    VaultError("fixture restore history failure")
+)
+retention._restore_ref_snapshot = lambda _root, _snapshot: (
+    (_ for _ in ()).throw(VaultError("fixture exact refs failure"))
+)
+try:
+    retention.purge(root, episode, None, None, apply=True)
+except VaultError as error:
+    print(f"flight-recorder: {error}", file=sys.stderr)
+    raise SystemExit(1)
+raise AssertionError("injected rollback unexpectedly succeeded")
+PY
+  status=$?
+  if [[ "$status" -ne 0 ]] \
+    && grep -Eiq 'rollback incomplete|rollback.*incomplete' "$err" \
+    && grep -Fq 'fixture original mutation failure' "$err" \
+    && ! grep -q 'Traceback' "$err"; then
+    pass "rollback incompleteを元例外文脈付きでCLIへ有限表示する"
+  else
+    fail "rollback incompleteを元例外文脈付きでCLIへ有限表示する"
+  fi
+}
+
+test_post_push_cleanup_failure_keeps_remote_commit_point() {
+  echo "test_post_push_cleanup_failure_keeps_remote_commit_point:"
+  local base="$TEST_ROOT/purge-cycle10-post-push"
+  local state="$base/vault" remote="$base/remote.git"
+  local db="$state/index/vault.sqlite"
+  local episode original_remote result="$base/result.json"
+  init_fixture "$base" || {
+    fail "cycle10 post-push fixtureを作成できる"
+    return
+  }
+  episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+  original_remote="$(git --git-dir="$remote" rev-parse main)"
+  PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$state" "$episode" "$result" <<'PY'
+import json
+import pathlib
+import sys
+
+import retention
+from vault import VaultError
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+result = pathlib.Path(sys.argv[3])
+rollback_calls = 0
+original_rollback = retention._rollback_purge_state
+
+
+def counted_rollback(*args, **kwargs):
+    global rollback_calls
+    rollback_calls += 1
+    return original_rollback(*args, **kwargs)
+
+
+def broken_cleanup(_root):
+    raise VaultError("fixture cleanup failure")
+
+
+retention._rollback_purge_state = counted_rollback
+retention._cleanup_original_history = broken_cleanup
+try:
+    retention.purge(root, episode, None, None, apply=True)
+except VaultError as error:
+    result.write_text(json.dumps({
+        "error": str(error),
+        "rollback_calls": rollback_calls,
+    }))
+else:
+    raise AssertionError("cleanup failure unexpectedly succeeded")
+PY
+  if python3 - "$state" "$remote" "$original_remote" "$result" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+
+root = pathlib.Path(sys.argv[1])
+remote = pathlib.Path(sys.argv[2])
+original_remote = sys.argv[3]
+result = json.loads(pathlib.Path(sys.argv[4]).read_text())
+
+
+def git(*arguments):
+    return subprocess.run(
+        ["git", *arguments], check=True, stdout=subprocess.PIPE
+    ).stdout.decode().strip()
+
+
+remote_oid = git(f"--git-dir={remote}", "rev-parse", "main")
+local_oid = git("-C", str(root), "rev-parse", "HEAD")
+refs = git(
+    "-C", str(root), "for-each-ref", "--format=%(refname)",
+    "refs/original/",
+).splitlines()
+assert remote_oid != original_remote
+assert remote_oid == local_oid
+assert refs, "post-push cleanup retry material was removed"
+assert result["rollback_calls"] == 0
+message = result["error"].lower()
+assert "remote rewrite applied" in message
+assert "local cleanup incomplete" in message
+PY
+  then
+    pass "push成功後cleanup失敗はremote commitを維持しretry材料を残す"
+  else
+    fail "push成功後cleanup失敗はremote commitを維持しretry材料を残す"
+  fi
+}
+
+test_cleanup_failure_marker_recovers_before_scope() {
+  echo "test_cleanup_failure_marker_recovers_before_scope:"
+  local base="$TEST_ROOT/purge-cycle11-cleanup"
+  local state="$base/vault" remote="$base/remote.git"
+  local db="$state/index/vault.sqlite"
+  local episode old_oid new_oid marker="$state/index/purge-recovery.json"
+  init_fixture "$base" || {
+    fail "cycle11 cleanup marker fixtureを作成できる"
+    return
+  }
+  episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+  old_oid="$(git --git-dir="$remote" rev-parse main)"
+  if ! PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$state" "$episode" "$marker" <<'PY'
+import json
+import pathlib
+import stat
+import sys
+
+import retention
+from vault import VaultError
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+marker = pathlib.Path(sys.argv[3])
+original_run_git = retention._run_git
+
+
+def validate_marker_before_push():
+    metadata = marker.lstat()
+    assert stat.S_ISREG(metadata.st_mode)
+    assert stat.S_IMODE(metadata.st_mode) == 0o600
+    assert metadata.st_uid == __import__("os").geteuid()
+    assert metadata.st_nlink == 1
+    value = json.loads(marker.read_text())
+    assert value == {
+        "schema_version": 1,
+        "contract_version": "purge-cleanup-recovery-v1",
+        "state": "push_pending",
+        "episode_id": episode,
+        "policy_version": "default-v1",
+        "old_remote_oid": value["old_remote_oid"],
+        "new_rewritten_oid": value["new_rewritten_oid"],
+    }
+    assert value["new_rewritten_oid"] == retention._ref_snapshot(root)["refs/heads/main"]
+
+
+def checked_run_git(root, arguments, *, env=None):
+    if arguments[:3] == ["push", "--force", "origin"]:
+        validate_marker_before_push()
+    return original_run_git(root, arguments, env=env)
+
+
+retention._run_git = checked_run_git
+retention._cleanup_original_history = lambda _root: (
+    (_ for _ in ()).throw(VaultError("fixture cleanup failure"))
+)
+try:
+    retention.purge(root, episode, None, None, apply=True)
+except VaultError as error:
+    assert "remote rewrite applied" in str(error).lower()
+else:
+    raise AssertionError("cleanup failure unexpectedly succeeded")
+PY
+  then
+    fail "push前marker保存とcleanup failureを注入できる"
+    return
+  fi
+  if ! python3 - "$marker" "$episode" "$old_oid" <<'PY'
+import json
+import pathlib
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+metadata = path.lstat()
+assert stat.S_ISREG(metadata.st_mode)
+assert stat.S_IMODE(metadata.st_mode) == 0o600
+assert metadata.st_nlink == 1
+value = json.loads(path.read_text())
+assert value["episode_id"] == sys.argv[2]
+assert value["old_remote_oid"] == sys.argv[3]
+assert value["state"] == "push_pending"
+PY
+  then
+    fail "cleanup failure後にstrict durable markerが残る"
+    return
+  fi
+  new_oid="$(git --git-dir="$remote" rev-parse main)"
+  if [[ "$new_oid" == "$old_oid" ]]; then
+    fail "cleanup failure前のremote rewriteがcommit済みである"
+    return
+  fi
+  if run_cli "$state" purge "$episode" --apply \
+      >"$base/retry.out" 2>"$base/retry.err" \
+    && [[ "$(git --git-dir="$remote" rev-parse main)" == "$new_oid" \
+      && ! -e "$marker" ]] \
+    && [[ -z "$(
+      git -C "$state" for-each-ref --format='%(refname)' refs/original/
+    )" ]]; then
+    pass "cleanup失敗後の再applyはscope前にcleanup-only回復する"
+  else
+    fail "cleanup失敗後の再applyはscope前にcleanup-only回復する"
+  fi
+}
+
+test_crash_after_push_recovers_cleanup_only() {
+  echo "test_crash_after_push_recovers_cleanup_only:"
+  local base="$TEST_ROOT/purge-cycle11-crash"
+  local state="$base/vault" remote="$base/remote.git"
+  local db="$state/index/vault.sqlite"
+  local episode old_oid new_oid marker="$state/index/purge-recovery.json"
+  local status
+  init_fixture "$base" || {
+    fail "cycle11 crash marker fixtureを作成できる"
+    return
+  }
+  episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+  old_oid="$(git --git-dir="$remote" rev-parse main)"
+  PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$state" "$episode" "$marker" <<'PY'
+import pathlib
+import sys
+
+import retention
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+marker = pathlib.Path(sys.argv[3])
+original_run_git = retention._run_git
+
+
+def checked_run_git(root, arguments, *, env=None):
+    if arguments[:3] == ["push", "--force", "origin"]:
+        assert marker.is_file(), "push occurred before durable marker"
+    return original_run_git(root, arguments, env=env)
+
+
+retention._run_git = checked_run_git
+retention._cleanup_original_history = lambda _root: (_ for _ in ()).throw(
+    SystemExit(75)
+)
+retention.purge(root, episode, None, None, apply=True)
+PY
+  status=$?
+  new_oid="$(git --git-dir="$remote" rev-parse main)"
+  if [[ "$status" -eq 75 && "$new_oid" != "$old_oid" && -f "$marker" ]] \
+    && run_cli "$state" purge "$episode" --apply \
+      >"$base/retry.out" 2>"$base/retry.err" \
+    && [[ "$(git --git-dir="$remote" rev-parse main)" == "$new_oid" \
+      && ! -e "$marker" ]]; then
+    pass "push後process crashのmarkerをcleanup-onlyで回収する"
+  else
+    fail "push後process crashのmarkerをcleanup-onlyで回収する"
+  fi
+}
+
+test_push_pending_marker_with_old_remote_resumes_normal_purge() {
+  echo "test_push_pending_marker_with_old_remote_resumes_normal_purge:"
+  local base="$TEST_ROOT/purge-cycle11-old-remote"
+  local state="$base/vault" remote="$base/remote.git"
+  local db="$state/index/vault.sqlite"
+  local episode old_oid marker="$state/index/purge-recovery.json"
+  init_fixture "$base" || {
+    fail "cycle11 old-remote marker fixtureを作成できる"
+    return
+  }
+  episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+  old_oid="$(git --git-dir="$remote" rev-parse main)"
+  write_purge_recovery_marker \
+    "$state" "$episode" "$old_oid" "$(printf 'b%.0s' {1..40})"
+  if run_cli "$state" purge "$episode" --apply \
+      >"$base/apply.out" 2>"$base/apply.err" \
+    && [[ ! -e "$marker" \
+      && "$(git --git-dir="$remote" rev-parse main)" != "$old_oid" ]]; then
+    pass "remote==oldのpush_pending markerをclearしnormal purgeを続行する"
+  else
+    fail "remote==oldのpush_pending markerをclearしnormal purgeを続行する"
+  fi
+}
+
+test_unsafe_cleanup_markers_fail_before_mutation() {
+  echo "test_unsafe_cleanup_markers_fail_before_mutation:"
+  local kind base state remote db episode marker old_oid new_oid
+  local before_files before_head before_remote failures=0 status
+  for kind in malformed symlink hardlink mode remote-diverged; do
+    base="$TEST_ROOT/purge-cycle11-unsafe-$kind"
+    state="$base/vault"
+    remote="$base/remote.git"
+    db="$state/index/vault.sqlite"
+    marker="$state/index/purge-recovery.json"
+    init_fixture "$base" || {
+      fail "cycle11 unsafe $kind fixtureを作成できる"
+      return
+    }
+    episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+    old_oid="$(git --git-dir="$remote" rev-parse main)"
+    new_oid="$(printf 'b%.0s' {1..40})"
+    if [[ "$kind" == "remote-diverged" ]]; then
+      write_purge_recovery_marker \
+        "$state" "$episode" "$(printf 'a%.0s' {1..40})" "$new_oid"
+    else
+      write_purge_recovery_marker "$state" "$episode" "$old_oid" "$new_oid"
+    fi
+    case "$kind" in
+      malformed)
+        printf '%s\n' '{"schema_version":1,"broken":true}' >"$marker"
+        chmod 600 "$marker"
+        ;;
+      symlink)
+        mv "$marker" "$state/index/purge-recovery-target.json"
+        ln -s purge-recovery-target.json "$marker"
+        ;;
+      hardlink)
+        ln "$marker" "$state/index/purge-recovery-hardlink.json"
+        ;;
+      mode)
+        chmod 644 "$marker"
+        ;;
+    esac
+    before_files="$(vault_byte_snapshot "$state")"
+    before_head="$(git -C "$state" rev-parse HEAD)"
+    before_remote="$(git --git-dir="$remote" rev-parse main)"
+    run_cli "$state" purge "$episode" --apply \
+      >"$base/apply.out" 2>"$base/apply.err"
+    status=$?
+    if [[ "$status" -eq 0 \
+      || "$before_head" != "$(git -C "$state" rev-parse HEAD)" \
+      || "$before_remote" != "$(git --git-dir="$remote" rev-parse main)" \
+      || "$before_files" != "$(vault_byte_snapshot "$state")" \
+      || $(grep -c 'Traceback' "$base/apply.err") -ne 0 ]]; then
+      failures=$((failures + 1))
+    fi
+  done
+  if [[ "$failures" -eq 0 ]]; then
+    pass "malformed/unsafe/diverged cleanup markerをmutation前に拒否する"
+  else
+    fail "malformed/unsafe/diverged cleanup markerをmutation前に拒否する"
+  fi
+}
+
+test_pre_push_crash_marker_pushes_new_with_lease() {
+  echo "test_pre_push_crash_marker_pushes_new_with_lease:"
+  local base="$TEST_ROOT/purge-cycle12-pre-push"
+  local state="$base/vault" remote="$base/remote.git"
+  local db="$state/index/vault.sqlite"
+  local episode old_oid new_oid marker="$state/index/purge-recovery.json"
+  local status calls="$base/push-calls.json"
+  init_fixture "$base" || {
+    fail "cycle12 pre-push crash fixtureを作成できる"
+    return
+  }
+  episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+  old_oid="$(git --git-dir="$remote" rev-parse main)"
+  PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$state" "$episode" "$marker" <<'PY'
+import pathlib
+import sys
+
+import retention
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+marker = pathlib.Path(sys.argv[3])
+original = retention._run_git
+
+
+def crash_before_push(root, arguments, *, env=None):
+    if arguments and arguments[0] == "push":
+        assert marker.is_file(), "push attempted before marker durability"
+        raise SystemExit(76)
+    return original(root, arguments, env=env)
+
+
+retention._run_git = crash_before_push
+retention.purge(root, episode, None, None, apply=True)
+PY
+  status=$?
+  new_oid="$(git -C "$state" rev-parse HEAD)"
+  if [[ "$status" -ne 76 || ! -f "$marker" \
+    || "$(git --git-dir="$remote" rev-parse main)" != "$old_oid" \
+    || "$new_oid" == "$old_oid" ]]; then
+    fail "push直前crashでmarker/local=new/remote=oldを保持する"
+    return
+  fi
+  if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$state" "$episode" "$calls" "$old_oid" <<'PY'
+import json
+import pathlib
+import sys
+
+import retention
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+output = pathlib.Path(sys.argv[3])
+old_oid = sys.argv[4]
+calls = []
+original = retention._run_git
+
+
+def checked(root, arguments, *, env=None):
+    if arguments and arguments[0] == "push":
+        calls.append(arguments)
+        assert f"--force-with-lease=refs/heads/main:{old_oid}" in arguments
+        assert "--force" not in arguments
+    return original(root, arguments, env=env)
+
+
+retention._run_git = checked
+result = retention.purge(root, episode, None, None, apply=True)
+assert result.get("cleanup_only") is True
+output.write_text(json.dumps(calls))
+PY
+  then
+    if [[ ! -e "$marker" \
+      && "$(git --git-dir="$remote" rev-parse main)" == "$new_oid" ]] \
+      && python3 - "$calls" <<'PY'
+import json
+import pathlib
+import sys
+
+calls = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert len(calls) == 1
+assert all("--force" not in call for call in calls)
+PY
+    then
+      pass "pre-push crash markerをold leaseでpushしcleanup-only完了する"
+    else
+      fail "pre-push crash markerをold leaseでpushしcleanup-only完了する"
+    fi
+  else
+    fail "pre-push crash markerをold leaseでpushしcleanup-only完了する"
+  fi
+}
+
+test_normal_push_lease_rejects_third_party_race() {
+  echo "test_normal_push_lease_rejects_third_party_race:"
+  local base="$TEST_ROOT/purge-cycle12-third-race"
+  local state="$base/vault" remote="$base/remote.git"
+  local db="$state/index/vault.sqlite"
+  local episode old_oid third_oid result="$base/result.json"
+  init_fixture "$base" || {
+    fail "cycle12 third-party race fixtureを作成できる"
+    return
+  }
+  episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+  old_oid="$(git --git-dir="$remote" rev-parse main)"
+  third_oid="$(python3 - "$remote" "$old_oid" <<'PY'
+import subprocess
+import sys
+
+remote, parent = sys.argv[1:]
+tree = subprocess.run(
+    ["git", f"--git-dir={remote}", "rev-parse", f"{parent}^{{tree}}"],
+    check=True,
+    stdout=subprocess.PIPE,
+).stdout.decode().strip()
+print(subprocess.run(
+    ["git", f"--git-dir={remote}", "commit-tree", tree, "-p", parent],
+    input=b"fixture third-party update\n",
+    check=True,
+    stdout=subprocess.PIPE,
+).stdout.decode().strip())
+PY
+)"
+  PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - \
+      "$state" "$episode" "$remote" "$third_oid" "$old_oid" "$result" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+
+import retention
+from vault import VaultError
+
+root = pathlib.Path(sys.argv[1])
+episode, remote, third_oid, old_oid = sys.argv[2:6]
+output = pathlib.Path(sys.argv[6])
+original = retention._run_git
+calls = []
+moved = False
+
+
+def raced(root, arguments, *, env=None):
+    global moved
+    if arguments and arguments[0] == "push":
+        calls.append(arguments)
+        if not moved:
+            subprocess.run(
+                ["git", f"--git-dir={remote}", "update-ref", "refs/heads/main", third_oid],
+                check=True,
+            )
+            moved = True
+    return original(root, arguments, env=env)
+
+
+retention._run_git = raced
+try:
+    retention.purge(root, episode, None, None, apply=True)
+except VaultError as error:
+    output.write_text(json.dumps({"error": str(error), "calls": calls}))
+else:
+    raise AssertionError("third-party race unexpectedly succeeded")
+PY
+  if python3 - "$state" "$remote" "$old_oid" "$third_oid" "$result" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+
+root = pathlib.Path(sys.argv[1])
+remote, old_oid, third_oid = sys.argv[2:5]
+result = json.loads(pathlib.Path(sys.argv[5]).read_text())
+
+
+def git(*arguments):
+    return subprocess.run(
+        ["git", *arguments], check=True, stdout=subprocess.PIPE
+    ).stdout.decode().strip()
+
+
+assert git(f"--git-dir={remote}", "rev-parse", "main") == third_oid
+assert git("-C", str(root), "rev-parse", "HEAD") == old_oid
+refs = git(
+    "-C", str(root), "for-each-ref", "--format=%(refname)", "refs/original/"
+).splitlines()
+assert refs, "rollback recovery material was cleaned after remote race"
+calls = result["calls"]
+assert calls
+first = calls[0]
+assert f"--force-with-lease=refs/heads/main:{old_oid}" in first
+assert all("--force" not in call for call in calls)
+assert "rollback incomplete" in result["error"].lower()
+PY
+  then
+    pass "normal push leaseはthird-party remoteを上書きせずrollback材料を保持する"
+  else
+    fail "normal push leaseはthird-party remoteを上書きせずrollback材料を保持する"
+  fi
+}
+
+test_rollback_remote_restore_uses_new_oid_lease_only() {
+  echo "test_rollback_remote_restore_uses_new_oid_lease_only:"
+  if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$TEST_ROOT" <<'PY'
+import pathlib
+import sys
+
+import retention
+
+root = pathlib.Path(sys.argv[1])
+old = "a" * 40
+new = "b" * 40
+third = "c" * 40
+
+
+def exercise(initial):
+    current = initial
+    calls = []
+    cleanup = []
+    retention._original_refs = lambda _root: []
+    retention._restore_ref_snapshot = lambda _root, _refs: None
+    retention._restore_local_file_snapshots = lambda _files: []
+    retention.restore_value_attempts = lambda _root, _snapshot: None
+    retention.restore_attempts = lambda _root, _snapshot: None
+    retention.restore_receipt_attempts = lambda _root, _snapshot: None
+    retention._remote_main_oid = lambda _root: current
+
+    def run_git(_root, arguments, *, env=None):
+        nonlocal current
+        calls.append(arguments)
+        expected = f"--force-with-lease=refs/heads/main:{new}"
+        if expected in arguments and initial == new:
+            current = old
+
+    retention._run_git = run_git
+    retention._cleanup_original_history = lambda _root: cleanup.append(True)
+    errors = retention._rollback_purge_state(
+        root,
+        refs={"refs/heads/main": old},
+        remote_main_oid=old,
+        rewritten_remote_oid=new,
+        files=[],
+        value_attempts=None,
+        evaluation_attempts=None,
+        receipt_attempts=None,
+    )
+    return current, calls, cleanup, errors
+
+
+current, calls, cleanup, errors = exercise(new)
+assert current == old and not errors and cleanup
+assert len(calls) == 1
+assert f"--force-with-lease=refs/heads/main:{new}" in calls[0]
+assert "--force" not in calls[0]
+assert f"{old}:refs/heads/main" in calls[0]
+
+current, calls, cleanup, errors = exercise(old)
+assert current == old and calls == [] and not errors and cleanup
+
+current, calls, cleanup, errors = exercise(third)
+assert current == third
+assert calls == []
+assert errors
+assert cleanup == []
+PY
+  then
+    pass "rollbackはknown newだけをlease付きでoldへ戻しthirdを変更しない"
+  else
+    fail "rollbackはknown newだけをlease付きでoldへ戻しthirdを変更しない"
+  fi
+}
+
+git_state_snapshot() {
+  local state="$1"
+  {
+    if git -C "$state" symbolic-ref -q HEAD; then
+      true
+    else
+      echo DETACHED
+    fi
+    git -C "$state" rev-parse HEAD
+    git -C "$state" for-each-ref \
+      --format='%(refname) %(objectname)' | LC_ALL=C sort
+    git -C "$state" status --porcelain=v1 --untracked-files=all
+  }
+}
+
+test_purge_preflight_requires_synced_main_head() {
+  echo "test_purge_preflight_requires_synced_main_head:"
+  local kind base state remote db episode unrelated old_oid third_oid
+  local before_git before_files before_remote result failures=0
+  for kind in remote-ahead detached other-branch; do
+    base="$TEST_ROOT/purge-cycle13-$kind"
+    state="$base/vault"
+    remote="$base/remote.git"
+    db="$state/index/vault.sqlite"
+    result="$base/result.json"
+    init_fixture "$base" || {
+      fail "cycle13 $kind fixtureを作成できる"
+      return
+    }
+    episode="$(db_value_for_event "$db" "$TARGET_EVENT" episode_id)"
+    unrelated="$(db_value_for_event "$db" "$UNRELATED_EVENT" episode_id)"
+    write_attempt_ledger "$state" "$episode" "$unrelated"
+    write_receipt_attempt_ledger "$state" "$episode" "$unrelated" || {
+      fail "cycle13 $kind receipt ledgerを作成できる"
+      return
+    }
+    write_value_artifacts "$state" "$episode" "$unrelated" || {
+      fail "cycle13 $kind Value artifactsを作成できる"
+      return
+    }
+    materialize_prepared_receipts "$state" || {
+      fail "cycle13 $kind stored receiptsを作成できる"
+      return
+    }
+    old_oid="$(git --git-dir="$remote" rev-parse main)"
+    case "$kind" in
+      remote-ahead)
+        third_oid="$(python3 - "$remote" "$old_oid" <<'PY'
+import subprocess
+import sys
+
+remote, parent = sys.argv[1:]
+tree = subprocess.run(
+    ["git", f"--git-dir={remote}", "rev-parse", f"{parent}^{{tree}}"],
+    check=True,
+    stdout=subprocess.PIPE,
+).stdout.decode().strip()
+print(subprocess.run(
+    ["git", f"--git-dir={remote}", "commit-tree", tree, "-p", parent],
+    input=b"fixture remote-ahead preflight\n",
+    check=True,
+    stdout=subprocess.PIPE,
+).stdout.decode().strip())
+PY
+)"
+        git --git-dir="$remote" update-ref refs/heads/main "$third_oid"
+        ;;
+      detached)
+        git -C "$state" checkout --detach -q
+        ;;
+      other-branch)
+        git -C "$state" checkout -q -b fixture-other
+        ;;
+    esac
+    before_git="$(git_state_snapshot "$state")"
+    before_files="$(vault_byte_snapshot "$state")"
+    before_remote="$(git --git-dir="$remote" rev-parse main)"
+    PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+      python3 - "$state" "$episode" "$result" <<'PY'
+import json
+import pathlib
+import sys
+
+import retention
+
+root = pathlib.Path(sys.argv[1])
+episode = sys.argv[2]
+result = pathlib.Path(sys.argv[3])
+original = retention._run_git
+pushes = []
+
+
+def tracked(root, arguments, *, env=None):
+    if arguments and arguments[0] == "push":
+        pushes.append(arguments)
+    return original(root, arguments, env=env)
+
+
+retention._run_git = tracked
+try:
+    retention.purge(root, episode, None, None, apply=True)
+except Exception as error:
+    result.write_text(json.dumps({
+        "success": False,
+        "error": str(error),
+        "pushes": pushes,
+    }))
+else:
+    result.write_text(json.dumps({
+        "success": True,
+        "error": "",
+        "pushes": pushes,
+    }))
+PY
+    if ! python3 - "$result" <<'PY'
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert value["success"] is False
+assert "sync required" in value["error"].lower()
+assert value["pushes"] == []
+PY
+    then
+      failures=$((failures + 1))
+    elif [[ "$before_git" != "$(git_state_snapshot "$state")" \
+      || "$before_files" != "$(vault_byte_snapshot "$state")" \
+      || "$before_remote" != "$(git --git-dir="$remote" rev-parse main)" ]]; then
+      failures=$((failures + 1))
+    fi
+  done
+  if [[ "$failures" -eq 0 ]]; then
+    pass "purge preflightはsynced main以外をpushゼロ・mutationゼロで拒否する"
+  else
+    fail "purge preflightはsynced main以外をpushゼロ・mutationゼロで拒否する"
+  fi
+}
+
 echo "=== Flight Recorder Retention Tests ==="
-test_forget_preserves_source_and_survives_rebuild
-test_dangling_forget_marker_fails_closed
-test_purge_dry_run_previews_scope_without_rewriting_history
-test_purge_apply_removes_target_history_and_keeps_unrelated_chunk
-test_purge_push_rejection_restores_retryable_local_state
-test_invalid_attempt_ledger_blocks_purge_before_rewrite
+if [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE7_ONLY:-0}" == "1" ]]; then
+  test_purge_push_rejection_restores_retryable_local_state
+elif [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE8_ONLY:-0}" == "1" ]]; then
+  test_purge_dry_run_does_not_recover_prepared_temp
+elif [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE9_ONLY:-0}" == "1" ]]; then
+  test_purge_unlink_failure_restores_complete_local_state
+elif [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE10_ONLY:-0}" == "1" ]]; then
+  case "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE10_CASE:-all}" in
+    ordering)
+      test_rollback_attempts_exact_refs_after_restore_history_failure
+      ;;
+    preserve)
+      test_incomplete_ref_rollback_preserves_original_history
+      ;;
+    visibility)
+      test_cli_reports_incomplete_rollback_with_original_context
+      ;;
+    commit-point)
+      test_post_push_cleanup_failure_keeps_remote_commit_point
+      ;;
+    all)
+      test_rollback_attempts_exact_refs_after_restore_history_failure
+      test_incomplete_ref_rollback_preserves_original_history
+      test_cli_reports_incomplete_rollback_with_original_context
+      test_post_push_cleanup_failure_keeps_remote_commit_point
+      ;;
+    *)
+      fail "unknown cycle10 test case"
+      ;;
+  esac
+elif [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE11_ONLY:-0}" == "1" ]]; then
+  case "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE11_CASE:-all}" in
+    cleanup)
+      test_cleanup_failure_marker_recovers_before_scope
+      ;;
+    crash)
+      test_crash_after_push_recovers_cleanup_only
+      ;;
+    old-remote)
+      test_push_pending_marker_with_old_remote_resumes_normal_purge
+      ;;
+    unsafe)
+      test_unsafe_cleanup_markers_fail_before_mutation
+      ;;
+    all)
+      test_cleanup_failure_marker_recovers_before_scope
+      test_crash_after_push_recovers_cleanup_only
+      test_push_pending_marker_with_old_remote_resumes_normal_purge
+      test_unsafe_cleanup_markers_fail_before_mutation
+      ;;
+    *)
+      fail "unknown cycle11 test case"
+      ;;
+  esac
+elif [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE12_ONLY:-0}" == "1" ]]; then
+  case "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE12_CASE:-all}" in
+    resume-push)
+      test_pre_push_crash_marker_pushes_new_with_lease
+      ;;
+    third-race)
+      test_normal_push_lease_rejects_third_party_race
+      ;;
+    rollback-lease)
+      test_rollback_remote_restore_uses_new_oid_lease_only
+      ;;
+    all)
+      test_pre_push_crash_marker_pushes_new_with_lease
+      test_normal_push_lease_rejects_third_party_race
+      test_rollback_remote_restore_uses_new_oid_lease_only
+      ;;
+    *)
+      fail "unknown cycle12 test case"
+      ;;
+  esac
+elif [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE13_ONLY:-0}" == "1" ]]; then
+  test_purge_preflight_requires_synced_main_head
+else
+  test_forget_preserves_source_and_survives_rebuild
+  test_dangling_forget_marker_fails_closed
+  test_purge_dry_run_previews_scope_without_rewriting_history
+  test_purge_apply_removes_target_history_and_keeps_unrelated_chunk
+  test_purge_push_rejection_restores_retryable_local_state
+  test_invalid_attempt_ledger_blocks_purge_before_rewrite
+  test_purge_dry_run_does_not_recover_prepared_temp
+  test_purge_unlink_failure_restores_complete_local_state
+  test_rollback_attempts_exact_refs_after_restore_history_failure
+  test_incomplete_ref_rollback_preserves_original_history
+  test_cli_reports_incomplete_rollback_with_original_context
+  test_post_push_cleanup_failure_keeps_remote_commit_point
+  test_cleanup_failure_marker_recovers_before_scope
+  test_crash_after_push_recovers_cleanup_only
+  test_push_pending_marker_with_old_remote_resumes_normal_purge
+  test_unsafe_cleanup_markers_fail_before_mutation
+  test_pre_push_crash_marker_pushes_new_with_lease
+  test_normal_push_lease_rejects_third_party_race
+  test_rollback_remote_restore_uses_new_oid_lease_only
+  test_purge_preflight_requires_synced_main_head
+fi
 echo
 echo "Results: $PASS passed, $FAIL failed"
 [[ "$FAIL" -eq 0 ]]

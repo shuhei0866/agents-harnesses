@@ -128,6 +128,7 @@ assert_fail_closed() {
   local description="$1" mode="$2" stdin_path="$3"
   local suffix="$4"
   local provider_expected="${5:-yes}"
+  local forbidden="${6:-RAW_SOURCE_CANARY_iam178}"
   local capture="$TEST_ROOT/capture-$suffix"
   local output="$TEST_ROOT/$suffix.out"
   local error="$TEST_ROOT/$suffix.err"
@@ -138,12 +139,138 @@ assert_fail_closed() {
   [[ -f "$capture/argv.json" ]] && provider_observed=yes
   if [[ "$status" -ne 0 && ! -s "$output" ]] \
     && ! grep -q "Traceback" "$error" \
-    && ! grep -q "RAW_SOURCE_CANARY_iam178" "$error" \
+    && ! grep -Fq "$forbidden" "$error" \
     && [[ "$provider_observed" == "$provider_expected" ]]; then
     pass "$description"
   else
     fail "$description"
   fi
+}
+
+write_nested_jsonl_request() {
+  local destination="$1"
+  write_request "$destination"
+  python3 - "$destination" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+value = json.loads(path.read_text())
+user_text = (
+    "Please preserve the existing retry boundary while correcting this "
+    "specific nested fixture behavior."
+)
+assistant_text = (
+    "The bounded implementation now preserves retries and verifies the "
+    "nested fixture behavior."
+)
+rows = [
+    {
+        "type": "response_item",
+        "payload": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": user_text}],
+        },
+    },
+    {
+        "type": "response_item",
+        "payload": {
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": assistant_text}],
+        },
+    },
+]
+content = "\n".join(
+    json.dumps(row, sort_keys=True, separators=(",", ":")) for row in rows
+)
+value["source"]["content"] = content
+value["source"]["content_sha256"] = (
+    "sha256:" + hashlib.sha256(content.encode()).hexdigest()
+)
+value["source"]["span_sha256"] = value["source"]["content_sha256"]
+path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")))
+PY
+}
+
+write_trimmed_nested_jsonl_request() {
+  local destination="$1"
+  write_request "$destination"
+  python3 - "$destination" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+value = json.loads(path.read_text())
+dict_fragment = "D" * 32
+list_fragment = "L" * 32
+primitive_fragment = "P" * 32
+short_fragment = "S" * 31
+rows = [
+    {
+        "nested": {
+            "items": [
+                {"text": f"   {dict_fragment}   "},
+                {"short": f"   {short_fragment}   "},
+            ],
+        },
+    },
+    ["metadata", {"assistant": f"   {list_fragment}   "}],
+    f"   {primitive_fragment}   ",
+]
+content = "\n".join(
+    json.dumps(row, sort_keys=True, separators=(",", ":")) for row in rows
+)
+value["source"]["content"] = content
+digest = "sha256:" + hashlib.sha256(content.encode()).hexdigest()
+value["source"]["content_sha256"] = digest
+value["source"]["span_sha256"] = digest
+path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")))
+PY
+}
+
+write_recursive_jsonl_request() {
+  local destination="$1"
+  write_request "$destination"
+  python3 - "$destination" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+value = json.loads(path.read_text())
+fragment = "R" * 32
+content = "[" * 2000 + json.dumps(fragment) + "]" * 2000
+value["source"]["content"] = content
+digest = "sha256:" + hashlib.sha256(content.encode()).hexdigest()
+value["source"]["content_sha256"] = digest
+value["source"]["span_sha256"] = digest
+path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")))
+PY
+}
+
+write_non_json_privacy_request() {
+  local destination="$1"
+  write_request "$destination"
+  python3 - "$destination" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+value = json.loads(path.read_text())
+content = "NOT_JSON_PRIVATE_FRAGMENT_" + "N" * 40
+value["source"]["content"] = content
+digest = "sha256:" + hashlib.sha256(content.encode()).hexdigest()
+value["source"]["content_sha256"] = digest
+value["source"]["span_sha256"] = digest
+path.write_text(json.dumps(value, sort_keys=True, separators=(",", ":")))
+PY
 }
 
 test_protocol_v2_and_safe_claude_invocation() {
@@ -204,6 +331,9 @@ assert "--no-session-persistence" in argv
 assert "--disable-slash-commands" in argv
 assert "--strict-mcp-config" in argv
 assert option("--model") == request["model"]
+system_prompt = option("--system-prompt")
+assert "32 or more characters" in system_prompt
+assert "JSONL" in system_prompt
 budget_usd = decimal.Decimal(option("--max-budget-usd"))
 assert budget_usd * decimal.Decimal(1_000_000) <= decimal.Decimal(
     request["remaining_cost_microusd"]
@@ -320,6 +450,275 @@ test_provider_failures_and_budget_fail_closed() {
     echo-source "$REQUEST" provider-source-echo
 }
 
+test_nested_jsonl_source_copy_fails_at_adapter_boundary() {
+  echo "test_nested_jsonl_source_copy_fails_at_adapter_boundary:"
+  local request="$TEST_ROOT/nested-jsonl-request.json"
+  local copied=(
+    "Please preserve the existing retry boundary while correcting this specific nested fixture behavior."
+  )
+  local capture="$TEST_ROOT/capture-nested-jsonl-paraphrase"
+  local output="$TEST_ROOT/nested-jsonl-paraphrase.out"
+  local error="$TEST_ROOT/nested-jsonl-paraphrase.err"
+  write_nested_jsonl_request "$request"
+  assert_fail_closed \
+    "JSONL nested user/assistant文字列のcopyをadapter段階で拒否する" \
+    nested-jsonl-copy "$request" nested-jsonl-copy yes "$copied"
+
+  if run_adapter valid "$capture" "$request" >"$output" 2>"$error" \
+    && [[ ! -s "$error" ]] \
+    && python3 - "$output" "$request" <<'PY'
+import json
+import pathlib
+import sys
+
+output = json.loads(pathlib.Path(sys.argv[1]).read_text())
+request = json.loads(pathlib.Path(sys.argv[2]).read_text())
+serialized = json.dumps(output, sort_keys=True)
+for line in request["source"]["content"].splitlines():
+    decoded = json.loads(line)
+    for item in decoded["payload"]["content"]:
+        assert item["text"] not in serialized
+assert output["result"]["summary"] == (
+    "The bounded generic failure was corrected."
+)
+PY
+  then
+    pass "JSONL sourceのparaphrase responseは既存どおり通過する"
+  else
+    cat "$error" >&2
+    fail "JSONL sourceのparaphrase responseは既存どおり通過する"
+  fi
+}
+
+test_trimmed_nested_jsonl_fragments_share_privacy_boundary() {
+  echo "test_trimmed_nested_jsonl_fragments_share_privacy_boundary:"
+  local request="$TEST_ROOT/trimmed-nested-jsonl-request.json"
+  local mode prefix description
+  local capture="$TEST_ROOT/capture-trimmed-jsonl-short"
+  local output="$TEST_ROOT/trimmed-jsonl-short.out"
+  local error="$TEST_ROOT/trimmed-jsonl-short.err"
+  write_trimmed_nested_jsonl_request "$request"
+  for mode in dict list primitive; do
+    case "$mode" in
+      dict) prefix="$(printf 'D%.0s' {1..32})" ;;
+      list) prefix="$(printf 'L%.0s' {1..32})" ;;
+      primitive) prefix="$(printf 'P%.0s' {1..32})" ;;
+    esac
+    description="前後空白付きJSONL $mode nested 32文字のtrimmed copyを拒否する"
+    assert_fail_closed "$description" \
+      "trimmed-jsonl-$mode-copy" "$request" \
+      "trimmed-jsonl-$mode-copy" yes "$prefix"
+  done
+
+  if run_adapter trimmed-jsonl-short-copy "$capture" "$request" \
+      >"$output" 2>"$error" \
+    && [[ ! -s "$error" ]] \
+    && python3 - "$output" <<'PY'
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert value["result"]["summary"] == "S" * 31
+PY
+  then
+    pass "trimmed 31文字はprivacy fragment閾値では拒否しない"
+  else
+    cat "$error" >&2
+    fail "trimmed 31文字はprivacy fragment閾値では拒否しない"
+  fi
+
+  if PYTHONPATH="$PLUGIN_DIR/scripts" python3 - "$request" <<'PY'
+import json
+import pathlib
+import sys
+
+from semantic_receipts import _validate_response
+from vault import VaultError
+
+request = json.loads(pathlib.Path(sys.argv[1]).read_text())
+evidence = "sha256:" + "1" * 64
+rubric = request["rubric"]
+base = {
+    "schema_version": 1,
+    "task": {
+        "type": "bug_fix",
+        "intent": "A bounded paraphrase of the requested work.",
+        "deliverable": "A verified bounded repository change.",
+        "constraints": ["Preserve existing behavior."],
+        "difficulty": "medium",
+    },
+    "execution": {
+        "harness": "claude-code",
+        "model": "fixture-worker-model",
+        "duration_ms": 1200,
+        "tool_count": 0,
+        "retry_count": 0,
+    },
+    "result": {
+        "summary": "placeholder",
+        "artifacts": ["test-result"],
+        "outcome": "success",
+    },
+    "assessment": {
+        "criteria": {
+            name: {
+                "state": "supported",
+                "evidence_references": [evidence],
+            }
+            for name in rubric["criteria"]
+        },
+        "confidence": "high",
+    },
+}
+
+for fragment in ("D" * 32, "L" * 32, "P" * 32):
+    response = json.loads(json.dumps(base))
+    response["result"]["summary"] = fragment
+    try:
+        _validate_response(
+            json.dumps(response, sort_keys=True, separators=(",", ":")).encode(),
+            {evidence},
+            rubric,
+            request["source"]["content"],
+            "/private/fixture/session.jsonl",
+            "claude-code",
+        )
+    except VaultError as error:
+        assert "copied raw source content" in str(error)
+    else:
+        raise AssertionError(f"Recorder accepted trimmed source fragment: {fragment[0]}")
+PY
+  then
+    pass "RecorderもJSONL nested trimmed 32文字copyを拒否する"
+  else
+    fail "RecorderもJSONL nested trimmed 32文字copyを拒否する"
+  fi
+}
+
+test_recursive_jsonl_privacy_fails_closed_without_breaking_non_json() {
+  echo "test_recursive_jsonl_privacy_fails_closed_without_breaking_non_json:"
+  local recursive="$TEST_ROOT/recursive-jsonl-request.json"
+  local non_json="$TEST_ROOT/non-json-privacy-request.json"
+  local capture="$TEST_ROOT/capture-recursive-jsonl"
+  local output="$TEST_ROOT/recursive-jsonl.out"
+  local error="$TEST_ROOT/recursive-jsonl.err"
+  local status=0
+  write_recursive_jsonl_request "$recursive"
+  run_adapter valid "$capture" "$recursive" >"$output" 2>"$error" \
+    || status=$?
+  if [[ "$status" -eq 1 && ! -s "$output" ]] \
+    && [[ -f "$capture/argv.json" ]] \
+    && [[ "$(cat "$error")" == \
+      "flight recorder Claude evaluator failed" ]]; then
+    pass "深いvalid JSONLをadapter固定stderrでfail closedする"
+  else
+    fail "深いvalid JSONLをadapter固定stderrでfail closedする"
+  fi
+
+  write_non_json_privacy_request "$non_json"
+  capture="$TEST_ROOT/capture-non-json-privacy"
+  output="$TEST_ROOT/non-json-privacy.out"
+  error="$TEST_ROOT/non-json-privacy.err"
+  if run_adapter valid "$capture" "$non_json" >"$output" 2>"$error" \
+    && [[ ! -s "$error" ]] \
+    && python3 - "$output" <<'PY'
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert value["result"]["summary"] == (
+    "The bounded generic failure was corrected."
+)
+PY
+  then
+    pass "非JSON行はwhole-line検査のみでparaphraseを通す"
+  else
+    cat "$error" >&2
+    fail "非JSON行はwhole-line検査のみでparaphraseを通す"
+  fi
+
+  if PYTHONPATH="$PLUGIN_DIR/scripts" python3 - "$recursive" "$non_json" <<'PY'
+import json
+import pathlib
+import sys
+
+from semantic_receipts import _validate_response
+from vault import VaultError
+
+recursive_request = json.loads(pathlib.Path(sys.argv[1]).read_text())
+non_json_request = json.loads(pathlib.Path(sys.argv[2]).read_text())
+evidence = "sha256:" + "1" * 64
+rubric = recursive_request["rubric"]
+response = {
+    "schema_version": 1,
+    "task": {
+        "type": "bug_fix",
+        "intent": "A bounded paraphrase of the requested work.",
+        "deliverable": "A verified bounded repository change.",
+        "constraints": ["Preserve existing behavior."],
+        "difficulty": "medium",
+    },
+    "execution": {
+        "harness": "claude-code",
+        "model": "fixture-worker-model",
+        "duration_ms": 1200,
+        "tool_count": 0,
+        "retry_count": 0,
+    },
+    "result": {
+        "summary": "The bounded generic failure was corrected.",
+        "artifacts": ["test-result"],
+        "outcome": "success",
+    },
+    "assessment": {
+        "criteria": {
+            name: {
+                "state": "supported",
+                "evidence_references": [evidence],
+            }
+            for name in rubric["criteria"]
+        },
+        "confidence": "high",
+    },
+}
+raw = json.dumps(response, sort_keys=True, separators=(",", ":")).encode()
+try:
+    _validate_response(
+        raw,
+        {evidence},
+        rubric,
+        recursive_request["source"]["content"],
+        "/private/fixture/session.jsonl",
+        "claude-code",
+    )
+except VaultError as error:
+    assert str(error) == "semantic evaluator source content is invalid"
+    assert isinstance(error.__cause__, RecursionError)
+except RecursionError as error:
+    raise AssertionError("raw RecursionError escaped Recorder") from error
+else:
+    raise AssertionError("Recorder accepted excessively nested JSONL")
+
+validated, references = _validate_response(
+    raw,
+    {evidence},
+    rubric,
+    non_json_request["source"]["content"],
+    "/private/fixture/session.jsonl",
+    "claude-code",
+)
+assert validated["result"]["summary"] == response["result"]["summary"]
+assert references == [evidence]
+PY
+  then
+    pass "Recorderは再帰超過を固定VaultErrorへ閉じ非JSON paraphraseを維持する"
+  else
+    fail "Recorderは再帰超過を固定VaultErrorへ閉じ非JSON paraphraseを維持する"
+  fi
+}
+
 test_timeout_budget_contract() {
   echo "test_timeout_budget_contract:"
   if python3 - "$ADAPTER" "$PLUGIN_DIR/scripts/receipt_automation.py" \
@@ -365,10 +764,10 @@ calls = [
     for node in ast.walk(worker_tree)
     if isinstance(node, ast.Call)
     and isinstance(node.func, ast.Name)
-    and node.func.id == "generate"
+    and node.func.id == "_prepare_receipt"
 ]
 assert len(calls) == 1
-timeout_argument = calls[0].args[8]
+timeout_argument = calls[0].args[9]
 assert isinstance(timeout_argument, ast.Call)
 assert isinstance(timeout_argument.func, ast.Name)
 assert timeout_argument.func.id == "_evaluator_timeout_seconds"
@@ -497,13 +896,24 @@ if [[ ! -x "$ADAPTER" ]]; then
   echo "Results: $PASS passed, $FAIL failed"
   exit 1
 fi
-test_protocol_v2_and_safe_claude_invocation
-test_invalid_and_oversized_input_fail_closed
-test_normalizes_worker_contract_fields
-test_provider_failures_and_budget_fail_closed
-test_timeout_budget_contract
-test_timeout_override_is_harness_only
-test_slow_provider_times_out_cleanly
+if [[ "${FLIGHT_RECORDER_TEST_NESTED_JSONL_ONLY:-0}" == "1" ]]; then
+  test_nested_jsonl_source_copy_fails_at_adapter_boundary
+elif [[ "${FLIGHT_RECORDER_TEST_TRIMMED_JSONL_ONLY:-0}" == "1" ]]; then
+  test_trimmed_nested_jsonl_fragments_share_privacy_boundary
+elif [[ "${FLIGHT_RECORDER_TEST_RECURSIVE_JSONL_ONLY:-0}" == "1" ]]; then
+  test_recursive_jsonl_privacy_fails_closed_without_breaking_non_json
+else
+  test_protocol_v2_and_safe_claude_invocation
+  test_invalid_and_oversized_input_fail_closed
+  test_normalizes_worker_contract_fields
+  test_provider_failures_and_budget_fail_closed
+  test_nested_jsonl_source_copy_fails_at_adapter_boundary
+  test_trimmed_nested_jsonl_fragments_share_privacy_boundary
+  test_recursive_jsonl_privacy_fails_closed_without_breaking_non_json
+  test_timeout_budget_contract
+  test_timeout_override_is_harness_only
+  test_slow_provider_times_out_cleanly
+fi
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

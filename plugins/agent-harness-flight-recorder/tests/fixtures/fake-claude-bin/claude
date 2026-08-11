@@ -169,17 +169,161 @@ if mode.startswith("meaning-"):
         semantic["intent"]["summary"] = request["packet"]["evidence"][0][
             "content"
         ]
+if mode.startswith("value-"):
+    axes = (
+        "goal_achievement",
+        "deliverable_quality",
+        "risk_reduction",
+        "learning",
+        "reuse_potential",
+        "decision_leverage",
+        "attention_saved",
+        "rework",
+    )
+    evidence = {
+        item["field"]: item
+        for item in request.get("packet", {}).get("evidence", [])
+        if isinstance(item, dict)
+        and isinstance(item.get("field"), str)
+        and isinstance(item.get("evidence_id"), str)
+    }
+
+    def evidence_id(field):
+        item = evidence.get(field)
+        return [] if item is None else [item["evidence_id"]]
+
+    support = {
+        "goal_achievement": evidence_id("meaning.outcome"),
+        "deliverable_quality": evidence_id("meaning.verification"),
+        "learning": evidence_id("meaning.reusable_learning"),
+        "reuse_potential": evidence_id("meaning.reusable_learning"),
+    }
+    semantic = {"schema_version": 1, "primitives": {}}
+    for axis in axes:
+        references = support.get(axis, [])
+        semantic["primitives"][axis] = {
+            "state": "positive" if references else "unknown",
+            "summary": (
+                f"Grounded evidence supports the {axis.replace('_', ' ')} signal."
+                if references
+                else "No dedicated grounded signal is available for this axis."
+            ),
+            "confidence": "high" if references else "low",
+            "evidence_references": references,
+        }
+    if mode == "value-invalid-schema":
+        semantic["primitives"].pop("rework")
+    if mode == "value-invalid-ref":
+        semantic["primitives"]["goal_achievement"][
+            "evidence_references"
+        ] = ["sha256:" + "f" * 64]
+    if mode == "value-wrong-axis-ref":
+        semantic["primitives"]["learning"][
+            "evidence_references"
+        ] = support["goal_achievement"]
+    if mode == "value-unsupported-axis-positive":
+        semantic["primitives"]["risk_reduction"] = {
+            "state": "positive",
+            "summary": "A risk reduction signal was inferred without dedicated evidence.",
+            "confidence": "high",
+            "evidence_references": support["goal_achievement"],
+        }
+    if mode == "value-unknown-with-ref":
+        semantic["primitives"]["risk_reduction"][
+            "evidence_references"
+        ] = support["goal_achievement"]
+    if mode == "value-positive-without-ref":
+        semantic["primitives"]["goal_achievement"][
+            "evidence_references"
+        ] = []
+    if mode == "value-enum-prose":
+        semantic["primitives"]["goal_achievement"]["summary"] = (
+            "The bounded work was a success with verified outcomes."
+        )
+        semantic["primitives"]["deliverable_quality"]["summary"] = (
+            "The supported quality evidence indicates a sound deliverable."
+        )
+    if mode == "value-deliverable-parity":
+        semantic["primitives"]["deliverable_quality"][
+            "evidence_references"
+        ] = sorted(
+            evidence_id("meaning.deliverable")
+            + evidence_id("receipt.task.deliverable")
+        )
+    if mode == "value-raw-copy":
+        copied = evidence["meaning.verification"]["content"]["summary"]
+        semantic["primitives"]["deliverable_quality"]["summary"] = copied
 if mode == "invalid-schema":
     semantic.pop("assessment")
 if mode == "unsafe-execution-model":
     semantic["execution"]["model"] = "Claude Sonnet 4.6"
 if mode == "echo-source":
     semantic["result"]["summary"] = "RAW_SOURCE_CANARY_iam178"
+if mode == "nested-jsonl-copy":
+    nested_strings = []
+
+    def strings(value):
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, dict):
+            return [
+                item for nested in value.values() for item in strings(nested)
+            ]
+        if isinstance(value, list):
+            return [item for nested in value for item in strings(nested)]
+        return []
+
+    for line in request.get("source", {}).get("content", "").splitlines():
+        try:
+            nested_strings.extend(strings(json.loads(line)))
+        except json.JSONDecodeError:
+            continue
+    copied = [item for item in nested_strings if len(item.strip()) >= 32]
+    if not copied:
+        raise SystemExit(91)
+    semantic["result"]["summary"] = copied[0]
+if mode.startswith("trimmed-jsonl-"):
+    target_prefix = {
+        "trimmed-jsonl-dict-copy": "D",
+        "trimmed-jsonl-list-copy": "L",
+        "trimmed-jsonl-primitive-copy": "P",
+        "trimmed-jsonl-short-copy": "S",
+    }.get(mode)
+    if target_prefix is None:
+        raise SystemExit(92)
+
+    def strings(value):
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, dict):
+            return [
+                item for nested in value.values() for item in strings(nested)
+            ]
+        if isinstance(value, list):
+            return [item for nested in value for item in strings(nested)]
+        return []
+
+    candidates = []
+    for line in request.get("source", {}).get("content", "").splitlines():
+        try:
+            candidates.extend(strings(json.loads(line)))
+        except json.JSONDecodeError:
+            continue
+    selected = [
+        item.strip()
+        for item in candidates
+        if item.strip().startswith(target_prefix)
+    ]
+    if len(selected) != 1:
+        raise SystemExit(93)
+    semantic["result"]["summary"] = selected[0]
 
 total_cost_usd: object = 0.012345000001
 if mode == "over-budget":
     total_cost_usd = 0.0500001
 elif mode == "meaning-over-budget":
+    total_cost_usd = 0.0500001
+elif mode == "value-over-budget":
     total_cost_usd = 0.0500001
 elif mode == "invalid-cost":
     total_cost_usd = "0.001"

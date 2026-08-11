@@ -100,6 +100,18 @@ GITIGNORE = PRE_MEANING_CARD_GITIGNORE.replace(
     "/receipt-automation/\n/meaning-cards/\n",
 )
 assert "/meaning-cards/\n" in GITIGNORE
+PRE_VALUE_PRIMITIVE_CARD_GITIGNORE = GITIGNORE
+GITIGNORE = PRE_VALUE_PRIMITIVE_CARD_GITIGNORE.replace(
+    "/meaning-cards/\n",
+    "/meaning-cards/\n/value-primitive-cards/\n",
+)
+assert "/value-primitive-cards/\n" in GITIGNORE
+PRE_VALUE_COMPILER_GITIGNORE = GITIGNORE
+GITIGNORE = PRE_VALUE_COMPILER_GITIGNORE.replace(
+    "/value-primitive-cards/\n",
+    "/value-primitive-cards/\n/value-compiler/\n",
+)
+assert "/value-compiler/\n" in GITIGNORE
 LEGACY_GITIGNORE = """# Local-only Flight Recorder state
 /hash.key
 /events.jsonl
@@ -388,6 +400,8 @@ def ensure_managed_gitignore(root: Path) -> None:
         PRE_SEMANTIC_RECEIPT_GITIGNORE,
         PRE_RECEIPT_AUTOMATION_GITIGNORE,
         PRE_MEANING_CARD_GITIGNORE,
+        PRE_VALUE_PRIMITIVE_CARD_GITIGNORE,
+        PRE_VALUE_COMPILER_GITIGNORE,
     ):
         atomic_replace(path, GITIGNORE.encode("utf-8"))
     elif contents != GITIGNORE:
@@ -920,6 +934,20 @@ def parser() -> argparse.ArgumentParser:
     )
     meaning_generate.add_argument("--timeout", type=int, default=240)
     meaning_generate.add_argument("--json", action="store_true")
+    value = commands.add_parser("value")
+    value_commands = value.add_subparsers(
+        dest="value_command", required=True
+    )
+    value_compile = value_commands.add_parser("compile")
+    value_compile.add_argument("--evaluator", required=True)
+    value_compile.add_argument("--model", required=True)
+    value_compile.add_argument("--max-episodes", required=True, type=int)
+    value_compile.add_argument(
+        "--max-cost-microusd", required=True, type=int
+    )
+    value_compile.add_argument("--timeout", type=int, default=240)
+    value_compile.add_argument("--policy-version")
+    value_compile.add_argument("--json", action="store_true")
     receipt_auto = commands.add_parser("receipt-auto")
     receipt_auto_commands = receipt_auto.add_subparsers(
         dest="receipt_auto_command", required=True
@@ -994,6 +1022,7 @@ def main() -> int:
         "source",
         "receipt",
         "meaning",
+        "value",
         "receipt-auto",
         "forget",
         "purge",
@@ -1139,6 +1168,22 @@ def main() -> int:
                 args.policy,
             )
             emit(value, as_json=args.json, human=render_generate(value))
+        elif args.command == "value":
+            from reporting import emit
+            from value_compiler import compile_values, render_compile
+
+            if args.value_command != "compile":
+                raise VaultError("unsupported value command")
+            result = compile_values(
+                root,
+                args.evaluator,
+                args.model,
+                args.max_episodes,
+                args.max_cost_microusd,
+                args.timeout,
+                args.policy_version,
+            )
+            emit(result, as_json=args.json, human=render_compile(result))
         elif args.command == "receipt-auto":
             from receipt_automation import configure, run as run_receipt_automation
             from reporting import emit

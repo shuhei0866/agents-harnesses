@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import json
+import contextlib
 import os
 import re
+import stat
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
-from chunk_rotation import atomic_replace, canonical_json
+from chunk_rotation import atomic_replace, canonical_json, fsync_directory
 from background_evaluation import (
     remove_episode_attempts,
     restore_attempts,
@@ -31,14 +32,21 @@ from receipt_automation import (
     restore_attempts as restore_receipt_attempts,
     run_lock as receipt_automation_lock,
 )
-from retention_state import load_forgotten, store_forgotten
+from retention_state import FORGET_PATH, load_forgotten, store_forgotten
 from semantic_receipts import semantic_receipt_record_snapshots
+from value_compiler import (
+    prepared_record_snapshots,
+    remove_episode_attempts as remove_value_attempts,
+    restore_attempts as restore_value_attempts,
+    run_lock as value_compiler_lock,
+    value_attempt_record_count,
+    value_primitive_card_record_snapshots,
+)
 from sync import (
     CHUNK_PATH_RE,
     PENDING_PATH,
     RECEIPT_PATH,
     git,
-    import_chunks,
     load_pending,
     text_output,
 )
@@ -49,6 +57,139 @@ LIMITATION = (
     "Best-effort purge cannot guarantee deletion from independent or "
     "uncontrolled remote clones, provider caches, or backups."
 )
+PURGE_RECOVERY_PATH = Path("index/purge-recovery.json")
+PURGE_RECOVERY_CONTRACT = "purge-cleanup-recovery-v1"
+MAX_PURGE_RECOVERY_BYTES = 4096
+GIT_OBJECT_ID_RE = re.compile(r"^[0-9a-f]{40,64}$")
+
+
+def _purge_recovery_directory(root: Path) -> Path:
+    directory = root / "index"
+    try:
+        metadata = directory.lstat()
+    except OSError as error:
+        raise VaultError("purge recovery directory is unsafe") from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise VaultError("purge recovery directory is unsafe")
+    return directory
+
+
+def _validate_purge_recovery(value: object) -> dict[str, Any]:
+    fields = {
+        "schema_version",
+        "contract_version",
+        "state",
+        "episode_id",
+        "policy_version",
+        "old_remote_oid",
+        "new_rewritten_oid",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise VaultError("purge recovery marker is invalid")
+    policy_version = value["policy_version"]
+    if (
+        isinstance(value["schema_version"], bool)
+        or not isinstance(value["schema_version"], int)
+        or value["schema_version"] != 1
+        or value["contract_version"] != PURGE_RECOVERY_CONTRACT
+        or value["state"] != "push_pending"
+        or not isinstance(value["episode_id"], str)
+        or EPISODE_ID_RE.fullmatch(value["episode_id"]) is None
+        or not isinstance(policy_version, str)
+        or not policy_version
+        or len(policy_version) > 128
+        or any(
+            character
+            not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+            for character in policy_version
+        )
+        or not isinstance(value["old_remote_oid"], str)
+        or GIT_OBJECT_ID_RE.fullmatch(value["old_remote_oid"]) is None
+        or not isinstance(value["new_rewritten_oid"], str)
+        or GIT_OBJECT_ID_RE.fullmatch(value["new_rewritten_oid"]) is None
+        or value["old_remote_oid"] == value["new_rewritten_oid"]
+    ):
+        raise VaultError("purge recovery marker is invalid")
+    return value
+
+
+def _load_purge_recovery(root: Path) -> dict[str, Any] | None:
+    _purge_recovery_directory(root)
+    path = root / PURGE_RECOVERY_PATH
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise VaultError("purge recovery marker is unsafe") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size > MAX_PURGE_RECOVERY_BYTES
+        ):
+            raise VaultError("purge recovery marker is unsafe")
+        chunks = []
+        remaining = MAX_PURGE_RECOVERY_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 4096))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        if len(raw) > MAX_PURGE_RECOVERY_BYTES:
+            raise VaultError("purge recovery marker is unsafe")
+    except OSError as error:
+        raise VaultError("purge recovery marker is unsafe") from error
+    finally:
+        os.close(descriptor)
+    try:
+        value = json.loads(raw)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as error:
+        raise VaultError("purge recovery marker is invalid") from error
+    return _validate_purge_recovery(value)
+
+
+def _store_purge_recovery(root: Path, value: dict[str, Any]) -> None:
+    expected = _validate_purge_recovery(value)
+    _purge_recovery_directory(root)
+    path = root / PURGE_RECOVERY_PATH
+    atomic_replace(path, canonical_json(expected) + b"\n")
+    current = _load_purge_recovery(root)
+    if current != expected:
+        raise VaultError("purge recovery marker changed while storing")
+
+
+def _clear_purge_recovery(
+    root: Path, expected: dict[str, Any]
+) -> None:
+    if _load_purge_recovery(root) != expected:
+        raise VaultError("purge recovery marker changed")
+    path = root / PURGE_RECOVERY_PATH
+    try:
+        path.unlink()
+        fsync_directory(path.parent)
+    except OSError as error:
+        raise VaultError("purge recovery marker cannot be removed") from error
+
+
+@contextlib.contextmanager
+def _purge_evaluator_locks(root: Path):
+    # Value Compiler takes its own run lock before Vault. Purge uses the same
+    # order, then preserves the established auto-evaluation/Receipt order.
+    with value_compiler_lock(root, blocking=True):
+        with auto_evaluation_lock(root, blocking=True):
+            yield
 
 
 def _selection(
@@ -113,6 +254,21 @@ def _scope(
             "meaning_card_record_count": len(
                 meaning_card_record_snapshots(
                     root, policy_version, episode_id
+                )
+            ),
+            "value_primitive_card_record_count": len(
+                value_primitive_card_record_snapshots(
+                    root, policy_version, episode_id
+                )
+            ),
+            "value_compiler_prepared_record_count": len(
+                prepared_record_snapshots(
+                    root, policy_version, episode_id
+                )
+            ),
+            "value_compiler_attempt_record_count": (
+                value_attempt_record_count(
+                    root, episode_id, policy_version
                 )
             ),
             "limitation": LIMITATION,
@@ -248,6 +404,300 @@ def _cleanup_original_history(root: Path) -> None:
     _run_git(root, ["gc", "--prune=now"])
 
 
+def _ref_snapshot(root: Path, *, require_main: bool = True) -> dict[str, str]:
+    output = text_output(
+        git(root, ["for-each-ref", "--format=%(refname) %(objectname)"])
+    )
+    result: dict[str, str] = {}
+    for line in output.splitlines():
+        try:
+            ref, object_id = line.split(" ", 1)
+        except ValueError as error:
+            raise VaultError("Git history purge failed") from error
+        if (
+            re.fullmatch(r"refs/[A-Za-z0-9._/-]+", ref) is None
+            or re.fullmatch(r"[0-9a-f]{40,64}", object_id) is None
+            or ref in result
+        ):
+            raise VaultError("Git history purge failed")
+        result[ref] = object_id
+    if require_main and "refs/heads/main" not in result:
+        raise VaultError("Git history purge failed")
+    return result
+
+
+def _remote_main_oid(root: Path) -> str:
+    output = text_output(
+        git(root, ["ls-remote", "--refs", "origin", "refs/heads/main"])
+    ).splitlines()
+    if len(output) != 1 or "\t" not in output[0]:
+        raise VaultError("Git history purge failed")
+    object_id, ref = output[0].split("\t", 1)
+    if (
+        ref != "refs/heads/main"
+        or re.fullmatch(r"[0-9a-f]{40,64}", object_id) is None
+    ):
+        raise VaultError("Git history purge failed")
+    return object_id
+
+
+def _require_synced_main(root: Path) -> str:
+    try:
+        symbolic_head = text_output(
+            git(root, ["symbolic-ref", "--quiet", "HEAD"])
+        ).strip()
+        head_oid = text_output(git(root, ["rev-parse", "HEAD"])).strip()
+        main_oid = text_output(
+            git(
+                root,
+                ["show-ref", "--verify", "--hash", "refs/heads/main"],
+            )
+        ).strip()
+        remote_oid = _remote_main_oid(root)
+    except VaultError as error:
+        raise VaultError("purge sync required before apply") from error
+    if (
+        symbolic_head != "refs/heads/main"
+        or GIT_OBJECT_ID_RE.fullmatch(head_oid) is None
+        or GIT_OBJECT_ID_RE.fullmatch(main_oid) is None
+        or head_oid != main_oid
+        or main_oid != remote_oid
+    ):
+        raise VaultError("purge sync required before apply")
+    return main_oid
+
+
+def _push_main_with_lease(
+    root: Path,
+    *,
+    expected_remote_oid: str,
+    new_oid: str,
+) -> None:
+    if (
+        GIT_OBJECT_ID_RE.fullmatch(expected_remote_oid) is None
+        or GIT_OBJECT_ID_RE.fullmatch(new_oid) is None
+    ):
+        raise VaultError("Git history purge lease is invalid")
+    _run_git(
+        root,
+        [
+            "push",
+            f"--force-with-lease=refs/heads/main:{expected_remote_oid}",
+            "origin",
+            f"{new_oid}:refs/heads/main",
+        ],
+    )
+    if _remote_main_oid(root) != new_oid:
+        raise VaultError("Git history purge lease did not converge")
+
+
+def _cleanup_only_result(marker: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": OUTPUT_VERSION,
+        "command": "purge",
+        "episode_id": marker["episode_id"],
+        "policy_version": marker["policy_version"],
+        "apply": True,
+        "cleanup_only": True,
+        "chunks": [],
+        "evaluation_record_count": 0,
+        "semantic_receipt_record_count": 0,
+        "meaning_card_record_count": 0,
+        "value_primitive_card_record_count": 0,
+        "value_compiler_prepared_record_count": 0,
+        "value_compiler_attempt_record_count": 0,
+        "limitation": LIMITATION,
+    }
+
+
+def _resume_purge_recovery(
+    root: Path,
+    episode_id: str,
+    policy_version: str,
+) -> dict[str, Any] | None:
+    marker = _load_purge_recovery(root)
+    if marker is None:
+        return None
+    if (
+        marker["episode_id"] != episode_id
+        or marker["policy_version"] != policy_version
+    ):
+        raise VaultError("purge recovery marker does not match request")
+    _validate_remote_namespace(root)
+    remote_oid = _remote_main_oid(root)
+    local_oid = _ref_snapshot(root)["refs/heads/main"]
+    if remote_oid == marker["new_rewritten_oid"]:
+        if local_oid != marker["new_rewritten_oid"]:
+            raise VaultError("purge recovery local history diverged")
+        try:
+            _cleanup_original_history(root)
+            _clear_purge_recovery(root, marker)
+        except Exception as error:
+            raise VaultError(
+                "remote rewrite applied; local cleanup incomplete; "
+                "retry required"
+            ) from error
+        return _cleanup_only_result(marker)
+    if remote_oid == marker["old_remote_oid"]:
+        if local_oid == marker["old_remote_oid"]:
+            _clear_purge_recovery(root, marker)
+            return None
+        if local_oid != marker["new_rewritten_oid"]:
+            raise VaultError("purge recovery local history diverged")
+        _push_main_with_lease(
+            root,
+            expected_remote_oid=marker["old_remote_oid"],
+            new_oid=marker["new_rewritten_oid"],
+        )
+        try:
+            _cleanup_original_history(root)
+            _clear_purge_recovery(root, marker)
+        except Exception as error:
+            raise VaultError(
+                "remote rewrite applied; local cleanup incomplete; "
+                "retry required"
+            ) from error
+        return _cleanup_only_result(marker)
+    raise VaultError("purge recovery remote history diverged")
+
+
+def _local_file_snapshots(
+    paths: list[Path],
+) -> list[tuple[Path, bytes | None, int | None]]:
+    snapshots = []
+    for path in sorted(set(paths)):
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            snapshots.append((path, None, None))
+            continue
+        except OSError as error:
+            raise VaultError("purge rollback input is unsafe") from error
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+        ):
+            raise VaultError("purge rollback input is unsafe")
+        try:
+            raw = path.read_bytes()
+        except OSError as error:
+            raise VaultError("purge rollback input is unsafe") from error
+        snapshots.append((path, raw, stat.S_IMODE(metadata.st_mode)))
+    return snapshots
+
+
+def _restore_local_file_snapshots(
+    snapshots: list[tuple[Path, bytes | None, int | None]],
+) -> list[Exception]:
+    errors: list[Exception] = []
+    for path, raw, mode in snapshots:
+        try:
+            if raw is None:
+                path.unlink()
+                fsync_directory(path.parent)
+                continue
+            assert mode is not None
+            atomic_replace(path, raw)
+            path.chmod(mode)
+        except FileNotFoundError:
+            if raw is not None:
+                errors.append(
+                    VaultError("purge rollback target disappeared")
+                )
+        except Exception as error:
+            errors.append(error)
+    return errors
+
+
+def _restore_ref_snapshot(root: Path, snapshot: dict[str, str]) -> None:
+    current = _ref_snapshot(root, require_main=False)
+    for ref in sorted(current.keys() - snapshot.keys()):
+        if ref.startswith("refs/original/"):
+            continue
+        _run_git(root, ["update-ref", "-d", ref])
+    for ref, object_id in sorted(snapshot.items()):
+        _run_git(root, ["update-ref", ref, object_id])
+    _run_git(root, ["reset", "--hard", snapshot["refs/heads/main"]])
+
+
+def _rollback_purge_state(
+    root: Path,
+    *,
+    refs: dict[str, str],
+    remote_main_oid: str,
+    rewritten_remote_oid: str | None = None,
+    files: list[tuple[Path, bytes | None, int | None]],
+    value_attempts: bytes | None,
+    evaluation_attempts: bytes | None,
+    receipt_attempts: bytes | None,
+) -> list[Exception]:
+    """Best-effort restoration of every state mutated after rewrite begins."""
+    errors: list[Exception] = []
+
+    # filter-branch may have stopped at any point. Restore its original refs
+    # first when available, then reconcile the complete ref namespace to the
+    # exact pre-transaction snapshot.
+    try:
+        legacy_refs = _original_refs(root)
+    except Exception as error:
+        errors.append(error)
+        legacy_refs = []
+    if legacy_refs:
+        try:
+            _restore_history(root)
+        except Exception as error:
+            errors.append(error)
+
+    exact_refs_restored = False
+    try:
+        _restore_ref_snapshot(root, refs)
+        exact_refs_restored = True
+    except Exception as error:
+        errors.append(error)
+
+    errors.extend(_restore_local_file_snapshots(files))
+
+    for restore, snapshot in (
+        (restore_value_attempts, value_attempts),
+        (restore_attempts, evaluation_attempts),
+        (restore_receipt_attempts, receipt_attempts),
+    ):
+        try:
+            restore(root, snapshot)
+        except Exception as error:
+            errors.append(error)
+
+    remote_restored = False
+    try:
+        current_remote = _remote_main_oid(root)
+        if current_remote == remote_main_oid:
+            remote_restored = True
+        elif (
+            rewritten_remote_oid is not None
+            and current_remote == rewritten_remote_oid
+        ):
+            _push_main_with_lease(
+                root,
+                expected_remote_oid=rewritten_remote_oid,
+                new_oid=remote_main_oid,
+            )
+            remote_restored = True
+        else:
+            raise VaultError("remote purge rollback history diverged")
+    except Exception as error:
+        errors.append(error)
+
+    # Never discard refs/original while either exact local refs or the remote
+    # still need recovery material.
+    if exact_refs_restored and remote_restored:
+        try:
+            _cleanup_original_history(root)
+        except Exception as error:
+            errors.append(error)
+    return errors
+
+
 def _remove_local_derivatives(
     root: Path, scope: dict[str, Any], *, apply: bool = True
 ) -> None:
@@ -315,15 +765,20 @@ def purge(
     apply: bool,
 ) -> dict[str, Any]:
     selected, trusted = _selection(episode_id, policy_version, policy_path)
-    scope = _scope(root, episode_id, selected, trusted)
     if not apply:
-        return scope
-    # Global order for purge is background evaluation, Receipt automation,
-    # then Vault. Each runner takes only its own run lock before Vault, so this
-    # order cannot form a cycle and blocks both evaluator types during purge.
-    with auto_evaluation_lock(root, blocking=True):
+        return _scope(root, episode_id, selected, trusted)
+    # Global order for purge is Value Compiler, background evaluation,
+    # Receipt automation, then Vault. Each runner takes only its own run lock
+    # before Vault, so this cannot form a cycle and blocks all evaluators.
+    with _purge_evaluator_locks(root):
         with receipt_automation_lock(root, blocking=True):
             with vault_lock(root):
+                recovered = _resume_purge_recovery(
+                    root, episode_id, selected
+                )
+                if recovered is not None:
+                    return recovered
+                _require_synced_main(root)
                 # Reauthenticate and resolve scope under the same exclusive lock
                 # used for mutation so a sync/rebuild cannot make the preview stale.
                 scope = _scope(
@@ -334,10 +789,6 @@ def purge(
                 # Validate every local input before history or derivative mutation.
                 _remove_local_derivatives(root, scope, apply=False)
                 original_forgotten = load_forgotten(root)
-                pending_path = root / PENDING_PATH
-                original_pending = (
-                    pending_path.read_bytes() if pending_path.exists() else None
-                )
                 evaluation_snapshots = evaluation_record_snapshots(
                     root, selected, episode_id
                 )
@@ -347,15 +798,60 @@ def purge(
                 meaning_card_snapshots = meaning_card_record_snapshots(
                     root, selected, episode_id
                 )
-                attempt_snapshot = remove_episode_attempts(root, episode_id)
+                value_primitive_card_snapshots = (
+                    value_primitive_card_record_snapshots(
+                        root, selected, episode_id
+                    )
+                )
+                value_prepared_snapshots = prepared_record_snapshots(
+                    root, selected, episode_id
+                )
+                derivative_snapshots = [
+                    *evaluation_snapshots,
+                    *semantic_receipt_snapshots,
+                    *meaning_card_snapshots,
+                    *value_primitive_card_snapshots,
+                    *value_prepared_snapshots,
+                ]
+                rollback_paths = [
+                    root / item[key]
+                    for item in scope["chunks"]
+                    for key in ("source_path", "cache_path")
+                ]
+                rollback_paths.extend(
+                    (
+                        root / RECEIPT_PATH,
+                        root / PENDING_PATH,
+                        root / DATABASE_PATH,
+                        root / FORGET_PATH,
+                        root / PURGE_RECOVERY_PATH,
+                    )
+                )
+                rollback_paths.extend(
+                    path for path, _raw in derivative_snapshots
+                )
+                local_snapshots = _local_file_snapshots(rollback_paths)
+                original_refs = _ref_snapshot(root)
+                original_remote_main = _remote_main_oid(root)
+                value_attempt_snapshot = remove_value_attempts(
+                    root, episode_id, selected
+                )
+                try:
+                    attempt_snapshot = remove_episode_attempts(
+                        root, episode_id
+                    )
+                except VaultError:
+                    restore_value_attempts(root, value_attempt_snapshot)
+                    raise
                 try:
                     receipt_attempt_snapshot = remove_receipt_attempts(
                         root, episode_id
                     )
                 except VaultError:
                     restore_attempts(root, attempt_snapshot)
+                    restore_value_attempts(root, value_attempt_snapshot)
                     raise
-                attempt_committed = False
+                rewritten_oid: str | None = None
                 try:
                     _rewrite_history(root, paths)
                     _remove_local_derivatives(root, scope)
@@ -363,74 +859,60 @@ def purge(
                     forgotten = set(original_forgotten)
                     forgotten.discard((selected, episode_id))
                     store_forgotten(root, forgotten)
-                    derivative_snapshots = [
-                        *evaluation_snapshots,
-                        *semantic_receipt_snapshots,
-                        *meaning_card_snapshots,
-                    ]
-                    removed_derivatives: list[tuple[Path, bytes]] = []
                     try:
-                        for derivative_path, derivative_bytes in derivative_snapshots:
+                        for derivative_path, _derivative_bytes in derivative_snapshots:
                             derivative_path.unlink()
-                            removed_derivatives.append(
-                                (derivative_path, derivative_bytes)
-                            )
                     except OSError as error:
-                        for derivative_path, derivative_bytes in removed_derivatives:
-                            atomic_replace(derivative_path, derivative_bytes)
                         raise VaultError(
                             "derived record storage is unsafe"
                         ) from error
-                    try:
-                        # Keep refs/original until the remote accepts the rewrite.
-                        # A rejection restores the Vault to a retryable state.
-                        _run_git(
-                            root, ["push", "--force", "origin", "HEAD:main"]
-                        )
-                    except VaultError:
-                        _restore_history(root)
-                        import_chunks(root)
-                        rebuild_index_locked(root, incremental=False)
-                        store_forgotten(root, original_forgotten)
-                        if original_pending is None:
-                            try:
-                                pending_path.unlink()
-                            except FileNotFoundError:
-                                pass
-                        else:
-                            atomic_replace(pending_path, original_pending)
-                        for evaluation_path, evaluation_bytes in evaluation_snapshots:
-                            atomic_replace(evaluation_path, evaluation_bytes)
-                        for receipt_path, receipt_bytes in semantic_receipt_snapshots:
-                            atomic_replace(receipt_path, receipt_bytes)
-                        for card_path, card_bytes in meaning_card_snapshots:
-                            atomic_replace(card_path, card_bytes)
-                        _cleanup_original_history(root)
-                        raise
+                    # Keep refs/original until the remote accepts the rewrite.
+                    # Any failure from rewrite onward runs the same complete
+                    # rollback, including failures before this push.
+                    rewritten_oid = _ref_snapshot(root)["refs/heads/main"]
+                    recovery_marker = {
+                        "schema_version": 1,
+                        "contract_version": PURGE_RECOVERY_CONTRACT,
+                        "state": "push_pending",
+                        "episode_id": episode_id,
+                        "policy_version": selected,
+                        "old_remote_oid": original_remote_main,
+                        "new_rewritten_oid": rewritten_oid,
+                    }
+                    _store_purge_recovery(root, recovery_marker)
+                    _push_main_with_lease(
+                        root,
+                        expected_remote_oid=original_remote_main,
+                        new_oid=rewritten_oid,
+                    )
+                except Exception as error:
+                    rollback_errors = _rollback_purge_state(
+                        root,
+                        refs=original_refs,
+                        remote_main_oid=original_remote_main,
+                        rewritten_remote_oid=rewritten_oid,
+                        files=local_snapshots,
+                        value_attempts=value_attempt_snapshot,
+                        evaluation_attempts=attempt_snapshot,
+                        receipt_attempts=receipt_attempt_snapshot,
+                    )
+                    if rollback_errors:
+                        raise VaultError(
+                            "purge failed and rollback incomplete: "
+                            f"{error}"
+                        ) from error
+                    raise
+                # A successful remote update is the commit point. Never undo
+                # the accepted rewrite because local pruning subsequently
+                # failed; retain refs/original as retry material instead.
+                try:
                     _cleanup_original_history(root)
-                    attempt_committed = True
-                finally:
-                    if not attempt_committed:
-                        active_error = sys.exc_info()[0] is not None
-                        restore_errors: list[Exception] = []
-                        for restore, snapshot in (
-                            (restore_attempts, attempt_snapshot),
-                            (
-                                restore_receipt_attempts,
-                                receipt_attempt_snapshot,
-                            ),
-                        ):
-                            try:
-                                restore(root, snapshot)
-                            except Exception as error:
-                                restore_errors.append(error)
-                        if restore_errors and not active_error:
-                            error = restore_errors[0]
-                            if isinstance(error, VaultError):
-                                raise error
-                            raise VaultError(
-                                "attempt ledger restoration failed"
-                            ) from error
+                    _clear_purge_recovery(root, recovery_marker)
+                except Exception as error:
+                    raise VaultError(
+                        "remote rewrite applied; local cleanup incomplete; "
+                        "retry required"
+                    ) from error
     scope["apply"] = True
     return scope
 
@@ -443,6 +925,12 @@ def render_forget(value: dict[str, Any]) -> str:
 
 
 def render_purge(value: dict[str, Any]) -> str:
+    if value.get("cleanup_only") is True:
+        return (
+            "Recovered committed purge cleanup for episode "
+            f"{value['episode_id']} under policy "
+            f"{value['policy_version']}.\n"
+        )
     mode = "Applied" if value["apply"] else "Dry run"
     paths = "\n".join(
         f"- {item['source_path']}" for item in value["chunks"]
@@ -455,5 +943,11 @@ def render_purge(value: dict[str, Any]) -> str:
         f"{value['semantic_receipt_record_count']}\n"
         "Local Meaning Card records: "
         f"{value['meaning_card_record_count']}\n"
+        "Local Value Primitive Card records: "
+        f"{value['value_primitive_card_record_count']}\n"
+        "Local Value Compiler prepared records: "
+        f"{value['value_compiler_prepared_record_count']}\n"
+        "Local Value Compiler attempts: "
+        f"{value['value_compiler_attempt_record_count']}\n"
         f"{value['limitation']}\n"
     )
