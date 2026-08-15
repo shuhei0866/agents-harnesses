@@ -572,6 +572,7 @@ PY
 vault_byte_snapshot() {
   python3 - "$1" <<'PY'
 import hashlib
+import json
 import os
 import pathlib
 import stat
@@ -585,7 +586,18 @@ for path in sorted(root.rglob("*")):
     metadata = path.lstat()
     mode = stat.S_IMODE(metadata.st_mode)
     if stat.S_ISREG(metadata.st_mode):
-        print("F", relative, mode, hashlib.sha256(path.read_bytes()).hexdigest())
+        raw = path.read_bytes()
+        if relative.as_posix() == "index/index-seal.json":
+            value = json.loads(raw)
+            value.pop("issued_at", None)
+            value.pop("integrity", None)
+            database = value.get("database", {})
+            database.pop("inode", None)
+            database.pop("mtime_ns", None)
+            raw = json.dumps(
+                value, sort_keys=True, separators=(",", ":")
+            ).encode()
+        print("F", relative, mode, hashlib.sha256(raw).hexdigest())
     elif stat.S_ISLNK(metadata.st_mode):
         print("L", relative, mode, os.readlink(path))
 PY
@@ -1153,9 +1165,12 @@ PY
       git -C "$state" for-each-ref --format='%(refname) %(objectname)'
     )" \
     && "$before_files" == "$(vault_byte_snapshot "$state")" ]]; then
-    pass "push前unlink失敗でhistoryと全local stateをbyte-exact復元する"
+    pass "push前unlink失敗でhistoryと全local stateを復元しsealを再発行する"
   else
-    fail "push前unlink失敗でhistoryと全local stateをbyte-exact復元する"
+    printf '%s\n' "$before_files" >"$base/before-files.snapshot"
+    vault_byte_snapshot "$state" >"$base/after-files.snapshot"
+    diff -u "$base/before-files.snapshot" "$base/after-files.snapshot" >&2 || true
+    fail "push前unlink失敗でhistoryと全local stateを復元しsealを再発行する"
   fi
 }
 

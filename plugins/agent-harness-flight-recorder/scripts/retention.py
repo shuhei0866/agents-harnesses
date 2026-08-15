@@ -17,7 +17,12 @@ from background_evaluation import (
     restore_attempts,
     run_lock as auto_evaluation_lock,
 )
-from evidence_index import DATABASE_PATH, rebuild_index_locked
+from evidence_index import (
+    DATABASE_PATH,
+    INDEX_SEAL_PATH,
+    issue_index_seal,
+    rebuild_index_locked,
+)
 from evaluation import evaluation_record_snapshots
 from meaning_lift import meaning_card_record_snapshots
 from reporting import (
@@ -61,6 +66,8 @@ PURGE_RECOVERY_PATH = Path("index/purge-recovery.json")
 PURGE_RECOVERY_CONTRACT = "purge-cleanup-recovery-v1"
 MAX_PURGE_RECOVERY_BYTES = 4096
 GIT_OBJECT_ID_RE = re.compile(r"^[0-9a-f]{40,64}$")
+PURGE_ROLLBACK_DIRECTORY = Path("index/purge-index-rollback")
+ROLLBACK_COPY_BYTES = 1024 * 1024
 
 
 def _purge_recovery_directory(root: Path) -> Path:
@@ -292,6 +299,7 @@ def forget(
         entries = load_forgotten(root)
         entries.add((selected, episode_id))
         store_forgotten(root, entries)
+        issue_index_seal(root)
     return {
         "schema_version": OUTPUT_VERSION,
         "command": "forget",
@@ -530,6 +538,7 @@ def _resume_purge_recovery(
         if local_oid != marker["new_rewritten_oid"]:
             raise VaultError("purge recovery local history diverged")
         try:
+            _discard_index_projection_snapshots(root)
             _cleanup_original_history(root)
             _clear_purge_recovery(root, marker)
         except Exception as error:
@@ -540,6 +549,7 @@ def _resume_purge_recovery(
         return _cleanup_only_result(marker)
     if remote_oid == marker["old_remote_oid"]:
         if local_oid == marker["old_remote_oid"]:
+            _discard_index_projection_snapshots(root)
             _clear_purge_recovery(root, marker)
             return None
         if local_oid != marker["new_rewritten_oid"]:
@@ -550,6 +560,7 @@ def _resume_purge_recovery(
             new_oid=marker["new_rewritten_oid"],
         )
         try:
+            _discard_index_projection_snapshots(root)
             _cleanup_original_history(root)
             _clear_purge_recovery(root, marker)
         except Exception as error:
@@ -585,6 +596,170 @@ def _local_file_snapshots(
             raise VaultError("purge rollback input is unsafe") from error
         snapshots.append((path, raw, stat.S_IMODE(metadata.st_mode)))
     return snapshots
+
+
+def _index_projection_snapshot_paths(root: Path) -> tuple[Path, Path]:
+    return root / DATABASE_PATH, root / INDEX_SEAL_PATH
+
+
+def _copy_disk_snapshot(source: Path, target: Path) -> int:
+    source_descriptor = -1
+    target_descriptor = -1
+    try:
+        source_descriptor = os.open(
+            source,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        before = os.fstat(source_descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
+        ):
+            raise VaultError("purge disk rollback input is unsafe")
+        target_descriptor = os.open(
+            target,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        while True:
+            block = os.read(source_descriptor, ROLLBACK_COPY_BYTES)
+            if not block:
+                break
+            view = memoryview(block)
+            while view:
+                written = os.write(target_descriptor, view)
+                if written <= 0:
+                    raise VaultError("purge disk rollback snapshot failed")
+                view = view[written:]
+        os.fsync(target_descriptor)
+        after = os.fstat(source_descriptor)
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_size",
+            "st_mtime_ns",
+            "st_mode",
+            "st_uid",
+            "st_nlink",
+        )
+        if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
+            raise VaultError("purge disk rollback input changed")
+        return stat.S_IMODE(before.st_mode)
+    except VaultError:
+        raise
+    except OSError as error:
+        raise VaultError("purge disk rollback snapshot failed") from error
+    finally:
+        if target_descriptor >= 0:
+            os.close(target_descriptor)
+        if source_descriptor >= 0:
+            os.close(source_descriptor)
+
+
+def _snapshot_index_projection(
+    root: Path,
+) -> list[tuple[Path, Path, int]]:
+    index = _purge_recovery_directory(root)
+    directory = root / PURGE_ROLLBACK_DIRECTORY
+    try:
+        os.mkdir(directory, 0o700)
+    except OSError as error:
+        raise VaultError("purge disk rollback directory is unsafe") from error
+    snapshots: list[tuple[Path, Path, int]] = []
+    try:
+        for source in _index_projection_snapshot_paths(root):
+            target = directory / source.name
+            mode = _copy_disk_snapshot(source, target)
+            snapshots.append((source, target, mode))
+        fsync_directory(directory)
+        fsync_directory(index)
+        return snapshots
+    except Exception:
+        for source in reversed(_index_projection_snapshot_paths(root)):
+            target = directory / source.name
+            try:
+                target.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+        raise
+
+
+def _validate_disk_snapshot(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise VaultError("purge disk rollback snapshot is unsafe") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise VaultError("purge disk rollback snapshot is unsafe")
+
+
+def _restore_index_projection_snapshots(
+    root: Path, snapshots: list[tuple[Path, Path, int]]
+) -> list[Exception]:
+    if not snapshots:
+        return []
+    errors: list[Exception] = []
+    directory = root / PURGE_ROLLBACK_DIRECTORY
+    for target, backup, mode in snapshots:
+        try:
+            _validate_disk_snapshot(backup)
+            os.replace(backup, target)
+            target.chmod(mode)
+            fsync_directory(target.parent)
+        except Exception as error:
+            errors.append(error)
+    if not errors:
+        try:
+            directory.rmdir()
+            fsync_directory(directory.parent)
+            # A copy-backed restore has a new inode even when its bytes are
+            # exact, so the restored seal must be rebound to that inode.
+            issue_index_seal(root)
+        except Exception as error:
+            errors.append(error)
+    return errors
+
+
+def _discard_index_projection_snapshots(root: Path) -> None:
+    directory = root / PURGE_ROLLBACK_DIRECTORY
+    if not directory.exists() and not directory.is_symlink():
+        return
+    try:
+        metadata = directory.lstat()
+    except OSError as error:
+        raise VaultError("purge disk rollback directory is unsafe") from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise VaultError("purge disk rollback directory is unsafe")
+    for name in (DATABASE_PATH.name, INDEX_SEAL_PATH.name):
+        backup = directory / name
+        if not backup.exists() and not backup.is_symlink():
+            continue
+        _validate_disk_snapshot(backup)
+        backup.unlink()
+    directory.rmdir()
+    fsync_directory(directory.parent)
 
 
 def _restore_local_file_snapshots(
@@ -631,6 +806,7 @@ def _rollback_purge_state(
     value_attempts: bytes | None,
     evaluation_attempts: bytes | None,
     receipt_attempts: bytes | None,
+    index_projection_files: list[tuple[Path, Path, int]] | None = None,
 ) -> list[Exception]:
     """Best-effort restoration of every state mutated after rewrite begins."""
     errors: list[Exception] = []
@@ -657,6 +833,11 @@ def _rollback_purge_state(
         errors.append(error)
 
     errors.extend(_restore_local_file_snapshots(files))
+    errors.extend(
+        _restore_index_projection_snapshots(
+            root, index_projection_files or []
+        )
+    )
 
     for restore, snapshot in (
         (restore_value_attempts, value_attempts),
@@ -735,8 +916,11 @@ def _remove_local_derivatives(
     # database contents; these checks close path/type races.
     load_forgotten(root)
     database = root / DATABASE_PATH
+    seal = root / INDEX_SEAL_PATH
     if database.is_symlink() or not database.is_file():
         raise VaultError("evidence index is unsafe")
+    if seal.is_symlink() or not seal.is_file():
+        raise VaultError("evidence index seal is unsafe")
     if not apply:
         return
 
@@ -754,6 +938,7 @@ def _remove_local_derivatives(
         atomic_replace(root / PENDING_PATH, canonical_json(pending) + b"\n")
 
     database.unlink()
+    seal.unlink()
 
 
 def purge(
@@ -822,7 +1007,6 @@ def purge(
                     (
                         root / RECEIPT_PATH,
                         root / PENDING_PATH,
-                        root / DATABASE_PATH,
                         root / FORGET_PATH,
                         root / PURGE_RECOVERY_PATH,
                     )
@@ -852,13 +1036,18 @@ def purge(
                     restore_value_attempts(root, value_attempt_snapshot)
                     raise
                 rewritten_oid: str | None = None
+                index_projection_snapshots: list[tuple[Path, Path, int]] = []
                 try:
+                    index_projection_snapshots = _snapshot_index_projection(
+                        root
+                    )
                     _rewrite_history(root, paths)
                     _remove_local_derivatives(root, scope)
                     rebuild_index_locked(root, incremental=False)
                     forgotten = set(original_forgotten)
                     forgotten.discard((selected, episode_id))
                     store_forgotten(root, forgotten)
+                    issue_index_seal(root)
                     try:
                         for derivative_path, _derivative_bytes in derivative_snapshots:
                             derivative_path.unlink()
@@ -892,6 +1081,7 @@ def purge(
                         remote_main_oid=original_remote_main,
                         rewritten_remote_oid=rewritten_oid,
                         files=local_snapshots,
+                        index_projection_files=index_projection_snapshots,
                         value_attempts=value_attempt_snapshot,
                         evaluation_attempts=attempt_snapshot,
                         receipt_attempts=receipt_attempt_snapshot,
@@ -906,6 +1096,7 @@ def purge(
                 # the accepted rewrite because local pruning subsequently
                 # failed; retain refs/original as retry material instead.
                 try:
+                    _discard_index_projection_snapshots(root)
                     _cleanup_original_history(root)
                     _clear_purge_recovery(root, recovery_marker)
                 except Exception as error:

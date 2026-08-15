@@ -198,6 +198,43 @@ their owner-held policy files. R1 does not migrate evidence rows in place.
 An unsupported schema is recovered through a full rebuild from canonical
 chunks, leaving encrypted evidence and decoded inputs untouched.
 
+### Authenticated evidence index seal
+
+The authenticated evidence index seal moves complete evidence and graph
+verification to a trusted writer boundary. After validating the canonical
+source projection, relationship policy, SQLite integrity, and projection
+generation, a trusted rebuild writer publishes the owner-only database and an
+owner-only `index/index-seal.json`. The bounded seal binds the database file
+identity and digest, index schema, source inventory, forget inventory,
+relationship policy inventory, and projection generation. Its canonical body
+is authenticated with `hmac-sha256` using the Vault correlation key.
+
+A sealed Card read remains fail-closed but does not repeat that complete work.
+In short Vault-lock sections before and after the query, it authenticates the
+key envelope and seal and validates the bound database identity, source
+inventory, and forget state. The read-only query selects only the requested
+Episode projection outside the long-held lock, then the second section rejects
+any intervening drift before returning. This per-read guarantee detects
+replacement or drift across the bounded read; it is an attestation from the
+last trusted writer, not a fresh
+cryptographic digest of every database byte.
+
+Selected-Episode consumers (`inspect`, evaluation, Meaning, Semantic Receipt,
+and Value compilation) use the bounded member/primary-key lookup path. The
+vault-wide `report` command is intentionally a separate aggregate operation:
+it may scan all Episodes and holds the Vault lock for a consistent snapshot,
+so it is not used as an unattended hot-query API.
+
+A missing, stale, malformed, or mismatched seal fails closed. The read path has
+no full verification fallback, because silently rebuilding the whole
+graph would restore the latency and memory bottleneck and obscure stale state.
+Recovery requires an explicit rebuild, which repeats complete verification and
+publishes a new database/seal generation before reads resume. A same-UID local
+process with the correlation key is not protected: it can authenticate a
+replacement database and seal. The boundary protects against other local
+users, accidental corruption, and untrusted Git transport; protecting against
+a key-holding same-UID process would require a separately privileged signer.
+
 R1.1 wakes a local policy every five minutes through `launchd` on macOS and a
 `systemd --user` timer on Linux. `RunAtLoad` and the user timer recover after
 login or wake. A healthy policy enters the serialized sync core at most once
@@ -342,11 +379,9 @@ requires its owner-held file through `--policy`. A custom definition stored
 only in the derived database is not an authenticity anchor.
 
 Card reads are authenticated, not ordinary SQLite selects. Under the Vault
-lock, the reader validates imported chunks and receipts, compares the complete
-source projection, authenticates the stored policy, and rederives both
-deterministic evidence and that policy's edges and episodes in memory. It
-returns a card only when all stored derived rows match those projections
-exactly. Human-readable output never weakens this check.
+lock, the reader applies the authenticated evidence index seal contract above
+and queries only the requested Episode projection. Human-readable output never
+weakens this check.
 
 `elapsed_ms` is the observed timestamp span. Recorded duration and cost metrics
 are labeled as sums of recorded values and carry `complete`, `partial`, or
@@ -512,8 +547,10 @@ next matching `purge --apply`, which validates the marker and resumes before
 trying to resolve the now-deleted Episode scope. Ordinary Python and command
 errors from history rewrite onward enter rollback. An abrupt process or power
 loss between rewrite start and durable marker storage remains best-effort in
-v0. Byte-exact pre-push rollback can temporarily consume memory proportional
-to the affected local files.
+v0. Ordinary local artifacts use byte-exact in-memory snapshots. The large
+SQLite index and its seal use 1 MiB streaming copies in an owner-only local
+rollback directory: database bytes and mode are restored exactly, then a new
+seal is issued for the restored database inode.
 
 ## Retention and deletion
 
@@ -584,7 +621,6 @@ this limitation clearly.
 
 ### Later
 
-- authenticated evidence-index seals for bounded hot-path reads;
 - deterministic Session Atlas facets and query-time cohort construction;
 - bounded semantic taxonomy for Episodes with current anchors;
 - selected, privacy-reviewed episode export;

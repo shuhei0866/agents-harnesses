@@ -19,9 +19,12 @@ from evidence_index import (
     DATABASE_PATH,
     _check_existing_database,
     _open_readonly,
+    _target_episode_edges,
     create_schema,
     insert_chunk,
     load_chunks,
+    read_sealed_episode,
+    read_sealed_query_locked,
     rebuild_deterministic_evidence,
     validate_database,
     validate_source_projection,
@@ -244,32 +247,9 @@ def _authenticated_query_locked(
     query: Callable[[sqlite3.Connection, dict[str, Any]], T],
     trusted_policy: dict[str, Any] | None = None,
 ) -> T:
-    chunks = _authenticated_chunks(root)
-    connection = _open_reporting(root / DATABASE_PATH)
-    try:
-        connection.execute("BEGIN")
-        validate_source_projection(connection, chunks, exact=True)
-        validate_database(connection)
-        policy = _policy(connection, policy_version)
-        if (
-            trusted_policy is not None
-            and canonical_json(policy) != canonical_json(trusted_policy)
-        ):
-            raise VaultError("stored relationship policy conflicts")
-        _verify_graph(connection, chunks, policy)
-        result = query(connection, policy)
-        connection.execute("COMMIT")
-        return result
-    except VaultError:
-        if connection.in_transaction:
-            connection.execute("ROLLBACK")
-        raise
-    except sqlite3.Error as error:
-        if connection.in_transaction:
-            connection.execute("ROLLBACK")
-        raise VaultError("evidence index query failed") from error
-    finally:
-        connection.close()
+    return read_sealed_query_locked(
+        root, policy_version, query, trusted_policy
+    )
 
 
 def _iso(value: dt.datetime) -> str:
@@ -597,12 +577,49 @@ def inspect_episode(
         policy_version, policy_path
     )
 
+    if not locked:
+        projection = read_sealed_episode(root, policy_version, episode_id)
+        if (policy_version, episode_id) in load_forgotten(root):
+            raise VaultError("episode is forgotten for relationship policy")
+        policy = projection["policy"]
+        if (
+            trusted_policy is not None
+            and canonical_json(policy) != canonical_json(trusted_policy)
+        ):
+            raise VaultError("stored relationship policy conflicts")
+        card = projection["card"]
+        from semantic_receipts import load_semantic_receipts
+        from value_compiler import load_value_primitive_cards
+
+        return {
+            "schema_version": INSPECT_OUTPUT_VERSION,
+            "command": "inspect",
+            "policy_version": policy_version,
+            "card": card,
+            "supporting_edges": projection["supporting_edges"],
+            "semantic_receipts": load_semantic_receipts(
+                root,
+                policy_version,
+                episode_id,
+                card["source_event_ids"],
+                {
+                    item["evidence_id"]
+                    for item in card["deterministic_evidence"]
+                },
+            ),
+            "value_primitive_cards": load_value_primitive_cards(
+                root, policy_version, episode_id, card
+            ),
+        }
+
     def query(
         connection: sqlite3.Connection, policy: dict[str, Any]
     ) -> dict[str, Any]:
         if (policy_version, episode_id) in load_forgotten(root):
             raise VaultError("episode is forgotten for relationship policy")
-        edges_by_episode = _edges_by_episode(connection, policy_version)
+        edges_by_episode = _target_episode_edges(
+            connection, policy_version, episode_id
+        )
         card, edges = _episode_card(
             root, connection, policy, episode_id, edges_by_episode
         )

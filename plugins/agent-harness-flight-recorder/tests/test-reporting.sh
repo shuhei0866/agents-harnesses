@@ -802,10 +802,10 @@ receipt.write_text(
 for path in (root / "cache/imported").rglob("*.jsonl"):
     path.unlink()
 PY
-  run_cli rebuild-index >/dev/null 2>&1 || {
-    fail "欠落receiptからempty derived DBを再現できる"
+  if run_cli rebuild-index >/dev/null 2>&1; then
+    fail "欠落receiptをtrusted writerが受理しない"
     return
-  }
+  fi
   local status=0
   run_cli report --last 1h --json \
     >"$TEST_ROOT/omission.out" 2>"$TEST_ROOT/omission.err" || status=$?

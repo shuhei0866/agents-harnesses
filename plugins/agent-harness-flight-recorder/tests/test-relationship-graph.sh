@@ -637,20 +637,21 @@ test_relationship_rebuild_is_deterministic_idempotent_and_source_immutable() {
   fi
 
   chmod 0644 "$db"
-  if run_cli "$state" rebuild-relationships >/dev/null 2>&1 \
+  if ! run_cli "$state" rebuild-relationships >/dev/null 2>&1 \
     && python3 - "$db" <<'PY'
 import pathlib
 import stat
 import sys
 
-assert stat.S_IMODE(pathlib.Path(sys.argv[1]).stat().st_mode) == 0o600
+assert stat.S_IMODE(pathlib.Path(sys.argv[1]).stat().st_mode) == 0o644
 PY
   then
-    pass "relationship再計算後にevidence indexをowner-onlyへ戻す"
+    pass "unsafe modeのevidence indexをwriterが変更せず拒否する"
   else
-    fail "relationship再計算後にevidence indexをowner-onlyへ戻す"
+    fail "unsafe modeのevidence indexをwriterが変更せず拒否する"
     return
   fi
+  chmod 0600 "$db"
 
   python3 - "$db" <<'PY'
 import sqlite3

@@ -509,8 +509,9 @@ all eight state/basis/confidence/summary/evidence vectors. Episode work cost
 remains in `observations`; it is never confused with Value generation cost.
 `forget` hides the Episode without deleting cards. Only `purge --apply`
 physically removes matching cards, prepared results, and attempts; purge
-rollback snapshots are byte-exact and can temporarily use memory proportional
-to the affected local artifacts.
+rollback keeps ordinary local artifacts byte-exact. The SQLite index and seal
+use a bounded-memory, disk-backed snapshot; database bytes and mode are restored
+exactly, then the seal is reissued for the restored database inode.
 
 The first classification pilot is recorded in
 [`docs/SESSION_ATLAS_PILOT.md`](docs/SESSION_ATLAS_PILOT.md). It assigns
