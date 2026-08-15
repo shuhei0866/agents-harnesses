@@ -1216,7 +1216,11 @@ assert result["compiled_count"] == 3
 assert counts["meaning"] == 1, counts
 assert counts["receipt"] == 1, counts
 assert counts["episode"] <= 2 * result["candidate_count"], counts
-assert counts["edges"] <= 2 * result["candidate_count"], counts
+assert (
+    result["candidate_count"]
+    <= counts["edges"]
+    <= 2 * result["candidate_count"]
+), counts
 PY
   then
     pass "再認証はanchor全scanを繰返さず対象candidateだけ読む"

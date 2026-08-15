@@ -525,6 +525,9 @@ def _resume_purge_recovery(
 ) -> dict[str, Any] | None:
     marker = _load_purge_recovery(root)
     if marker is None:
+        rollback_directory = root / PURGE_ROLLBACK_DIRECTORY
+        if rollback_directory.exists() or rollback_directory.is_symlink():
+            _discard_index_projection_snapshots(root)
         return None
     if (
         marker["episode_id"] != episode_id
@@ -628,6 +631,7 @@ def _copy_disk_snapshot(source: Path, target: Path) -> int:
             | getattr(os, "O_NOFOLLOW", 0),
             0o600,
         )
+        os.fchmod(target_descriptor, 0o600)
         while True:
             block = os.read(source_descriptor, ROLLBACK_COPY_BYTES)
             if not block:
@@ -712,7 +716,10 @@ def _validate_disk_snapshot(path: Path) -> None:
 
 
 def _restore_index_projection_snapshots(
-    root: Path, snapshots: list[tuple[Path, Path, int]]
+    root: Path,
+    snapshots: list[tuple[Path, Path, int]],
+    *,
+    reseal: bool = True,
 ) -> list[Exception]:
     if not snapshots:
         return []
@@ -732,7 +739,12 @@ def _restore_index_projection_snapshots(
             fsync_directory(directory.parent)
             # A copy-backed restore has a new inode even when its bytes are
             # exact, so the restored seal must be rebound to that inode.
-            issue_index_seal(root)
+            if reseal:
+                issue_index_seal(root)
+            else:
+                errors.append(
+                    VaultError("index seal not reissued; run rebuild-index")
+                )
         except Exception as error:
             errors.append(error)
     return errors
@@ -757,8 +769,16 @@ def _discard_index_projection_snapshots(root: Path) -> None:
         if not backup.exists() and not backup.is_symlink():
             continue
         _validate_disk_snapshot(backup)
-        backup.unlink()
-    directory.rmdir()
+        try:
+            backup.unlink()
+        except OSError as error:
+            raise VaultError(
+                "purge disk rollback directory is unsafe"
+            ) from error
+    try:
+        directory.rmdir()
+    except OSError as error:
+        raise VaultError("purge disk rollback directory is unsafe") from error
     fsync_directory(directory.parent)
 
 
@@ -806,7 +826,7 @@ def _rollback_purge_state(
     value_attempts: bytes | None,
     evaluation_attempts: bytes | None,
     receipt_attempts: bytes | None,
-    index_projection_files: list[tuple[Path, Path, int]] | None = None,
+    index_projection_files: list[tuple[Path, Path, int]],
 ) -> list[Exception]:
     """Best-effort restoration of every state mutated after rewrite begins."""
     errors: list[Exception] = []
@@ -832,10 +852,13 @@ def _rollback_purge_state(
     except Exception as error:
         errors.append(error)
 
-    errors.extend(_restore_local_file_snapshots(files))
+    local_errors = _restore_local_file_snapshots(files)
+    errors.extend(local_errors)
     errors.extend(
         _restore_index_projection_snapshots(
-            root, index_projection_files or []
+            root,
+            index_projection_files,
+            reseal=not local_errors,
         )
     )
 

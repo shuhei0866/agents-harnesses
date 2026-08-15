@@ -8,11 +8,17 @@ PLUGIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CLI="$PLUGIN_DIR/scripts/flight-recorder"
 FAKE_BIN="$SCRIPT_DIR/fixtures/fake-bin"
 TEST_ROOT="$(mktemp -d)"
+if [[ -z "$TEST_ROOT" || ! -d "$TEST_ROOT" ]]; then
+  echo "failed to create temporary test root" >&2
+  exit 1
+fi
 PASS=0
 FAIL=0
 
 cleanup() {
-  rm -rf "$TEST_ROOT"
+  if [[ -n "${TEST_ROOT:-}" && -d "$TEST_ROOT" ]]; then
+    rm -rf -- "$TEST_ROOT"
+  fi
 }
 trap cleanup EXIT
 
@@ -221,7 +227,7 @@ test_trusted_full_and_incremental_rebuild_emit_bound_seal() {
     fail "seal emission fixtureを構築できる"
     return
   }
-  if ! validate_seal_contract "$seal" "$state/index/vault.sqlite" 2>/dev/null; then
+  if ! validate_seal_contract "$seal" "$state/index/vault.sqlite"; then
     fail "trusted full rebuildはDB fsync/validation後にbounded v1 sealを発行する"
     return
   fi
@@ -234,7 +240,7 @@ test_trusted_full_and_incremental_rebuild_emit_bound_seal() {
     return
   }
   if run_cli "$state" rebuild-index --incremental >/dev/null 2>&1 \
-    && validate_seal_contract "$seal" "$state/index/vault.sqlite" 2>/dev/null; then
+    && validate_seal_contract "$seal" "$state/index/vault.sqlite"; then
     after="$(sha256_file "$seal")"
     if [[ "$before" != "$after" ]]; then
       pass "full/incremental trusted rebuildは現在DB・source・policy generationへsealを更新する"
@@ -256,7 +262,7 @@ test_seal_missing_and_tampered_fail_without_legacy_fallback() {
   }
   episode="$(episode_id_for_fixture "$state")"
   if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
-    python3 - "$state" "$episode" <<'PY' 2>/dev/null
+    python3 - "$state" "$episode" <<'PY'
 import pathlib
 import signal
 import sys
@@ -374,7 +380,7 @@ PY
   cp "$saved" "$seal"
   chmod 0600 "$seal"
   if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
-    python3 - "$state" <<'PY' 2>/dev/null
+    python3 - "$state" <<'PY'
 import os
 import pathlib
 import sys
@@ -414,7 +420,7 @@ test_source_forget_database_and_relationship_changes_invalidate_seal() {
     return
   fi
   episode="$(episode_id_for_fixture "$state")"
-  generation_before="$(python3 - "$seal" <<'PY' 2>/dev/null
+  generation_before="$(python3 - "$seal" <<'PY'
 import json, pathlib, sys
 print(json.loads(pathlib.Path(sys.argv[1]).read_text())["relationship_projection"]["generation"])
 PY
@@ -476,7 +482,7 @@ PY
     fail "relationship rebuildでsealを再発行できる"
     return
   fi
-  generation_after="$(python3 - "$seal" <<'PY' 2>/dev/null
+  generation_after="$(python3 - "$seal" <<'PY'
 import json, pathlib, sys
 print(json.loads(pathlib.Path(sys.argv[1]).read_text())["relationship_projection"]["generation"])
 PY
@@ -499,7 +505,7 @@ test_hot_inspect_uses_sealed_read_without_full_graph_or_chunk_materialization() 
   }
   episode="$(episode_id_for_fixture "$state")"
   if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
-    python3 - "$state" "$episode" <<'PY' 2>/dev/null
+    python3 - "$state" "$episode" <<'PY'
 import pathlib
 import signal
 import sys
@@ -534,7 +540,7 @@ test_database_digest_is_streamed_with_bounded_reads() {
     fail "streaming fixtureを構築できる"
     return
   }
-  if PYTHONPATH="$PLUGIN_DIR/scripts" python3 - "$state" <<'PY' 2>/dev/null
+  if PYTHONPATH="$PLUGIN_DIR/scripts" python3 - "$state" <<'PY'
 import os
 import pathlib
 import signal
@@ -609,7 +615,7 @@ test_docs_define_seal_threat_model_and_per_read_guarantee() {
   echo "test_docs_define_seal_threat_model_and_per_read_guarantee:"
   if python3 - \
     "$PLUGIN_DIR/docs/ARCHITECTURE.md" \
-    "$PLUGIN_DIR/docs/DECISIONS.md" <<'PY' 2>/dev/null
+    "$PLUGIN_DIR/docs/DECISIONS.md" <<'PY'
 import pathlib
 import sys
 
@@ -653,7 +659,7 @@ test_seal_binds_internal_generation_and_authorized_envelope_key() {
     return
   }
   if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
-    python3 - "$state" "$seal" <<'PY' 2>/dev/null
+    python3 - "$state" "$seal" <<'PY'
 import json
 import pathlib
 import signal
@@ -722,7 +728,7 @@ test_typed_episode_api_checks_source_before_and_after_outside_long_lock() {
   }
   episode="$(episode_id_for_fixture "$state")"
   if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
-    python3 - "$state" "$episode" <<'PY' 2>/dev/null
+    python3 - "$state" "$episode" <<'PY'
 import contextlib
 import inspect
 import pathlib
@@ -797,7 +803,7 @@ test_purge_snapshots_database_and_seal_for_exact_rollback() {
     return
   }
   if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
-    python3 - "$state" <<'PY' 2>/dev/null
+    python3 - "$state" <<'PY'
 import os
 import hashlib
 import pathlib
@@ -819,6 +825,7 @@ before = {
     path: (hashlib.sha256(path.read_bytes()).hexdigest(), stat.S_IMODE(path.stat().st_mode))
     for path in paths
 }
+
 original_read_bytes = pathlib.Path.read_bytes
 
 def bounded_read_bytes(path):
@@ -848,6 +855,51 @@ PY
   fi
 }
 
+test_locked_sealed_query_revalidates_complete_database_identity() {
+  echo "test_locked_sealed_query_revalidates_complete_database_identity:"
+  local base="$TEST_ROOT/locked-query-post-auth"
+  local state="$base/vault"
+  init_fixture "$base" || {
+    fail "locked sealed query fixtureを構築できる"
+    return
+  }
+  if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$state" <<'PY'
+import pathlib
+import sys
+from unittest import mock
+
+import evidence_index
+from vault import vault_lock
+
+root = pathlib.Path(sys.argv[1])
+real_identity = evidence_index._sealed_database_identity
+calls = []
+
+def tracked_identity(*args, **kwargs):
+    calls.append(True)
+    return real_identity(*args, **kwargs)
+
+with mock.patch.object(
+    evidence_index, "_sealed_database_identity", tracked_identity
+):
+    with vault_lock(root):
+        result = evidence_index.read_sealed_query_locked(
+            root,
+            "default-v1",
+            lambda _connection, policy: policy["policy_version"],
+        )
+assert result == "default-v1"
+# Initial seal validation, read-only open validation, and post-read validation.
+assert len(calls) == 3, calls
+PY
+  then
+    pass "locked sealed queryはread前後でsidecar・Vault・DB identityを対称検証する"
+  else
+    fail "locked sealed queryはread前後でsidecar・Vault・DB identityを対称検証する"
+  fi
+}
+
 echo "=== Flight Recorder Authenticated Index Seal Tests ==="
 TESTS=(
   test_trusted_full_and_incremental_rebuild_emit_bound_seal
@@ -862,6 +914,7 @@ TESTS=(
   test_wal_sidecars_fail_closed_without_mutation
   test_typed_episode_api_checks_source_before_and_after_outside_long_lock
   test_purge_snapshots_database_and_seal_for_exact_rollback
+  test_locked_sealed_query_revalidates_complete_database_identity
 )
 for test_name in "${TESTS[@]}"; do
   if [[ -z "${INDEX_SEAL_TEST_FILTER:-}" \

@@ -26,10 +26,10 @@ from chunk_rotation import (
 )
 from sync import (
     CHUNK_PATH_RE,
+    git,
     indexed_blob_oid,
     load_receipts,
     strict_preflight,
-    tracked_paths,
     validate_plaintext,
     working_blob_oid,
 )
@@ -366,14 +366,34 @@ def _authorized_seal_key(root: Path) -> tuple[dict[str, object], bytes]:
 
 
 def _source_inventory(root: Path) -> dict[str, Any]:
-    strict_preflight(root)
+    indexed = strict_preflight(root)
     receipts = load_receipts(root)
     tracked = {
-        path for path in tracked_paths(root)
+        path for path in indexed
         if CHUNK_PATH_RE.fullmatch(path) is not None
     }
     if set(receipts) != tracked:
         raise VaultError("index seal source inventory is invalid; run a rebuild")
+    paths = sorted(receipts)
+    working: dict[str, str] = {}
+    for offset in range(0, len(paths), 500):
+        batch = paths[offset : offset + 500]
+        try:
+            values = git(root, ["hash-object", "--", *batch]).stdout.decode(
+                "utf-8"
+            ).splitlines()
+        except UnicodeError as error:
+            raise VaultError(
+                "index seal source inventory is invalid; run a rebuild"
+            ) from error
+        if len(values) != len(batch) or any(
+            re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value) is None
+            for value in values
+        ):
+            raise VaultError(
+                "index seal source inventory is invalid; run a rebuild"
+            )
+        working.update(zip(batch, values, strict=True))
     normalized = []
     for relative, receipt in sorted(receipts.items()):
         path = root / relative
@@ -385,8 +405,8 @@ def _source_inventory(root: Path) -> dict[str, Any]:
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_uid != os.geteuid()
             or metadata.st_nlink != 1
-            or working_blob_oid(root, relative) != receipt["blob_oid"]
-            or indexed_blob_oid(root, relative) != receipt["blob_oid"]
+            or working.get(relative) != receipt["blob_oid"]
+            or indexed.get(relative) != receipt["blob_oid"]
         ):
             raise VaultError("index seal source inventory is invalid; run a rebuild")
         normalized.append({"source_path": relative, **receipt})
@@ -457,6 +477,7 @@ def _reject_duplicate_json_keys(
 
 
 def issue_index_seal(root: Path) -> dict[str, Any]:
+    """Issue a seal while the caller holds the Vault lock."""
     database_path = root / DATABASE_PATH
     identity_before = _check_existing_database(database_path)
     connection = _open_readonly(database_path)
@@ -876,7 +897,7 @@ def read_sealed_query_locked(
 
     seal = load_index_seal(root)
     _validate_sealed_source_inventory(root, seal)
-    identity = _sealed_database_identity(root, seal)
+    _sealed_database_identity(root, seal)
     connection = _open_sealed_readonly(root, seal)
     try:
         connection.execute("BEGIN")
@@ -897,12 +918,11 @@ def read_sealed_query_locked(
         raise
     finally:
         connection.close()
-    if _check_existing_database(root / DATABASE_PATH) != identity:
-        raise VaultError("evidence index changed during sealed read")
     current = load_index_seal(root)
     if current != seal:
         raise VaultError("evidence index seal changed during sealed read")
     _validate_sealed_source_inventory(root, current)
+    _sealed_database_identity(root, current)
     return result
 
 
