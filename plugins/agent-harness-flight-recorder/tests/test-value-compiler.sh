@@ -1176,7 +1176,7 @@ counts = {"meaning": 0, "receipt": 0, "episode": 0, "edges": 0}
 original_meaning = value_compiler.stored_meaning_cards
 original_receipts = value_compiler._stored_receipts
 original_episode = value_compiler._episode_card
-original_edges = value_compiler._edges_by_episode
+original_edges = value_compiler._target_episode_edges
 
 
 def meanings(*args, **kwargs):
@@ -1202,7 +1202,7 @@ def edges(*args, **kwargs):
 value_compiler.stored_meaning_cards = meanings
 value_compiler._stored_receipts = receipts
 value_compiler._episode_card = episode
-value_compiler._edges_by_episode = edges
+value_compiler._target_episode_edges = edges
 result = value_compiler.compile_values(
     root,
     "flight-recorder-value-evaluator",
@@ -1216,7 +1216,11 @@ assert result["compiled_count"] == 3
 assert counts["meaning"] == 1, counts
 assert counts["receipt"] == 1, counts
 assert counts["episode"] <= 2 * result["candidate_count"], counts
-assert counts["edges"] <= 1, counts
+assert (
+    result["candidate_count"]
+    <= counts["edges"]
+    <= 2 * result["candidate_count"]
+), counts
 PY
   then
     pass "再認証はanchor全scanを繰返さず対象candidateだけ読む"

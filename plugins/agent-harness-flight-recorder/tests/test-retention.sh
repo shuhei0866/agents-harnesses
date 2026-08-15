@@ -572,6 +572,7 @@ PY
 vault_byte_snapshot() {
   python3 - "$1" <<'PY'
 import hashlib
+import json
 import os
 import pathlib
 import stat
@@ -585,7 +586,18 @@ for path in sorted(root.rglob("*")):
     metadata = path.lstat()
     mode = stat.S_IMODE(metadata.st_mode)
     if stat.S_ISREG(metadata.st_mode):
-        print("F", relative, mode, hashlib.sha256(path.read_bytes()).hexdigest())
+        raw = path.read_bytes()
+        if relative.as_posix() == "index/index-seal.json":
+            value = json.loads(raw)
+            value.pop("issued_at", None)
+            value.pop("integrity", None)
+            database = value.get("database", {})
+            database.pop("inode", None)
+            database.pop("mtime_ns", None)
+            raw = json.dumps(
+                value, sort_keys=True, separators=(",", ":")
+            ).encode()
+        print("F", relative, mode, hashlib.sha256(raw).hexdigest())
     elif stat.S_ISLNK(metadata.st_mode):
         print("L", relative, mode, os.readlink(path))
 PY
@@ -1153,9 +1165,12 @@ PY
       git -C "$state" for-each-ref --format='%(refname) %(objectname)'
     )" \
     && "$before_files" == "$(vault_byte_snapshot "$state")" ]]; then
-    pass "push前unlink失敗でhistoryと全local stateをbyte-exact復元する"
+    pass "push前unlink失敗でhistoryと全local stateを復元しsealを再発行する"
   else
-    fail "push前unlink失敗でhistoryと全local stateをbyte-exact復元する"
+    printf '%s\n' "$before_files" >"$base/before-files.snapshot"
+    vault_byte_snapshot "$state" >"$base/after-files.snapshot"
+    diff -u "$base/before-files.snapshot" "$base/after-files.snapshot" >&2 || true
+    fail "push前unlink失敗でhistoryと全local stateを復元しsealを再発行する"
   fi
 }
 
@@ -1212,6 +1227,7 @@ errors = retention._rollback_purge_state(
     refs={"refs/heads/main": "a" * 40},
     remote_main_oid="a" * 40,
     files=[],
+    index_projection_files=[],
     value_attempts=b"value",
     evaluation_attempts=b"evaluation",
     receipt_attempts=b"receipt",
@@ -1263,6 +1279,7 @@ errors = retention._rollback_purge_state(
     refs={"refs/heads/main": "a" * 40},
     remote_main_oid="a" * 40,
     files=[],
+    index_projection_files=[],
     value_attempts=None,
     evaluation_attempts=None,
     receipt_attempts=None,
@@ -1907,6 +1924,7 @@ def exercise(initial):
         remote_main_oid=old,
         rewritten_remote_oid=new,
         files=[],
+        index_projection_files=[],
         value_attempts=None,
         evaluation_attempts=None,
         receipt_attempts=None,
@@ -2076,6 +2094,92 @@ PY
   fi
 }
 
+test_review_rollback_boundaries_fail_closed() {
+  echo "test_review_rollback_boundaries_fail_closed:"
+  if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$TEST_ROOT" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+import retention
+from vault import VaultError
+
+root = pathlib.Path(sys.argv[1]) / "review-cycle14"
+index = root / "index"
+index.mkdir(parents=True, mode=0o700)
+
+# Snapshot files must be exactly 0600 even under a restrictive umask.
+source = index / "source.sqlite"
+target = index / "snapshot.sqlite"
+source.write_bytes(b"snapshot")
+source.chmod(0o600)
+previous_umask = os.umask(0o777)
+try:
+    retention._copy_disk_snapshot(source, target)
+finally:
+    os.umask(previous_umask)
+assert stat.S_IMODE(target.stat().st_mode) == 0o600
+target.unlink()
+
+# A pre-marker crash may leave an empty, safe rollback directory. The next
+# apply must remove it before normal purge processing can resume.
+rollback = root / retention.PURGE_ROLLBACK_DIRECTORY
+rollback.mkdir(mode=0o700)
+assert retention._resume_purge_recovery(root, "episode", "default-v1") is None
+assert not rollback.exists()
+
+# Unexpected contents must fail through the stable VaultError boundary.
+rollback.mkdir(mode=0o700)
+(rollback / "unexpected").write_bytes(b"x")
+try:
+    retention._discard_index_projection_snapshots(root)
+except VaultError as error:
+    assert isinstance(error.__cause__, OSError)
+else:
+    raise AssertionError("unsafe rollback directory was accepted")
+(rollback / "unexpected").unlink()
+rollback.rmdir()
+
+# Never issue a valid seal after restoring the forget state failed.
+captured_reseal = []
+retention._original_refs = lambda _root: []
+retention._restore_ref_snapshot = lambda _root, _refs: None
+retention._restore_local_file_snapshots = lambda _files: [
+    VaultError("forget restore failed")
+]
+
+def restore_projection(_root, _snapshots, *, reseal=True):
+    captured_reseal.append(reseal)
+    return []
+
+retention._restore_index_projection_snapshots = restore_projection
+retention.restore_value_attempts = lambda _root, _snapshot: None
+retention.restore_attempts = lambda _root, _snapshot: None
+retention.restore_receipt_attempts = lambda _root, _snapshot: None
+retention._remote_main_oid = lambda _root: "a" * 40
+retention._cleanup_original_history = lambda _root: None
+errors = retention._rollback_purge_state(
+    root,
+    refs={"refs/heads/main": "a" * 40},
+    remote_main_oid="a" * 40,
+    files=[],
+    index_projection_files=[],
+    value_attempts=None,
+    evaluation_attempts=None,
+    receipt_attempts=None,
+)
+assert errors
+assert captured_reseal == [False]
+PY
+  then
+    pass "purge rollbackはmode・残留directory・例外境界・forget失敗時resealを安全に扱う"
+  else
+    fail "purge rollbackはmode・残留directory・例外境界・forget失敗時resealを安全に扱う"
+  fi
+}
+
 echo "=== Flight Recorder Retention Tests ==="
 if [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE7_ONLY:-0}" == "1" ]]; then
   test_purge_push_rejection_restores_retryable_local_state
@@ -2153,6 +2257,8 @@ elif [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE12_ONLY:-0}" == "1" ]]; then
   esac
 elif [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE13_ONLY:-0}" == "1" ]]; then
   test_purge_preflight_requires_synced_main_head
+elif [[ "${FLIGHT_RECORDER_TEST_RETENTION_CYCLE14_ONLY:-0}" == "1" ]]; then
+  test_review_rollback_boundaries_fail_closed
 else
   test_forget_preserves_source_and_survives_rebuild
   test_dangling_forget_marker_fails_closed
@@ -2174,6 +2280,7 @@ else
   test_normal_push_lease_rejects_third_party_race
   test_rollback_remote_restore_uses_new_oid_lease_only
   test_purge_preflight_requires_synced_main_head
+  test_review_rollback_boundaries_fail_closed
 fi
 echo
 echo "Results: $PASS passed, $FAIL failed"

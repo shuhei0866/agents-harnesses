@@ -432,3 +432,29 @@ Accepted decisions remain recorded when later superseded.
   path, then deterministic Atlas projection, then semantic background
   classification. The pilot and rollout order are recorded in
   `SESSION_ATLAS_PILOT.md` and GitHub issues #49, #51, and #50.
+
+## D-20260814-29: Seal the authenticated evidence index at the trusted writer
+
+- Status: accepted
+- Decision: make full and incremental index rebuilds the trusted writer
+  boundary for an authenticated evidence index seal. After complete source,
+  schema, SQLite, relationship policy, and projection generation validation,
+  publish owner-only `index/vault.sqlite` with owner-only
+  `index/index-seal.json`. Bind the database identity and digest, source
+  inventory, forget inventory, policy inventory, and projection generation in
+  a canonical `hmac-sha256` seal. On every bounded Card read, authenticate and
+  compare the seal, database identity, source inventory, and forget state
+  before and after the selected projection query.
+- Reason: reloading all canonical chunks and reconstructing the complete
+  relationship graph per read made a small Episode query proportional to the
+  whole Vault. Writer authentication can retain a fail-closed read boundary
+  without paying that full cost repeatedly.
+- Consequence: a missing, stale, malformed, or mismatched seal has no full
+  verification fallback; it requires an explicit rebuild before reads resume.
+  The per-read guarantee is the trusted writer's attestation plus identity and
+  inventory drift detection, not a fresh digest of every SQLite byte. This
+  does not protect against a same-UID local process that holds the correlation
+  key, because that process can create both a replacement database and a valid
+  seal. Protecting against that actor requires a separately privileged signer;
+  this contract instead protects against other local users, accidental
+  corruption, and untrusted transport.

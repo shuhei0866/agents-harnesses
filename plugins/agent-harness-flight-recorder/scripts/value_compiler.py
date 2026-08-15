@@ -18,11 +18,11 @@ from typing import Iterator
 
 from chunk_rotation import canonical_json, parse_time, safe_subdirectory
 from evaluation import _evaluated_at, _executable_identity, _invoke, _safe_name
+from evidence_index import _target_episode_edges
 from meaning_lift import _read_card_record as _read_meaning_card_record
 from meaning_lift import _stored_cards as stored_meaning_cards
 from reporting import (
     _authenticated_query_locked,
-    _edges_by_episode,
     _episode_card,
     _policy_selection,
 )
@@ -699,41 +699,13 @@ def _edges_for_episode_ids(
     policy_version: str,
     episode_ids: set[str],
 ) -> dict[str, list[dict[str, Any]]]:
-    if not episode_ids:
-        return {}
-    placeholders = ",".join("?" for _item in episode_ids)
-    query = f"""
-        SELECT left_member.episode_id, edge.left_event_id,
-               edge.right_event_id, edge.score, edge.decision,
-               edge.evidence_json
-        FROM relationship_edges AS edge
-        JOIN episode_members AS left_member
-          ON left_member.policy_version = edge.policy_version
-         AND left_member.event_id = edge.left_event_id
-        JOIN episode_members AS right_member
-          ON right_member.policy_version = edge.policy_version
-         AND right_member.event_id = edge.right_event_id
-         AND right_member.episode_id = left_member.episode_id
-        WHERE edge.policy_version = ? AND edge.decision = 'link'
-          AND left_member.episode_id IN ({placeholders})
-        ORDER BY left_member.episode_id, edge.left_event_id,
-                 edge.right_event_id
-    """
     result: dict[str, list[dict[str, Any]]] = {}
-    for episode_id, left, right, score, decision, encoded in connection.execute(
-        query, (policy_version, *sorted(episode_ids))
-    ):
-        try:
-            evidence = json.loads(encoded)
-        except (TypeError, json.JSONDecodeError) as error:
-            raise VaultError("relationship evidence is invalid") from error
-        result.setdefault(episode_id, []).append({
-            "left_event_id": left,
-            "right_event_id": right,
-            "score": score,
-            "decision": decision,
-            "evidence": evidence,
-        })
+    for episode_id in sorted(episode_ids):
+        result.update(
+            _target_episode_edges(
+                connection, policy_version, episode_id
+            )
+        )
     return result
 
 

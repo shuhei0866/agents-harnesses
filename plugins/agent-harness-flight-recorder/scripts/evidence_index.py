@@ -4,26 +4,39 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import sqlite3
 import stat
 import tempfile
+import datetime as dt
+import re
+import secrets
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from chunk_rotation import canonical_json, local_device, safe_subdirectory
+from chunk_rotation import (
+    atomic_replace,
+    canonical_json,
+    local_device,
+    safe_subdirectory,
+)
 from sync import (
     CHUNK_PATH_RE,
+    git,
     indexed_blob_oid,
     load_receipts,
+    strict_preflight,
     validate_plaintext,
     working_blob_oid,
 )
 from vault import (
     HASH_KEY_PATH,
     VaultError,
+    authorized_key,
     ensure_safe_existing_root,
     fsync_directory,
     load_config,
@@ -33,6 +46,14 @@ from vault import (
 
 
 DATABASE_PATH = Path("index/vault.sqlite")
+INDEX_SEAL_PATH = Path("index/index-seal.json")
+INDEX_SEAL_CONTRACT = "authenticated-evidence-index-seal-v1"
+MAX_INDEX_SEAL_BYTES = 64 * 1024
+FILE_DIGEST_CHUNK_BYTES = 1024 * 1024
+GENERATION_NAMESPACE = "authenticated_index_seal"
+GENERATION_KEY = "projection_generation"
+GENERATION_POLICY = "_global"
+SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 INDEX_VERSION = 3
 DETERMINISTIC_COLLECTOR_VERSION = "deterministic-v1"
 DETERMINISTIC_METRICS = (
@@ -198,6 +219,725 @@ class Chunk:
     chunk_row: tuple[Any, ...]
     event_rows: tuple[tuple[Any, ...], ...]
     provenance_row: tuple[Any, ...]
+
+
+def _sha256(value: bytes) -> str:
+    return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def _stream_file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o600
+        ):
+            raise VaultError(
+                "evidence index digest input is unsafe; run a full rebuild"
+            )
+        while True:
+            chunk = os.read(descriptor, FILE_DIGEST_CHUNK_BYTES)
+            if not chunk:
+                break
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_size",
+            "st_mtime_ns",
+            "st_mode",
+            "st_uid",
+            "st_nlink",
+        )
+        if any(
+            getattr(before, field) != getattr(after, field)
+            for field in stable_fields
+        ):
+            raise VaultError("evidence index changed while hashing")
+    except VaultError:
+        raise
+    except OSError as error:
+        raise VaultError("evidence index digest failed; run a full rebuild") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return "sha256:" + digest.hexdigest()
+
+
+def _derive_database_generation(connection: sqlite3.Connection) -> str:
+    """Derive a stable generation without materializing the relationship graph."""
+    digest = hashlib.sha256()
+    digest.update(b"flight-recorder-index-generation-v1\0")
+    for table, query in (
+        (
+            "source_chunks",
+            "SELECT chunk_id,source_path,git_blob_oid,canonical_plaintext_sha256 "
+            "FROM source_chunks ORDER BY chunk_id",
+        ),
+        (
+            "relationship_policies",
+            "SELECT policy_version,schema_version,policy_sha256,policy_json "
+            "FROM relationship_policies ORDER BY policy_version",
+        ),
+    ):
+        digest.update(table.encode("ascii") + b"\0")
+        for row in connection.execute(query):
+            digest.update(canonical_json(tuple(row)) + b"\n")
+    return "sha256:" + digest.hexdigest()
+
+
+def _write_database_generation(
+    connection: sqlite3.Connection, generation: str | None = None
+) -> str:
+    selected = generation or _derive_database_generation(connection)
+    connection.execute(
+        "INSERT OR REPLACE INTO derived_state "
+        "(namespace,key,policy_version,value_json) VALUES (?,?,?,?)",
+        (
+            GENERATION_NAMESPACE,
+            GENERATION_KEY,
+            GENERATION_POLICY,
+            json.dumps(selected),
+        ),
+    )
+    return selected
+
+
+def read_database_generation(connection: sqlite3.Connection) -> str:
+    row = connection.execute(
+        "SELECT value_json FROM derived_state "
+        "WHERE namespace=? AND key=? AND policy_version=?",
+        (GENERATION_NAMESPACE, GENERATION_KEY, GENERATION_POLICY),
+    ).fetchone()
+    try:
+        value = json.loads(row[0]) if row is not None else None
+    except (TypeError, json.JSONDecodeError) as error:
+        raise VaultError("evidence index generation is invalid; run a full rebuild") from error
+    if (
+        not isinstance(value, str)
+        or not value.startswith("sha256:")
+        or len(value) != 71
+    ):
+        raise VaultError("evidence index generation is missing; run a full rebuild")
+    return value
+
+
+def _authorized_seal_key(root: Path) -> tuple[dict[str, object], bytes]:
+    config = load_config(root)
+    key_path = root / HASH_KEY_PATH
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            key_path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+        key = os.read(descriptor, 33)
+    except OSError as error:
+        raise VaultError("local correlation key is missing or unsafe") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    envelope_key = authorized_key(root, None)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or len(key) != 32
+        or not secrets.compare_digest(key, envelope_key)
+    ):
+        raise VaultError("local correlation key does not match the envelope")
+    verify_recipient_state_hmac(config, key)
+    return config, key
+
+
+def _source_inventory(root: Path) -> dict[str, Any]:
+    indexed = strict_preflight(root)
+    receipts = load_receipts(root)
+    tracked = {
+        path for path in indexed
+        if CHUNK_PATH_RE.fullmatch(path) is not None
+    }
+    if set(receipts) != tracked:
+        raise VaultError("index seal source inventory is invalid; run a rebuild")
+    paths = sorted(receipts)
+    working: dict[str, str] = {}
+    for offset in range(0, len(paths), 500):
+        batch = paths[offset : offset + 500]
+        try:
+            values = git(root, ["hash-object", "--", *batch]).stdout.decode(
+                "utf-8"
+            ).splitlines()
+        except UnicodeError as error:
+            raise VaultError(
+                "index seal source inventory is invalid; run a rebuild"
+            ) from error
+        if len(values) != len(batch) or any(
+            re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value) is None
+            for value in values
+        ):
+            raise VaultError(
+                "index seal source inventory is invalid; run a rebuild"
+            )
+        working.update(zip(batch, values, strict=True))
+    normalized = []
+    for relative, receipt in sorted(receipts.items()):
+        path = root / relative
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            raise VaultError("index seal source inventory is unsafe") from error
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or working.get(relative) != receipt["blob_oid"]
+            or indexed.get(relative) != receipt["blob_oid"]
+        ):
+            raise VaultError("index seal source inventory is invalid; run a rebuild")
+        normalized.append({"source_path": relative, **receipt})
+    return {
+        "chunk_count": len(normalized),
+        "sha256": _sha256(canonical_json(normalized)),
+    }
+
+
+def _forget_inventory(root: Path) -> dict[str, Any]:
+    from retention_state import load_forgotten
+
+    entries = [
+        {"policy_version": policy, "episode_id": episode}
+        for policy, episode in sorted(load_forgotten(root))
+    ]
+    return {"entry_count": len(entries), "sha256": _sha256(canonical_json(entries))}
+
+
+def _schema_inventory(connection: sqlite3.Connection) -> dict[str, Any]:
+    schema_rows = [
+        tuple(row) for row in connection.execute(
+            "SELECT type,name,sql FROM sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
+        )
+    ]
+    metadata = [
+        tuple(row) for row in connection.execute(
+            "SELECT key,value FROM schema_metadata ORDER BY key"
+        )
+    ]
+    return {
+        "user_version": connection.execute("PRAGMA user_version").fetchone()[0],
+        "signature_sha256": _sha256(canonical_json(schema_rows)),
+        "metadata_sha256": _sha256(canonical_json(metadata)),
+    }
+
+
+def _relationship_inventory(connection: sqlite3.Connection) -> dict[str, Any]:
+    policies = [
+        tuple(row) for row in connection.execute(
+            "SELECT * FROM relationship_policies ORDER BY policy_version"
+        )
+    ]
+    generation = read_database_generation(connection)
+    return {
+        "generation": generation,
+        "policy_count": len(policies),
+        "policy_inventory_sha256": _sha256(canonical_json(policies)),
+    }
+
+
+def _seal_mac(value: dict[str, Any], key: bytes) -> str:
+    return "sha256:" + hmac.new(
+        key, canonical_json(value), hashlib.sha256
+    ).hexdigest()
+
+
+def _reject_duplicate_json_keys(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def issue_index_seal(root: Path) -> dict[str, Any]:
+    """Issue a seal while the caller holds the Vault lock."""
+    database_path = root / DATABASE_PATH
+    identity_before = _check_existing_database(database_path)
+    connection = _open_readonly(database_path)
+    try:
+        generation = read_database_generation(connection)
+        schema_inventory = _schema_inventory(connection)
+        relationship_inventory = _relationship_inventory(connection)
+        event_count = connection.execute(
+            "SELECT COUNT(*) FROM source_events"
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    source_inventory = _source_inventory(root)
+    source_inventory["event_count"] = event_count
+    config, key = _authorized_seal_key(root)
+    digest = _stream_file_sha256(database_path)
+    if _check_existing_database(database_path) != identity_before:
+        raise VaultError("evidence index changed while sealing")
+    metadata = database_path.stat()
+    unsigned = {
+        "schema_version": 1,
+        "contract_version": INDEX_SEAL_CONTRACT,
+        "issued_at": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "database": {
+            "sha256": digest,
+            "size_bytes": metadata.st_size,
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
+            "mtime_ns": metadata.st_mtime_ns,
+            "mode": stat.S_IMODE(metadata.st_mode),
+            "vault_id": config["vault_id"],
+            "generation": generation,
+        },
+        "index_schema": schema_inventory,
+        "source_inventory": source_inventory,
+        "forget_inventory": _forget_inventory(root),
+        "relationship_projection": relationship_inventory,
+    }
+    seal = {
+        **unsigned,
+        "integrity": {
+            "algorithm": "hmac-sha256",
+            "mac": _seal_mac(unsigned, key),
+        },
+    }
+    encoded = canonical_json(seal) + b"\n"
+    if len(encoded) > MAX_INDEX_SEAL_BYTES:
+        raise VaultError("evidence index seal exceeds size limit")
+    atomic_replace(root / INDEX_SEAL_PATH, encoded)
+    return seal
+
+
+def load_index_seal(root: Path) -> dict[str, Any]:
+    path = root / INDEX_SEAL_PATH
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size > MAX_INDEX_SEAL_BYTES
+        ):
+            raise VaultError("evidence index seal is unsafe; run a rebuild")
+        with os.fdopen(descriptor, "rb", closefd=True) as stream:
+            descriptor = -1
+            raw = stream.read(MAX_INDEX_SEAL_BYTES + 1)
+        value = json.loads(raw, object_pairs_hook=_reject_duplicate_json_keys)
+    except VaultError:
+        raise
+    except (OSError, ValueError, UnicodeError, RecursionError) as error:
+        raise VaultError("evidence index seal is invalid; run a rebuild") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if not isinstance(value, dict) or not _valid_index_seal_shape(value):
+        raise VaultError("evidence index seal is invalid; run a rebuild")
+    integrity = value.get("integrity")
+    if not isinstance(integrity, dict) or set(integrity) != {"algorithm", "mac"}:
+        raise VaultError("evidence index seal integrity is invalid; run a rebuild")
+    unsigned = {key: item for key, item in value.items() if key != "integrity"}
+    _config, key = _authorized_seal_key(root)
+    if integrity.get("algorithm") != "hmac-sha256" or not hmac.compare_digest(
+        str(integrity.get("mac")), _seal_mac(unsigned, key)
+    ):
+        raise VaultError("evidence index seal integrity mismatch; run a rebuild")
+    return value
+
+
+def _is_int(value: object, *, minimum: int = 0) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
+
+
+def _is_sha256(value: object) -> bool:
+    return isinstance(value, str) and SHA256_RE.fullmatch(value) is not None
+
+
+def _valid_index_seal_shape(value: dict[str, Any]) -> bool:
+    if set(value) != {
+        "schema_version",
+        "contract_version",
+        "issued_at",
+        "database",
+        "index_schema",
+        "source_inventory",
+        "forget_inventory",
+        "relationship_projection",
+        "integrity",
+    }:
+        return False
+    if (
+        value.get("schema_version") != 1
+        or value.get("contract_version") != INDEX_SEAL_CONTRACT
+        or not isinstance(value.get("issued_at"), str)
+    ):
+        return False
+    issued_text = value["issued_at"]
+    if not issued_text.endswith("Z"):
+        return False
+    try:
+        issued_at = dt.datetime.fromisoformat(issued_text[:-1] + "+00:00")
+    except ValueError:
+        return False
+    if (
+        issued_at.tzinfo is None
+        or issued_at.utcoffset() != dt.timedelta(0)
+        or issued_at.isoformat().replace("+00:00", "Z") != issued_text
+    ):
+        return False
+
+    database = value.get("database")
+    if not isinstance(database, dict) or set(database) != {
+        "sha256",
+        "size_bytes",
+        "device",
+        "inode",
+        "mtime_ns",
+        "mode",
+        "vault_id",
+        "generation",
+    }:
+        return False
+    try:
+        vault_id = database.get("vault_id", "")
+        parsed_vault_id = uuid.UUID(vault_id)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if str(parsed_vault_id) != vault_id:
+        return False
+    if not (
+        _is_sha256(database.get("sha256"))
+        and _is_sha256(database.get("generation"))
+        and _is_int(database.get("size_bytes"), minimum=1)
+        and _is_int(database.get("device"))
+        and _is_int(database.get("inode"), minimum=1)
+        and _is_int(database.get("mtime_ns"))
+        and database.get("mode") == 0o600
+    ):
+        return False
+
+    index_schema = value.get("index_schema")
+    if not isinstance(index_schema, dict) or set(index_schema) != {
+        "user_version",
+        "signature_sha256",
+        "metadata_sha256",
+    }:
+        return False
+    if not (
+        index_schema.get("user_version") == INDEX_VERSION
+        and _is_sha256(index_schema.get("signature_sha256"))
+        and _is_sha256(index_schema.get("metadata_sha256"))
+    ):
+        return False
+
+    source = value.get("source_inventory")
+    if not isinstance(source, dict) or set(source) != {
+        "chunk_count",
+        "event_count",
+        "sha256",
+    }:
+        return False
+    if not (
+        _is_int(source.get("chunk_count"))
+        and _is_int(source.get("event_count"))
+        and _is_sha256(source.get("sha256"))
+    ):
+        return False
+
+    forgotten = value.get("forget_inventory")
+    if not isinstance(forgotten, dict) or set(forgotten) != {
+        "entry_count",
+        "sha256",
+    }:
+        return False
+    if not (
+        _is_int(forgotten.get("entry_count"))
+        and _is_sha256(forgotten.get("sha256"))
+    ):
+        return False
+
+    relationship = value.get("relationship_projection")
+    if not isinstance(relationship, dict) or set(relationship) != {
+        "generation",
+        "policy_count",
+        "policy_inventory_sha256",
+    }:
+        return False
+    if not (
+        relationship.get("generation") == database.get("generation")
+        and _is_sha256(relationship.get("generation"))
+        and _is_int(relationship.get("policy_count"), minimum=1)
+        and _is_sha256(relationship.get("policy_inventory_sha256"))
+    ):
+        return False
+
+    integrity = value.get("integrity")
+    return (
+        isinstance(integrity, dict)
+        and set(integrity) == {"algorithm", "mac"}
+        and integrity.get("algorithm") == "hmac-sha256"
+        and _is_sha256(integrity.get("mac"))
+    )
+
+
+def _validate_sealed_source_inventory(
+    root: Path, seal: dict[str, Any]
+) -> None:
+    current = _source_inventory(root)
+    expected = seal.get("source_inventory")
+    if (
+        not isinstance(expected, dict)
+        or current.get("chunk_count") != expected.get("chunk_count")
+        or current.get("sha256") != expected.get("sha256")
+    ):
+        raise VaultError("source inventory changed; run a rebuild")
+    _validate_sealed_forget_inventory(root, seal)
+
+
+def _validate_sealed_forget_inventory(
+    root: Path, seal: dict[str, Any]
+) -> None:
+    if _forget_inventory(root) != seal.get("forget_inventory"):
+        raise VaultError("forget inventory changed; run a rebuild")
+
+
+def _reject_sqlite_sidecars(root: Path) -> None:
+    database = root / DATABASE_PATH
+    for suffix in ("-wal", "-shm", "-journal"):
+        path = Path(str(database) + suffix)
+        if path.exists() or path.is_symlink():
+            raise VaultError("evidence index sidecar is present; run a full rebuild")
+
+
+def _sealed_database_identity(root: Path, seal: dict[str, Any]) -> tuple[int, int, int, int]:
+    _reject_sqlite_sidecars(root)
+    database = root / DATABASE_PATH
+    identity = _check_existing_database(database)
+    metadata = database.stat()
+    expected = seal.get("database")
+    if (
+        not isinstance(expected, dict)
+        or expected.get("device") != metadata.st_dev
+        or expected.get("inode") != metadata.st_ino
+        or expected.get("size_bytes") != metadata.st_size
+        or expected.get("mtime_ns") != metadata.st_mtime_ns
+        or expected.get("mode") != stat.S_IMODE(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise VaultError("evidence index seal does not match database; run a rebuild")
+    config = load_config(root)
+    if expected.get("vault_id") != config.get("vault_id"):
+        raise VaultError("evidence index seal does not match Vault; run a rebuild")
+    return identity
+
+
+def _open_sealed_readonly(
+    root: Path, seal: dict[str, Any]
+) -> sqlite3.Connection:
+    identity = _sealed_database_identity(root, seal)
+    path = root / DATABASE_PATH
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            f"file:{path}?mode=ro&nofollow=1",
+            uri=True,
+            isolation_level=None,
+        )
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("PRAGMA trusted_schema = OFF")
+        connection.execute("PRAGMA foreign_keys = ON")
+        mode = connection.execute("PRAGMA journal_mode").fetchone()
+        if mode is None or str(mode[0]).lower() != "delete":
+            raise VaultError("evidence index journal mode is unsupported; run a full rebuild")
+        if _schema_inventory(connection) != seal.get("index_schema"):
+            raise VaultError("evidence index schema seal mismatch; run a full rebuild")
+        generation = read_database_generation(connection)
+        if (
+            generation != seal.get("database", {}).get("generation")
+            or _relationship_inventory(connection)
+            != seal.get("relationship_projection")
+        ):
+            raise VaultError("evidence index generation seal mismatch; run a rebuild")
+        if _check_existing_database(path) != identity:
+            raise VaultError("evidence index changed during sealed validation")
+        return connection
+    except VaultError:
+        if connection is not None:
+            connection.close()
+        raise
+    except sqlite3.Error as error:
+        if connection is not None:
+            connection.close()
+        raise VaultError("evidence index sealed read failed; run a rebuild") from error
+
+
+def _target_episode_edges(
+    connection: sqlite3.Connection,
+    policy_version: str,
+    episode_id: str,
+) -> dict[str, list[dict[str, Any]]]:
+    member_ids = [
+        row[0]
+        for row in connection.execute(
+            "SELECT event_id FROM episode_members "
+            "WHERE policy_version=? AND episode_id=? ORDER BY event_id",
+            (policy_version, episode_id),
+        )
+    ]
+    edges = []
+    # SQLite's primary key starts with (policy_version, left_event_id), so
+    # bounded member batches avoid scanning every edge in the policy.
+    for offset in range(0, len(member_ids), 500):
+        batch = member_ids[offset:offset + 500]
+        placeholders = ",".join("?" for _item in batch)
+        rows = connection.execute(
+            "SELECT left_event_id,right_event_id,score,decision,evidence_json "
+            "FROM relationship_edges WHERE policy_version=? "
+            f"AND left_event_id IN ({placeholders}) AND decision='link' "
+            "ORDER BY left_event_id,right_event_id",
+            (policy_version, *batch),
+        )
+        for left, right, score, decision, encoded in rows:
+            try:
+                evidence = json.loads(encoded)
+            except (TypeError, json.JSONDecodeError) as error:
+                raise VaultError("relationship evidence is invalid") from error
+            edges.append({
+                "left_event_id": left,
+                "right_event_id": right,
+                "score": score,
+                "decision": decision,
+                "evidence": evidence,
+            })
+    edges.sort(key=lambda item: (item["left_event_id"], item["right_event_id"]))
+    return {episode_id: edges} if edges else {}
+
+
+def _read_episode_projection(
+    root: Path,
+    seal: dict[str, Any],
+    policy_version: str,
+    episode_id: str,
+) -> dict[str, Any]:
+    from reporting import _episode_card, _policy
+
+    connection = _open_sealed_readonly(root, seal)
+    identity = _check_existing_database(root / DATABASE_PATH)
+    try:
+        connection.execute("BEGIN")
+        policy = _policy(connection, policy_version)
+        edges = _target_episode_edges(connection, policy_version, episode_id)
+        card, supporting = _episode_card(
+            root, connection, policy, episode_id, edges
+        )
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
+    if _check_existing_database(root / DATABASE_PATH) != identity:
+        raise VaultError("evidence index changed during sealed read")
+    return {"card": card, "supporting_edges": supporting, "policy": policy}
+
+
+def read_sealed_episode(
+    root: Path, policy_version: str, episode_id: str
+) -> dict[str, Any]:
+    with vault_lock(root):
+        seal = load_index_seal(root)
+        _validate_sealed_source_inventory(root, seal)
+        _sealed_database_identity(root, seal)
+    result = _read_episode_projection(root, seal, policy_version, episode_id)
+    with vault_lock(root):
+        current = load_index_seal(root)
+        if current != seal:
+            raise VaultError("evidence index seal changed during sealed read")
+        _validate_sealed_source_inventory(root, current)
+        _sealed_database_identity(root, current)
+    return result
+
+
+def read_sealed_query_locked(
+    root: Path,
+    policy_version: str,
+    query: Any,
+    trusted_policy: dict[str, Any] | None = None,
+) -> Any:
+    from relationship_graph import load_stored_policies
+
+    seal = load_index_seal(root)
+    _validate_sealed_source_inventory(root, seal)
+    _sealed_database_identity(root, seal)
+    connection = _open_sealed_readonly(root, seal)
+    try:
+        connection.execute("BEGIN")
+        policies = {
+            item["policy_version"]: item
+            for item in load_stored_policies(connection)
+        }
+        policy = policies.get(policy_version)
+        if policy is None:
+            raise VaultError("relationship policy version was not found")
+        if trusted_policy is not None and canonical_json(policy) != canonical_json(trusted_policy):
+            raise VaultError("stored relationship policy conflicts")
+        result = query(connection, policy)
+        connection.execute("COMMIT")
+    except Exception:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
+    current = load_index_seal(root)
+    if current != seal:
+        raise VaultError("evidence index seal changed during sealed read")
+    _validate_sealed_source_inventory(root, current)
+    _sealed_database_identity(root, current)
+    return result
+
+
+def _authenticate_existing_index_for_write(
+    root: Path, *, source_may_advance: bool
+) -> None:
+    """Authenticate the current DB/seal pair before any in-place mutation."""
+    seal = load_index_seal(root)
+    _sealed_database_identity(root, seal)
+    connection = _open_sealed_readonly(root, seal)
+    connection.close()
+    if source_may_advance:
+        _validate_sealed_forget_inventory(root, seal)
+    else:
+        _validate_sealed_source_inventory(root, seal)
 
 
 def _json_text(value: object) -> str | None:
@@ -824,6 +1564,7 @@ def rebuild_full(root: Path, chunks: list[Chunk]) -> tuple[int, int]:
         from relationship_graph import DEFAULT_POLICY, rebuild_relationships
 
         rebuild_relationships(connection, DEFAULT_POLICY)
+        _write_database_generation(connection)
         connection.execute("COMMIT")
         validate_database(connection)
         connection.close()
@@ -876,6 +1617,7 @@ def rebuild_incremental(root: Path, chunks: list[Chunk]) -> tuple[int, int]:
         policies = load_stored_policies(connection)
         for policy in policies:
             rebuild_relationships(connection, policy)
+        _write_database_generation(connection)
         connection.execute("COMMIT")
     except (sqlite3.Error, VaultError) as error:
         if connection.in_transaction:
@@ -886,12 +1628,21 @@ def rebuild_incremental(root: Path, chunks: list[Chunk]) -> tuple[int, int]:
     finally:
         connection.close()
     os.chmod(target, 0o600)
+    descriptor = os.open(target, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
     return added_chunks, added_events
 
 
 def rebuild_index_locked(root: Path, *, incremental: bool) -> None:
     index = safe_index_directory(root)
     collect_stale_temporaries(index)
+    if incremental:
+        _authenticate_existing_index_for_write(
+            root, source_may_advance=True
+        )
     chunks = load_chunks(root)
     if incremental:
         added_chunks, added_events = rebuild_incremental(root, chunks)
@@ -899,6 +1650,7 @@ def rebuild_index_locked(root: Path, *, incremental: bool) -> None:
     else:
         added_chunks, added_events = rebuild_full(root, chunks)
         mode = "full"
+    issue_index_seal(root)
     print(
         f"rebuild-index: mode={mode} "
         f"chunks={added_chunks} events={added_events}"
@@ -918,6 +1670,9 @@ def rebuild_relationship_views(root: Path, policy_path: Path | None) -> None:
     policy = load_policy(policy_path)
     with vault_lock(root):
         safe_index_directory(root)
+        _authenticate_existing_index_for_write(
+            root, source_may_advance=False
+        )
         chunks = load_chunks(root)
         connection = _open_existing(root / DATABASE_PATH)
         try:
@@ -925,6 +1680,7 @@ def rebuild_relationship_views(root: Path, policy_path: Path | None) -> None:
             connection.execute("BEGIN IMMEDIATE")
             validate_source_projection(connection, chunks, exact=True)
             edges, episodes = rebuild_relationships(connection, policy)
+            _write_database_generation(connection)
             validate_database(connection)
             connection.execute("COMMIT")
         except (sqlite3.Error, VaultError) as error:
@@ -936,6 +1692,12 @@ def rebuild_relationship_views(root: Path, policy_path: Path | None) -> None:
         finally:
             connection.close()
         os.chmod(root / DATABASE_PATH, 0o600)
+        descriptor = os.open(root / DATABASE_PATH, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        issue_index_seal(root)
         print(
             "rebuild-relationships: "
             f"policy={policy['policy_version']} edges={edges} episodes={episodes}"

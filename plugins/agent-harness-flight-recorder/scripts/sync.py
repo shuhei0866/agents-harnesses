@@ -171,24 +171,27 @@ def allowed_path(path: str) -> bool:
     return path in FIXED_TRACKED or CHUNK_PATH_RE.fullmatch(path) is not None
 
 
-def strict_preflight(root: Path) -> None:
+def strict_preflight(root: Path) -> dict[str, str]:
     stage_output = git(root, ["ls-files", "--stage", "-z"]).stdout
     try:
         entries = stage_output.decode("utf-8").split("\0")
     except UnicodeError as error:
         raise VaultError("Git index contains an invalid entry") from error
+    indexed: dict[str, str] = {}
     for entry in (item for item in entries if item):
         try:
             metadata, path = entry.split("\t", 1)
-            mode, _oid, stage_number = metadata.split(" ", 2)
+            mode, oid, stage_number = metadata.split(" ", 2)
         except ValueError as error:
             raise VaultError("Git index contains an invalid entry") from error
         if (
             mode != "100644"
             or stage_number != "0"
             or not allowed_path(path)
+            or path in indexed
         ):
             raise VaultError("Git index contains an unsafe entry")
+        indexed[path] = oid
     if (root / ".gitmodules").exists():
         raise VaultError("Git submodules are not allowed in a Vault")
     for relative in FIXED_TRACKED:
@@ -215,6 +218,7 @@ def strict_preflight(root: Path) -> None:
         raise VaultError("encrypted correlation key does not match local authority")
     verify_recipient_state_hmac(config, key)
     local_device(config, root)
+    return indexed
 
 
 def stage_allowlist(root: Path) -> None:

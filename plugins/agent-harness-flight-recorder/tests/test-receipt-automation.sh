@@ -847,17 +847,17 @@ import receipt_automation
 import reporting
 
 root = pathlib.Path(sys.argv[1])
-verify_graph = reporting._verify_graph
+sealed_query = reporting.read_sealed_query_locked
 verify_count = 0
 
 
-def counting_verify_graph(*args, **kwargs):
+def counting_sealed_query(*args, **kwargs):
     global verify_count
     verify_count += 1
-    return verify_graph(*args, **kwargs)
+    return sealed_query(*args, **kwargs)
 
 
-reporting._verify_graph = counting_verify_graph
+reporting.read_sealed_query_locked = counting_sealed_query
 try:
     result = receipt_automation.run(root)
     generated_verify_count = verify_count
@@ -885,7 +885,7 @@ try:
     no_candidate = receipt_automation.run(root)
     no_candidate_verify_count = verify_count
 finally:
-    reporting._verify_graph = verify_graph
+    reporting.read_sealed_query_locked = sealed_query
 
 assert result["matched_count"] == 2
 assert result["generated_count"] == 2
@@ -903,10 +903,10 @@ assert no_candidate_verify_count == 0
 PY
   ) 2>"$err"
   then
-    pass "生成時2回・stageなし1回・候補なし0回だけgraphを認証する"
+    pass "生成時2回・stageなし1回・候補なし0回だけsealed indexを認証する"
   else
     cat "$err" >&2
-    fail "生成時2回・stageなし1回・候補なし0回だけgraphを認証する"
+    fail "生成時2回・stageなし1回・候補なし0回だけsealed indexを認証する"
   fi
 }
 

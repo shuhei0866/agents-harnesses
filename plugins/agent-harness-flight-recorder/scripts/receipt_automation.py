@@ -833,9 +833,9 @@ def _authenticated_episode_snapshot(
     event_ids: set[str],
 ) -> dict[str, dict[str, Any]]:
     """Authenticate the graph once and snapshot candidate Episodes."""
+    from evidence_index import _target_episode_edges
     from reporting import (
         _authenticated_query,
-        _edges_by_episode,
         _episode_card,
     )
     from retention_state import load_forgotten
@@ -894,7 +894,11 @@ def _authenticated_episode_snapshot(
                 )
 
         forgotten = load_forgotten(root)
-        edges_by_episode = _edges_by_episode(connection, policy)
+        edges_by_episode: dict[str, list[dict[str, Any]]] = {}
+        for episode_id in sorted(selected_episode_ids):
+            edges_by_episode.update(
+                _target_episode_edges(connection, policy, episode_id)
+            )
         snapshot: dict[str, dict[str, Any]] = {}
         for episode_id in sorted(selected_episode_ids):
             members = members_by_episode[episode_id]
@@ -956,9 +960,9 @@ def _commit_staged_receipts(
     policy: str,
     staged: list[dict[str, Any]],
 ) -> None:
+    from evidence_index import _target_episode_edges
     from reporting import (
         _authenticated_query_locked,
-        _edges_by_episode,
         _episode_card,
     )
     from retention_state import load_forgotten
@@ -973,7 +977,11 @@ def _commit_staged_receipts(
         if any((policy, episode_id) in forgotten for episode_id in episode_ids):
             raise VaultError("episode was forgotten during receipt generation")
 
-        edges_by_episode = _edges_by_episode(connection, policy)
+        edges_by_episode: dict[str, list[dict[str, Any]]] = {}
+        for episode_id in sorted(episode_ids):
+            edges_by_episode.update(
+                _target_episode_edges(connection, policy, episode_id)
+            )
         inspections: dict[str, dict[str, Any]] = {}
         for episode_id in sorted(episode_ids):
             card, _edges = _episode_card(
