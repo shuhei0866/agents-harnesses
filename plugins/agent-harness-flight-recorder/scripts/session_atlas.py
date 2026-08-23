@@ -103,10 +103,21 @@ def _facet_insert_sql(expression: str) -> str:
     """
 
 
+def clear_session_atlas(
+    connection: sqlite3.Connection, policy_version: str
+) -> None:
+    """Remove one policy's Atlas rows before its Episodes are replaced."""
+    connection.execute(
+        "DELETE FROM session_atlas_facets WHERE policy_version=?",
+        (policy_version,),
+    )
+
+
 def materialize_session_atlas(
     connection: sqlite3.Connection, policy_version: str
 ) -> None:
     """Replace one policy's one-row-per-Episode Atlas projection."""
+    clear_session_atlas(connection, policy_version)
     connection.execute(
         "CREATE TEMP TABLE IF NOT EXISTS session_atlas_values ("
         "policy_version TEXT NOT NULL, episode_id TEXT NOT NULL, "
@@ -423,15 +434,20 @@ def read_session_atlas_facets(
 
 def query_cohort(
     root: Path,
-    policy_version: str,
+    policy_version: str | None,
     episode_id: str,
     tier: str,
     facets: list[str],
     limit: int,
     cursor: str | None,
+    *,
+    policy_path: Path | None = None,
 ) -> dict[str, Any]:
-    if not isinstance(policy_version, str) or not policy_version:
-        raise VaultError("Atlas relationship policy is invalid")
+    from reporting import _policy_selection
+
+    policy_version, trusted_policy = _policy_selection(
+        policy_version, policy_path
+    )
     if not isinstance(episode_id, str) or SHA256_RE.fullmatch(episode_id) is None:
         raise VaultError("Atlas Episode ID is invalid")
     if (
@@ -555,7 +571,9 @@ def query_cohort(
                 "next_cursor": next_cursor,
             }
 
-        return read_sealed_query_locked(root, policy_version, query)
+        return read_sealed_query_locked(
+            root, policy_version, query, trusted_policy
+        )
 
 
 def render_cohort(value: dict[str, Any]) -> str:

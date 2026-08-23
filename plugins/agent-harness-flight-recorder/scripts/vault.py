@@ -853,7 +853,11 @@ def parser() -> argparse.ArgumentParser:
     atlas_cohort.add_argument("--facet", action="append", default=[])
     atlas_cohort.add_argument("--limit", type=int, default=20)
     atlas_cohort.add_argument("--cursor")
-    atlas_cohort.add_argument("--policy-version", default="default-v1")
+    atlas_policy = atlas_cohort.add_mutually_exclusive_group()
+    atlas_policy.add_argument("--policy-version")
+    atlas_policy.add_argument(
+        "--policy", "--policy-file", dest="policy", type=Path
+    )
     atlas_cohort.add_argument("--json", action="store_true")
     evaluate = commands.add_parser("evaluate")
     evaluate.add_argument("episode_id")
@@ -1104,6 +1108,7 @@ def main() -> int:
                 args.facet,
                 args.limit,
                 args.cursor,
+                policy_path=args.policy,
             )
             emit(value, as_json=args.json, human=render_cohort(value))
         elif args.command == "evaluate":

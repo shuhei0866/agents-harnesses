@@ -225,6 +225,10 @@ recipient before older chunks are created lets its adopted identity decrypt
 those chunks; otherwise retain access to the recovery identity when historical
 import is required.
 
+Session Atlas requires the Python `sqlite3` runtime to use SQLite 3.25 or
+newer with the JSON1 extension enabled. These provide the ordered window
+aggregates and bounded `json_each` list query used by the projection.
+
 Build the local SQLite evidence index and bundled `default-v1` relationship
 view from validated imported chunks:
 
@@ -311,6 +315,13 @@ authenticated cursor; `--limit` is bounded to 1--100. The fixed four-facet
 selected.
 
 The cohort read is bounded and authenticated by the Evidence Index seal.
+It uses `default-v1` when no policy option is given. A custom Atlas view must
+be selected with its owner-held `--policy` file; a bare custom
+`--policy-version` is rejected.
+It keeps the current Vault lock for the complete query so the forget set and
+seal remain one consistent snapshot. Large forget sets are passed as one
+canonical JSON list; even at 40,000 entries, `json_each` materializes a single
+list subquery instead of expanding one SQL variable per forgotten Episode.
 `inspect` and `report` expose `session_atlas_facets` as an independent section
 instead of folding structure into the Evidence Card, Semantic Receipt, or Value
 vector. `forget` hides an Episode from Atlas queries and normal output. `purge`

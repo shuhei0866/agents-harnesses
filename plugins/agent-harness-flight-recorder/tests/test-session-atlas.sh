@@ -7,7 +7,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CLI="$PLUGIN_DIR/scripts/flight-recorder"
 FAKE_BIN="$SCRIPT_DIR/fixtures/fake-bin"
-TEST_ROOT="$(mktemp -d)"
+TEST_ROOT="$(mktemp -d)" || exit 1
+readonly TEST_ROOT
 STATE="$TEST_ROOT/vault"
 REPORT_STATE="$TEST_ROOT/report-vault"
 TEST_HOME="$TEST_ROOT/home"
@@ -17,7 +18,10 @@ FIXTURE_READY=0
 QUERY_FIXTURE_READY=0
 
 cleanup() {
-  rm -rf "$TEST_ROOT"
+  [[ -n "$TEST_ROOT" && "$TEST_ROOT" != "/" && -d "$TEST_ROOT" ]] \
+    || return
+  [[ "${TEST_ROOT##*/}" == tmp.* ]] || return
+  rm -rf -- "$TEST_ROOT"
 }
 trap cleanup EXIT
 
@@ -374,6 +378,55 @@ print(row[0])
 PY
 }
 
+episode_id_for_policy_event_at() {
+  local state="$1" policy_version="$2" event_id="$3"
+  python3 - "$state/index/vault.sqlite" "$policy_version" "$event_id" <<'PY'
+import sqlite3
+import sys
+
+connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+row = connection.execute(
+    "SELECT episode_id FROM episode_members "
+    "WHERE policy_version=? AND event_id=?",
+    (sys.argv[2], sys.argv[3]),
+).fetchone()
+assert row is not None
+print(row[0])
+PY
+}
+
+write_policy() {
+  local path="$1" version="$2"
+  python3 - "$path" "$version" <<'PY'
+import json
+import pathlib
+import sys
+
+path, version = sys.argv[1:]
+policy = {
+    "schema_version": 1,
+    "policy_version": version,
+    "threshold": 500,
+    "weights": {
+        "explicit_task_match": 600,
+        "workspace_match": 100,
+        "branch_or_worktree_match": 150,
+        "changed_file_overlap": 150,
+    },
+    "time_buckets": [
+        {"max_seconds": 300, "contribution": 100},
+        {"max_seconds": 3600, "contribution": 25},
+    ],
+    "time_window_seconds": 3600,
+    "hard_veto": {"contradictory_task_ids": True},
+}
+pathlib.Path(path).write_text(
+    json.dumps(policy, sort_keys=True, separators=(",", ":")),
+    encoding="utf-8",
+)
+PY
+}
+
 # Seed only derived SQLite rows. This avoids creating 24k encrypted artifacts;
 # the ordinary rebuild above remains responsible for testing real projection.
 seed_query_fixture() {
@@ -658,6 +711,65 @@ PY
   fi
 }
 
+test_materialize_replaces_existing_rows_idempotently() {
+  echo "test_materialize_replaces_existing_rows_idempotently:"
+  local database="$TEST_ROOT/materialize-replace.sqlite"
+  if [[ "$FIXTURE_READY" -ne 1 ]]; then
+    fail "fixtureを構築できる"
+    return
+  fi
+  cp "$STATE/index/vault.sqlite" "$database"
+  if PYTHONPATH="$PLUGIN_DIR/scripts" python3 - "$database" <<'PY'
+import sqlite3
+import sys
+
+from session_atlas import materialize_session_atlas
+
+connection = sqlite3.connect(sys.argv[1])
+target = connection.execute(
+    "SELECT episode_id FROM session_atlas_facets "
+    "WHERE policy_version='default-v1' AND context_identity_state='present' "
+    "ORDER BY episode_id LIMIT 1"
+).fetchone()[0]
+connection.execute(
+    "UPDATE session_atlas_facets "
+    "SET context_identity_state='unknown',context_identity_value_json=NULL "
+    "WHERE policy_version='default-v1' AND episode_id=?",
+    (target,),
+)
+
+# The materializer owns replace semantics. Callers must not pre-delete rows.
+materialize_session_atlas(connection, "default-v1")
+first = connection.execute(
+    "SELECT * FROM session_atlas_facets WHERE policy_version='default-v1' "
+    "ORDER BY episode_id"
+).fetchall()
+assert first
+restored = connection.execute(
+    "SELECT context_identity_state FROM session_atlas_facets "
+    "WHERE policy_version='default-v1' AND episode_id=?",
+    (target,),
+).fetchone()
+assert restored == ("present",), restored
+
+materialize_session_atlas(connection, "default-v1")
+second = connection.execute(
+    "SELECT * FROM session_atlas_facets WHERE policy_version='default-v1' "
+    "ORDER BY episode_id"
+).fetchall()
+assert second == first
+assert len(second) == connection.execute(
+    "SELECT COUNT(*) FROM episodes WHERE policy_version='default-v1'"
+).fetchone()[0]
+connection.close()
+PY
+  then
+    pass "materialize単体が既存rowを置換し反復実行も冪等になる"
+  else
+    fail "materialize単体が既存rowを置換し反復実行も冪等になる"
+  fi
+}
+
 test_scalar_mixed_values_are_sorted_and_unique() {
   echo "test_scalar_mixed_values_are_sorted_and_unique:"
   local database="$TEST_ROOT/scalar-order.sqlite"
@@ -896,6 +1008,70 @@ PY
     fi
   fi
   fail "exact=4 facet、structural=identity以外3 facet、partial=明示facetで照合する"
+}
+
+test_custom_policy_requires_owner_held_policy_for_cli_and_api() {
+  echo "test_custom_policy_requires_owner_held_policy_for_cli_and_api:"
+  local policy="$TEST_ROOT/atlas-custom-policy.json"
+  local target trusted_cli="$TEST_ROOT/custom-policy-cli.json"
+  write_policy "$policy" "atlas-custom-v1"
+  if ! run_cli rebuild-relationships --policy "$policy" >/dev/null 2>&1; then
+    fail "custom policy projectionを準備できる"
+    return
+  fi
+  target="$(episode_id_for_policy_event_at \
+    "$STATE" "atlas-custom-v1" \
+    51000000-0000-4000-8000-000000000001)"
+
+  local cli_contract=0 api_contract=0
+  if ! run_cli atlas cohort "$target" --tier exact --limit 10 \
+      --policy-version atlas-custom-v1 --json >/dev/null 2>&1 \
+    && run_cli atlas cohort "$target" --tier exact --limit 10 \
+      --policy "$policy" --json >"$trusted_cli" 2>/dev/null \
+    && python3 - "$trusted_cli" <<'PY'
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert value["policy_version"] == "atlas-custom-v1"
+PY
+  then
+    cli_contract=1
+  fi
+  if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" python3 - \
+      "$STATE" "$target" "$policy" <<'PY'
+import pathlib
+import sys
+
+from session_atlas import query_cohort
+from vault import VaultError
+
+root = pathlib.Path(sys.argv[1])
+target = sys.argv[2]
+policy_path = pathlib.Path(sys.argv[3])
+try:
+    query_cohort(
+        root, "atlas-custom-v1", target, "exact", [], 10, None
+    )
+except VaultError as error:
+    assert "requires --policy" in str(error)
+else:
+    raise AssertionError("custom policy version was accepted without policy file")
+
+value = query_cohort(
+    root, None, target, "exact", [], 10, None, policy_path=policy_path
+)
+assert value["policy_version"] == "atlas-custom-v1"
+PY
+  then
+    api_contract=1
+  fi
+  if [[ "$cli_contract" -eq 1 && "$api_contract" -eq 1 ]]; then
+    pass "Atlas CLI/APIはcustom policyにowner-held validated fileを必須化する"
+  else
+    fail "Atlas CLI/APIはcustom policyにowner-held validated fileを必須化する"
+  fi
 }
 
 test_unknown_never_matches_and_partial_requires_nonempty_facets() {
@@ -1255,6 +1431,7 @@ build_fixture || true
 TESTS=(
   test_projection_is_one_row_per_episode_without_treatment_leakage
   test_projection_preserves_present_mixed_and_unknown
+  test_materialize_replaces_existing_rows_idempotently
   test_scalar_mixed_values_are_sorted_and_unique
   test_operation_coverage_uses_only_tool_completed_denominator
   test_artifact_change_uses_bounded_finite_shapes_without_raw_identifiers
@@ -1266,6 +1443,7 @@ prepare_report_fixture
 seed_query_fixture >/dev/null 2>&1 || true
 QUERY_TESTS=(
   test_exact_structural_and_partial_tiers
+  test_custom_policy_requires_owner_held_policy_for_cli_and_api
   test_unknown_never_matches_and_partial_requires_nonempty_facets
   test_large_forgotten_set_does_not_expand_sql_variables
   test_mixed_requires_equal_canonical_finite_value
