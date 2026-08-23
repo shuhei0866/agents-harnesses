@@ -147,7 +147,9 @@ def materialize_session_atlas(
                    SUM(CASE WHEN e.event_kind='tool.completed'
                                  AND e.operation_kind IS NOT NULL
                             THEN 1 ELSE 0 END) AS classified_count,
-                   COUNT(DISTINCT e.operation_kind) AS kind_count
+                   COUNT(DISTINCT CASE
+                       WHEN e.event_kind='tool.completed'
+                       THEN e.operation_kind END) AS kind_count
             FROM episode_members AS m
             JOIN source_events AS e ON e.event_id=m.event_id
             WHERE m.policy_version=?
@@ -157,7 +159,9 @@ def materialize_session_atlas(
                    e.operation_kind AS kind
             FROM episode_members AS m
             JOIN source_events AS e ON e.event_id=m.event_id
-            WHERE m.policy_version=? AND e.operation_kind IS NOT NULL
+            WHERE m.policy_version=?
+              AND e.event_kind='tool.completed'
+              AND e.operation_kind IS NOT NULL
         ), kinds AS (
             SELECT policy_version,episode_id,
                    '[' || rtrim(

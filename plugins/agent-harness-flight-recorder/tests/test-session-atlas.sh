@@ -857,13 +857,47 @@ test_operation_coverage_uses_only_tool_completed_denominator() {
   complete="$(episode_id_for_event 51000000-0000-4000-8000-000000000104)"
   unknown="$(episode_id_for_event 51000000-0000-4000-8000-000000000003)"
   multiple="$(episode_id_for_event 51000000-0000-4000-8000-000000000106)"
-  if python3 - "$STATE/index/vault.sqlite" "$partial" "$complete" "$unknown" \
-    "$multiple" <<'PY'
+  if python3 - "$PLUGIN_DIR/scripts" "$STATE/index/vault.sqlite" "$partial" \
+    "$complete" "$unknown" "$multiple" <<'PY'
 import json
 import sqlite3
 import sys
 
-connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+sys.path.insert(0, sys.argv[1])
+from session_atlas import materialize_session_atlas
+
+connection = sqlite3.connect(sys.argv[2])
+connection.execute("BEGIN")
+
+# Relationship construction may place the non-tool event in another Episode.
+# Force it into the classified tool's Episode inside a rolled-back transaction
+# so the materializer contract itself proves that the label is ignored.
+event_id = "51000000-0000-4000-8000-000000000105"
+connection.execute(
+    "UPDATE source_events SET operation_kind='build' WHERE event_id=?",
+    (event_id,),
+)
+connection.execute(
+    "DELETE FROM episode_members WHERE policy_version='default-v1' "
+    "AND event_id=?", (event_id,),
+)
+next_ordinal = connection.execute(
+    "SELECT COALESCE(MAX(ordinal),-1)+1 FROM episode_members "
+    "WHERE policy_version='default-v1' AND episode_id=?", (sys.argv[4],),
+).fetchone()[0]
+connection.execute(
+    "INSERT INTO episode_members VALUES ('default-v1',?,?,?)",
+    (sys.argv[4], event_id, next_ordinal),
+)
+assert connection.execute(
+    "SELECT operation_kind,event_kind FROM source_events WHERE event_id=?",
+    (event_id,),
+).fetchone() == ("build", "turn.completed")
+assert connection.execute(
+    "SELECT COUNT(*) FROM episode_members WHERE policy_version='default-v1' "
+    "AND episode_id=?", (sys.argv[4],),
+).fetchone()[0] >= 2
+materialize_session_atlas(connection, "default-v1")
 
 
 def operation(episode_id):
@@ -883,18 +917,19 @@ def operation(episode_id):
 
 # One of two tool.completed events is unclassified. The non-tool event is not
 # a third denominator item.
-assert operation(sys.argv[2]) == (
+assert operation(sys.argv[3]) == (
     "mixed", {"coverage": "partial", "kinds": ["test"]},
 )
-# A classified tool plus an unclassified turn remains complete coverage.
-assert operation(sys.argv[3]) == (
+# A classified tool plus a non-tool operation label remains complete coverage;
+# the non-tool label must not enter the operation-kind set.
+assert operation(sys.argv[4]) == (
     "present", {"coverage": "complete", "kinds": ["test"]},
 )
 # No eligible tool.completed event is unknown, not zero-percent "partial".
-assert operation(sys.argv[4]) == ("unknown", None)
+assert operation(sys.argv[5]) == ("unknown", None)
 # Multiple classified kinds are mixed even at complete coverage; their order
 # is the finite operation allowlist order, not observation order.
-assert operation(sys.argv[5]) == (
+assert operation(sys.argv[6]) == (
     "mixed", {"coverage": "complete", "kinds": ["test", "build"]},
 )
 PY
