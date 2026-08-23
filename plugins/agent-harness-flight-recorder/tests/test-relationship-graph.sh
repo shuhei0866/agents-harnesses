@@ -476,8 +476,8 @@ ensure_rich_graph() {
   fi
 }
 
-test_index_v2_schema_and_six_feature_evidence() {
-  echo "test_index_v2_schema_and_six_feature_evidence:"
+test_index_v4_schema_and_six_feature_evidence() {
+  echo "test_index_v4_schema_and_six_feature_evidence:"
   local state="$TEST_ROOT/rich/vault"
   local db="$state/index/vault.sqlite"
   ensure_rich_graph || {
@@ -490,7 +490,7 @@ import sqlite3
 import sys
 
 connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
-assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
 tables = {
     row[0]
     for row in connection.execute(
@@ -502,6 +502,7 @@ assert {
     "relationship_edges",
     "episodes",
     "episode_members",
+    "session_atlas_facets",
 } <= tables
 metadata = dict(connection.execute("SELECT key, value FROM schema_metadata"))
 assert metadata["event_schema_versions"] == "1,2,3"
@@ -541,9 +542,9 @@ for feature in evidence.values():
 assert encoded == json.dumps(evidence, sort_keys=True, separators=(",", ":"))
 PY
   then
-    pass "SQLite v3はversioned graphとcanonicalな全6特徴・integer scoreを保持する"
+    pass "SQLite v4はAtlas projection・versioned graph・canonicalな全6特徴・integer scoreを保持する"
   else
-    fail "SQLite v3はversioned graphとcanonicalな全6特徴・integer scoreを保持する"
+    fail "SQLite v4はAtlas projection・versioned graph・canonicalな全6特徴・integer scoreを保持する"
   fi
 }
 
@@ -907,7 +908,7 @@ test_full_rebuild_restores_graph_without_privacy_leak() {
 
 test_recorder_emits_private_domain_separated_event_v2
 test_mixed_v1_v2_inbox_is_lossless_and_versioned
-test_index_v2_schema_and_six_feature_evidence
+test_index_v4_schema_and_six_feature_evidence
 test_cross_harness_veto_bridge_missing_and_singletons
 test_relationship_rebuild_is_deterministic_idempotent_and_source_immutable
 test_policy_versions_coexist_and_invalid_policy_is_atomic

@@ -270,7 +270,7 @@ import sqlite3
 import sys
 
 connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
-assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
 metadata = dict(connection.execute("SELECT key, value FROM schema_metadata"))
 assert metadata["event_schema_versions"] == "1,2,3"
 rows = list(connection.execute(
@@ -334,7 +334,7 @@ import sys
 
 report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 inspect = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
-assert report["schema_version"] == 3
+assert report["schema_version"] == 4
 card = inspect["card"]
 assert card["schema_version"] == 3
 facts = card["deterministic_evidence"]

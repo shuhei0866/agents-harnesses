@@ -327,7 +327,7 @@ import sys
 
 value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 human = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
-assert value["schema_version"] == 3
+assert value["schema_version"] == 4
 assert value["command"] == "report"
 assert value["policy_version"] == "default-v1"
 assert value["window"]["requested"] == "1h"
@@ -405,7 +405,7 @@ import sys
 value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 human = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
 episode = sys.argv[3]
-assert value["schema_version"] == 5
+assert value["schema_version"] == 6
 assert value["command"] == "inspect"
 assert value["policy_version"] == "default-v1"
 assert value["semantic_receipts"] == []

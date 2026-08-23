@@ -55,7 +55,8 @@ from retention_state import load_forgotten
 
 
 OUTPUT_VERSION = 3
-INSPECT_OUTPUT_VERSION = 5
+REPORT_OUTPUT_VERSION = 4
+INSPECT_OUTPUT_VERSION = 6
 STATUS_OUTPUT_VERSION = 4
 DEFAULT_POLICY_VERSION = "default-v1"
 EPISODE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -532,6 +533,7 @@ def report(
         ]
         edges_by_episode = _edges_by_episode(connection, policy_version)
         cards = []
+        atlas_by_episode = {}
         for episode_id in episode_ids:
             card, _edges = _episode_card(
                 root, connection, policy, episode_id, edges_by_episode
@@ -539,6 +541,11 @@ def report(
             last_recorded = parse_time(card["time"]["last_recorded_at"])
             if start <= last_recorded <= end:
                 cards.append(card)
+                from session_atlas import read_session_atlas_facets
+
+                atlas_by_episode[episode_id] = read_session_atlas_facets(
+                    connection, policy_version, episode_id
+                )
         cards.sort(
             key=lambda card: (
                 parse_time(card["time"]["last_recorded_at"]),
@@ -547,7 +554,7 @@ def report(
             reverse=True,
         )
         return {
-            "schema_version": OUTPUT_VERSION,
+            "schema_version": REPORT_OUTPUT_VERSION,
             "command": "report",
             "policy_version": policy_version,
             "window": {
@@ -556,6 +563,10 @@ def report(
                 "end": _iso(end),
             },
             "cards": cards,
+            "session_atlas_facets": {
+                card["episode_id"]: atlas_by_episode[card["episode_id"]]
+                for card in cards
+            },
         }
 
     return _authenticated_query(
@@ -596,6 +607,7 @@ def inspect_episode(
             "command": "inspect",
             "policy_version": policy_version,
             "card": card,
+            "session_atlas_facets": projection["session_atlas_facets"],
             "supporting_edges": projection["supporting_edges"],
             "semantic_receipts": load_semantic_receipts(
                 root,
@@ -623,6 +635,7 @@ def inspect_episode(
         card, edges = _episode_card(
             root, connection, policy, episode_id, edges_by_episode
         )
+        from session_atlas import read_session_atlas_facets
         from semantic_receipts import load_semantic_receipts
         from value_compiler import load_value_primitive_cards
 
@@ -631,6 +644,9 @@ def inspect_episode(
             "command": "inspect",
             "policy_version": policy_version,
             "card": card,
+            "session_atlas_facets": read_session_atlas_facets(
+                connection, policy_version, episode_id
+            ),
             "supporting_edges": edges,
             "semantic_receipts": load_semantic_receipts(
                 root,
@@ -992,6 +1008,18 @@ def _terminal_text(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)[1:-1]
 
 
+def _render_session_atlas_facets(
+    facets: dict[str, dict[str, Any]], *, indent: str = ""
+) -> list[str]:
+    lines = [f"{indent}Session Atlas facets:"]
+    for name, facet in facets.items():
+        rendered = canonical_json(facet["value"]).decode("utf-8")
+        lines.append(
+            f"{indent}  {name}: {facet['state']} value={rendered}"
+        )
+    return lines
+
+
 def render_report(value: dict[str, Any]) -> str:
     lines = [
         (
@@ -1066,6 +1094,10 @@ def render_report(value: dict[str, Any]) -> str:
                     )
                 ),
                 f"  Source events: {len(card['source_event_ids'])}",
+                *_render_session_atlas_facets(
+                    value["session_atlas_facets"][card["episode_id"]],
+                    indent="  ",
+                ),
             )
         )
     return "\n".join(lines)
@@ -1179,6 +1211,7 @@ def render_inspect(value: dict[str, Any]) -> str:
         ),
         "Source evidence IDs:",
         *(f"  {event_id}" for event_id in card["source_event_ids"]),
+        *_render_session_atlas_facets(value["session_atlas_facets"]),
         "Deterministic evidence IDs:",
         *(
             f"  {fact['evidence_id']} "
