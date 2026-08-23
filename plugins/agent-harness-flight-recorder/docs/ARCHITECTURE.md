@@ -29,7 +29,7 @@ Claude Code / Codex
         |
         | lifecycle hooks
         v
-privacy allowlist + canonical Event v1/v2
+privacy allowlist + canonical Event v1/v2/v3
         |
         v
 local append-only inbox/events.jsonl
@@ -44,10 +44,13 @@ immutable device-scoped chunks
         |                         +-----------+-----------+
         |                                     |
         v                                     v
-age encryption                         local SQLite index
-        |                                     |
-        v                                     v
-private Git remote                    status/report/inspect
+age encryption                    local SQLite Evidence Index v4
+        |                              |               |
+        v                              v               v
+private Git remote          Session Atlas facets  status/report/inspect
+                                       |
+                                       v
+                             query-time cohort lookup
 ```
 
 ## Local and synchronized state
@@ -173,7 +176,7 @@ import receipt + canonical decoded cache
 index/vault.sqlite (derived, local-only, replaceable)
 ```
 
-Schema v3 separates immutable source projections from recomputable state:
+Schema v4 separates immutable source projections from recomputable state:
 
 - `source_chunks` records chunk identity, source path, Git blob OID, producer,
   event count, and canonical plaintext digest;
@@ -186,6 +189,8 @@ Schema v3 separates immutable source projections from recomputable state:
 - `derived_state` is namespaced and policy-versioned;
 - `relationship_policies`, `relationship_edges`, `episodes`, and
   `episode_members` contain recomputable versioned relationship views.
+- `session_atlas_facets` contains exactly one recomputable row per Episode and
+  relationship policy with four finite structural facets.
 
 `rebuild-index` constructs a fresh user-only temporary database, validates
 foreign keys and SQLite integrity, fsyncs it, and atomically replaces the
@@ -220,10 +225,11 @@ last trusted writer, not a fresh
 cryptographic digest of every database byte.
 
 Selected-Episode consumers (`inspect`, evaluation, Meaning, Semantic Receipt,
-and Value compilation) use the bounded member/primary-key lookup path. The
-vault-wide `report` command is intentionally a separate aggregate operation:
-it may scan all Episodes and holds the Vault lock for a consistent snapshot,
-so it is not used as an unattended hot-query API.
+and Value compilation) use the bounded member/primary-key lookup path. Session
+Atlas cohort lookup uses a separate bounded, indexed, cursor-paginated sealed
+query. The vault-wide `report` command is intentionally a separate aggregate
+operation: it may scan all Episodes and holds the Vault lock for a consistent
+snapshot, so it is not used as an unattended hot-query API.
 
 A missing, stale, malformed, or mismatched seal fails closed. The read path has
 no full verification fallback, because silently rebuilding the whole
@@ -294,6 +300,59 @@ threshold changes create a coexisting view without rewriting source events.
 `rebuild-relationships` replaces only the requested policy version in one
 transaction.
 
+### Deterministic Session Atlas
+
+Session Atlas is a deterministic comparison-candidate projection over the
+versioned Episode view. Evidence Index v4 stores exactly one
+`session_atlas_facets` row for each `(policy_version, episode_id)`. It does not
+alter relationship formation or write a second Episode identity.
+
+The row contains four finite facets, each represented by an explicit
+`present`, `mixed`, or `unknown` state and a canonical JSON value:
+
+- `context_identity` summarizes available privacy-safe workspace, session,
+  explicit-task, or branch/worktree identity. It is a cohort facet, not an
+  assertion that two raw people, accounts, or repositories are identical.
+- `event_lifecycle` summarizes canonical lifecycle event kinds across Episode
+  members.
+- `operation` summarizes the allowlisted operation kinds on eligible
+  `tool.completed` members. Coverage uses only that eligible denominator. When
+  no eligible event has a classified operation the facet remains `unknown`;
+  incomplete coverage or multiple finite kinds is `mixed`.
+- `artifact_change` stores only coverage and a bounded
+  `none / single / few / many` shape. Shape is derived from the unique union of
+  changed-file fingerprints across the whole Episode. Neither fingerprints nor
+  raw paths enter the Atlas row or its output.
+
+The three cohort tiers are query-time views, not persisted clusters:
+
+```text
+exact       context_identity + event_lifecycle + operation + artifact_change
+structural                     event_lifecycle + operation + artifact_change
+partial     one or more explicitly selected allowlisted facets
+```
+
+Every selected facet must have the same state and canonical value. An
+`unknown` target facet produces no match for that tier, so two absences are
+never treated as positive evidence. `mixed` can match only the same canonical
+finite mixture. Results are ordered by Episode ID and paginated with a bounded,
+HMAC-authenticated cursor bound to the index generation, query, and limit. Each
+item carries a fixed four-key `match_mask` so the returned relation is
+inspectable without introducing a scalar distance, score, rank, winner, or
+global cluster.
+
+`atlas cohort` reads only the sealed, indexed projection and caps each page at
+100 Episodes. `inspect` and `report` expose Atlas facets as an independent
+section rather than promoting them into deterministic facts, model-derived
+semantics, or Value primitives. A forgotten Episode is excluded from Atlas
+reads. Purge removes source scope; because Atlas is derived state, its row is
+removed and recomputed through the ordinary Evidence Index rebuild rather than
+through a separate deletion store.
+
+This v1 projection deliberately contains no semantic `domain`, `activity`, or
+`deliverable_kind` taxonomy. Such labels remain a later, model-derived overlay
+with separate provenance and adoption policy.
+
 ## Evaluation
 
 Evaluation is layered by cost and privacy:
@@ -358,6 +417,7 @@ The first interface is a stable CLI that agent harnesses can also invoke:
 flight-recorder status
 flight-recorder report --last 7d
 flight-recorder inspect <episode-id>
+flight-recorder atlas cohort <episode-id> --tier exact|structural|partial ...
 flight-recorder evaluate <episode-id> --evaluator ADAPTER --model MODEL
 flight-recorder auto-evaluation configure ...
 flight-recorder auto-evaluation run
@@ -369,7 +429,11 @@ flight-recorder receipt-auto run
 
 The primary output is an Episode Evidence Card containing task type, model,
 duration, measured cost, deterministic outcomes, retry count, confidence, and
-supporting evidence. A dashboard is not required for the first value test.
+supporting evidence. `inspect` and `report` add Session Atlas facets as an
+independent section. `atlas cohort` returns an ordered, cursor-paginated set of
+matching Episode IDs, their four facets, and an auditable fixed `match_mask`;
+it does not return a score or ranking. A dashboard is not required for the
+first value test.
 
 All evaluation and reporting commands accept `--json` and build their output
 from the same versioned domain object. `report` uses an explicit positive
@@ -619,9 +683,17 @@ this limitation clearly.
 - versioned anchor coexistence, detailed inspect output, and purge rollback;
 - explicit positive provider budgets before any real or unattended execution.
 
+### R1.6: Deterministic Session Atlas v1
+
+- Evidence Index v4 with one finite four-facet row per Episode and policy;
+- explicit `present`, `mixed`, and `unknown` states with no absence matching;
+- exact, structural, and explicit partial cohorts constructed at query time;
+- sealed bounded reads, stable Episode-ID order, and authenticated pagination;
+- independent `inspect` and `report` facets plus forget and purge coverage;
+- no score, rank, winner, hidden distance, or stored global cluster.
+
 ### Later
 
-- deterministic Session Atlas facets and query-time cohort construction;
 - bounded semantic taxonomy for Episodes with current anchors;
 - selected, privacy-reviewed episode export;
 - aggregate signals and incentive design;

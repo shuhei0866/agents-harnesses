@@ -458,3 +458,38 @@ Accepted decisions remain recorded when later superseded.
   seal. Protecting against that actor requires a separately privileged signer;
   this contract instead protects against other local users, accidental
   corruption, and untrusted transport.
+
+## D-20260823-30: Materialize deterministic Atlas facets and construct cohorts at query time
+
+- Status: accepted
+- Decision: implement deterministic Session Atlas v1 as part of Evidence Index
+  schema v4. Materialize exactly one row per authenticated Episode and
+  relationship policy with four finite facets: `context_identity`,
+  `event_lifecycle`, `operation`, and `artifact_change`. Give every facet an
+  explicit `present`, `mixed`, or `unknown` state and canonical JSON value.
+  Compute operation coverage only over eligible `tool.completed` events and
+  compute artifact shape from the unique Episode-wide union of changed-file
+  fingerprints. Construct exact, structural, and explicit partial cohorts only
+  at query time. Require every selected facet to be known and equal, so
+  `unknown` never matches `unknown`. Do not persist a global cluster or produce
+  a score, hidden distance, rank, or winner.
+- Reason: the authenticated index seal from D-20260814-29 makes a bounded
+  structural lookup possible without reconstructing the whole Vault on each
+  read. The pilot in D-20260811-28 showed that comparison becomes misleading
+  before comparable work is separated, but its analyst-guided semantic labels
+  were neither sufficiently general nor deterministic for production
+  backfill. Finite facets derived from already authenticated Event and Episode
+  evidence provide an auditable first filter whose precision can improve
+  independently of personal Value weighting.
+- Consequence: `atlas cohort` reads a sealed indexed projection, orders by
+  Episode ID, caps pages, and authenticates cursors against the index
+  generation, query, and limit. Exact cohorts use all four facets; structural
+  cohorts exclude context identity; partial cohorts require an explicit
+  nonempty facet allowlist. Every result includes all four facets and a fixed
+  match mask. `inspect` and `report` present Atlas as an independent section
+  rather than changing the Evidence Card, Semantic Receipt, or Value contract.
+  Forget hides Episodes from cohort and reporting reads. Purge relies on the
+  normal derived-index rebuild to remove and recompute Atlas rows; there is no
+  separate Atlas source of truth. The semantic
+  `domain / activity / deliverable_kind` taxonomy remains a later overlay with
+  separate model provenance and an explicit adoption decision.

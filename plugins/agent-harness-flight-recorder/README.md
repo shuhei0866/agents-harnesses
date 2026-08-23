@@ -237,10 +237,11 @@ foreign keys and SQLite integrity, then atomically publishes
 `index/vault.sqlite`. A corrupt or unsupported existing database is replaced
 only after the new index is complete. Full rebuild restores the bundled
 `default-v1` relationship view; custom views are derived local state and must
-be reapplied from their owner-held policy files. Schema v3 also rebuilds
+be reapplied from their owner-held policy files. Schema v4 also rebuilds
 stable deterministic evidence IDs with their source event, collector version,
-and collection timestamp. To add only unseen chunks to a current schema-v3
-database, use:
+and collection timestamp, plus one deterministic Session Atlas facet row per
+Episode and relationship policy. To add only unseen chunks to a current
+schema-v4 database, use:
 
 ```bash
 scripts/flight-recorder rebuild-index --incremental
@@ -269,6 +270,52 @@ scripts/flight-recorder rebuild-relationships --policy /path/to/policy.json
 
 Policies use integer weights and thresholds. Different versions coexist, and
 an invalid policy or failed rebuild leaves every existing view unchanged.
+
+### Deterministic Session Atlas
+
+Session Atlas constructs comparable Episode cohorts without assigning a score,
+rank, winner, hidden distance, or permanent global cluster. Evidence Index v4
+materializes one row per Episode and relationship policy with four finite
+facets:
+
+- `context_identity`: the available privacy-safe workspace, session, task, or
+  branch/worktree identity;
+- `event_lifecycle`: the canonical lifecycle event kinds present in the
+  Episode;
+- `operation`: the finite operation kinds observed on eligible
+  `tool.completed` events, with coverage measured only over those events;
+- `artifact_change`: `none`, `single`, `few`, or `many`, computed from the
+  unique union of changed-file fingerprints across the whole Episode, plus
+  bounded coverage.
+
+Each facet is explicitly `present`, `mixed`, or `unknown` and carries only a
+canonical finite value. `unknown` never matches another `unknown`. Raw paths,
+commands, file fingerprints, and semantic labels are not exposed by this
+projection.
+
+Construct a cohort at query time from an authenticated Episode:
+
+```bash
+scripts/flight-recorder atlas cohort <episode-id> --tier exact --json
+scripts/flight-recorder atlas cohort <episode-id> --tier structural --json
+scripts/flight-recorder atlas cohort <episode-id> \
+  --tier partial --facet operation --facet artifact_change --json
+```
+
+`exact` matches all four facets. `structural` matches lifecycle, operation,
+and artifact change while intentionally excluding context identity. `partial`
+requires one or more explicitly allowlisted `--facet` choices. Results are
+ordered by Episode ID and use a generation-, query-, and limit-bound
+authenticated cursor; `--limit` is bounded to 1--100. The fixed four-facet
+`match_mask` makes every returned match auditable even when only a subset was
+selected.
+
+The cohort read is bounded and authenticated by the Evidence Index seal.
+`inspect` and `report` expose `session_atlas_facets` as an independent section
+instead of folding structure into the Evidence Card, Semantic Receipt, or Value
+vector. `forget` hides an Episode from Atlas queries and normal output. `purge`
+removes its source scope and the derived Atlas row disappears when the evidence
+index is rebuilt; Atlas has no separate source-of-truth store.
 
 Read local health and grounded Episode Evidence Cards without a dashboard:
 
@@ -421,8 +468,9 @@ reinterpret the original local session without overwriting earlier results.
 `flight-recorder inspect <episode-id>` returns matching records in the
 top-level `semantic_receipts` array and labels them as model-derived in human
 output; it does not promote their task or outcome into deterministic Card
-fields. Inspect output is version 5 after adding the separate Value Primitive
-Card projection, while the embedded Card and report output remain version 3.
+fields. Inspect output is version 6 after adding the independent Session Atlas
+projection. The embedded Evidence Card remains version 3; report output is
+version 4 and carries its Episode-to-Atlas map outside those Cards.
 
 ### Meaning Lift pilot
 
@@ -517,9 +565,10 @@ The first classification pilot is recorded in
 [`docs/SESSION_ATLAS_PILOT.md`](docs/SESSION_ATLAS_PILOT.md). It assigns
 independent `domain`, `activity`, and `deliverable_kind` facets before comparing
 sessions. Model, harness, outcome, duration, cost, and Value remain comparison
-columns inside an explicit cohort rather than classification inputs. Production
-backfill and background classification stay disabled until authenticated
-hot-path reads are bounded.
+columns inside an explicit cohort rather than classification inputs. Evidence
+Index v4 now provides the deterministic production facets and bounded cohort
+read described above. The pilot's semantic taxonomy remains model-derived and
+is not backfilled or automatically adopted by production Atlas.
 
 ### Unconscious Semantic Receipts
 
@@ -629,6 +678,7 @@ bash plugins/agent-harness-flight-recorder/tests/test-evidence-index.sh
 bash plugins/agent-harness-flight-recorder/tests/test-deterministic-evidence.sh
 bash plugins/agent-harness-flight-recorder/tests/test-relationship-graph.sh
 bash plugins/agent-harness-flight-recorder/tests/test-reporting.sh
+bash plugins/agent-harness-flight-recorder/tests/test-session-atlas.sh
 bash plugins/agent-harness-flight-recorder/tests/test-background-evaluation.sh
 bash plugins/agent-harness-flight-recorder/tests/test-session-sources.sh
 bash plugins/agent-harness-flight-recorder/tests/test-semantic-receipts.sh
