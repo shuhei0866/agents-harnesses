@@ -315,7 +315,7 @@ assert "/value-primitive-cards/\n" in (pathlib.Path(state_path) / ".gitignore").
 
 inspection = json.loads(pathlib.Path(inspect_path).read_text())
 human = pathlib.Path(human_path).read_text()
-assert inspection["schema_version"] == 5
+assert inspection["schema_version"] == 6
 cards = inspection["value_primitive_cards"]
 assert len(cards) == 1 and cards[0] == selected
 assert "goal_achievement" in human
@@ -496,7 +496,7 @@ inspection = json.loads(pathlib.Path(inspected).read_text())
 assert int(pathlib.Path(counter).read_text()) == 1
 assert sum(item["compiled_count"] for item in outputs) == 1
 assert sum(item["reused_count"] for item in outputs) >= 1
-assert inspection["schema_version"] == 5
+assert inspection["schema_version"] == 6
 assert inspection["card"]["episode_id"] == episode
 PY
   then
@@ -2020,7 +2020,7 @@ root = pathlib.Path(sys.argv[1])
 episode = sys.argv[2]
 human = pathlib.Path(sys.argv[3]).read_text()
 inspection = json.loads(pathlib.Path(sys.argv[4]).read_text())
-assert inspection["schema_version"] == 5
+assert inspection["schema_version"] == 6
 cards = inspection["value_primitive_cards"]
 assert len(cards) == 1
 card = cards[0]
@@ -2230,7 +2230,7 @@ import pathlib
 import sys
 
 inspection = json.loads(pathlib.Path(sys.argv[1]).read_text())
-assert inspection["schema_version"] == 5
+assert inspection["schema_version"] == 6
 cards = inspection["value_primitive_cards"]
 assert len(cards) == 2
 assert {

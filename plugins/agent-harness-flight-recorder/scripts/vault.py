@@ -841,6 +841,24 @@ def parser() -> argparse.ArgumentParser:
         "--policy", "--policy-file", dest="policy", type=Path
     )
     inspect.add_argument("--json", action="store_true")
+    atlas = commands.add_parser("atlas")
+    atlas_commands = atlas.add_subparsers(
+        dest="atlas_command", required=True
+    )
+    atlas_cohort = atlas_commands.add_parser("cohort")
+    atlas_cohort.add_argument("episode_id")
+    atlas_cohort.add_argument(
+        "--tier", required=True, choices=("exact", "structural", "partial")
+    )
+    atlas_cohort.add_argument("--facet", action="append", default=[])
+    atlas_cohort.add_argument("--limit", type=int, default=20)
+    atlas_cohort.add_argument("--cursor")
+    atlas_policy = atlas_cohort.add_mutually_exclusive_group()
+    atlas_policy.add_argument("--policy-version")
+    atlas_policy.add_argument(
+        "--policy", "--policy-file", dest="policy", type=Path
+    )
+    atlas_cohort.add_argument("--json", action="store_true")
     evaluate = commands.add_parser("evaluate")
     evaluate.add_argument("episode_id")
     evaluate_policy = evaluate.add_mutually_exclusive_group()
@@ -1017,6 +1035,7 @@ def main() -> int:
         "status",
         "report",
         "inspect",
+        "atlas",
         "evaluate",
         "auto-evaluation",
         "source",
@@ -1075,6 +1094,23 @@ def main() -> int:
                     args.policy,
                 )
                 emit(value, as_json=args.json, human=render_inspect(value))
+        elif args.command == "atlas":
+            from reporting import emit
+            from session_atlas import query_cohort, render_cohort
+
+            if args.atlas_command != "cohort":
+                raise VaultError("unsupported atlas command")
+            value = query_cohort(
+                root,
+                args.policy_version,
+                args.episode_id,
+                args.tier,
+                args.facet,
+                args.limit,
+                args.cursor,
+                policy_path=args.policy,
+            )
+            emit(value, as_json=args.json, human=render_cohort(value))
         elif args.command == "evaluate":
             from evaluation import evaluate, render_evaluate
             from reporting import emit

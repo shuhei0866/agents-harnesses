@@ -54,7 +54,7 @@ GENERATION_NAMESPACE = "authenticated_index_seal"
 GENERATION_KEY = "projection_generation"
 GENERATION_POLICY = "_global"
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-INDEX_VERSION = 3
+INDEX_VERSION = 4
 DETERMINISTIC_COLLECTOR_VERSION = "deterministic-v1"
 DETERMINISTIC_METRICS = (
     "duration_ms",
@@ -193,6 +193,30 @@ CREATE TABLE episode_members (
     FOREIGN KEY (event_id) REFERENCES source_events(event_id)
         ON UPDATE RESTRICT ON DELETE RESTRICT
 ) WITHOUT ROWID;
+CREATE TABLE session_atlas_facets (
+    policy_version TEXT NOT NULL,
+    episode_id TEXT NOT NULL,
+    context_identity_state TEXT NOT NULL CHECK (
+        context_identity_state IN ('present', 'mixed', 'unknown')
+    ),
+    context_identity_value_json TEXT,
+    event_lifecycle_state TEXT NOT NULL CHECK (
+        event_lifecycle_state IN ('present', 'mixed', 'unknown')
+    ),
+    event_lifecycle_value_json TEXT,
+    operation_state TEXT NOT NULL CHECK (
+        operation_state IN ('present', 'mixed', 'unknown')
+    ),
+    operation_value_json TEXT,
+    artifact_change_state TEXT NOT NULL CHECK (
+        artifact_change_state IN ('present', 'mixed', 'unknown')
+    ),
+    artifact_change_value_json TEXT,
+    PRIMARY KEY (policy_version, episode_id),
+    FOREIGN KEY (policy_version, episode_id)
+        REFERENCES episodes(policy_version, episode_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+) WITHOUT ROWID;
 CREATE INDEX source_chunks_by_device_time
     ON source_chunks(device_id, created_at);
 CREATE INDEX source_events_by_time
@@ -205,11 +229,30 @@ CREATE INDEX source_events_by_workspace_time
     ON source_events(workspace_id, recorded_at);
 CREATE INDEX deterministic_evidence_by_source
     ON deterministic_evidence(source_event_id, evidence_type);
+CREATE INDEX session_atlas_by_context
+    ON session_atlas_facets(
+        policy_version, context_identity_state,
+        context_identity_value_json, episode_id
+    );
+CREATE INDEX session_atlas_by_lifecycle
+    ON session_atlas_facets(
+        policy_version, event_lifecycle_state,
+        event_lifecycle_value_json, episode_id
+    );
+CREATE INDEX session_atlas_by_operation
+    ON session_atlas_facets(
+        policy_version, operation_state, operation_value_json, episode_id
+    );
+CREATE INDEX session_atlas_by_artifact
+    ON session_atlas_facets(
+        policy_version, artifact_change_state,
+        artifact_change_value_json, episode_id
+    );
 """
 METADATA = (
     ("event_schema_versions", "1,2,3"),
     ("index_role", "derived_rebuildable"),
-    ("schema_version", "3"),
+    ("schema_version", "4"),
     ("source_of_truth", "encrypted_chunk_v1_event_v1_v2_v3"),
 )
 
@@ -848,6 +891,7 @@ def _read_episode_projection(
     episode_id: str,
 ) -> dict[str, Any]:
     from reporting import _episode_card, _policy
+    from session_atlas import read_session_atlas_facets
 
     connection = _open_sealed_readonly(root, seal)
     identity = _check_existing_database(root / DATABASE_PATH)
@@ -858,6 +902,9 @@ def _read_episode_projection(
         card, supporting = _episode_card(
             root, connection, policy, episode_id, edges
         )
+        atlas = read_session_atlas_facets(
+            connection, policy_version, episode_id
+        )
         connection.execute("COMMIT")
     except Exception:
         if connection.in_transaction:
@@ -867,7 +914,12 @@ def _read_episode_projection(
         connection.close()
     if _check_existing_database(root / DATABASE_PATH) != identity:
         raise VaultError("evidence index changed during sealed read")
-    return {"card": card, "supporting_edges": supporting, "policy": policy}
+    return {
+        "card": card,
+        "supporting_edges": supporting,
+        "policy": policy,
+        "session_atlas_facets": atlas,
+    }
 
 
 def read_sealed_episode(

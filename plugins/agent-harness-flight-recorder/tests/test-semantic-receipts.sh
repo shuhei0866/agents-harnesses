@@ -267,7 +267,7 @@ assert raw_path not in serialized_receipt
 assert "CODEX_SELECTED_SPAN_CANARY" not in serialized_receipt
 assert "CODEX_OUTSIDE_AFTER_CANARY" not in serialized_receipt
 
-assert inspect_value["schema_version"] == 5
+assert inspect_value["schema_version"] == 6
 assert inspect_value["card"]["task_type"] is None
 assert len(inspect_value["semantic_receipts"]) == 2
 assert {

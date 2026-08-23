@@ -387,6 +387,9 @@ def rebuild_relationships(
         raise VaultError(
             "relationship policy version conflicts with existing definition"
         )
+    from session_atlas import clear_session_atlas, materialize_session_atlas
+
+    clear_session_atlas(connection, version)
     connection.execute(
         "DELETE FROM episode_members WHERE policy_version = ?", (version,)
     )
@@ -427,4 +430,5 @@ def rebuild_relationships(
     connection.executemany(
         "INSERT INTO episode_members VALUES (?, ?, ?, ?)", member_rows
     )
+    materialize_session_atlas(connection, version)
     return len(pairs), len(episode_rows)
