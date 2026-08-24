@@ -341,6 +341,8 @@ def _episode_card(
     policy: dict[str, Any],
     episode_id: str,
     edges_by_episode: dict[str, list[dict[str, Any]]],
+    *,
+    include_model_evaluations: bool = True,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     rows = list(
         connection.execute(
@@ -487,11 +489,15 @@ def _episode_card(
             "evidence": outcome_evidence,
         },
         "deterministic_evidence": deterministic_evidence,
-        "model_evaluations": load_evaluations(
-            root,
-            policy["policy_version"],
-            episode_id,
-            {fact["evidence_id"] for fact in deterministic_evidence},
+        "model_evaluations": (
+            load_evaluations(
+                root,
+                policy["policy_version"],
+                episode_id,
+                {fact["evidence_id"] for fact in deterministic_evidence},
+            )
+            if include_model_evaluations
+            else []
         ),
         "retry_count": _measurement(events, "retry_count"),
         "confidence": confidence,
