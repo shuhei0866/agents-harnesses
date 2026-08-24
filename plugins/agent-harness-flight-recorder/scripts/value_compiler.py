@@ -1435,14 +1435,15 @@ def _packet_for_stored_anchor_ids(
     return packet
 
 
-def load_value_primitive_cards(
+def authenticate_value_primitive_cards(
     root: Path,
     policy_version: str,
     episode_id: str,
     current_episode_card: dict[str, Any],
+    records: list[tuple[Path, bytes, dict[str, Any]]],
 ) -> list[dict[str, Any]]:
     result = [
-        value for _path, _raw, value in _stored_records(root)
+        value for _path, _raw, value in records
         if value["episode_id"] == episode_id
         and value["provenance"]["policy_version"] == policy_version
     ]
@@ -1492,6 +1493,21 @@ def load_value_primitive_cards(
         authenticated.append(value)
     authenticated.sort(key=lambda item: (parse_time(item["provenance"]["generated_at"]), item["value_primitive_card_id"]))
     return authenticated
+
+
+def load_value_primitive_cards(
+    root: Path,
+    policy_version: str,
+    episode_id: str,
+    current_episode_card: dict[str, Any],
+) -> list[dict[str, Any]]:
+    return authenticate_value_primitive_cards(
+        root,
+        policy_version,
+        episode_id,
+        current_episode_card,
+        _stored_records(root),
+    )
 
 
 def value_primitive_card_record_snapshots(root: Path, policy_version: str, episode_id: str) -> list[tuple[Path, bytes]]:

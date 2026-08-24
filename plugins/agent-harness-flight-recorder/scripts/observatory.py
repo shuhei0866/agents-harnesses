@@ -13,10 +13,13 @@ from typing import Any, Callable
 from chunk_rotation import canonical_json
 from evidence_index import read_sealed_query_locked
 from receipt_automation import status as receipt_automation_status
-from reporting import DEFAULT_POLICY_VERSION, _inbox_count
+from reporting import DEFAULT_POLICY_VERSION, _episode_card, _inbox_count
 from retention_state import load_forgotten
 from semantic_receipts import _stored_receipts
-from value_compiler import _stored_records as _stored_value_records
+from value_compiler import (
+    _stored_records as _stored_value_records,
+    authenticate_value_primitive_cards,
+)
 from vault import VaultError, vault_lock
 
 
@@ -28,6 +31,7 @@ MAX_EVIDENCE_BINDINGS = 2_000_000
 MAX_LOCAL_RECORDS = 10_000
 MAX_LOCAL_RECORD_BYTES = 256 * 1024 * 1024
 MAX_INBOX_BYTES = 256 * 1024 * 1024
+MAX_CURRENT_VALUE_EPISODES = 100
 QUERY_DEADLINE_SECONDS = 2
 AUTOMATION_FIELDS = (
     "schema_version",
@@ -121,9 +125,55 @@ def _bound_record_count(
     return count
 
 
+def _current_value_card_count(
+    root: Path,
+    records: list[tuple[Path, bytes, dict[str, Any]]],
+    current_cards: dict[str, dict[str, Any]] | None,
+) -> int:
+    if current_cards is None:
+        return len(records)
+    count = 0
+    for episode_id, card in current_cards.items():
+        count += len(
+            authenticate_value_primitive_cards(
+                root,
+                DEFAULT_POLICY_VERSION,
+                episode_id,
+                card,
+                records,
+            )
+        )
+    return count
+
+
 def overview(root: Path) -> dict[str, Any]:
     """Return the fixed, privacy-safe observatory projection."""
     root = Path(root)
+    pending_events = _bounded_inbox_count(root)
+    receipts = _bounded_local_records(
+        root,
+        "semantic-receipts",
+        _stored_receipts,
+        "Semantic Receipt",
+    )
+    values = _bounded_local_records(
+        root,
+        "value-primitive-cards",
+        _stored_value_records,
+        "Value Primitive Card",
+    )
+    value_episode_ids = sorted(
+        {
+            value["episode_id"]
+            for _path, _raw, value in values
+            if value["provenance"]["policy_version"]
+            == DEFAULT_POLICY_VERSION
+        }
+    )
+    if len(value_episode_ids) > MAX_CURRENT_VALUE_EPISODES:
+        raise VaultError("Value Card coverage exceeds observatory limits")
+    automation_source = receipt_automation_status(root)
+
     with vault_lock(root):
         forgotten = sorted(
             episode_id
@@ -190,6 +240,7 @@ def overview(root: Path) -> dict[str, Any]:
                     )
                 }
                 bindings: dict[str, dict[str, Any]] | None = None
+                current_value_cards: dict[str, dict[str, Any]] | None = None
                 if tables == {"episode_members", "deterministic_evidence"}:
                     member_rows = list(
                         connection.execute(
@@ -252,6 +303,19 @@ def overview(root: Path) -> dict[str, Any]:
                         binding = bindings.get(episode_id)
                         if binding is not None:
                             binding["evidence_ids"].add(evidence_id)
+                    current_value_cards = {}
+                    for episode_id in value_episode_ids:
+                        if episode_id not in bindings:
+                            continue
+                        card, _edges = _episode_card(
+                            root,
+                            connection,
+                            _policy,
+                            episode_id,
+                            {},
+                            include_model_evaluations=False,
+                        )
+                        current_value_cards[episode_id] = card
                 return {
                     "index_schema_version": index_schema_version,
                     "events": events,
@@ -259,6 +323,7 @@ def overview(root: Path) -> dict[str, Any]:
                     "singleton_episodes": singleton_episodes,
                     "comparable_episodes": comparable_episodes,
                     "bindings": bindings,
+                    "current_value_cards": current_value_cards,
                 }
             except sqlite3.Error as error:
                 raise VaultError("observatory sealed query failed") from error
@@ -275,26 +340,12 @@ def overview(root: Path) -> dict[str, Any]:
     singleton_episodes = projection["singleton_episodes"]
     comparable_episodes = projection["comparable_episodes"]
     bindings = projection["bindings"]
-    pending_events = _bounded_inbox_count(root)
-    receipts = _bounded_local_records(
-        root,
-        "semantic-receipts",
-        _stored_receipts,
-        "Semantic Receipt",
-    )
-    values = _bounded_local_records(
-        root,
-        "value-primitive-cards",
-        _stored_value_records,
-        "Value Primitive Card",
-    )
     semantic_receipts = _bound_record_count(
         receipts, bindings, require_evidence=True
     )
-    value_cards = _bound_record_count(
-        values, bindings, require_evidence=False
+    value_cards = _current_value_card_count(
+        root, values, projection["current_value_cards"]
     )
-    automation_source = receipt_automation_status(root)
 
     automation = {
         field: automation_source[field] for field in AUTOMATION_FIELDS

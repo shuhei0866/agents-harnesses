@@ -106,7 +106,19 @@ def receipts(_root):
 
 
 def values(_root):
-    return [(None, b"", {})]
+    return [
+        (
+            None,
+            b"",
+            {
+                "episode_id": "episode-1",
+                "provenance": {
+                    "policy_version": "default-v1",
+                    "source_event_ids": ["event-1"],
+                },
+            },
+        )
+    ]
 
 
 automation = {
@@ -460,6 +472,12 @@ values = [
         ["event-a"],
     ),
     value_card(
+        "value-stale-anchor",
+        "episode-current",
+        "default-v1",
+        ["event-a", "event-b"],
+    ),
+    value_card(
         "value-forgotten",
         "episode-forgotten",
         "default-v1",
@@ -496,7 +514,30 @@ def sealed_query(_root, version, query, trusted_policy=None):
     return query(connection, {"policy_version": version})
 
 
+def episode_card(_root, _connection, policy, episode_id, _edges, **kwargs):
+    assert policy["policy_version"] == "default-v1"
+    assert episode_id == "episode-current"
+    assert kwargs == {"include_model_evaluations": False}
+    return {
+        "episode_id": episode_id,
+        "source_event_ids": ["event-a", "event-b"],
+    }, []
+
+
+def authenticate_values(_root, policy, episode_id, card, records):
+    assert policy == "default-v1"
+    assert episode_id == "episode-current"
+    assert card["source_event_ids"] == ["event-a", "event-b"]
+    return [
+        value
+        for _path, _raw, value in records
+        if value["value_primitive_card_id"] == "value-current"
+    ]
+
+
 observatory.read_sealed_query_locked = sealed_query
+observatory._episode_card = episode_card
+observatory.authenticate_value_primitive_cards = authenticate_values
 observatory.load_forgotten = lambda _root: {
     ("default-v1", "episode-forgotten")
 }
