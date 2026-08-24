@@ -336,6 +336,40 @@ scripts/flight-recorder report --last 7d
 scripts/flight-recorder inspect sha256:<episode-digest>
 ```
 
+For a compact, owner-facing view of the same local state, start the read-only
+Observatory on an explicit port:
+
+```bash
+scripts/flight-recorder observe --port 8765
+scripts/flight-recorder observe --port 8765 --json
+```
+
+Open the printed loopback URL and stop the server with Ctrl-C. The page reduces
+the current state to three questions: whether events are being recorded,
+whether they form useful work units, and whether enough structure and semantic
+evidence exists for value comparison. It refreshes from one authenticated,
+sealed index projection on each request. Machine-readable data is available at
+`/api/v1/overview`, and `/healthz` reports only server liveness. `--json`
+changes the startup line to a single canonical JSON document; it does not
+change the HTTP response schema.
+
+Observatory binds only to `127.0.0.1`, accepts only `GET` and `HEAD`, has no
+mutation or arbitrary-file routes, and rejects non-loopback Host headers. It
+also rejects cross-site browser requests before loading the overview. It
+serves finite counters and derived rates only: raw session content, source
+paths, prompts, commands, and identifiers are never exposed. The local server
+has no authentication, so it is intentionally unavailable to other devices
+and must not be placed behind a proxy or port-forward.
+
+Each page/API read is bounded. The sealed aggregate has a two-second SQLite
+deadline and refuses indexes above 1,000,000 events, 500,000 Episodes, or
+2,000,000 evidence bindings. The pending inbox and each local semantic store
+are preflighted before their strict readers run; the inbox and each store are
+limited to 256 MiB, and a semantic store is also limited to 10,000 records.
+Crossing a limit returns a fixed unavailable response instead of extending the
+Vault lock or scanning indefinitely. These are Observatory read limits only;
+recording and the existing CLI workflows are unchanged.
+
 Add `--json` to any command for a canonical, single-document JSON response that
 Claude Code, Codex, or another local tool can consume. `report` and `inspect`
 use `default-v1`; `--policy-version default-v1` states that default explicitly.
@@ -690,6 +724,7 @@ bash plugins/agent-harness-flight-recorder/tests/test-deterministic-evidence.sh
 bash plugins/agent-harness-flight-recorder/tests/test-relationship-graph.sh
 bash plugins/agent-harness-flight-recorder/tests/test-reporting.sh
 bash plugins/agent-harness-flight-recorder/tests/test-session-atlas.sh
+bash plugins/agent-harness-flight-recorder/tests/test-observatory.sh
 bash plugins/agent-harness-flight-recorder/tests/test-background-evaluation.sh
 bash plugins/agent-harness-flight-recorder/tests/test-session-sources.sh
 bash plugins/agent-harness-flight-recorder/tests/test-semantic-receipts.sh

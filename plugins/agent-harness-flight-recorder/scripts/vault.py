@@ -991,6 +991,23 @@ def parser() -> argparse.ArgumentParser:
     receipt_auto_configure.add_argument("--json", action="store_true")
     receipt_auto_run = receipt_auto_commands.add_parser("run")
     receipt_auto_run.add_argument("--json", action="store_true")
+    observe = commands.add_parser("observe")
+
+    def observatory_port(value: str) -> int:
+        try:
+            selected = int(value, 10)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(
+                "port must be an integer between 0 and 65535"
+            ) from error
+        if not 0 <= selected <= 65535:
+            raise argparse.ArgumentTypeError(
+                "port must be an integer between 0 and 65535"
+            )
+        return selected
+
+    observe.add_argument("--port", required=True, type=observatory_port)
+    observe.add_argument("--json", action="store_true")
     forget = commands.add_parser("forget")
     forget.add_argument("episode_id")
     forget_policy = forget.add_mutually_exclusive_group()
@@ -1043,6 +1060,7 @@ def main() -> int:
         "meaning",
         "value",
         "receipt-auto",
+        "observe",
         "forget",
         "purge",
         "scheduler",
@@ -1245,6 +1263,10 @@ def main() -> int:
                     f"{value['generated_count']} generated.\n"
                 )
             emit(value, as_json=args.json, human=human)
+        elif args.command == "observe":
+            import observatory
+
+            observatory.serve(root, args.port, startup_as_json=args.json)
         elif args.command in ("forget", "purge"):
             from reporting import emit
             from retention import (
