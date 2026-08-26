@@ -14,8 +14,8 @@ from vault import VaultError
 NAMESPACE = "index-storage-v1"
 KEY = "major-components"
 POLICY = "global-v1"
-WARNING_AT_BYTES = 3_758_096_384
-CRITICAL_AT_BYTES = 4_294_967_296
+WARNING_AT_BYTES = 5_368_709_120
+CRITICAL_AT_BYTES = 8_589_934_592
 SOURCE_NAMES = {
     "source_chunks",
     "source_events",

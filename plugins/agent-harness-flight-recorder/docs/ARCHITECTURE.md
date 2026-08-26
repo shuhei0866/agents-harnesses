@@ -224,8 +224,8 @@ writer retains only the compact evidence dictionary and link candidates needed
 to rebuild connected components in memory; it does not materialize the full
 candidate set or all edge rows. Writer-time `dbstat` totals are cached in
 `derived_state`, while Observatory reads only SQLite page counts and that one
-cached row. A local index is marked `attention` at 3.5 GiB and `critical` at
-4 GiB. These are operational budgets for rebuildable local state, not deletion
+cached row. A local index is marked `attention` at 5 GiB and `critical` at
+8 GiB. These are operational budgets for rebuildable local state, not deletion
 thresholds for source evidence.
 
 ### Authenticated evidence index seal

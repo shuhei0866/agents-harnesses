@@ -164,8 +164,8 @@ observatory.index_freshness_status = lambda _root: refresh
 storage = {
     "state": "critical",
     "total_bytes": 11 * 1024**3,
-    "warning_at_bytes": 3758096384,
-    "critical_at_bytes": 4294967296,
+    "warning_at_bytes": 5368709120,
+    "critical_at_bytes": 8589934592,
     "components": {
         "source_bytes": 1 * 1024**3,
         "relationship_bytes": 8 * 1024**3,
@@ -303,8 +303,8 @@ value_compiler._stored_records = observatory._stored_value_records
 observatory._index_storage_snapshot = lambda _connection: {
     "state": "ready",
     "total_bytes": 0,
-    "warning_at_bytes": 3758096384,
-    "critical_at_bytes": 4294967296,
+    "warning_at_bytes": 5368709120,
+    "critical_at_bytes": 8589934592,
     "components": {
         "source_bytes": 0,
         "relationship_bytes": 0,
@@ -615,8 +615,8 @@ observatory.receipt_automation_status = lambda _root: {
 observatory._index_storage_snapshot = lambda _connection: {
     "state": "ready",
     "total_bytes": 0,
-    "warning_at_bytes": 3758096384,
-    "critical_at_bytes": 4294967296,
+    "warning_at_bytes": 5368709120,
+    "critical_at_bytes": 8589934592,
     "components": {
         "source_bytes": 0,
         "relationship_bytes": 0,
@@ -753,8 +753,8 @@ observatory.receipt_automation_status = unlocked_status
 observatory._index_storage_snapshot = lambda _connection: {
     "state": "ready",
     "total_bytes": 0,
-    "warning_at_bytes": 3758096384,
-    "critical_at_bytes": 4294967296,
+    "warning_at_bytes": 5368709120,
+    "critical_at_bytes": 8589934592,
     "components": {
         "source_bytes": 0,
         "relationship_bytes": 0,
@@ -831,8 +831,8 @@ value = observatory._index_storage_snapshot(connection)
 assert value == {
     "state": "critical",
     "total_bytes": 11 * GIB,
-    "warning_at_bytes": 3758096384,
-    "critical_at_bytes": 4294967296,
+    "warning_at_bytes": 5368709120,
+    "critical_at_bytes": 8589934592,
     "components": {
         "source_bytes": 1 * GIB,
         "relationship_bytes": 8 * GIB,
@@ -845,7 +845,7 @@ assert len(connection.calls) == 3
 # Thresholds are inclusive and explicit so growth cannot silently cross a
 # budget boundary between two Observatory versions.
 assert observatory._index_storage_snapshot(
-    BoundedConnection(3758096384 - 4096, {
+    BoundedConnection(5368709120 - 4096, {
         "schema_version": 1,
         "source_bytes": 0,
         "relationship_bytes": 0,
@@ -853,7 +853,7 @@ assert observatory._index_storage_snapshot(
     })
 )["state"] == "ready"
 assert observatory._index_storage_snapshot(
-    BoundedConnection(3758096384, {
+    BoundedConnection(5368709120, {
         "schema_version": 1,
         "source_bytes": 0,
         "relationship_bytes": 0,
@@ -861,7 +861,7 @@ assert observatory._index_storage_snapshot(
     })
 )["state"] == "attention"
 assert observatory._index_storage_snapshot(
-    BoundedConnection(4294967296, {
+    BoundedConnection(8589934592, {
         "schema_version": 1,
         "source_bytes": 0,
         "relationship_bytes": 0,
@@ -947,8 +947,8 @@ value = {
     "index_storage": {
         "state": "critical",
         "total_bytes": 11289051136,
-        "warning_at_bytes": 3758096384,
-        "critical_at_bytes": 4294967296,
+        "warning_at_bytes": 5368709120,
+        "critical_at_bytes": 8589934592,
         "components": {
             "source_bytes": 1073741824,
             "relationship_bytes": 9126805504,
@@ -1060,8 +1060,8 @@ expected = {
     "index_storage": {
         "state": "ready",
         "total_bytes": 1048576,
-        "warning_at_bytes": 3758096384,
-        "critical_at_bytes": 4294967296,
+        "warning_at_bytes": 5368709120,
+        "critical_at_bytes": 8589934592,
         "components": {
             "source_bytes": 262144,
             "relationship_bytes": 262144,

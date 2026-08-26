@@ -271,7 +271,7 @@ Relationship candidates and edge writes are streamed in bounded batches. All
 four decisions remain stored and auditable, but identical canonical evidence
 JSON is stored once per policy and referenced by digest from each edge.
 Observatory reports the local index allocation and its major components using
-writer-cached metrics; 3.5 GiB is `attention` and 4 GiB is `critical`. These
+writer-cached metrics; 5 GiB is `attention` and 8 GiB is `critical`. These
 states never delete source evidence automatically.
 
 Event v2 adds privacy-safe relationship context: domain-separated HMACs for

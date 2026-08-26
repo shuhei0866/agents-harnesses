@@ -214,8 +214,8 @@ assert set(storage) == {
     "components",
 }
 assert storage["total_bytes"] == database.stat().st_size
-assert storage["warning_at_bytes"] == 3758096384
-assert storage["critical_at_bytes"] == 4294967296
+assert storage["warning_at_bytes"] == 5368709120
+assert storage["critical_at_bytes"] == 8589934592
 assert storage["state"] == "ready"
 assert set(storage["components"]) == {
     "source_bytes", "relationship_bytes", "projection_bytes", "other_bytes",

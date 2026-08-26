@@ -514,7 +514,7 @@ Accepted decisions remain recorded when later superseded.
 - Consequence: v4 indexes require an explicit full rebuild from canonical
   chunks. The encrypted source, Episode identity contract, Atlas facets, and
   report/inspect evidence remain unchanged. Observatory uses writer-cached
-  storage components and marks 3.5 GiB as attention and 4 GiB as critical;
+  storage components and marks 5 GiB as attention and 8 GiB as critical;
   those states are diagnostics, not automatic deletion policy.
 
 ## D-20260826-32: Refresh the derived index in coalesced authenticated units
