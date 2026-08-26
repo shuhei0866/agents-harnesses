@@ -321,7 +321,6 @@ def _candidate_ids(
                     break
                 yield tuple(sorted((left_id, right_id)))
     else:
-        yielded_window: set[tuple[str, str]] = set()
         for index, (selected_time, selected_id) in enumerate(chronological):
             if selected_id not in new_event_ids:
                 continue
@@ -333,10 +332,15 @@ def _candidate_ids(
                         (candidate_time - selected_time).total_seconds()
                     ) > window:
                         break
-                    pair = tuple(sorted((selected_id, candidate_id)))
-                    if pair not in yielded_window:
-                        yielded_window.add(pair)
-                        yield pair
+                    # A new-old pair has one new endpoint and is visited once.
+                    # A new-new pair is visited from both endpoints, so the
+                    # stable ID order emits it from only one without retaining
+                    # an unbounded de-duplication set.
+                    if (
+                        candidate_id not in new_event_ids
+                        or selected_id < candidate_id
+                    ):
+                        yield tuple(sorted((selected_id, candidate_id)))
                     candidate_index += step
     task_groups: dict[str, list[str]] = {}
     for event in events:

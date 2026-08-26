@@ -734,6 +734,18 @@ assert set(pairs) == {
 }
 assert (c, d) not in pairs
 
+incremental_pairs = list(
+    _candidate_ids(semantic_events, DEFAULT_POLICY, {b, c})
+)
+assert len(incremental_pairs) == len(set(incremental_pairs))
+assert set(incremental_pairs) == {
+    (a, b),
+    (a, c),
+    (b, c),
+    (b, d),
+}
+assert "yielded_window" not in inspect.getsource(_candidate_ids)
+
 
 database = pathlib.Path(sys.argv[1])
 inner = sqlite3.connect(database)
