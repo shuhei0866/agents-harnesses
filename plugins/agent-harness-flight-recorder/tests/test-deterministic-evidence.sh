@@ -270,7 +270,7 @@ import sqlite3
 import sys
 
 connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
-assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
 metadata = dict(connection.execute("SELECT key, value FROM schema_metadata"))
 assert metadata["event_schema_versions"] == "1,2,3"
 rows = list(connection.execute(

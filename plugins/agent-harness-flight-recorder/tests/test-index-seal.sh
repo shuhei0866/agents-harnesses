@@ -200,7 +200,7 @@ assert re.fullmatch(r"sha256:[0-9a-f]{64}", identity["generation"])
 assert set(value["index_schema"]) == {
     "user_version", "signature_sha256", "metadata_sha256",
 }
-assert value["index_schema"]["user_version"] == 4
+assert value["index_schema"]["user_version"] == 5
 assert set(value["source_inventory"]) == {
     "chunk_count", "event_count", "sha256",
 }
