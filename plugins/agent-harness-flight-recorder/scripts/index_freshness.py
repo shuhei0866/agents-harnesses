@@ -13,14 +13,19 @@ import time
 from pathlib import Path
 from typing import Any, Iterator
 
-from chunk_rotation import atomic_replace, canonical_json, safe_subdirectory
+from chunk_rotation import (
+    MAX_EVENTS_PER_CHUNK,
+    atomic_replace,
+    canonical_json,
+    safe_subdirectory,
+)
 from vault import VaultError, vault_lock
 
 
 STATE_PATH = Path("index/refresh-state.json")
 LOCK_PATH = Path("index/refresh.lock")
 MAX_REFRESH_CHUNKS = 2
-MAX_REFRESH_EVENTS = 5_000
+MAX_REFRESH_EVENTS = MAX_EVENTS_PER_CHUNK
 STATES = {"refresh_required", "refreshing", "ready", "error"}
 DIAGNOSTICS = {
     None,

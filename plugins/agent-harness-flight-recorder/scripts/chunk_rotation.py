@@ -44,6 +44,7 @@ def request_index_refresh_locked(root: Path) -> dict[str, object]:
 
 
 DIGEST_DOMAIN = b"agent-harness-flight-recorder/chunk-v1\0"
+MAX_EVENTS_PER_CHUNK = 5_000
 HASH_FIELDS = ("session_id_hash", "turn_id_hash", "workspace_id")
 NULLABLE_STRINGS = ("model", "permission_mode", "tool")
 EVENT_KINDS = {
@@ -464,8 +465,13 @@ def process_job(root: Path, config: dict[str, object], identity: Path, job: Path
     events = read_job(root, job)
     for version in (1, 2, 3):
         homogeneous = [event for event in events if event["schema_version"] == version]
-        if homogeneous:
-            publish(root, config, identity, homogeneous)
+        for offset in range(0, len(homogeneous), MAX_EVENTS_PER_CHUNK):
+            publish(
+                root,
+                config,
+                identity,
+                homogeneous[offset : offset + MAX_EVENTS_PER_CHUNK],
+            )
     job.unlink()
     fsync_directory(job.parent)
 

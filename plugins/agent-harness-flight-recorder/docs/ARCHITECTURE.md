@@ -218,6 +218,10 @@ evidence remains, the seal binds only the authenticated imported horizon and
 ordinary reads fail closed until the next five-minute unit reaches the exact
 current source inventory. Missing, malformed, or pre-v5 index state requires
 an explicit full rebuild; it is never silently accepted as current.
+Rotation shares the 5,000-event ceiling and splits a larger detached inbox job
+before immutable publication. Legacy larger chunks are admitted through the
+schema-v5 full rebuild, so the current producer cannot create a source unit
+that bounded automatic refresh cannot consume.
 
 Candidate pairs and relationship rows stream through bounded batches. The
 writer retains only the compact evidence dictionary and link candidates needed

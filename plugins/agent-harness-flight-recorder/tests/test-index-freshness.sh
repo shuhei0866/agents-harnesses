@@ -219,6 +219,7 @@ rotation_root = base / "rotation-vault"
 rotation_root.mkdir()
 (rotation_root / HASH_KEY_PATH).write_bytes(b"k" * 32)
 rotation_events = []
+real_process_job = chunk_rotation.process_job
 chunk_rotation.ensure_safe_existing_root = lambda _root: None
 chunk_rotation.load_config = lambda _root: {
     "git_sync_allowlist": list(GIT_SYNC_ALLOWLIST),
@@ -241,6 +242,27 @@ chunk_rotation.request_index_refresh_locked = rotation_request
 chunk_rotation.rotate_locked(rotation_root)
 assert rotation_events == ["requested", "published"]
 assert index_freshness.status(rotation_root)["state"] == "refresh_required"
+
+# Rotation and refresh share one event ceiling. A supported inbox can be much
+# larger, so rotation must split it before immutable publication rather than
+# creating a chunk that no bounded refresh can ever consume.
+assert (
+    chunk_rotation.MAX_EVENTS_PER_CHUNK
+    == index_freshness.MAX_REFRESH_EVENTS
+    == 5000
+)
+split_job = rotation_root / "split.jsonl.pending"
+split_job.write_bytes(b"")
+chunk_rotation.read_job = lambda *_args: [
+    {"schema_version": 1, "ordinal": ordinal}
+    for ordinal in range(5001)
+]
+published_sizes = []
+chunk_rotation.publish = lambda *_args: published_sizes.append(len(_args[-1]))
+chunk_rotation.fsync_directory = lambda _path: None
+real_process_job(rotation_root, {}, pathlib.Path("id"), split_job)
+assert published_sizes == [5000, 1]
+assert not split_job.exists()
 
 sync_root = base / "sync-vault"
 sync_root.mkdir()

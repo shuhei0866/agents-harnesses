@@ -266,6 +266,10 @@ continues while work remains. A partial horizon is sealed but not exposed as
 current: report, inspect, Atlas, and Observatory stay fail-closed until the
 authenticated index reaches the exact source inventory. A missing, damaged,
 or pre-v5 seal requires an explicit full `rebuild-index`.
+Rotation uses the same 5,000-event ceiling and splits larger inbox jobs before
+publishing immutable chunks, so every newly produced chunk can make bounded
+forward progress. The required schema-v5 full rebuild absorbs legacy larger
+chunks before automatic refresh starts.
 
 Relationship candidates and edge writes are streamed in bounded batches. All
 four decisions remain stored and auditable, but identical canonical evidence
