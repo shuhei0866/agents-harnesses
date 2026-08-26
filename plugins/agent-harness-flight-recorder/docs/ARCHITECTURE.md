@@ -44,7 +44,7 @@ immutable device-scoped chunks
         |                         +-----------+-----------+
         |                                     |
         v                                     v
-age encryption                    local SQLite Evidence Index v4
+age encryption                    local SQLite Evidence Index v5
         |                              |               |
         v                              v               v
 private Git remote          Session Atlas facets  status/report/inspect
@@ -70,7 +70,9 @@ vault/
 ├── devices/
 │   └── <device-id>/YYYY/MM/DD/<digest>.jsonl.age
 ├── index/
-│   └── vault.sqlite
+│   ├── vault.sqlite
+│   ├── index-seal.json
+│   └── refresh-state.json
 ├── keys/
 │   ├── device.agekey
 │   └── correlation-key.age
@@ -176,7 +178,7 @@ import receipt + canonical decoded cache
 index/vault.sqlite (derived, local-only, replaceable)
 ```
 
-Schema v4 separates immutable source projections from recomputable state:
+Schema v5 separates immutable source projections from recomputable state:
 
 - `source_chunks` records chunk identity, source path, Git blob OID, producer,
   event count, and canonical plaintext digest;
@@ -188,7 +190,12 @@ Schema v4 separates immutable source projections from recomputable state:
   values;
 - `derived_state` is namespaced and policy-versioned;
 - `relationship_policies`, `relationship_edges`, `episodes`, and
-  `episode_members` contain recomputable versioned relationship views.
+  `episode_members` contain recomputable versioned relationship views;
+- `relationship_evidence` stores each canonical relationship explanation once
+  per policy. Every edge retains its decision and references the deterministic
+  evidence digest, so `link`, `no_link`, `hard_veto`, and
+  `component_conflict` remain exactly reconstructable without repeating the
+  same JSON for every candidate pair;
 - `session_atlas_facets` contains exactly one recomputable row per Episode and
   relationship policy with four finite structural facets.
 
@@ -202,6 +209,24 @@ restores only the bundled default view; custom views must be reapplied from
 their owner-held policy files. R1 does not migrate evidence rows in place.
 An unsupported schema is recovered through a full rebuild from canonical
 chunks, leaving encrypted evidence and decoded inputs untouched.
+
+Automatic refresh is coalesced and bounded. Rotation and synchronization mark
+`index/refresh-state.json` while already holding the Vault lock. The scheduler
+then acquires its run lock, the dedicated refresh lock, and finally the Vault
+lock, and imports at most two chunks or 5,000 events per unit. If more source
+evidence remains, the seal binds only the authenticated imported horizon and
+ordinary reads fail closed until the next five-minute unit reaches the exact
+current source inventory. Missing, malformed, or pre-v5 index state requires
+an explicit full rebuild; it is never silently accepted as current.
+
+Candidate pairs and relationship rows stream through bounded batches. The
+writer retains only the compact evidence dictionary and link candidates needed
+to rebuild connected components in memory; it does not materialize the full
+candidate set or all edge rows. Writer-time `dbstat` totals are cached in
+`derived_state`, while Observatory reads only SQLite page counts and that one
+cached row. A local index is marked `attention` at 3.5 GiB and `critical` at
+4 GiB. These are operational budgets for rebuildable local state, not deletion
+thresholds for source evidence.
 
 ### Authenticated evidence index seal
 
@@ -303,7 +328,7 @@ transaction.
 ### Deterministic Session Atlas
 
 Session Atlas is a deterministic comparison-candidate projection over the
-versioned Episode view. Evidence Index v4 stores exactly one
+versioned Episode view. Introduced in Evidence Index v4 and retained by v5, it stores exactly one
 `session_atlas_facets` row for each `(policy_version, episode_id)`. It does not
 alter relationship formation or write a second Episode identity.
 
@@ -685,7 +710,8 @@ this limitation clearly.
 
 ### R1.6: Deterministic Session Atlas v1
 
-- Evidence Index v4 with one finite four-facet row per Episode and policy;
+- Evidence Index v5 with normalized relationship evidence and one finite
+  four-facet row per Episode and policy;
 - explicit `present`, `mixed`, and `unknown` states with no absence matching;
 - exact, structural, and explicit partial cohorts constructed at query time;
 - sealed bounded reads, stable Episode-ID order, and authenticated pagination;

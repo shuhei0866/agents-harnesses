@@ -241,11 +241,12 @@ foreign keys and SQLite integrity, then atomically publishes
 `index/vault.sqlite`. A corrupt or unsupported existing database is replaced
 only after the new index is complete. Full rebuild restores the bundled
 `default-v1` relationship view; custom views are derived local state and must
-be reapplied from their owner-held policy files. Schema v4 also rebuilds
+be reapplied from their owner-held policy files. Schema v5 also rebuilds
 stable deterministic evidence IDs with their source event, collector version,
-and collection timestamp, plus one deterministic Session Atlas facet row per
-Episode and relationship policy. To add only unseen chunks to a current
-schema-v4 database, use:
+and collection timestamp, normalizes repeated relationship explanations into
+a deterministic evidence dictionary, and retains one Session Atlas facet row
+per Episode and relationship policy. To add only unseen chunks to a current
+schema-v5 database, use:
 
 ```bash
 scripts/flight-recorder rebuild-index --incremental
@@ -258,6 +259,20 @@ receipt. Every canonical stored policy version is rebuilt in the same
 transaction, so custom views remain current; an invalid or conflicting stored
 policy rolls back the entire import. The SQLite database is derived local
 state, has user-only permissions, and remains outside the Git sync allowlist.
+
+Rotation and sync coalesce index work into a local freshness state. The
+scheduler imports at most two chunks or 5,000 events per five-minute unit and
+continues while work remains. A partial horizon is sealed but not exposed as
+current: report, inspect, Atlas, and Observatory stay fail-closed until the
+authenticated index reaches the exact source inventory. A missing, damaged,
+or pre-v5 seal requires an explicit full `rebuild-index`.
+
+Relationship candidates and edge writes are streamed in bounded batches. All
+four decisions remain stored and auditable, but identical canonical evidence
+JSON is stored once per policy and referenced by digest from each edge.
+Observatory reports the local index allocation and its major components using
+writer-cached metrics; 3.5 GiB is `attention` and 4 GiB is `critical`. These
+states never delete source evidence automatically.
 
 Event v2 adds privacy-safe relationship context: domain-separated HMACs for
 explicit tasks and branches/worktrees plus a bounded set of changed-file
@@ -278,8 +293,9 @@ an invalid policy or failed rebuild leaves every existing view unchanged.
 ### Deterministic Session Atlas
 
 Session Atlas constructs comparable Episode cohorts without assigning a score,
-rank, winner, hidden distance, or permanent global cluster. Evidence Index v4
-materializes one row per Episode and relationship policy with four finite
+rank, winner, hidden distance, or permanent global cluster. Introduced in
+Evidence Index v4 and retained by v5, it materializes one row per Episode and
+relationship policy with four finite
 facets:
 
 - `context_identity`: the available privacy-safe workspace, session, task, or

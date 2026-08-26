@@ -493,3 +493,47 @@ Accepted decisions remain recorded when later superseded.
   separate Atlas source of truth. The semantic
   `domain / activity / deliverable_kind` taxonomy remains a later overlay with
   separate model provenance and an explicit adoption decision.
+
+## D-20260826-31: Normalize relationship evidence without weakening auditability
+
+- Status: accepted
+- Decision: advance the Evidence Index to schema v5. Store canonical
+  relationship explanations once per policy in `relationship_evidence`, using
+  their SHA-256 digest as the deterministic identifier, and let every
+  `relationship_edges` row reference that identifier. Preserve every
+  `link`, `no_link`, `hard_veto`, and `component_conflict` row and reconstruct
+  the existing logical evidence shape through a strict join. Stream candidate
+  generation and edge persistence in bounded batches rather than materializing
+  the complete candidate set.
+- Reason: the real local index used 11.29 GB, of which 11.09 GB (98.27%) was
+  `relationship_edges`. Its 21.04 million rows contained only 90,147 distinct
+  evidence documents; the same canonical JSON was stored about 233 times on
+  average. Dropping `no_link` would be smaller but would weaken the accepted
+  versioned relationship-evidence contract. Normalization removes the dominant
+  duplication without discarding negative evidence.
+- Consequence: v4 indexes require an explicit full rebuild from canonical
+  chunks. The encrypted source, Episode identity contract, Atlas facets, and
+  report/inspect evidence remain unchanged. Observatory uses writer-cached
+  storage components and marks 3.5 GiB as attention and 4 GiB as critical;
+  those states are diagnostics, not automatic deletion policy.
+
+## D-20260826-32: Refresh the derived index in coalesced authenticated units
+
+- Status: accepted
+- Decision: make rotation and synchronization request one local index refresh
+  while holding the existing Vault mutation boundary. The scheduler performs
+  at most two chunks or 5,000 events per unit under the lock order
+  scheduler-run -> refresh -> Vault, and wakes every five minutes while either
+  inbox data or a `refresh_required` state remains. Store a finite owner-only
+  freshness record with separate total and Vault-lock durations.
+- Reason: a real incremental rebuild took about 17 minutes and peaked near
+  9.4 GB RSS, so running the complete projection after every arrival was not
+  compatible with unconscious operation. Coalescing and bounded units keep
+  ingestion responsive while the normalized writer removes the dominant
+  memory and disk repetition.
+- Consequence: an intermediate unit may publish an authenticated seal for only
+  the imported source horizon, but ordinary readers require exact current
+  inventory and therefore expose no stale counts. Missing, malformed, or
+  pre-v5 state is `full_rebuild_required`; there is no implicit legacy
+  fallback. A successful manual full or incremental rebuild alone may return
+  the state to `ready`, while failed rebuilds preserve the prior diagnostic.
