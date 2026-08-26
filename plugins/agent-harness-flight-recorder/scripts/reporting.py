@@ -837,7 +837,19 @@ def status(root: Path) -> dict[str, Any]:
     from index_freshness import status as index_freshness_status
     from index_storage import index_storage_snapshot
 
-    refresh = index_freshness_status(root)
+    try:
+        refresh = index_freshness_status(root)
+    except VaultError:
+        refresh = {
+            "schema_version": 1,
+            "state": "error",
+            "diagnostic_code": "incremental_refresh_failed",
+            "requested_at": None,
+            "last_attempt_at": None,
+            "last_success_at": None,
+            "last_refresh_duration_ms": None,
+            "last_vault_lock_duration_ms": None,
+        }
     if index_path.is_symlink():
         components["index"] = {
             "state": "invalid",
@@ -985,7 +997,7 @@ def status(root: Path) -> dict[str, Any]:
         for state in states
     ) else "attention"
     return {
-        "schema_version": STATUS_OUTPUT_VERSION if receipt_configured else 4,
+        "schema_version": STATUS_OUTPUT_VERSION,
         "command": "status",
         "overall": overall,
         **components,
@@ -1011,7 +1023,11 @@ def render_status(value: dict[str, Any]) -> str:
             ),
             (
                 "Index storage: "
-                f"{value['index'].get('storage', {}).get('total_bytes') if value['index'].get('storage') else None} bytes"
+                + (
+                    f"{value['index']['storage']['total_bytes']} bytes"
+                    if value['index'].get("storage")
+                    else "unavailable bytes"
+                )
             ),
             (
                 f"Queue: {value['queue']['state']} "

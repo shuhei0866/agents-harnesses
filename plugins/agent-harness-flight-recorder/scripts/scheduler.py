@@ -928,26 +928,14 @@ def _has_pending_inbox(root: Path) -> bool:
 
 
 def _scheduler_due(
-    root: Path | dict[str, Any] | None,
-    state: dict[str, Any] | dt.datetime | None,
-    now: dt.datetime | None = None,
+    root: Path,
+    state: dict[str, Any] | None,
+    now: dt.datetime,
 ) -> bool:
-    # The two-argument form remains a compatibility seam for older callers;
-    # only the root-aware form can shorten a healthy interval for pending data.
-    if now is None:
-        selected_root = None
-        selected_state = root if isinstance(root, dict) or root is None else None
-        selected_now = state
-    else:
-        selected_root = root if isinstance(root, Path) else Path(root)
-        selected_state = state
-        selected_now = now
-    if not isinstance(selected_now, dt.datetime):
+    if not isinstance(root, Path) or not isinstance(now, dt.datetime):
         raise VaultError("scheduler time is invalid")
-    if selected_state is not None and not isinstance(selected_state, dict):
+    if state is not None and not isinstance(state, dict):
         raise VaultError("scheduler state is invalid")
-    state = selected_state
-    now = selected_now
     if state is None:
         return True
     if state.get("failure_class") is not None:
@@ -955,9 +943,9 @@ def _scheduler_due(
     last_success = state.get("last_success_at")
     if last_success is None:
         return True
-    if selected_root is not None and (
-        _has_pending_inbox(selected_root)
-        or index_refresh_status(selected_root).get("state")
+    if (
+        _has_pending_inbox(root)
+        or index_refresh_status(root).get("state")
         in {"refresh_required", "refreshing"}
     ):
         return now >= _parse_time(last_success) + dt.timedelta(
@@ -1228,12 +1216,7 @@ def run(root: Path) -> None:
             return
         previous = _load_state(root)
         now = _now()
-        try:
-            due = _scheduler_due(root, previous, now)
-        except TypeError:
-            # Test/integration seams predating the root-aware due contract.
-            due = _scheduler_due(previous, now)
-        if not due:
+        if not _scheduler_due(root, previous, now):
             return
         try:
             sync(root)
@@ -1244,7 +1227,12 @@ def run(root: Path) -> None:
             )
             return
         _write_state(root, _state_after_success(previous, now=now))
-        run_pending_refresh(root)
+        try:
+            run_pending_refresh(root)
+        except VaultError:
+            # Refresh has an independent diagnostic state and must not stop
+            # the evaluation and Receipt automation workers.
+            pass
         should_evaluate = True
     config_path = root / "auto-evaluation/config.json"
     if should_evaluate and (

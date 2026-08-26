@@ -34,6 +34,12 @@ DIAGNOSTICS = {
     "incremental_refresh_failed",
     "full_rebuild_required",
 }
+
+
+class FullRebuildRequired(VaultError):
+    """Structured signal that incremental authentication cannot recover."""
+
+    diagnostic_code = "full_rebuild_required"
 FIELDS = {
     "schema_version",
     "state",
@@ -264,7 +270,12 @@ def _refresh_lock(root: Path, *, blocking: bool) -> Iterator[bool]:
 def authenticate_incremental_base(root: Path) -> None:
     from evidence_index import _authenticate_existing_index_for_write
 
-    _authenticate_existing_index_for_write(root, source_may_advance=True)
+    try:
+        _authenticate_existing_index_for_write(root, source_may_advance=True)
+    except VaultError as error:
+        raise FullRebuildRequired(
+            "incremental index authentication requires a full rebuild"
+        ) from error
 
 
 def rebuild_incremental_bounded(
@@ -305,10 +316,10 @@ def run_pending_refresh(root: Path) -> dict[str, Any]:
                 total_ms = max(
                     lock_ms, int((time.monotonic() - started) * 1000)
                 )
+                declared = getattr(error, "diagnostic_code", None)
                 diagnostic = (
-                    "full_rebuild_required"
-                    if "seal" in str(error).lower()
-                    or "full rebuild" in str(error).lower()
+                    declared
+                    if declared in DIAGNOSTICS and declared is not None
                     else "incremental_refresh_failed"
                 )
                 return _write(

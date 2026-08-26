@@ -431,7 +431,7 @@ scheduler._run_lock = run_lock
 scheduler.ensure_safe_existing_root = lambda _root: None
 scheduler.ensure_managed_gitignore = lambda _root: None
 scheduler._load_state = lambda _root: None
-scheduler._scheduler_due = lambda _previous, _now: True
+scheduler._scheduler_due = lambda _root, _previous, _now: True
 scheduler._write_state = lambda _root, _state: None
 scheduler.sync = sync
 scheduler.run_pending_refresh = index_freshness.run_pending_refresh
@@ -483,14 +483,11 @@ def forbidden_incremental(*args, **kwargs):
 
 
 index_freshness.rebuild_incremental_bounded = forbidden_incremental
-for message in (
-    "index seal is missing; run a rebuild",
-    "index seal integrity mismatch; run a rebuild",
-):
+for message in ("arbitrary authentication failure", "wording may change"):
     index_freshness.request_refresh_locked(root)
 
     def reject(_root, reason=message):
-        raise VaultError(reason)
+        raise index_freshness.FullRebuildRequired(reason)
 
     index_freshness.authenticate_incremental_base = reject
     result = index_freshness.run_pending_refresh(root)

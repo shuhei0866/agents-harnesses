@@ -780,6 +780,7 @@ test_index_storage_snapshot_is_cached_bounded_and_budgeted() {
 import json
 
 import observatory
+from index_storage import _category
 from vault import VaultError
 
 
@@ -841,6 +842,11 @@ assert value == {
     },
 }
 assert len(connection.calls) == 3
+assert _category("session_atlas_by_context") == "projection_bytes"
+assert (
+    _category("sqlite_autoindex_relationship_evidence_2")
+    == "relationship_bytes"
+)
 
 # Thresholds are inclusive and explicit so growth cannot silently cross a
 # budget boundary between two Observatory versions.

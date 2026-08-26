@@ -1755,8 +1755,6 @@ def rebuild_incremental_bounded(
                 break
             selected.append(chunk)
             selected_events += event_count
-        if not selected and pending:
-            raise VaultError("source drift cannot fit bounded refresh")
         new_event_ids = {
             row[0] for chunk in selected for row in chunk.event_rows
         }

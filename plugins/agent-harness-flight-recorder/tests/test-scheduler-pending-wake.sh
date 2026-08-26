@@ -202,8 +202,10 @@ import contextlib
 import datetime as dt
 import pathlib
 import sys
+import types
 
 import scheduler
+from vault import VaultError
 
 
 base = pathlib.Path(sys.argv[1])
@@ -251,6 +253,34 @@ scheduler.sync = sync
 scheduler.run_pending_refresh = refresh
 scheduler.run(pending_root)
 assert events == ["sync", "rotate", "request", "refresh"]
+
+# A broken refresh state is isolated from the two downstream workers.
+failure_root = base / "refresh-failure-vault"
+configure(failure_root)
+(failure_root / "inbox/events.jsonl").write_bytes(b"pending\n")
+(failure_root / "inbox/events.jsonl").chmod(0o600)
+for relative in (
+    "auto-evaluation/config.json",
+    "receipt-automation/config.json",
+):
+    path = failure_root / relative
+    path.parent.mkdir(parents=True)
+    path.write_text("{}", encoding="utf-8")
+downstream = []
+scheduler.sync = lambda _root: None
+scheduler.run_pending_refresh = lambda _root: (_ for _ in ()).throw(
+    VaultError("refresh state unavailable")
+)
+background = types.ModuleType("background_evaluation")
+background.run = lambda _root: downstream.append("evaluation")
+background.record_failure = lambda *_args: None
+receipt = types.ModuleType("receipt_automation")
+receipt.run = lambda _root: downstream.append("receipt")
+receipt.record_failure = lambda *_args: None
+sys.modules["background_evaluation"] = background
+sys.modules["receipt_automation"] = receipt
+scheduler.run(failure_root)
+assert downstream == ["evaluation", "receipt"]
 
 empty_root = base / "empty-vault"
 configure(empty_root)

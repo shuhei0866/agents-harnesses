@@ -28,15 +28,27 @@ RELATIONSHIP_NAMES = {
     "relationship_edges",
 }
 PROJECTION_NAMES = {"episodes", "episode_members", "session_atlas_facets"}
+INDEX_OWNERS = {
+    "session_atlas_by_context": "session_atlas_facets",
+    "session_atlas_by_lifecycle": "session_atlas_facets",
+    "session_atlas_by_operation": "session_atlas_facets",
+    "session_atlas_by_artifact": "session_atlas_facets",
+}
 
 
 def _category(name: str) -> str | None:
+    owner = INDEX_OWNERS.get(name)
+    if owner is None and name.startswith("sqlite_autoindex_"):
+        owner = name[len("sqlite_autoindex_") :].rsplit("_", 1)[0]
+    resolved = owner or name
     for category, names in (
         ("source_bytes", SOURCE_NAMES),
         ("relationship_bytes", RELATIONSHIP_NAMES),
         ("projection_bytes", PROJECTION_NAMES),
     ):
-        if name in names or any(name.startswith(f"{item}_") for item in names):
+        if resolved in names or any(
+            resolved.startswith(f"{item}_") for item in names
+        ):
             return category
     return None
 

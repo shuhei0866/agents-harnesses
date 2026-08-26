@@ -10,6 +10,7 @@ import math
 import sqlite3
 import os
 import stat
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -306,7 +307,7 @@ def _candidate_ids(
     events: list[Event],
     policy: dict[str, Any],
     new_event_ids: set[str] | None = None,
-) -> Any:
+) -> Iterator[tuple[str, str]]:
     chronological = sorted(
         (parse_time(event.recorded_at), event.event_id) for event in events
     )
@@ -325,6 +326,8 @@ def _candidate_ids(
         if event.task_id is not None:
             task_groups.setdefault(event.task_id, []).append(event.event_id)
     for group in task_groups.values():
+        if new_event_ids is not None and not new_event_ids.intersection(group):
+            continue
         for pair in itertools.combinations(group, 2):
             ordered = tuple(sorted(pair))
             left, right = (event_by_id[item] for item in ordered)

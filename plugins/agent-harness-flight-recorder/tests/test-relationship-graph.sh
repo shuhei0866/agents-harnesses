@@ -665,7 +665,8 @@ PY
 test_candidate_generation_and_full_persistence_are_bounded_streams() {
   echo "test_candidate_generation_and_full_persistence_are_bounded_streams:"
   local db="$TEST_ROOT/streaming-candidates.sqlite"
-  if PYTHONPATH="$PLUGIN_DIR/scripts" python3 - "$db" <<'PY' 2>/dev/null
+  local err="$TEST_ROOT/streaming-candidates.err"
+  if PYTHONPATH="$PLUGIN_DIR/scripts" python3 - "$db" <<'PY' 2>"$err"
 import builtins
 import inspect
 import pathlib
@@ -874,6 +875,7 @@ PY
   then
     pass "full candidateを重複なくstreamしedge insertを10k以下へ分割する"
   else
+    cat "$err" >&2
     fail "full candidateを重複なくstreamしedge insertを10k以下へ分割する"
   fi
 }
@@ -881,7 +883,8 @@ PY
 test_repeated_evidence_dictionary_has_no_orphans_and_bounded_bytes_per_edge() {
   echo "test_repeated_evidence_dictionary_has_no_orphans_and_bounded_bytes_per_edge:"
   local db="$TEST_ROOT/repeated-evidence.sqlite"
-  if PYTHONPATH="$PLUGIN_DIR/scripts" python3 - "$db" <<'PY' 2>/dev/null
+  local err="$TEST_ROOT/repeated-evidence.err"
+  if PYTHONPATH="$PLUGIN_DIR/scripts" python3 - "$db" <<'PY' 2>"$err"
 import hashlib
 import json
 import pathlib
@@ -1019,6 +1022,7 @@ PY
   then
     pass "repeat evidenceを1辞書行へ畳み孤児なし・384 bytes/edge以下で再現する"
   else
+    cat "$err" >&2
     fail "repeat evidenceを1辞書行へ畳み孤児なし・384 bytes/edge以下で再現する"
   fi
 }

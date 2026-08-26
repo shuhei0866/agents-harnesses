@@ -178,7 +178,7 @@ import sys
 value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 human = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
 database = pathlib.Path(sys.argv[3])
-assert value["schema_version"] == 4
+assert value["schema_version"] == 5
 assert value["command"] == "status"
 assert set(value) == {
     "schema_version", "command", "overall", "vault", "sync", "index", "queue",
@@ -359,6 +359,31 @@ PY
     fail "statusはbroken pending symlinkをidleと偽装しない"
   fi
   rm "$STATE/queue/pending-sync.json"
+
+  printf '%s\n' '{malformed' >"$STATE/index/refresh-state.json"
+  chmod 600 "$STATE/index/refresh-state.json"
+  if run_cli status --json >"$json_output" 2>"$TEST_ROOT/status-refresh.err" \
+    && run_cli status >"$human_output" 2>"$TEST_ROOT/status-refresh-human.err" \
+    && python3 - "$json_output" "$human_output" <<'PY'
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+human = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+assert value["schema_version"] == 5
+assert value["index"]["state"] == "error"
+assert value["index"]["storage"] is None
+assert value["index"]["refresh"]["diagnostic_code"] == "incremental_refresh_failed"
+assert "unavailable bytes" in human
+assert "None bytes" not in human
+PY
+  then
+    pass "壊れたfreshness stateでもstatusを有限errorへ縮退する"
+  else
+    fail "壊れたfreshness stateでもstatusを有限errorへ縮退する"
+  fi
+  rm "$STATE/index/refresh-state.json"
 }
 
 test_report_grounded_cards() {
