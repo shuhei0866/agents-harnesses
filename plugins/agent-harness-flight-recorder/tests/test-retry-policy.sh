@@ -214,7 +214,7 @@ assert state["failure_class"] == "transient"
 assert state["diagnostic_code"] == "remote_unavailable"
 assert state["next_action_code"] == "retry_automatically"
 assert _scheduler_due(
-    state, dt.datetime(2026, 7, 25, tzinfo=dt.timezone.utc)
+    root, state, dt.datetime(2026, 7, 25, tzinfo=dt.timezone.utc)
 ) is True
 
 bad = dict(state)

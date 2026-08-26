@@ -55,6 +55,14 @@ GENERATION_KEY = "projection_generation"
 GENERATION_POLICY = "_global"
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 INDEX_VERSION = 5
+
+
+class FullRebuildRequired(VaultError):
+    """A legal source shape that bounded incremental refresh cannot absorb."""
+
+    diagnostic_code = "full_rebuild_required"
+
+
 DETERMINISTIC_COLLECTOR_VERSION = "deterministic-v1"
 DETERMINISTIC_METRICS = (
     "duration_ms",
@@ -1750,7 +1758,9 @@ def rebuild_incremental_bounded(
         for chunk in pending:
             event_count = len(chunk.event_rows)
             if event_count > max_events:
-                raise VaultError("one source chunk exceeds refresh event bound")
+                raise FullRebuildRequired(
+                    "one legacy source chunk exceeds the refresh event bound"
+                )
             if len(selected) >= max_chunks or selected_events + event_count > max_events:
                 break
             selected.append(chunk)

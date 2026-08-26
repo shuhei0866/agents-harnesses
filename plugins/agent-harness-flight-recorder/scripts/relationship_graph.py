@@ -313,14 +313,31 @@ def _candidate_ids(
     )
     event_by_id = {event.event_id: event for event in events}
     window = policy["time_window_seconds"]
-    for index, (left_time, left_id) in enumerate(chronological):
-        for right_index in range(index + 1, len(chronological)):
-            right_time, right_id = chronological[right_index]
-            if (right_time - left_time).total_seconds() > window:
-                break
-            pair = tuple(sorted((left_id, right_id)))
-            if new_event_ids is None or new_event_ids.intersection(pair):
-                yield pair
+    if new_event_ids is None:
+        for index, (left_time, left_id) in enumerate(chronological):
+            for right_index in range(index + 1, len(chronological)):
+                right_time, right_id = chronological[right_index]
+                if (right_time - left_time).total_seconds() > window:
+                    break
+                yield tuple(sorted((left_id, right_id)))
+    else:
+        yielded_window: set[tuple[str, str]] = set()
+        for index, (selected_time, selected_id) in enumerate(chronological):
+            if selected_id not in new_event_ids:
+                continue
+            for step in (-1, 1):
+                candidate_index = index + step
+                while 0 <= candidate_index < len(chronological):
+                    candidate_time, candidate_id = chronological[candidate_index]
+                    if abs(
+                        (candidate_time - selected_time).total_seconds()
+                    ) > window:
+                        break
+                    pair = tuple(sorted((selected_id, candidate_id)))
+                    if pair not in yielded_window:
+                        yielded_window.add(pair)
+                        yield pair
+                    candidate_index += step
     task_groups: dict[str, list[str]] = {}
     for event in events:
         if event.task_id is not None:

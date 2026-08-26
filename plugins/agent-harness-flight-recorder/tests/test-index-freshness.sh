@@ -469,6 +469,7 @@ import pathlib
 import sys
 
 import index_freshness
+from evidence_index import FullRebuildRequired as LegacyFullRebuildRequired
 from vault import VaultError
 
 
@@ -496,6 +497,21 @@ for message in ("arbitrary authentication failure", "wording may change"):
     assert index_freshness.status(root) == result
 
 assert incremental_calls == []
+
+# A legacy/remote immutable chunk larger than the current producer ceiling is
+# legal source evidence, but only an explicit atomic full rebuild can absorb it.
+legacy_root = pathlib.Path(sys.argv[1]) / "legacy-oversized-vault"
+legacy_root.mkdir()
+index_freshness.request_refresh_locked(legacy_root)
+index_freshness.authenticate_incremental_base = lambda _root: None
+index_freshness.rebuild_incremental_bounded = lambda *_args, **_kwargs: (
+    (_ for _ in ()).throw(
+        LegacyFullRebuildRequired("legacy chunk requires full rebuild")
+    )
+)
+legacy = index_freshness.run_pending_refresh(legacy_root)
+assert legacy["state"] == "error"
+assert legacy["diagnostic_code"] == "full_rebuild_required"
 PY
   then
     pass "missing/tampered sealは増分禁止でfull_rebuild_requiredへ閉じる"

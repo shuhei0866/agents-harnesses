@@ -268,6 +268,9 @@ for relative in (
     path.write_text("{}", encoding="utf-8")
 downstream = []
 scheduler.sync = lambda _root: None
+scheduler.index_refresh_status = lambda _root: (_ for _ in ()).throw(
+    VaultError("refresh state unsafe")
+)
 scheduler.run_pending_refresh = lambda _root: (_ for _ in ()).throw(
     VaultError("refresh state unavailable")
 )
@@ -284,6 +287,7 @@ assert downstream == ["evaluation", "receipt"]
 
 empty_root = base / "empty-vault"
 configure(empty_root)
+scheduler.index_refresh_status = lambda _root: {"state": "ready"}
 (empty_root / "inbox/events.jsonl").write_bytes(b"")
 (empty_root / "inbox/events.jsonl").chmod(0o600)
 

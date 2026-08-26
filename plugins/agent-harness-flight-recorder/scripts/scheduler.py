@@ -943,11 +943,15 @@ def _scheduler_due(
     last_success = state.get("last_success_at")
     if last_success is None:
         return True
-    if (
-        _has_pending_inbox(root)
-        or index_refresh_status(root).get("state")
-        in {"refresh_required", "refreshing"}
-    ):
+    try:
+        refresh_pending = index_refresh_status(root).get("state") in {
+            "refresh_required", "refreshing"
+        }
+    except VaultError:
+        # A malformed refresh state still needs a healthy wake; status and the
+        # refresh worker own its finite diagnostic without stopping sync.
+        refresh_pending = True
+    if _has_pending_inbox(root) or refresh_pending:
         return now >= _parse_time(last_success) + dt.timedelta(
             seconds=WAKE_INTERVAL_SECONDS
         )
