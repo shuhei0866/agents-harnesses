@@ -10,6 +10,7 @@ import math
 import sqlite3
 import os
 import stat
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -298,6 +299,105 @@ def score_pair(
     return score, decision, canonical_json(evidence).decode("utf-8")
 
 
+def _evidence_id(encoded: str) -> str:
+    return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _candidate_ids(
+    events: list[Event],
+    policy: dict[str, Any],
+    new_event_ids: set[str] | None = None,
+) -> Iterator[tuple[str, str]]:
+    chronological = sorted(
+        (parse_time(event.recorded_at), event.event_id) for event in events
+    )
+    event_by_id = {event.event_id: event for event in events}
+    window = policy["time_window_seconds"]
+    if new_event_ids is None:
+        for index, (left_time, left_id) in enumerate(chronological):
+            for right_index in range(index + 1, len(chronological)):
+                right_time, right_id = chronological[right_index]
+                if (right_time - left_time).total_seconds() > window:
+                    break
+                yield tuple(sorted((left_id, right_id)))
+    else:
+        for index, (selected_time, selected_id) in enumerate(chronological):
+            if selected_id not in new_event_ids:
+                continue
+            for step in (-1, 1):
+                candidate_index = index + step
+                while 0 <= candidate_index < len(chronological):
+                    candidate_time, candidate_id = chronological[candidate_index]
+                    if abs(
+                        (candidate_time - selected_time).total_seconds()
+                    ) > window:
+                        break
+                    # A new-old pair has one new endpoint and is visited once.
+                    # A new-new pair is visited from both endpoints, so the
+                    # stable ID order emits it from only one without retaining
+                    # an unbounded de-duplication set.
+                    if (
+                        candidate_id not in new_event_ids
+                        or selected_id < candidate_id
+                    ):
+                        yield tuple(sorted((selected_id, candidate_id)))
+                    candidate_index += step
+    task_groups: dict[str, list[str]] = {}
+    for event in events:
+        if event.task_id is not None:
+            task_groups.setdefault(event.task_id, []).append(event.event_id)
+    for group in task_groups.values():
+        if new_event_ids is not None and not new_event_ids.intersection(group):
+            continue
+        for pair in itertools.combinations(group, 2):
+            ordered = tuple(sorted(pair))
+            left, right = (event_by_id[item] for item in ordered)
+            seconds = abs(
+                (parse_time(left.recorded_at) - parse_time(right.recorded_at))
+                .total_seconds()
+            )
+            if seconds <= window:
+                continue
+            if new_event_ids is None or new_event_ids.intersection(ordered):
+                yield ordered
+
+
+def _replace_episodes(
+    connection: sqlite3.Connection,
+    version: str,
+    events: list[Event],
+    components: "Components",
+) -> int:
+    from session_atlas import clear_session_atlas, materialize_session_atlas
+
+    clear_session_atlas(connection, version)
+    connection.execute(
+        "DELETE FROM episode_members WHERE policy_version = ?", (version,)
+    )
+    connection.execute("DELETE FROM episodes WHERE policy_version = ?", (version,))
+    groups: dict[str, list[str]] = {}
+    for event in events:
+        groups.setdefault(components.find(event.event_id), []).append(event.event_id)
+    episode_rows = []
+    member_rows = []
+    for members in sorted((sorted(group) for group in groups.values())):
+        identity = hashlib.sha256(
+            (version + "\0" + "\0".join(members)).encode("utf-8")
+        ).hexdigest()
+        episode_id = f"sha256:{identity}"
+        episode_rows.append((version, episode_id, len(members)))
+        member_rows.extend(
+            (version, episode_id, event_id, ordinal)
+            for ordinal, event_id in enumerate(members)
+        )
+    connection.executemany("INSERT INTO episodes VALUES (?, ?, ?)", episode_rows)
+    connection.executemany(
+        "INSERT INTO episode_members VALUES (?, ?, ?, ?)", member_rows
+    )
+    materialize_session_atlas(connection, version)
+    return len(episode_rows)
+
+
 class Components:
     def __init__(self, events: list[Event]) -> None:
         self.parent = {event.event_id: event.event_id for event in events}
@@ -331,50 +431,6 @@ def rebuild_relationships(
     version = policy["policy_version"]
     events = _events(connection)
     by_id = {event.event_id: event for event in events}
-    candidate_ids: set[tuple[str, str]] = set()
-    chronological = sorted(
-        (parse_time(event.recorded_at), event.event_id)
-        for event in events
-    )
-    window = policy["time_window_seconds"]
-    for index, (left_time, left_id) in enumerate(chronological):
-        for right_time, right_id in chronological[index + 1:]:
-            if (right_time - left_time).total_seconds() > window:
-                break
-            candidate_ids.add(tuple(sorted((left_id, right_id))))
-    task_groups: dict[str, list[str]] = {}
-    for event in events:
-        if event.task_id is not None:
-            task_groups.setdefault(event.task_id, []).append(event.event_id)
-    for group in task_groups.values():
-        candidate_ids.update(
-            tuple(sorted(pair)) for pair in itertools.combinations(group, 2)
-        )
-
-    pairs: list[tuple[int, str, str, str, str]] = []
-    for left_id, right_id in sorted(candidate_ids):
-        left, right = by_id[left_id], by_id[right_id]
-        score, decision, evidence = score_pair(left, right, policy)
-        pairs.append(
-            (score, left.event_id, right.event_id, decision, evidence)
-        )
-    components = Components(events)
-    conflicts: set[tuple[str, str]] = set()
-    for score, left, right, decision, _evidence in sorted(
-        pairs, key=lambda item: (-item[0], item[1], item[2])
-    ):
-        if decision == "link" and not components.join(left, right):
-            conflicts.add((left, right))
-    pairs = [
-        (
-            score,
-            left,
-            right,
-            "component_conflict" if (left, right) in conflicts else decision,
-            evidence,
-        )
-        for score, left, right, decision, evidence in pairs
-    ]
 
     encoded_policy = canonical_json(policy).decode("utf-8")
     policy_digest = hashlib.sha256(encoded_policy.encode("utf-8")).hexdigest()
@@ -387,7 +443,7 @@ def rebuild_relationships(
         raise VaultError(
             "relationship policy version conflicts with existing definition"
         )
-    from session_atlas import clear_session_atlas, materialize_session_atlas
+    from session_atlas import clear_session_atlas
 
     clear_session_atlas(connection, version)
     connection.execute(
@@ -398,37 +454,172 @@ def rebuild_relationships(
         "DELETE FROM relationship_edges WHERE policy_version = ?", (version,)
     )
     connection.execute(
+        "DELETE FROM relationship_evidence WHERE policy_version = ?", (version,)
+    )
+    connection.execute(
         "DELETE FROM relationship_policies WHERE policy_version = ?", (version,)
     )
     connection.execute(
         "INSERT INTO relationship_policies VALUES (?, ?, ?, ?)",
         (version, policy["schema_version"], policy_digest, encoded_policy),
     )
-    connection.executemany(
-        "INSERT INTO relationship_edges VALUES (?, ?, ?, ?, ?, ?)",
-        [
-            (version, left, right, score, decision, evidence)
-            for score, left, right, decision, evidence in pairs
-        ],
-    )
-    groups: dict[str, list[str]] = {}
-    for event in events:
-        groups.setdefault(components.find(event.event_id), []).append(event.event_id)
-    episode_rows = []
-    member_rows = []
-    for members in sorted((sorted(group) for group in groups.values())):
-        identity = hashlib.sha256(
-            (version + "\0" + "\0".join(members)).encode("utf-8")
-        ).hexdigest()
-        episode_id = f"sha256:{identity}"
-        episode_rows.append((version, episode_id, len(members)))
-        member_rows.extend(
-            (version, episode_id, event_id, ordinal)
-            for ordinal, event_id in enumerate(members)
+    evidence_cache: dict[str, str] = {}
+    edge_batch = []
+    link_candidates = []
+    pair_count = 0
+    for left_id, right_id in _candidate_ids(events, policy):
+        score, decision, evidence = score_pair(
+            by_id[left_id], by_id[right_id], policy
         )
-    connection.executemany("INSERT INTO episodes VALUES (?, ?, ?)", episode_rows)
-    connection.executemany(
-        "INSERT INTO episode_members VALUES (?, ?, ?, ?)", member_rows
+        evidence_id = _evidence_id(evidence)
+        prior = evidence_cache.get(evidence_id)
+        if prior is not None and prior != evidence:
+            raise VaultError("relationship evidence digest collision")
+        if prior is None:
+            evidence_cache[evidence_id] = evidence
+            connection.execute(
+                "INSERT INTO relationship_evidence VALUES (?, ?, ?)",
+                (version, evidence_id, evidence),
+            )
+        edge_batch.append(
+            (version, left_id, right_id, score, decision, evidence_id)
+        )
+        if decision == "link":
+            link_candidates.append((score, left_id, right_id))
+        pair_count += 1
+        if len(edge_batch) >= 1_000:
+            connection.executemany(
+                "INSERT INTO relationship_edges VALUES (?, ?, ?, ?, ?, ?)",
+                edge_batch,
+            )
+            edge_batch.clear()
+    if edge_batch:
+        connection.executemany(
+            "INSERT INTO relationship_edges VALUES (?, ?, ?, ?, ?, ?)",
+            edge_batch,
+        )
+    components = Components(events)
+    for _score, left_id, right_id in sorted(
+        link_candidates, key=lambda item: (-item[0], item[1], item[2])
+    ):
+        if not components.join(left_id, right_id):
+            connection.execute(
+                "UPDATE relationship_edges SET decision='component_conflict' "
+                "WHERE policy_version=? AND left_event_id=? AND right_event_id=?",
+                (version, left_id, right_id),
+            )
+    episode_count = _replace_episodes(connection, version, events, components)
+    return pair_count, episode_count
+
+
+def refresh_relationships_incremental(
+    connection: sqlite3.Connection,
+    policy: dict[str, Any],
+    new_event_ids: set[str],
+) -> tuple[int, int]:
+    """Score only new-involved candidates, then rebuild components from links."""
+    policy = validate_policy(policy)
+    version = policy["policy_version"]
+    events = _events(connection)
+    by_id = {event.event_id: event for event in events}
+    if not new_event_ids.issubset(by_id):
+        raise VaultError("incremental relationship event set is invalid")
+    edge_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(relationship_edges)")
+    }
+    evidence_table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='relationship_evidence'"
+    ).fetchone()
+    if "evidence_id" not in edge_columns or evidence_table is None:
+        raise VaultError("relationship schema requires a full index rebuild")
+    evidence_cache: dict[str, str] = {}
+    edge_batch = []
+    pair_count = 0
+    for left_id, right_id in _candidate_ids(events, policy, new_event_ids):
+        score, decision, evidence = score_pair(
+            by_id[left_id], by_id[right_id], policy
+        )
+        evidence_id = _evidence_id(evidence)
+        prior = evidence_cache.get(evidence_id)
+        if prior is not None and prior != evidence:
+            raise VaultError("relationship evidence digest collision")
+        if prior is None:
+            row = connection.execute(
+                "SELECT evidence_json FROM relationship_evidence "
+                "WHERE policy_version=? AND evidence_id=?",
+                (version, evidence_id),
+            ).fetchone()
+            if row is not None and row[0] != evidence:
+                raise VaultError("relationship evidence digest collision")
+            if row is None:
+                connection.execute(
+                    "INSERT INTO relationship_evidence VALUES (?, ?, ?)",
+                    (version, evidence_id, evidence),
+                )
+            evidence_cache[evidence_id] = evidence
+        edge_batch.append(
+            (version, left_id, right_id, score, decision, evidence_id)
+        )
+        pair_count += 1
+        if len(edge_batch) >= 1_000:
+            connection.executemany(
+                "INSERT OR REPLACE INTO relationship_edges "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                edge_batch,
+            )
+            edge_batch.clear()
+    if edge_batch:
+        connection.executemany(
+            "INSERT OR REPLACE INTO relationship_edges VALUES (?, ?, ?, ?, ?, ?)",
+            edge_batch,
+        )
+
+    # Component conflicts are a derived consequence of the global score order,
+    # not a permanent raw pair classification. New high-scoring edges can
+    # change that order, so restore every prior conflict to its raw ``link``
+    # state before replaying all saved links.
+    connection.execute(
+        "UPDATE relationship_edges SET decision='link' "
+        "WHERE policy_version=? AND decision='component_conflict'",
+        (version,),
     )
-    materialize_session_atlas(connection, version)
-    return len(pairs), len(episode_rows)
+    connection.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS relationship_conflict_updates ("
+        "left_event_id TEXT NOT NULL,right_event_id TEXT NOT NULL,"
+        "PRIMARY KEY(left_event_id,right_event_id)) WITHOUT ROWID"
+    )
+    connection.execute("DELETE FROM relationship_conflict_updates")
+    components = Components(events)
+    link_rows = connection.execute(
+        "SELECT score,left_event_id,right_event_id FROM relationship_edges "
+        "WHERE policy_version=? AND decision='link' "
+        "ORDER BY score DESC,left_event_id,right_event_id",
+        (version,),
+    )
+    conflict_batch = []
+    for _score, left_id, right_id in link_rows:
+        if not components.join(left_id, right_id):
+            conflict_batch.append((left_id, right_id))
+        if len(conflict_batch) >= 1_000:
+            connection.executemany(
+                "INSERT INTO relationship_conflict_updates VALUES (?,?)",
+                conflict_batch,
+            )
+            conflict_batch.clear()
+    if conflict_batch:
+        connection.executemany(
+            "INSERT INTO relationship_conflict_updates VALUES (?,?)",
+            conflict_batch,
+        )
+    connection.execute(
+        "UPDATE relationship_edges SET decision='component_conflict' "
+        "WHERE policy_version=? AND EXISTS ("
+        "SELECT 1 FROM relationship_conflict_updates AS update_row "
+        "WHERE update_row.left_event_id=relationship_edges.left_event_id "
+        "AND update_row.right_event_id=relationship_edges.right_event_id)",
+        (version,),
+    )
+    connection.execute("DROP TABLE relationship_conflict_updates")
+    episode_count = _replace_episodes(connection, version, events, components)
+    return pair_count, episode_count

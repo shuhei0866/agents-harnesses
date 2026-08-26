@@ -625,7 +625,7 @@ import sys
 path, private_root = sys.argv[1:]
 value = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
 component = value["receipt_automation"]
-assert value["schema_version"] == 4
+assert value["schema_version"] == 5
 assert component["enabled"] is True
 assert component["state"] in {"idle", "completed", "attention", "error"}
 for field in (

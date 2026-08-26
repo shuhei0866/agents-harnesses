@@ -37,6 +37,12 @@ from vault import (
 )
 
 
+def request_index_refresh_locked(root: Path) -> dict[str, object]:
+    from index_freshness import request_refresh_locked
+
+    return request_refresh_locked(root)
+
+
 CHUNK_PATH_RE = re.compile(
     r"^devices/"
     r"(?P<device>[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
@@ -508,7 +514,7 @@ def validate_plaintext(
     return plaintext, digest
 
 
-def import_chunks(root: Path) -> None:
+def import_chunks(root: Path) -> bool:
     config = load_config(root)
     _, identity = local_device(config, root)
     receipts = load_receipts(root)
@@ -551,7 +557,15 @@ def import_chunks(root: Path) -> None:
             (relative, match, canonical_plaintext, digest, blob_oid, target)
         )
 
-    changed = False
+    changed = any(
+        not target.exists() or receipts.get(relative) is None
+        for relative, _match, _plaintext, _digest, _blob_oid, target in plans
+    )
+    if changed:
+        # Publish freshness intent before any decoded cache or receipt. A
+        # crash after source publication must never leave a durable ready
+        # marker that a later idempotent import cannot repair.
+        request_index_refresh_locked(root)
     for relative, match, canonical_plaintext, digest, blob_oid, target in plans:
         target_directory = safe_subdirectory(
             root,
@@ -574,11 +588,11 @@ def import_chunks(root: Path) -> None:
         }
         if receipts.get(relative) != expected_receipt:
             receipts[relative] = expected_receipt
-            changed = True
     if changed or not (root / RECEIPT_PATH).exists():
         data = canonical_json({"schema_version": 1, "chunks": receipts}) + b"\n"
         atomic_replace(root / RECEIPT_PATH, data)
         os.chmod(receipt_directory, 0o700)
+    return changed
 
 
 def push(root: Path) -> None:

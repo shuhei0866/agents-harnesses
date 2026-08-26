@@ -62,6 +62,7 @@ build_fixture() {
 import datetime as dt
 import json
 import pathlib
+import sqlite3
 import sys
 
 now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
@@ -167,14 +168,17 @@ test_status_contract() {
   local json_output="$TEST_ROOT/status.json" human_output="$TEST_ROOT/status.txt"
   if run_cli status --json >"$json_output" 2>"$TEST_ROOT/status.err" \
     && run_cli status >"$human_output" 2>"$TEST_ROOT/status-human.err" \
-    && python3 - "$json_output" "$human_output" <<'PY'
+    && python3 - "$json_output" "$human_output" \
+      "$STATE/index/vault.sqlite" <<'PY'
 import json
 import pathlib
+import sqlite3
 import sys
 
 value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 human = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
-assert value["schema_version"] == 3
+database = pathlib.Path(sys.argv[3])
+assert value["schema_version"] == 5
 assert value["command"] == "status"
 assert set(value) == {
     "schema_version", "command", "overall", "vault", "sync", "index", "queue",
@@ -190,14 +194,56 @@ assert value["sync"]["next_action_code"] is None
 assert value["sync"]["next_retry_at"] is None
 assert value["sync"]["consecutive_failure_count"] == 0
 assert value["index"]["state"] == "ready"
+assert set(value["index"]) == {
+    "state", "schema_version", "source_event_count", "episode_count",
+    "storage", "refresh",
+}
 assert value["index"]["source_event_count"] == 3
 assert value["index"]["episode_count"] == 2
+refresh = value["index"]["refresh"]
+assert set(refresh) == {
+    "schema_version", "state", "diagnostic_code", "requested_at",
+    "last_attempt_at", "last_success_at", "last_refresh_duration_ms",
+    "last_vault_lock_duration_ms",
+}
+assert refresh["schema_version"] == 1
+assert refresh["state"] == "ready"
+storage = value["index"]["storage"]
+assert set(storage) == {
+    "state", "total_bytes", "warning_at_bytes", "critical_at_bytes",
+    "components",
+}
+assert storage["total_bytes"] == database.stat().st_size
+assert storage["warning_at_bytes"] == 5368709120
+assert storage["critical_at_bytes"] == 8589934592
+assert storage["state"] == "ready"
+assert set(storage["components"]) == {
+    "source_bytes", "relationship_bytes", "projection_bytes", "other_bytes",
+}
+assert all(
+    isinstance(number, int) and not isinstance(number, bool) and number >= 0
+    for number in storage["components"].values()
+)
+assert sum(storage["components"].values()) == storage["total_bytes"]
+connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+cached = connection.execute(
+    "SELECT value_json FROM derived_state "
+    "WHERE namespace=? AND key=? AND policy_version=?",
+    ("index-storage-v1", "major-components", "global-v1"),
+).fetchone()
+assert cached is not None
+cached_value = json.loads(cached[0])
+assert set(cached_value) == {
+    "schema_version", "source_bytes", "relationship_bytes", "projection_bytes",
+}
 assert value["queue"]["pending_count"] == 0
 assert value["scheduler"]["state"] == "unconfigured"
 assert value["scheduler"]["configured"] is False
 assert "status" in human.lower()
 assert "ready" in human.lower()
 assert "scheduler" in human.lower()
+assert "storage" in human.lower()
+assert "bytes" in human.lower()
 PY
   then
     pass "statusはsync/index/queue healthをJSONと人間表示で返す"
@@ -313,6 +359,31 @@ PY
     fail "statusはbroken pending symlinkをidleと偽装しない"
   fi
   rm "$STATE/queue/pending-sync.json"
+
+  printf '%s\n' '{malformed' >"$STATE/index/refresh-state.json"
+  chmod 600 "$STATE/index/refresh-state.json"
+  if run_cli status --json >"$json_output" 2>"$TEST_ROOT/status-refresh.err" \
+    && run_cli status >"$human_output" 2>"$TEST_ROOT/status-refresh-human.err" \
+    && python3 - "$json_output" "$human_output" <<'PY'
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+human = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+assert value["schema_version"] == 5
+assert value["index"]["state"] == "error"
+assert value["index"]["storage"] is None
+assert value["index"]["refresh"]["diagnostic_code"] == "incremental_refresh_failed"
+assert "unavailable bytes" in human
+assert "None bytes" not in human
+PY
+  then
+    pass "壊れたfreshness stateでもstatusを有限errorへ縮退する"
+  else
+    fail "壊れたfreshness stateでもstatusを有限errorへ縮退する"
+  fi
+  rm "$STATE/index/refresh-state.json"
 }
 
 test_report_grounded_cards() {

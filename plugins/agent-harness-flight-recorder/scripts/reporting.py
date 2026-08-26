@@ -57,7 +57,7 @@ from retention_state import load_forgotten
 OUTPUT_VERSION = 3
 REPORT_OUTPUT_VERSION = 4
 INSPECT_OUTPUT_VERSION = 6
-STATUS_OUTPUT_VERSION = 4
+STATUS_OUTPUT_VERSION = 5
 DEFAULT_POLICY_VERSION = "default-v1"
 EPISODE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 DURATION_RE = re.compile(r"^([1-9][0-9]*)([smhdw])$")
@@ -304,8 +304,11 @@ def _edges_by_episode(
         """
         SELECT left_member.episode_id, edge.left_event_id,
                edge.right_event_id, edge.score, edge.decision,
-               edge.evidence_json
+               evidence.evidence_json
         FROM relationship_edges AS edge
+        JOIN relationship_evidence AS evidence
+          ON evidence.policy_version = edge.policy_version
+         AND evidence.evidence_id = edge.evidence_id
         JOIN episode_members AS left_member
           ON left_member.policy_version = edge.policy_version
          AND left_member.event_id = edge.left_event_id
@@ -831,12 +834,30 @@ def status(root: Path) -> dict[str, Any]:
         }
 
     index_path = root / DATABASE_PATH
+    from index_freshness import status as index_freshness_status
+    from index_storage import index_storage_snapshot
+
+    try:
+        refresh = index_freshness_status(root)
+    except VaultError:
+        refresh = {
+            "schema_version": 1,
+            "state": "error",
+            "diagnostic_code": "incremental_refresh_failed",
+            "requested_at": None,
+            "last_attempt_at": None,
+            "last_success_at": None,
+            "last_refresh_duration_ms": None,
+            "last_vault_lock_duration_ms": None,
+        }
     if index_path.is_symlink():
         components["index"] = {
             "state": "invalid",
             "schema_version": None,
             "source_event_count": None,
             "episode_count": None,
+            "storage": None,
+            "refresh": refresh,
         }
     elif not index_path.exists():
         components["index"] = {
@@ -844,14 +865,26 @@ def status(root: Path) -> dict[str, Any]:
             "schema_version": None,
             "source_event_count": None,
             "episode_count": None,
+            "storage": None,
+            "refresh": refresh,
+        }
+    elif refresh["state"] != "ready":
+        components["index"] = {
+            "state": refresh["state"],
+            "schema_version": None,
+            "source_event_count": None,
+            "episode_count": None,
+            "storage": None,
+            "refresh": refresh,
         }
     else:
         try:
             def index_query(
                 connection: sqlite3.Connection, _policy: dict[str, Any]
             ) -> dict[str, Any]:
+                storage = index_storage_snapshot(connection)
                 return {
-                    "state": "ready",
+                    "state": storage["state"],
                     "schema_version": connection.execute(
                         "PRAGMA user_version"
                     ).fetchone()[0],
@@ -863,6 +896,8 @@ def status(root: Path) -> dict[str, Any]:
                         "WHERE policy_version = ?",
                         (DEFAULT_POLICY_VERSION,),
                     ).fetchone()[0],
+                    "storage": storage,
+                    "refresh": refresh,
                 }
 
             components["index"] = _authenticated_query(
@@ -874,6 +909,8 @@ def status(root: Path) -> dict[str, Any]:
                 "schema_version": None,
                 "source_event_count": None,
                 "episode_count": None,
+                "storage": None,
+                "refresh": refresh,
             }
 
     try:
@@ -960,7 +997,7 @@ def status(root: Path) -> dict[str, Any]:
         for state in states
     ) else "attention"
     return {
-        "schema_version": STATUS_OUTPUT_VERSION if receipt_configured else 3,
+        "schema_version": STATUS_OUTPUT_VERSION,
         "command": "status",
         "overall": overall,
         **components,
@@ -983,6 +1020,14 @@ def render_status(value: dict[str, Any]) -> str:
                 f"Index: {value['index']['state']} "
                 f"(events: {value['index'].get('source_event_count')}, "
                 f"episodes: {value['index'].get('episode_count')})"
+            ),
+            (
+                "Index storage: "
+                + (
+                    f"{value['index']['storage']['total_bytes']} bytes"
+                    if value['index'].get("storage")
+                    else "unavailable bytes"
+                )
             ),
             (
                 f"Queue: {value['queue']['state']} "

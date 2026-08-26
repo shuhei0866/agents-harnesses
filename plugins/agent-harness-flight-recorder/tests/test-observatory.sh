@@ -51,7 +51,7 @@ root.mkdir()
 connection = sqlite3.connect(":memory:")
 connection.executescript(
     """
-    PRAGMA user_version = 4;
+    PRAGMA user_version = 5;
     CREATE TABLE source_events(event_id TEXT, canonical_event_json TEXT);
     CREATE TABLE episodes(
         policy_version TEXT, episode_id TEXT, member_count INTEGER
@@ -138,6 +138,16 @@ automation = {
     "attempt_count": 4,
     "private_path": raw_canary,
 }
+refresh = {
+    "schema_version": 1,
+    "state": "ready",
+    "diagnostic_code": None,
+    "requested_at": None,
+    "last_attempt_at": None,
+    "last_success_at": "2026-08-25T00:00:00Z",
+    "last_refresh_duration_ms": 25,
+    "last_vault_lock_duration_ms": 10,
+}
 
 # Support either module-qualified strict readers or explicit local aliases.
 observatory.read_sealed_query_locked = sealed_query
@@ -150,15 +160,34 @@ observatory._stored_records = values
 value_compiler._stored_records = values
 observatory.receipt_automation_status = lambda _root: automation
 receipt_automation.status = observatory.receipt_automation_status
+observatory.index_freshness_status = lambda _root: refresh
+storage = {
+    "state": "critical",
+    "total_bytes": 11 * 1024**3,
+    "warning_at_bytes": 5368709120,
+    "critical_at_bytes": 8589934592,
+    "components": {
+        "source_bytes": 1 * 1024**3,
+        "relationship_bytes": 8 * 1024**3,
+        "projection_bytes": 1 * 1024**3,
+        "other_bytes": 1 * 1024**3,
+    },
+}
+observatory._index_storage_snapshot = lambda actual: (
+    storage if actual is connection else (_ for _ in ()).throw(
+        AssertionError("storage snapshot used a different connection")
+    )
+)
 
 value = observatory.overview(root)
 assert len(sealed_calls) == 1
 assert value == {
-    "schema_version": 1,
+    "schema_version": 2,
     "command": "observatory.overview",
+    "index_refresh": refresh,
     "recording": {
         "state": "ready",
-        "index_schema_version": 4,
+        "index_schema_version": 5,
         "events": 5,
         "pending_events": 2,
     },
@@ -175,6 +204,7 @@ assert value == {
         "semantic_receipts": 2,
         "value_cards": 1,
     },
+    "index_storage": storage,
     "receipt_automation": {
         "schema_version": 1,
         "state": "attention",
@@ -223,7 +253,7 @@ root.mkdir()
 connection = sqlite3.connect(":memory:")
 connection.executescript(
     """
-    PRAGMA user_version = 4;
+    PRAGMA user_version = 5;
     CREATE TABLE source_events(event_id TEXT);
     CREATE TABLE episodes(
         policy_version TEXT, episode_id TEXT, member_count INTEGER
@@ -270,6 +300,28 @@ semantic_receipts._stored_receipts = observatory._stored_receipts
 observatory._stored_value_records = lambda _root: []
 observatory._stored_records = observatory._stored_value_records
 value_compiler._stored_records = observatory._stored_value_records
+observatory._index_storage_snapshot = lambda _connection: {
+    "state": "ready",
+    "total_bytes": 0,
+    "warning_at_bytes": 5368709120,
+    "critical_at_bytes": 8589934592,
+    "components": {
+        "source_bytes": 0,
+        "relationship_bytes": 0,
+        "projection_bytes": 0,
+        "other_bytes": 0,
+    },
+}
+observatory.index_freshness_status = lambda _root: {
+    "schema_version": 1,
+    "state": "ready",
+    "diagnostic_code": None,
+    "requested_at": None,
+    "last_attempt_at": None,
+    "last_success_at": None,
+    "last_refresh_duration_ms": None,
+    "last_vault_lock_duration_ms": None,
+}
 
 value = observatory.overview(root)
 assert value["episode_formation"]["singleton_basis_points"] == 0
@@ -331,7 +383,7 @@ root.mkdir()
 connection = sqlite3.connect(":memory:")
 connection.executescript(
     """
-    PRAGMA user_version = 4;
+    PRAGMA user_version = 5;
     CREATE TABLE source_events(event_id TEXT, canonical_event_json TEXT);
     CREATE TABLE episodes(
         policy_version TEXT, episode_id TEXT, member_count INTEGER
@@ -560,6 +612,28 @@ observatory.receipt_automation_status = lambda _root: {
     "diagnostic_code": None,
     "attempt_count": 0,
 }
+observatory._index_storage_snapshot = lambda _connection: {
+    "state": "ready",
+    "total_bytes": 0,
+    "warning_at_bytes": 5368709120,
+    "critical_at_bytes": 8589934592,
+    "components": {
+        "source_bytes": 0,
+        "relationship_bytes": 0,
+        "projection_bytes": 0,
+        "other_bytes": 0,
+    },
+}
+observatory.index_freshness_status = lambda _root: {
+    "schema_version": 1,
+    "state": "ready",
+    "diagnostic_code": None,
+    "requested_at": None,
+    "last_attempt_at": None,
+    "last_success_at": None,
+    "last_refresh_duration_ms": None,
+    "last_vault_lock_duration_ms": None,
+}
 
 result = observatory.overview(root)
 assert strict_calls == {"receipts": 1, "values": 1}
@@ -594,7 +668,7 @@ root.mkdir()
 connection = sqlite3.connect(":memory:")
 connection.executescript(
     """
-    PRAGMA user_version = 4;
+    PRAGMA user_version = 5;
     CREATE TABLE source_events(event_id TEXT);
     CREATE TABLE episodes(
         policy_version TEXT, episode_id TEXT, member_count INTEGER
@@ -676,6 +750,18 @@ observatory._inbox_count = unlocked_zero
 observatory._stored_receipts = unlocked_empty
 observatory._stored_value_records = unlocked_empty
 observatory.receipt_automation_status = unlocked_status
+observatory._index_storage_snapshot = lambda _connection: {
+    "state": "ready",
+    "total_bytes": 0,
+    "warning_at_bytes": 5368709120,
+    "critical_at_bytes": 8589934592,
+    "components": {
+        "source_bytes": 0,
+        "relationship_bytes": 0,
+        "projection_bytes": 0,
+        "other_bytes": 0,
+    },
+}
 observatory.overview(root)
 assert inside_lock is False
 PY
@@ -687,20 +773,168 @@ PY
   fi
 }
 
+test_index_storage_snapshot_is_cached_bounded_and_budgeted() {
+  echo "test_index_storage_snapshot_is_cached_bounded_and_budgeted:"
+  local err="$TEST_ROOT/index-storage.err"
+  if PYTHONPATH="$PLUGIN_DIR/scripts" python3 - 2>"$err" <<'PY'
+import json
+
+import observatory
+from index_storage import _category
+from vault import VaultError
+
+
+GIB = 1024**3
+
+
+class OneRow:
+    def __init__(self, value):
+        self.value = value
+
+    def fetchone(self):
+        return (self.value,)
+
+
+class BoundedConnection:
+    def __init__(self, total_bytes, cached):
+        self.total_bytes = total_bytes
+        self.cached = cached
+        self.calls = []
+
+    def execute(self, sql, parameters=()):
+        normalized = " ".join(sql.lower().split())
+        self.calls.append((normalized, parameters))
+        assert "dbstat" not in normalized
+        assert "sqlite_master" not in normalized
+        if normalized == "pragma page_size":
+            return OneRow(4096)
+        if normalized == "pragma page_count":
+            assert self.total_bytes % 4096 == 0
+            return OneRow(self.total_bytes // 4096)
+        if "from derived_state" in normalized:
+            assert parameters == (
+                "index-storage-v1",
+                "major-components",
+                "global-v1",
+            )
+            return OneRow(json.dumps(self.cached, separators=(",", ":")))
+        raise AssertionError(f"unbounded or unexpected storage query: {sql!r}")
+
+
+cached = {
+    "schema_version": 1,
+    "source_bytes": 1 * GIB,
+    "relationship_bytes": 8 * GIB,
+    "projection_bytes": 1 * GIB,
+}
+connection = BoundedConnection(11 * GIB, cached)
+value = observatory._index_storage_snapshot(connection)
+assert value == {
+    "state": "critical",
+    "total_bytes": 11 * GIB,
+    "warning_at_bytes": 5368709120,
+    "critical_at_bytes": 8589934592,
+    "components": {
+        "source_bytes": 1 * GIB,
+        "relationship_bytes": 8 * GIB,
+        "projection_bytes": 1 * GIB,
+        "other_bytes": 1 * GIB,
+    },
+}
+assert len(connection.calls) == 3
+assert _category("session_atlas_by_context") == "projection_bytes"
+assert (
+    _category("sqlite_autoindex_relationship_evidence_2")
+    == "relationship_bytes"
+)
+
+# Thresholds are inclusive and explicit so growth cannot silently cross a
+# budget boundary between two Observatory versions.
+assert observatory._index_storage_snapshot(
+    BoundedConnection(5368709120 - 4096, {
+        "schema_version": 1,
+        "source_bytes": 0,
+        "relationship_bytes": 0,
+        "projection_bytes": 0,
+    })
+)["state"] == "ready"
+assert observatory._index_storage_snapshot(
+    BoundedConnection(5368709120, {
+        "schema_version": 1,
+        "source_bytes": 0,
+        "relationship_bytes": 0,
+        "projection_bytes": 0,
+    })
+)["state"] == "attention"
+assert observatory._index_storage_snapshot(
+    BoundedConnection(8589934592, {
+        "schema_version": 1,
+        "source_bytes": 0,
+        "relationship_bytes": 0,
+        "projection_bytes": 0,
+    })
+)["state"] == "critical"
+
+for invalid in (
+    {
+        "schema_version": 1,
+        "source_bytes": -1,
+        "relationship_bytes": 0,
+        "projection_bytes": 0,
+    },
+    {
+        "schema_version": 1,
+        "source_bytes": True,
+        "relationship_bytes": 0,
+        "projection_bytes": 0,
+    },
+    {
+        "schema_version": 1,
+        "source_bytes": 6 * GIB,
+        "relationship_bytes": 6 * GIB,
+        "projection_bytes": 0,
+    },
+):
+    try:
+        observatory._index_storage_snapshot(BoundedConnection(11 * GIB, invalid))
+    except VaultError:
+        pass
+    else:
+        raise AssertionError(f"invalid cached storage metrics accepted: {invalid!r}")
+PY
+  then
+    pass "storage snapshotはcached major componentsを定数回で読みgrowth budgetを明示する"
+  else
+    cat "$err" >&2
+    fail "storage snapshotはcached major componentsを定数回で読みgrowth budgetを明示する"
+  fi
+}
+
 test_render_is_three_question_self_contained_html() {
   echo "test_render_is_three_question_self_contained_html:"
   local err="$TEST_ROOT/render.err"
   if PYTHONPATH="$PLUGIN_DIR/scripts" python3 - 2>"$err" <<'PY'
 import observatory
+import copy
 
 
 canary = '<script src="https://evil.invalid/raw.js">RAW-CANARY</script>'
 value = {
-    "schema_version": 1,
+    "schema_version": 2,
     "command": "observatory.overview",
+    "index_refresh": {
+        "schema_version": 1,
+        "state": "ready",
+        "diagnostic_code": None,
+        "requested_at": None,
+        "last_attempt_at": None,
+        "last_success_at": "2026-08-25T00:00:00Z",
+        "last_refresh_duration_ms": 25,
+        "last_vault_lock_duration_ms": 10,
+    },
     "recording": {
         "state": "ready",
-        "index_schema_version": 4,
+        "index_schema_version": 5,
         "events": 47342,
         "pending_events": 2088,
     },
@@ -716,6 +950,18 @@ value = {
     "semantic_coverage": {
         "semantic_receipts": 19,
         "value_cards": 2,
+    },
+    "index_storage": {
+        "state": "critical",
+        "total_bytes": 11289051136,
+        "warning_at_bytes": 5368709120,
+        "critical_at_bytes": 8589934592,
+        "components": {
+            "source_bytes": 1073741824,
+            "relationship_bytes": 9126805504,
+            "projection_bytes": 536870912,
+            "other_bytes": 551632896,
+        },
     },
     "receipt_automation": {
         "schema_version": 1,
@@ -748,6 +994,10 @@ assert "99.18%" in html
 assert "0.56%" in html
 assert "Semantic Receipt" in html
 assert "Value Card" in html
+assert "10.51 GiB" in html
+assert "8.50 GiB" in html
+assert "Relationship" in html
+assert "critical" in lower
 assert "attempt_count" not in html
 assert "measured_cost_microusd" not in html
 assert "http://" not in lower
@@ -757,6 +1007,22 @@ assert "<link" not in lower
 assert canary not in html
 assert "RAW-CANARY" not in html
 assert len(html.encode("utf-8")) <= 65536
+
+# Python builds without SQLite dbstat must not render the zero-valued cached
+# component as if relationship storage were actually empty.
+fallback = copy.deepcopy(value)
+fallback["index_storage"]["state"] = "ready"
+fallback["index_storage"]["total_bytes"] = 4735942656
+fallback["index_storage"]["components"] = {
+    "source_bytes": 0,
+    "relationship_bytes": 0,
+    "projection_bytes": 0,
+    "other_bytes": 4735942656,
+}
+fallback_html = observatory.render_overview_html(fallback)
+assert "4.41 GiB" in fallback_html
+assert "Breakdown unavailable" in fallback_html
+assert "Relationship <strong>0.00 GiB" not in fallback_html
 PY
   then
     pass "HTMLは自己完結し詳細counterやraw値を出さず3問へ圧縮する"
@@ -783,11 +1049,21 @@ import observatory
 root = pathlib.Path(sys.argv[1]) / "http-vault"
 root.mkdir()
 expected = {
-    "schema_version": 1,
+    "schema_version": 2,
     "command": "observatory.overview",
+    "index_refresh": {
+        "schema_version": 1,
+        "state": "ready",
+        "diagnostic_code": None,
+        "requested_at": None,
+        "last_attempt_at": None,
+        "last_success_at": "2026-08-25T00:00:00Z",
+        "last_refresh_duration_ms": 25,
+        "last_vault_lock_duration_ms": 10,
+    },
     "recording": {
         "state": "ready",
-        "index_schema_version": 4,
+        "index_schema_version": 5,
         "events": 8,
         "pending_events": 0,
     },
@@ -803,6 +1079,18 @@ expected = {
     "semantic_coverage": {
         "semantic_receipts": 0,
         "value_cards": 0,
+    },
+    "index_storage": {
+        "state": "ready",
+        "total_bytes": 1048576,
+        "warning_at_bytes": 5368709120,
+        "critical_at_bytes": 8589934592,
+        "components": {
+            "source_bytes": 262144,
+            "relationship_bytes": 262144,
+            "projection_bytes": 262144,
+            "other_bytes": 262144,
+        },
     },
     "receipt_automation": {
         "schema_version": 1,
@@ -1269,6 +1557,7 @@ main() {
   test_overview_uses_strict_local_readers_and_zero_denominator
   test_semantic_coverage_only_counts_current_visible_bindings
   test_unbounded_local_scans_do_not_hold_global_vault_lock
+  test_index_storage_snapshot_is_cached_bounded_and_budgeted
   test_render_is_three_question_self_contained_html
   test_http_routes_methods_hosts_and_headers
   test_parser_errors_and_unknown_methods_are_fixed_safe_responses

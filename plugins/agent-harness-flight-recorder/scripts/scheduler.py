@@ -33,6 +33,18 @@ from vault import (
 )
 
 
+def run_pending_refresh(root: Path) -> dict[str, Any]:
+    from index_freshness import run_pending_refresh as run_refresh
+
+    return run_refresh(root)
+
+
+def index_refresh_status(root: Path) -> dict[str, Any]:
+    from index_freshness import status as refresh_status
+
+    return refresh_status(root)
+
+
 LABEL = "io.agent-harness.flight-recorder.sync"
 UNIT = "agent-harness-flight-recorder-sync"
 STATE_PATH = Path("scheduler/state.json")
@@ -43,6 +55,7 @@ RUNTIME_PATH = (
 COMMAND_TIMEOUT_SECONDS = 30
 WAKE_INTERVAL_SECONDS = 300
 HEALTHY_INTERVAL_SECONDS = 86400
+MAX_PENDING_INBOX_BYTES = 256 * 1024 * 1024
 RETRY_BASE_SECONDS = 300
 RETRY_CAP_SECONDS = 86400
 MAX_FAILURE_COUNT = 1_000_000
@@ -882,9 +895,47 @@ def _retry_due(state: dict[str, Any], now: dt.datetime) -> bool:
     return next_retry is None or now >= _parse_time(next_retry)
 
 
+def _has_pending_inbox(root: Path) -> bool:
+    directory = root / "inbox"
+    try:
+        directory_metadata = directory.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise VaultError("event inbox is unsafe") from error
+    if (
+        not stat.S_ISDIR(directory_metadata.st_mode)
+        or directory_metadata.st_uid != os.geteuid()
+        or directory_metadata.st_mode & 0o077
+    ):
+        raise VaultError("event inbox is unsafe")
+    path = root / "inbox/events.jsonl"
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise VaultError("event inbox is unsafe") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_size > MAX_PENDING_INBOX_BYTES
+    ):
+        raise VaultError("event inbox is unsafe")
+    return metadata.st_size > 0
+
+
 def _scheduler_due(
-    state: dict[str, Any] | None, now: dt.datetime
+    root: Path,
+    state: dict[str, Any] | None,
+    now: dt.datetime,
 ) -> bool:
+    if not isinstance(root, Path) or not isinstance(now, dt.datetime):
+        raise VaultError("scheduler time is invalid")
+    if state is not None and not isinstance(state, dict):
+        raise VaultError("scheduler state is invalid")
     if state is None:
         return True
     if state.get("failure_class") is not None:
@@ -892,6 +943,18 @@ def _scheduler_due(
     last_success = state.get("last_success_at")
     if last_success is None:
         return True
+    try:
+        refresh_pending = index_refresh_status(root).get("state") in {
+            "refresh_required", "refreshing"
+        }
+    except VaultError:
+        # A malformed refresh state still needs a healthy wake; status and the
+        # refresh worker own its finite diagnostic without stopping sync.
+        refresh_pending = True
+    if _has_pending_inbox(root) or refresh_pending:
+        return now >= _parse_time(last_success) + dt.timedelta(
+            seconds=WAKE_INTERVAL_SECONDS
+        )
     return now >= _parse_time(last_success) + dt.timedelta(
         seconds=HEALTHY_INTERVAL_SECONDS
     )
@@ -1157,7 +1220,7 @@ def run(root: Path) -> None:
             return
         previous = _load_state(root)
         now = _now()
-        if not _scheduler_due(previous, now):
+        if not _scheduler_due(root, previous, now):
             return
         try:
             sync(root)
@@ -1168,6 +1231,12 @@ def run(root: Path) -> None:
             )
             return
         _write_state(root, _state_after_success(previous, now=now))
+        try:
+            run_pending_refresh(root)
+        except VaultError:
+            # Refresh has an independent diagnostic state and must not stop
+            # the evaluation and Receipt automation workers.
+            pass
         should_evaluate = True
     config_path = root / "auto-evaluation/config.json"
     if should_evaluate and (

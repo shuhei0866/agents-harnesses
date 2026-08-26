@@ -151,6 +151,7 @@ connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
 snapshot = {}
 for table in (
     "relationship_policies",
+    "relationship_evidence",
     "relationship_edges",
     "episodes",
     "episode_members",
@@ -171,6 +172,7 @@ connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
 snapshot = {}
 for table in (
     "relationship_policies",
+    "relationship_evidence",
     "relationship_edges",
     "episodes",
     "episode_members",
@@ -476,8 +478,8 @@ ensure_rich_graph() {
   fi
 }
 
-test_index_v4_schema_and_six_feature_evidence() {
-  echo "test_index_v4_schema_and_six_feature_evidence:"
+test_index_v5_normalizes_canonical_six_feature_evidence() {
+  echo "test_index_v5_normalizes_canonical_six_feature_evidence:"
   local state="$TEST_ROOT/rich/vault"
   local db="$state/index/vault.sqlite"
   ensure_rich_graph || {
@@ -490,7 +492,7 @@ import sqlite3
 import sys
 
 connection = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
-assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
 tables = {
     row[0]
     for row in connection.execute(
@@ -499,6 +501,7 @@ tables = {
 }
 assert {
     "relationship_policies",
+    "relationship_evidence",
     "relationship_edges",
     "episodes",
     "episode_members",
@@ -506,12 +509,31 @@ assert {
 } <= tables
 metadata = dict(connection.execute("SELECT key, value FROM schema_metadata"))
 assert metadata["event_schema_versions"] == "1,2,3"
+assert metadata["schema_version"] == "5"
+
+edge_columns = {
+    row[1] for row in connection.execute("PRAGMA table_info(relationship_edges)")
+}
+assert "evidence_id" in edge_columns
+assert "evidence_json" not in edge_columns
+evidence_columns = {
+    row[1] for row in connection.execute("PRAGMA table_info(relationship_evidence)")
+}
+assert evidence_columns == {"policy_version", "evidence_id", "evidence_json"}
+edge_foreign_keys = {
+    (row[3], row[2], row[4])
+    for row in connection.execute("PRAGMA foreign_key_list(relationship_edges)")
+}
+assert ("evidence_id", "relationship_evidence", "evidence_id") in edge_foreign_keys
 
 row = connection.execute(
     """
-    SELECT score, decision, evidence_json
-    FROM relationship_edges
-    WHERE left_event_id = ? AND right_event_id = ?
+    SELECT re.score, re.decision, re.evidence_id, ev.evidence_json
+    FROM relationship_edges AS re
+    JOIN relationship_evidence AS ev
+      ON ev.policy_version = re.policy_version
+     AND ev.evidence_id = re.evidence_id
+    WHERE re.left_event_id = ? AND re.right_event_id = ?
     """,
     (
         "10000000-0000-4000-8000-000000000001",
@@ -519,9 +541,12 @@ row = connection.execute(
     ),
 ).fetchone()
 assert row is not None
-score, decision, encoded = row
+score, decision, evidence_id, encoded = row
 assert isinstance(score, int)
 assert decision == "link"
+assert evidence_id == "sha256:" + __import__("hashlib").sha256(
+    encoded.encode("utf-8")
+).hexdigest()
 evidence = json.loads(encoded)
 assert set(evidence) == {
     "explicit_task_id",
@@ -542,9 +567,9 @@ for feature in evidence.values():
 assert encoded == json.dumps(evidence, sort_keys=True, separators=(",", ":"))
 PY
   then
-    pass "SQLite v4はAtlas projection・versioned graph・canonicalな全6特徴・integer scoreを保持する"
+    pass "SQLite v5はcanonicalな6特徴証憑を決定論的IDの辞書へ正規化する"
   else
-    fail "SQLite v4はAtlas projection・versioned graph・canonicalな全6特徴・integer scoreを保持する"
+    fail "SQLite v5はcanonicalな6特徴証憑を決定論的IDの辞書へ正規化する"
   fi
 }
 
@@ -578,11 +603,35 @@ assert not any({a, c, d} <= group or {b, c, d} <= group for group in members.val
 assert any(group == {e} for group in members.values())
 assert any(group == {f} for group in members.values())
 
+logical_edges = list(connection.execute(
+    """
+    SELECT re.decision, ev.evidence_json
+    FROM relationship_edges AS re
+    JOIN relationship_evidence AS ev
+      ON ev.policy_version = re.policy_version
+     AND ev.evidence_id = re.evidence_id
+    WHERE re.policy_version = 'default-v1'
+    """
+))
+assert len(logical_edges) == connection.execute(
+    "SELECT COUNT(*) FROM relationship_edges WHERE policy_version='default-v1'"
+).fetchone()[0]
+assert {row[0] for row in logical_edges} == {
+    "link", "no_link", "hard_veto", "component_conflict",
+}
+for _decision, encoded in logical_edges:
+    assert encoded == json.dumps(
+        json.loads(encoded), sort_keys=True, separators=(",", ":")
+    )
+
 veto = connection.execute(
     """
-    SELECT decision, evidence_json
-    FROM relationship_edges
-    WHERE left_event_id = ? AND right_event_id = ?
+    SELECT re.decision, ev.evidence_json
+    FROM relationship_edges AS re
+    JOIN relationship_evidence AS ev
+      ON ev.policy_version = re.policy_version
+     AND ev.evidence_id = re.evidence_id
+    WHERE re.left_event_id = ? AND re.right_event_id = ?
     """,
     (a, d),
 ).fetchone()
@@ -591,9 +640,12 @@ assert json.loads(veto[1])["contradictory_task_ids"]["state"] == "contradiction"
 
 missing = connection.execute(
     """
-    SELECT decision, evidence_json
-    FROM relationship_edges
-    WHERE left_event_id = ? AND right_event_id = ?
+    SELECT re.decision, ev.evidence_json
+    FROM relationship_edges AS re
+    JOIN relationship_evidence AS ev
+      ON ev.policy_version = re.policy_version
+     AND ev.evidence_id = re.evidence_id
+    WHERE re.left_event_id = ? AND re.right_event_id = ?
     """,
     (e, f),
 ).fetchone()
@@ -607,6 +659,383 @@ PY
     pass "cross-harness link・hard veto・bridge防止・missing・singletonを区別する"
   else
     fail "cross-harness link・hard veto・bridge防止・missing・singletonを区別する"
+  fi
+}
+
+test_candidate_generation_and_full_persistence_are_bounded_streams() {
+  echo "test_candidate_generation_and_full_persistence_are_bounded_streams:"
+  local db="$TEST_ROOT/streaming-candidates.sqlite"
+  local err="$TEST_ROOT/streaming-candidates.err"
+  if PYTHONPATH="$PLUGIN_DIR/scripts" python3 - "$db" <<'PY' 2>"$err"
+import builtins
+import inspect
+import pathlib
+import sqlite3
+import sys
+
+import relationship_graph
+from evidence_index import configure, create_schema
+from relationship_graph import DEFAULT_POLICY, Event, _candidate_ids
+
+
+def event(number, timestamp, task):
+    return Event(
+        f"40000000-0000-4000-8000-{number:012d}",
+        timestamp,
+        "sha256:" + "a" * 24,
+        task,
+        None,
+        (),
+        "missing",
+    )
+
+
+task_one = "sha256:" + "1" * 24
+task_two = "sha256:" + "2" * 24
+semantic_events = [
+    event(1, "2026-07-25T00:00:00Z", task_one),
+    event(2, "2026-07-25T00:00:10Z", task_one),
+    event(3, "2026-07-25T00:00:20Z", task_two),
+    event(4, "2026-07-25T02:00:00Z", task_one),
+]
+
+# The production candidate API is an iterator contract, not a returned
+# O(n^2) set/list. It merges the window route and outside-window same-task
+# route without emitting the overlap twice.
+assert inspect.isgeneratorfunction(_candidate_ids)
+
+
+class NoSliceList(list):
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            raise AssertionError("candidate generation copied the chronological tail")
+        return super().__getitem__(index)
+
+
+original_candidate_sorted = builtins.sorted
+relationship_graph.sorted = lambda values, *args, **kwargs: NoSliceList(
+    original_candidate_sorted(values, *args, **kwargs)
+)
+candidate_iterator = _candidate_ids(semantic_events, DEFAULT_POLICY)
+assert inspect.isgenerator(candidate_iterator)
+try:
+    pairs = list(candidate_iterator)
+finally:
+    relationship_graph.sorted = original_candidate_sorted
+assert len(pairs) == len(set(pairs))
+assert all(left < right for left, right in pairs)
+a, b, c, d = [item.event_id for item in semantic_events]
+assert set(pairs) == {
+    (a, b),
+    (a, c),
+    (b, c),
+    (a, d),
+    (b, d),
+}
+assert (c, d) not in pairs
+
+incremental_pairs = list(
+    _candidate_ids(semantic_events, DEFAULT_POLICY, {b, c})
+)
+assert len(incremental_pairs) == len(set(incremental_pairs))
+assert set(incremental_pairs) == {
+    (a, b),
+    (a, c),
+    (b, c),
+    (b, d),
+}
+assert "yielded_window" not in inspect.getsource(_candidate_ids)
+
+
+database = pathlib.Path(sys.argv[1])
+inner = sqlite3.connect(database)
+configure(inner)
+create_schema(inner)
+event_count = 160
+inner.execute(
+    "INSERT INTO source_chunks VALUES (?,?,?,?,?,?,?,?,?)",
+    (
+        "stream-chunk", "devices/stream", "blob", "vault", "device",
+        "2026-07-25T00:00:00Z", 2, event_count, "digest",
+    ),
+)
+source_rows = []
+for number in range(event_count):
+    source_rows.append((
+        f"60000000-0000-4000-8000-{number:012d}",
+        "stream-chunk", number, 2, "2026-07-25T00:00:00Z", "codex",
+        "Stop", "turn.completed", "sha256:" + "a" * 24, None,
+        "sha256:" + "b" * 24, None, None, None, None, None, None,
+        None, None, None, "[]", "missing", "{}",
+    ))
+inner.executemany(
+    "INSERT INTO source_events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    source_rows,
+)
+inner.commit()
+
+
+class CandidateStream:
+    def __init__(self, events):
+        self.ids = [item.event_id for item in events]
+        self.left = 0
+        self.right = 1
+        self.consumed = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.left >= len(self.ids) - 1:
+            raise StopIteration
+        value = (self.ids[self.left], self.ids[self.right])
+        self.consumed += 1
+        self.right += 1
+        if self.right >= len(self.ids):
+            self.left += 1
+            self.right = self.left + 1
+        return value
+
+
+stream_holder = {}
+candidate_calls = []
+
+
+def instrumented_candidates(events, policy, new_event_ids=None):
+    assert policy["policy_version"] == "default-v1"
+    assert new_event_ids is None
+    candidate_calls.append(len(events))
+    stream = CandidateStream(events)
+    stream_holder["value"] = stream
+    return stream
+
+
+original_sorted = sorted
+
+
+def guarded_sorted(values, *args, **kwargs):
+    if isinstance(values, CandidateStream):
+        raise AssertionError("candidate stream was materialized with sorted()")
+    return original_sorted(values, *args, **kwargs)
+
+
+class TrackingConnection:
+    def __init__(self, connection):
+        self.connection = connection
+        self.edge_batch_sizes = []
+        self.edge_insert_consumed = []
+        self.edge_rows = 0
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+    def execute(self, sql, parameters=()):
+        normalized = " ".join(sql.lower().split())
+        if normalized.startswith("insert") and "relationship_edges" in normalized:
+            raise AssertionError("relationship edges must use bounded batch insert")
+        return self.connection.execute(sql, parameters)
+
+    def executemany(self, sql, rows):
+        normalized = " ".join(sql.lower().split())
+        if not (
+            normalized.startswith("insert")
+            and "relationship_edges" in normalized
+        ):
+            return self.connection.executemany(sql, rows)
+        stream = stream_holder["value"]
+        self.edge_insert_consumed.append(stream.consumed)
+        count = 0
+
+        def bounded_rows():
+            nonlocal count
+            for row in rows:
+                count += 1
+                assert count <= 10_000
+                yield row
+
+        result = self.connection.executemany(sql, bounded_rows())
+        self.edge_batch_sizes.append(count)
+        self.edge_rows += count
+        return result
+
+
+relationship_graph._candidate_ids = instrumented_candidates
+relationship_graph.sorted = guarded_sorted
+tracked = TrackingConnection(inner)
+edge_count, _episode_count = relationship_graph.rebuild_relationships(
+    tracked, DEFAULT_POLICY
+)
+inner.commit()
+expected_edges = event_count * (event_count - 1) // 2
+assert candidate_calls == [event_count]
+assert edge_count == expected_edges
+assert tracked.edge_rows == expected_edges
+assert len(tracked.edge_batch_sizes) >= 2
+assert max(tracked.edge_batch_sizes) <= 10_000
+assert tracked.edge_insert_consumed[0] < expected_edges
+previous_consumed = 0
+for consumed in tracked.edge_insert_consumed:
+    assert 0 < consumed - previous_consumed <= 10_000
+    previous_consumed = consumed
+assert inner.execute(
+    "SELECT COUNT(*) FROM relationship_edges"
+).fetchone()[0] == expected_edges
+assert inner.execute(
+    "SELECT COUNT(*) FROM relationship_evidence"
+).fetchone()[0] == 1
+PY
+  then
+    pass "full candidateを重複なくstreamしedge insertを10k以下へ分割する"
+  else
+    cat "$err" >&2
+    fail "full candidateを重複なくstreamしedge insertを10k以下へ分割する"
+  fi
+}
+
+test_repeated_evidence_dictionary_has_no_orphans_and_bounded_bytes_per_edge() {
+  echo "test_repeated_evidence_dictionary_has_no_orphans_and_bounded_bytes_per_edge:"
+  local db="$TEST_ROOT/repeated-evidence.sqlite"
+  local err="$TEST_ROOT/repeated-evidence.err"
+  if PYTHONPATH="$PLUGIN_DIR/scripts" python3 - "$db" <<'PY' 2>"$err"
+import hashlib
+import json
+import pathlib
+import sqlite3
+import sys
+
+from evidence_index import configure, create_schema
+from relationship_graph import DEFAULT_POLICY, rebuild_relationships
+
+
+database = pathlib.Path(sys.argv[1])
+connection = sqlite3.connect(database)
+configure(connection)
+create_schema(connection)
+assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+
+event_count = 128
+connection.execute(
+    "INSERT INTO source_chunks VALUES (?,?,?,?,?,?,?,?,?)",
+    (
+        "repeat-chunk", "devices/repeat", "blob", "vault", "device",
+        "2026-07-25T00:00:00Z", 2, event_count, "digest",
+    ),
+)
+events = []
+for number in range(event_count):
+    values = [
+        f"50000000-0000-4000-8000-{number:012d}",
+        "repeat-chunk",
+        number,
+        2,
+        "2026-07-25T00:00:00Z",
+        "codex",
+        "Stop",
+        "turn.completed",
+        "sha256:" + "a" * 24,
+        None,
+        "sha256:" + "b" * 24,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        "[]",
+        "missing",
+        "{}",
+    ]
+    assert len(values) == 23
+    events.append(tuple(values))
+connection.executemany(
+    "INSERT INTO source_events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    events,
+)
+connection.commit()
+page_size = connection.execute("PRAGMA page_size").fetchone()[0]
+before_bytes = connection.execute("PRAGMA page_count").fetchone()[0] * page_size
+
+edge_count, episode_count = rebuild_relationships(connection, DEFAULT_POLICY)
+connection.commit()
+after_bytes = connection.execute("PRAGMA page_count").fetchone()[0] * page_size
+expected_edges = event_count * (event_count - 1) // 2
+assert edge_count == expected_edges
+assert episode_count == event_count
+assert connection.execute(
+    "SELECT COUNT(*) FROM relationship_edges"
+).fetchone()[0] == expected_edges
+assert connection.execute(
+    "SELECT COUNT(*) FROM relationship_edges WHERE decision='no_link'"
+).fetchone()[0] == expected_edges
+assert connection.execute(
+    "SELECT COUNT(*) FROM relationship_evidence"
+).fetchone()[0] == 1
+evidence_id, encoded = connection.execute(
+    "SELECT evidence_id,evidence_json FROM relationship_evidence"
+).fetchone()
+assert encoded == json.dumps(json.loads(encoded), sort_keys=True, separators=(",", ":"))
+assert evidence_id == "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+connection.execute("SAVEPOINT duplicate_evidence")
+try:
+    connection.execute(
+        "INSERT INTO relationship_evidence VALUES (?,?,?)",
+        ("default-v1", "sha256:" + "f" * 64, encoded),
+    )
+except sqlite3.IntegrityError:
+    pass
+else:
+    raise AssertionError("duplicate canonical evidence was accepted for one policy")
+finally:
+    connection.execute("ROLLBACK TO duplicate_evidence")
+    connection.execute("RELEASE duplicate_evidence")
+assert connection.execute(
+    """
+    SELECT COUNT(*)
+    FROM relationship_edges AS re
+    LEFT JOIN relationship_evidence AS ev
+      ON ev.policy_version = re.policy_version
+     AND ev.evidence_id = re.evidence_id
+    WHERE ev.evidence_id IS NULL
+    """
+).fetchone()[0] == 0
+assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+# The fixture intentionally repeats one ~600-byte evidence document across
+# every edge. Dictionary normalization must keep incremental relationship
+# allocation below a realistic per-edge budget rather than copying the JSON.
+allocated_bytes = after_bytes - before_bytes
+assert allocated_bytes // expected_edges <= 384
+
+before = (
+    tuple(connection.execute(
+        "SELECT * FROM relationship_evidence ORDER BY policy_version,evidence_id"
+    )),
+    tuple(connection.execute(
+        "SELECT evidence_id FROM relationship_edges "
+        "ORDER BY policy_version,left_event_id,right_event_id"
+    )),
+)
+rebuild_relationships(connection, DEFAULT_POLICY)
+connection.commit()
+after = (
+    tuple(connection.execute(
+        "SELECT * FROM relationship_evidence ORDER BY policy_version,evidence_id"
+    )),
+    tuple(connection.execute(
+        "SELECT evidence_id FROM relationship_edges "
+        "ORDER BY policy_version,left_event_id,right_event_id"
+    )),
+)
+assert before == after
+PY
+  then
+    pass "repeat evidenceを1辞書行へ畳み孤児なし・384 bytes/edge以下で再現する"
+  else
+    cat "$err" >&2
+    fail "repeat evidenceを1辞書行へ畳み孤児なし・384 bytes/edge以下で再現する"
   fi
 }
 
@@ -747,6 +1176,12 @@ versions = {
 }
 assert "default-v1" in versions
 assert "relaxed-v2" in versions
+evidence_versions = {
+    row[0] for row in connection.execute(
+        "SELECT DISTINCT policy_version FROM relationship_evidence"
+    )
+}
+assert evidence_versions == versions
 assert all(
     isinstance(row[0], int)
     for row in connection.execute(
@@ -798,6 +1233,27 @@ for version in versions:
         )
     }
     assert member_ids == source_ids
+    orphan_count = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM relationship_edges AS re
+        LEFT JOIN relationship_evidence AS ev
+          ON ev.policy_version = re.policy_version
+         AND ev.evidence_id = re.evidence_id
+        WHERE re.policy_version = ? AND ev.evidence_id IS NULL
+        """,
+        (version,),
+    ).fetchone()[0]
+    assert orphan_count == 0
+    for evidence_id, encoded in connection.execute(
+        "SELECT evidence_id,evidence_json FROM relationship_evidence "
+        "WHERE policy_version=?",
+        (version,),
+    ):
+        import hashlib
+        assert evidence_id == "sha256:" + hashlib.sha256(
+            encoded.encode("utf-8")
+        ).hexdigest()
 PY
   then
     pass "incremental import後も登録済み全policy viewを同じsource horizonへ更新する"
@@ -908,8 +1364,10 @@ test_full_rebuild_restores_graph_without_privacy_leak() {
 
 test_recorder_emits_private_domain_separated_event_v2
 test_mixed_v1_v2_inbox_is_lossless_and_versioned
-test_index_v4_schema_and_six_feature_evidence
+test_index_v5_normalizes_canonical_six_feature_evidence
 test_cross_harness_veto_bridge_missing_and_singletons
+test_candidate_generation_and_full_persistence_are_bounded_streams
+test_repeated_evidence_dictionary_has_no_orphans_and_bounded_bytes_per_edge
 test_relationship_rebuild_is_deterministic_idempotent_and_source_immutable
 test_policy_versions_coexist_and_invalid_policy_is_atomic
 test_fractional_time_boundary_does_not_round_into_window

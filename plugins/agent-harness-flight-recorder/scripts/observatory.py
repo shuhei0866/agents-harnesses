@@ -12,6 +12,8 @@ from typing import Any, Callable
 
 from chunk_rotation import canonical_json
 from evidence_index import read_sealed_query_locked
+from index_freshness import status as index_freshness_status
+from index_storage import index_storage_snapshot as _index_storage_snapshot
 from receipt_automation import status as receipt_automation_status
 from reporting import DEFAULT_POLICY_VERSION, _episode_card, _inbox_count
 from retention_state import load_forgotten
@@ -150,6 +152,38 @@ def overview(root: Path) -> dict[str, Any]:
     """Return the fixed, privacy-safe observatory projection."""
     root = Path(root)
     pending_events = _bounded_inbox_count(root)
+    refresh = index_freshness_status(root)
+    automation_source = receipt_automation_status(root)
+    automation = {
+        field: automation_source[field] for field in AUTOMATION_FIELDS
+    }
+    if refresh["state"] != "ready":
+        return {
+            "schema_version": 2,
+            "command": "observatory.overview",
+            "index_refresh": refresh,
+            "recording": {
+                "state": refresh["state"],
+                "index_schema_version": None,
+                "events": None,
+                "pending_events": pending_events,
+            },
+            "episode_formation": {
+                "episodes": None,
+                "singleton_episodes": None,
+                "singleton_basis_points": None,
+            },
+            "comparison_readiness": {
+                "comparable_episodes": None,
+                "comparable_basis_points": None,
+            },
+            "semantic_coverage": {
+                "semantic_receipts": None,
+                "value_cards": None,
+            },
+            "index_storage": None,
+            "receipt_automation": automation,
+        }
     receipts = _bounded_local_records(
         root,
         "semantic-receipts",
@@ -172,8 +206,6 @@ def overview(root: Path) -> dict[str, Any]:
     )
     if len(value_episode_ids) > MAX_CURRENT_VALUE_EPISODES:
         raise VaultError("Value Card coverage exceeds observatory limits")
-    automation_source = receipt_automation_status(root)
-
     with vault_lock(root):
         forgotten = sorted(
             episode_id
@@ -231,6 +263,12 @@ def overview(root: Path) -> dict[str, Any]:
                 )
                 if events > MAX_INDEX_EVENTS or episodes > MAX_INDEX_EPISODES:
                     raise VaultError("observatory index exceeds read limits")
+                try:
+                    storage = _index_storage_snapshot(connection)
+                except VaultError:
+                    if index_schema_version >= 5:
+                        raise
+                    storage = None
 
                 tables = {
                     item[0]
@@ -324,6 +362,7 @@ def overview(root: Path) -> dict[str, Any]:
                     "comparable_episodes": comparable_episodes,
                     "bindings": bindings,
                     "current_value_cards": current_value_cards,
+                    "index_storage": storage,
                 }
             except sqlite3.Error as error:
                 raise VaultError("observatory sealed query failed") from error
@@ -347,12 +386,10 @@ def overview(root: Path) -> dict[str, Any]:
         root, values, projection["current_value_cards"]
     )
 
-    automation = {
-        field: automation_source[field] for field in AUTOMATION_FIELDS
-    }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "command": "observatory.overview",
+        "index_refresh": refresh,
         "recording": {
             "state": "ready",
             "index_schema_version": index_schema_version,
@@ -376,6 +413,7 @@ def overview(root: Path) -> dict[str, Any]:
             "semantic_receipts": semantic_receipts,
             "value_cards": value_cards,
         },
+        "index_storage": projection["index_storage"],
         "receipt_automation": automation,
     }
 
@@ -396,6 +434,14 @@ def _percent(basis_points: Any) -> str:
 
 def render_overview_html(value: dict[str, Any]) -> str:
     """Compress the fixed overview into the three owner-facing questions."""
+    recording_value = value.get("recording")
+    if isinstance(recording_value, dict) and recording_value.get("events") is None:
+        state = recording_value.get("state")
+        if state not in {"refresh_required", "refreshing", "error"}:
+            raise VaultError("observatory overview is invalid")
+        pending = _number(recording_value.get("pending_events"))
+        return f"""<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Flight Recorder Observatory</title><style>:root{{color-scheme:dark;font-family:system-ui,sans-serif;background:#08111f;color:#edf4ff}}main{{max-width:760px;margin:12vh auto;padding:32px}}section{{padding:28px;border:1px solid #29415f;border-radius:20px;background:#12233a}}p{{color:#a9bad0;line-height:1.7}}</style></head><body><main><section><h1>Index refresh: {state}</h1><p>認証済みの更新が完了するまで、古い集計値は表示しません。次の更新を待つイベントは {pending} 件です。</p></section></main></body></html>"""
     try:
         recording = value["recording"]
         formation = value["episode_formation"]
@@ -410,6 +456,37 @@ def render_overview_html(value: dict[str, Any]) -> str:
         comparable_rate = _percent(comparison["comparable_basis_points"])
         receipts = _number(semantic["semantic_receipts"])
         cards = _number(semantic["value_cards"])
+        storage = value.get("index_storage")
+        storage_html = ""
+        if storage is not None:
+            storage_state = storage["state"]
+            if storage_state not in {"ready", "attention", "critical"}:
+                raise VaultError("observatory overview is invalid")
+            total_gib = _integer(storage["total_bytes"]) / 1024**3
+            relationship_gib = _integer(
+                storage["components"]["relationship_bytes"]
+            ) / 1024**3
+            other_bytes = _integer(storage["components"]["other_bytes"])
+            component_bytes = sum(
+                _integer(storage["components"][name])
+                for name in (
+                    "source_bytes", "relationship_bytes", "projection_bytes"
+                )
+            )
+            if component_bytes == 0 and other_bytes == _integer(
+                storage["total_bytes"]
+            ):
+                breakdown_html = "Breakdown unavailable"
+            else:
+                breakdown_html = (
+                    "Relationship "
+                    f"<strong>{relationship_gib:.2f} GiB</strong>"
+                )
+            storage_html = (
+                f'<aside class="storage {storage_state}">Index storage '
+                f'<strong>{total_gib:.2f} GiB</strong> · {breakdown_html} · '
+                f'{storage_state}</aside>'
+            )
     except (KeyError, TypeError) as error:
         raise VaultError("observatory overview is invalid") from error
 
@@ -441,6 +518,8 @@ h1 {{ margin: 10px 0 8px; font-size: clamp(32px, 5vw, 58px); letter-spacing: -.0
 .warning {{ color: #ffbd70; }}
 .good {{ color: #79d6c7; }}
 .detail {{ margin-top: 24px; padding-top: 18px; border-top: 1px solid #29415f; color: #c7d4e6; font-size: 14px; line-height: 1.7; }}
+.storage {{ margin: 0 0 24px; padding: 14px 18px; border: 1px solid #29415f; border-radius: 12px; color: #c7d4e6; }}
+.storage.attention, .storage.critical {{ border-color: #ffbd70; color: #ffcf96; }}
 footer {{ margin-top: 28px; color: #6f86a3; font-size: 12px; }}
 @media (max-width: 780px) {{ .flow {{ grid-template-columns: 1fr 1fr; }} .questions {{ grid-template-columns: 1fr; }} }}
 </style>
@@ -457,6 +536,7 @@ footer {{ margin-top: 28px; color: #6f86a3; font-size: 12px; }}
     <div class="step"><strong>{receipts}</strong><span>Semantic Receipts</span></div>
     <div class="step"><strong>{cards}</strong><span>Value Cards</span></div>
   </section>
+  {storage_html}
   <section class="questions">
     <article class="card">
       <h2>1. 記録できているか</h2>

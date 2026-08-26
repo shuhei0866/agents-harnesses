@@ -341,6 +341,7 @@ required_tables = {
     "source_events",
     "import_provenance",
     "derived_state",
+    "relationship_evidence",
     "session_atlas_facets",
 }
 tables = {
@@ -350,7 +351,7 @@ tables = {
     )
 }
 assert required_tables <= tables
-assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
 
 def columns(table):
     return {row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')}
@@ -378,6 +379,9 @@ assert {
     "evidence_id", "source_event_id", "collector_version", "collected_at",
     "evidence_type", "state", "value_json",
 } <= columns("deterministic_evidence")
+assert columns("relationship_evidence") == {
+    "policy_version", "evidence_id", "evidence_json",
+}
 assert columns("session_atlas_facets") == {
     "policy_version", "episode_id",
     "context_identity_state", "context_identity_value_json",
@@ -417,11 +421,11 @@ assert not (source_only & columns("derived_state"))
 
 metadata = dict(connection.execute("SELECT key, value FROM schema_metadata"))
 assert metadata["event_schema_versions"] == "1,2,3"
-assert metadata["schema_version"] == "4"
+assert metadata["schema_version"] == "5"
 assert metadata["source_of_truth"] == "encrypted_chunk_v1_event_v1_v2_v3"
 assert metadata["index_role"] == "derived_rebuildable"
 
-# This fixture was recorded as Event v1. SQLite v4 must preserve its existing
+# This fixture was recorded as Event v1. SQLite v5 must preserve its existing
 # projection while representing absent newer context as SQL NULL,
 # rather than manufacturing a misleading "same missing value" signal.
 v1_projection = connection.execute(
@@ -448,9 +452,9 @@ assert any(row[2] == "source_chunks" and row[3] == "chunk_id" for row in provena
 assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 PY
   then
-    pass "SQLite v4はAtlas contract・旧Event互換・derived境界・provenance・FKを明示する"
+    pass "SQLite v5はAtlas contract・旧Event互換・derived境界・provenance・FKを明示する"
   else
-    fail "SQLite v4はAtlas contract・旧Event互換・derived境界・provenance・FKを明示する"
+    fail "SQLite v5はAtlas contract・旧Event互換・derived境界・provenance・FKを明示する"
   fi
 
   if python3 - "$db" <<'PY' 2>/dev/null
