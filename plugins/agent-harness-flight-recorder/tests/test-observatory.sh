@@ -909,6 +909,7 @@ test_render_is_three_question_self_contained_html() {
   local err="$TEST_ROOT/render.err"
   if PYTHONPATH="$PLUGIN_DIR/scripts" python3 - 2>"$err" <<'PY'
 import observatory
+import copy
 
 
 canary = '<script src="https://evil.invalid/raw.js">RAW-CANARY</script>'
@@ -1000,6 +1001,22 @@ assert "<link" not in lower
 assert canary not in html
 assert "RAW-CANARY" not in html
 assert len(html.encode("utf-8")) <= 65536
+
+# Python builds without SQLite dbstat must not render the zero-valued cached
+# component as if relationship storage were actually empty.
+fallback = copy.deepcopy(value)
+fallback["index_storage"]["state"] = "ready"
+fallback["index_storage"]["total_bytes"] = 4735942656
+fallback["index_storage"]["components"] = {
+    "source_bytes": 0,
+    "relationship_bytes": 0,
+    "projection_bytes": 0,
+    "other_bytes": 4735942656,
+}
+fallback_html = observatory.render_overview_html(fallback)
+assert "4.41 GiB" in fallback_html
+assert "Breakdown unavailable" in fallback_html
+assert "Relationship <strong>0.00 GiB" not in fallback_html
 PY
   then
     pass "HTMLは自己完結し詳細counterやraw値を出さず3問へ圧縮する"

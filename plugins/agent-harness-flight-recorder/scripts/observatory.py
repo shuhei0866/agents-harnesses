@@ -466,10 +466,25 @@ def render_overview_html(value: dict[str, Any]) -> str:
             relationship_gib = _integer(
                 storage["components"]["relationship_bytes"]
             ) / 1024**3
+            other_bytes = _integer(storage["components"]["other_bytes"])
+            component_bytes = sum(
+                _integer(storage["components"][name])
+                for name in (
+                    "source_bytes", "relationship_bytes", "projection_bytes"
+                )
+            )
+            if component_bytes == 0 and other_bytes == _integer(
+                storage["total_bytes"]
+            ):
+                breakdown_html = "Breakdown unavailable"
+            else:
+                breakdown_html = (
+                    "Relationship "
+                    f"<strong>{relationship_gib:.2f} GiB</strong>"
+                )
             storage_html = (
                 f'<aside class="storage {storage_state}">Index storage '
-                f'<strong>{total_gib:.2f} GiB</strong> · Relationship '
-                f'<strong>{relationship_gib:.2f} GiB</strong> · '
+                f'<strong>{total_gib:.2f} GiB</strong> · {breakdown_html} · '
                 f'{storage_state}</aside>'
             )
     except (KeyError, TypeError) as error:
