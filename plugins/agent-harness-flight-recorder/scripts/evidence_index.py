@@ -54,7 +54,7 @@ GENERATION_NAMESPACE = "authenticated_index_seal"
 GENERATION_KEY = "projection_generation"
 GENERATION_POLICY = "_global"
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-INDEX_VERSION = 4
+INDEX_VERSION = 5
 DETERMINISTIC_COLLECTOR_VERSION = "deterministic-v1"
 DETERMINISTIC_METRICS = (
     "duration_ms",
@@ -153,6 +153,15 @@ CREATE TABLE relationship_policies (
     policy_sha256 TEXT NOT NULL,
     policy_json TEXT NOT NULL
 ) WITHOUT ROWID;
+CREATE TABLE relationship_evidence (
+    policy_version TEXT NOT NULL,
+    evidence_id TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    PRIMARY KEY (policy_version, evidence_id),
+    UNIQUE (policy_version, evidence_json),
+    FOREIGN KEY (policy_version) REFERENCES relationship_policies(policy_version)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+) WITHOUT ROWID;
 CREATE TABLE relationship_edges (
     policy_version TEXT NOT NULL,
     left_event_id TEXT NOT NULL,
@@ -161,7 +170,7 @@ CREATE TABLE relationship_edges (
     decision TEXT NOT NULL CHECK (
         decision IN ('link', 'no_link', 'hard_veto', 'component_conflict')
     ),
-    evidence_json TEXT NOT NULL,
+    evidence_id TEXT NOT NULL,
     PRIMARY KEY (policy_version, left_event_id, right_event_id),
     CHECK (left_event_id < right_event_id),
     FOREIGN KEY (policy_version) REFERENCES relationship_policies(policy_version)
@@ -169,6 +178,9 @@ CREATE TABLE relationship_edges (
     FOREIGN KEY (left_event_id) REFERENCES source_events(event_id)
         ON UPDATE RESTRICT ON DELETE RESTRICT,
     FOREIGN KEY (right_event_id) REFERENCES source_events(event_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (policy_version, evidence_id)
+        REFERENCES relationship_evidence(policy_version, evidence_id)
         ON UPDATE RESTRICT ON DELETE RESTRICT
 ) WITHOUT ROWID;
 CREATE TABLE episodes (
@@ -252,7 +264,7 @@ CREATE INDEX session_atlas_by_artifact
 METADATA = (
     ("event_schema_versions", "1,2,3"),
     ("index_role", "derived_rebuildable"),
-    ("schema_version", "4"),
+    ("schema_version", "5"),
     ("source_of_truth", "encrypted_chunk_v1_event_v1_v2_v3"),
 )
 
@@ -408,7 +420,9 @@ def _authorized_seal_key(root: Path) -> tuple[dict[str, object], bytes]:
     return config, key
 
 
-def _source_inventory(root: Path) -> dict[str, Any]:
+def _source_inventory(
+    root: Path, included_paths: set[str] | None = None
+) -> dict[str, Any]:
     indexed = strict_preflight(root)
     receipts = load_receipts(root)
     tracked = {
@@ -417,6 +431,8 @@ def _source_inventory(root: Path) -> dict[str, Any]:
     }
     if set(receipts) != tracked:
         raise VaultError("index seal source inventory is invalid; run a rebuild")
+    if included_paths is not None and not included_paths.issubset(receipts):
+        raise VaultError("index seal source horizon is invalid; run a rebuild")
     paths = sorted(receipts)
     working: dict[str, str] = {}
     for offset in range(0, len(paths), 500):
@@ -452,7 +468,8 @@ def _source_inventory(root: Path) -> dict[str, Any]:
             or indexed.get(relative) != receipt["blob_oid"]
         ):
             raise VaultError("index seal source inventory is invalid; run a rebuild")
-        normalized.append({"source_path": relative, **receipt})
+        if included_paths is None or relative in included_paths:
+            normalized.append({"source_path": relative, **receipt})
     return {
         "chunk_count": len(normalized),
         "sha256": _sha256(canonical_json(normalized)),
@@ -519,7 +536,9 @@ def _reject_duplicate_json_keys(
     return result
 
 
-def issue_index_seal(root: Path) -> dict[str, Any]:
+def issue_index_seal(
+    root: Path, source_horizon_paths: set[str] | None = None
+) -> dict[str, Any]:
     """Issue a seal while the caller holds the Vault lock."""
     database_path = root / DATABASE_PATH
     identity_before = _check_existing_database(database_path)
@@ -533,7 +552,7 @@ def issue_index_seal(root: Path) -> dict[str, Any]:
         ).fetchone()[0]
     finally:
         connection.close()
-    source_inventory = _source_inventory(root)
+    source_inventory = _source_inventory(root, source_horizon_paths)
     source_inventory["event_count"] = event_count
     config, key = _authorized_seal_key(root)
     digest = _stream_file_sha256(database_path)
@@ -862,8 +881,13 @@ def _target_episode_edges(
         batch = member_ids[offset:offset + 500]
         placeholders = ",".join("?" for _item in batch)
         rows = connection.execute(
-            "SELECT left_event_id,right_event_id,score,decision,evidence_json "
-            "FROM relationship_edges WHERE policy_version=? "
+            "SELECT edge.left_event_id,edge.right_event_id,edge.score,"
+            "edge.decision,evidence.evidence_json "
+            "FROM relationship_edges AS edge "
+            "JOIN relationship_evidence AS evidence "
+            "ON evidence.policy_version=edge.policy_version "
+            "AND evidence.evidence_id=edge.evidence_id "
+            "WHERE edge.policy_version=? "
             f"AND left_event_id IN ({placeholders}) AND decision='link' "
             "ORDER BY left_event_id,right_event_id",
             (policy_version, *batch),
@@ -1614,8 +1638,10 @@ def rebuild_full(root: Path, chunks: list[Chunk]) -> tuple[int, int]:
             insert_chunk(connection, chunk)
         rebuild_deterministic_evidence(connection)
         from relationship_graph import DEFAULT_POLICY, rebuild_relationships
+        from index_storage import cache_index_storage_metrics
 
         rebuild_relationships(connection, DEFAULT_POLICY)
+        cache_index_storage_metrics(connection)
         _write_database_generation(connection)
         connection.execute("COMMIT")
         validate_database(connection)
@@ -1669,6 +1695,9 @@ def rebuild_incremental(root: Path, chunks: list[Chunk]) -> tuple[int, int]:
         policies = load_stored_policies(connection)
         for policy in policies:
             rebuild_relationships(connection, policy)
+        from index_storage import cache_index_storage_metrics
+
+        cache_index_storage_metrics(connection)
         _write_database_generation(connection)
         connection.execute("COMMIT")
     except (sqlite3.Error, VaultError) as error:
@@ -1688,6 +1717,86 @@ def rebuild_incremental(root: Path, chunks: list[Chunk]) -> tuple[int, int]:
     return added_chunks, added_events
 
 
+def rebuild_incremental_bounded(
+    root: Path, *, max_chunks: int, max_events: int
+) -> bool:
+    """Import one bounded source delta and return whether more drift remains."""
+    if (
+        isinstance(max_chunks, bool)
+        or not isinstance(max_chunks, int)
+        or not 1 <= max_chunks <= 2
+        or isinstance(max_events, bool)
+        or not isinstance(max_events, int)
+        or not 1 <= max_events <= 5_000
+    ):
+        raise VaultError("incremental refresh bounds are invalid")
+    chunks = load_chunks(root)
+    target = root / DATABASE_PATH
+    connection = _open_existing(target)
+    try:
+        from index_storage import cache_index_storage_metrics
+        from relationship_graph import (
+            load_stored_policies,
+            refresh_relationships_incremental,
+        )
+
+        validate_source_projection(connection, chunks, exact=False)
+        existing = {
+            row[0] for row in connection.execute("SELECT chunk_id FROM source_chunks")
+        }
+        pending = [chunk for chunk in chunks if chunk.chunk_row[0] not in existing]
+        selected = []
+        selected_events = 0
+        for chunk in pending:
+            event_count = len(chunk.event_rows)
+            if event_count > max_events:
+                raise VaultError("one source chunk exceeds refresh event bound")
+            if len(selected) >= max_chunks or selected_events + event_count > max_events:
+                break
+            selected.append(chunk)
+            selected_events += event_count
+        if not selected and pending:
+            raise VaultError("source drift cannot fit bounded refresh")
+        new_event_ids = {
+            row[0] for chunk in selected for row in chunk.event_rows
+        }
+        connection.execute("BEGIN IMMEDIATE")
+        for chunk in selected:
+            insert_chunk(connection, chunk)
+        expected = [
+            chunk
+            for chunk in chunks
+            if chunk.chunk_row[0] in existing
+            or chunk.chunk_row[0] in {item.chunk_row[0] for item in selected}
+        ]
+        validate_source_projection(connection, expected, exact=True)
+        rebuild_deterministic_evidence(connection)
+        policies = load_stored_policies(connection)
+        for policy in policies:
+            refresh_relationships_incremental(connection, policy, new_event_ids)
+        cache_index_storage_metrics(connection)
+        _write_database_generation(connection)
+        validate_database(connection)
+        connection.execute("COMMIT")
+    except (sqlite3.Error, VaultError) as error:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        if isinstance(error, VaultError):
+            raise
+        raise VaultError("bounded incremental refresh failed") from error
+    finally:
+        connection.close()
+    os.chmod(target, 0o600)
+    descriptor = os.open(target, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    horizon_paths = {chunk.provenance_row[1] for chunk in expected}
+    issue_index_seal(root, horizon_paths)
+    return len(selected) < len(pending)
+
+
 def rebuild_index_locked(root: Path, *, incremental: bool) -> None:
     index = safe_index_directory(root)
     collect_stale_temporaries(index)
@@ -1703,6 +1812,9 @@ def rebuild_index_locked(root: Path, *, incremental: bool) -> None:
         added_chunks, added_events = rebuild_full(root, chunks)
         mode = "full"
     issue_index_seal(root)
+    from index_freshness import mark_manual_rebuild_ready_locked
+
+    mark_manual_rebuild_ready_locked(root)
     print(
         f"rebuild-index: mode={mode} "
         f"chunks={added_chunks} events={added_events}"
@@ -1732,6 +1844,9 @@ def rebuild_relationship_views(root: Path, policy_path: Path | None) -> None:
             connection.execute("BEGIN IMMEDIATE")
             validate_source_projection(connection, chunks, exact=True)
             edges, episodes = rebuild_relationships(connection, policy)
+            from index_storage import cache_index_storage_metrics
+
+            cache_index_storage_metrics(connection)
             _write_database_generation(connection)
             validate_database(connection)
             connection.execute("COMMIT")

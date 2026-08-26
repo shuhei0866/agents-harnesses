@@ -24,6 +24,7 @@ from evidence_index import (
     rebuild_index_locked,
 )
 from evaluation import evaluation_record_snapshots
+from index_freshness import STATE_PATH as INDEX_REFRESH_STATE_PATH
 from meaning_lift import meaning_card_record_snapshots
 from reporting import (
     EPISODE_ID_RE,
@@ -1032,6 +1033,7 @@ def purge(
                         root / PENDING_PATH,
                         root / FORGET_PATH,
                         root / PURGE_RECOVERY_PATH,
+                        root / INDEX_REFRESH_STATE_PATH,
                     )
                 )
                 rollback_paths.extend(

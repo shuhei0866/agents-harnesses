@@ -37,6 +37,12 @@ from vault import (
 )
 
 
+def request_index_refresh_locked(root: Path) -> dict[str, object]:
+    from index_freshness import request_refresh_locked
+
+    return request_refresh_locked(root)
+
+
 DIGEST_DOMAIN = b"agent-harness-flight-recorder/chunk-v1\0"
 HASH_FIELDS = ("session_id_hash", "turn_id_hash", "workspace_id")
 NULLABLE_STRINGS = ("model", "permission_mode", "tool")
@@ -482,11 +488,19 @@ def rotate_locked(root: Path) -> None:
 
     queue = safe_subdirectory(root, "queue")
     # Retry detached jobs before detaching the current inbox.
-    for job in sorted(queue.glob("*.jsonl.pending")):
+    pending_jobs = sorted(queue.glob("*.jsonl.pending"))
+    for job in pending_jobs:
         if job.is_symlink() or not job.is_file():
             raise VaultError("pending rotation job is unsafe")
+    acquired_jobs = acquire_inbox(root)
+    if pending_jobs or acquired_jobs:
+        # Publish the coalescing marker before any immutable source artifact.
+        # A failed job may leave a harmless no-op refresh request; the reverse
+        # ordering could leave a published chunk with a stale ready marker.
+        request_index_refresh_locked(root)
+    for job in pending_jobs:
         process_job(root, config, identity, job)
-    for job in acquire_inbox(root):
+    for job in acquired_jobs:
         process_job(root, config, identity, job)
 
 

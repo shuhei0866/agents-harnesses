@@ -33,6 +33,18 @@ from vault import (
 )
 
 
+def run_pending_refresh(root: Path) -> dict[str, Any]:
+    from index_freshness import run_pending_refresh as run_refresh
+
+    return run_refresh(root)
+
+
+def index_refresh_status(root: Path) -> dict[str, Any]:
+    from index_freshness import status as refresh_status
+
+    return refresh_status(root)
+
+
 LABEL = "io.agent-harness.flight-recorder.sync"
 UNIT = "agent-harness-flight-recorder-sync"
 STATE_PATH = Path("scheduler/state.json")
@@ -43,6 +55,7 @@ RUNTIME_PATH = (
 COMMAND_TIMEOUT_SECONDS = 30
 WAKE_INTERVAL_SECONDS = 300
 HEALTHY_INTERVAL_SECONDS = 86400
+MAX_PENDING_INBOX_BYTES = 256 * 1024 * 1024
 RETRY_BASE_SECONDS = 300
 RETRY_CAP_SECONDS = 86400
 MAX_FAILURE_COUNT = 1_000_000
@@ -882,9 +895,59 @@ def _retry_due(state: dict[str, Any], now: dt.datetime) -> bool:
     return next_retry is None or now >= _parse_time(next_retry)
 
 
+def _has_pending_inbox(root: Path) -> bool:
+    directory = root / "inbox"
+    try:
+        directory_metadata = directory.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise VaultError("event inbox is unsafe") from error
+    if (
+        not stat.S_ISDIR(directory_metadata.st_mode)
+        or directory_metadata.st_uid != os.geteuid()
+        or directory_metadata.st_mode & 0o077
+    ):
+        raise VaultError("event inbox is unsafe")
+    path = root / "inbox/events.jsonl"
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise VaultError("event inbox is unsafe") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_size > MAX_PENDING_INBOX_BYTES
+    ):
+        raise VaultError("event inbox is unsafe")
+    return metadata.st_size > 0
+
+
 def _scheduler_due(
-    state: dict[str, Any] | None, now: dt.datetime
+    root: Path | dict[str, Any] | None,
+    state: dict[str, Any] | dt.datetime | None,
+    now: dt.datetime | None = None,
 ) -> bool:
+    # The two-argument form remains a compatibility seam for older callers;
+    # only the root-aware form can shorten a healthy interval for pending data.
+    if now is None:
+        selected_root = None
+        selected_state = root if isinstance(root, dict) or root is None else None
+        selected_now = state
+    else:
+        selected_root = root if isinstance(root, Path) else Path(root)
+        selected_state = state
+        selected_now = now
+    if not isinstance(selected_now, dt.datetime):
+        raise VaultError("scheduler time is invalid")
+    if selected_state is not None and not isinstance(selected_state, dict):
+        raise VaultError("scheduler state is invalid")
+    state = selected_state
+    now = selected_now
     if state is None:
         return True
     if state.get("failure_class") is not None:
@@ -892,6 +955,14 @@ def _scheduler_due(
     last_success = state.get("last_success_at")
     if last_success is None:
         return True
+    if selected_root is not None and (
+        _has_pending_inbox(selected_root)
+        or index_refresh_status(selected_root).get("state")
+        in {"refresh_required", "refreshing"}
+    ):
+        return now >= _parse_time(last_success) + dt.timedelta(
+            seconds=WAKE_INTERVAL_SECONDS
+        )
     return now >= _parse_time(last_success) + dt.timedelta(
         seconds=HEALTHY_INTERVAL_SECONDS
     )
@@ -1157,7 +1228,12 @@ def run(root: Path) -> None:
             return
         previous = _load_state(root)
         now = _now()
-        if not _scheduler_due(previous, now):
+        try:
+            due = _scheduler_due(root, previous, now)
+        except TypeError:
+            # Test/integration seams predating the root-aware due contract.
+            due = _scheduler_due(previous, now)
+        if not due:
             return
         try:
             sync(root)
@@ -1168,6 +1244,7 @@ def run(root: Path) -> None:
             )
             return
         _write_state(root, _state_after_success(previous, now=now))
+        run_pending_refresh(root)
         should_evaluate = True
     config_path = root / "auto-evaluation/config.json"
     if should_evaluate and (
