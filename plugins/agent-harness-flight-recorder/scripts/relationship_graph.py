@@ -574,6 +574,10 @@ def refresh_relationships_incremental(
                 )
             if len(evidence_cache) < MAX_INCREMENTAL_EVIDENCE_CACHE:
                 evidence_cache[evidence_id] = evidence
+            else:
+                # New rows beyond the preload ceiling are not represented in
+                # memory, so every later miss must authenticate against SQLite.
+                evidence_cache_complete = False
         edge_batch.append(
             (version, left_id, right_id, score, decision, evidence_id)
         )

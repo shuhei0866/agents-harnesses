@@ -881,21 +881,25 @@ events = [
     Event("C", "2026-08-26T00:00:02Z", None, "task-2", None, (), "missing"),
     Event("D", "2026-08-26T00:00:03Z", None, None, None, (), "missing"),
     Event("E", "2026-08-26T00:00:04Z", None, "task-2", None, (), "missing"),
+    Event("F", "2026-08-26T00:00:05Z", None, "task-2", None, (), "missing"),
 ]
 relationship_graph._events = lambda _connection: events
 relationship_graph._candidate_ids = (
-    lambda _events, _policy, _new_event_ids=None: iter([("B", "E")])
+    lambda _events, _policy, _new_event_ids=None: iter([
+        ("B", "E"), ("B", "F")
+    ])
 )
-relationship_graph.score_pair = lambda *_args: (100, "link", evidence)
+new_evidence = '{"new":true}'
+relationship_graph.score_pair = lambda *_args: (100, "link", new_evidence)
 relationship_graph._replace_episodes = lambda *_args: 1
-# Force the bounded fallback and prove an existing evidence row is reused
-# without violating the unique canonical-evidence constraint.
-relationship_graph.MAX_INCREMENTAL_EVIDENCE_CACHE = 0
+# Fill the cache with the existing row, then return the same new evidence from
+# two candidates. The first insert must switch later misses to point lookup.
+relationship_graph.MAX_INCREMENTAL_EVIDENCE_CACHE = 1
 
 statements = []
 connection.set_trace_callback(statements.append)
 relationship_graph.refresh_relationships_incremental(
-    connection, DEFAULT_POLICY, {"E"}
+    connection, DEFAULT_POLICY, {"E", "F"}
 )
 connection.set_trace_callback(None)
 decisions = dict(connection.execute(
@@ -906,8 +910,14 @@ assert decisions == {
     "AB": "component_conflict",
     "BD": "link",
     "BE": "link",
+    "BF": "link",
     "CD": "link",
 }
+
+assert connection.execute(
+    "SELECT COUNT(*) FROM relationship_evidence WHERE policy_version=?",
+    ("default-v1",),
+).fetchone()[0] == 2
 assert connection.execute(
     "SELECT COUNT(*) FROM sqlite_master WHERE type='index' "
     "AND name='relationship_edges_link_candidates' "
@@ -940,6 +950,98 @@ PY
   fi
 }
 
+test_incremental_decision_staging_crosses_batch_boundary() {
+  echo "test_incremental_decision_staging_crosses_batch_boundary:"
+  local err="$TEST_ROOT/decision-staging.err"
+  if PYTHONPATH="$PLUGIN_DIR/scripts" python3 - "$TEST_ROOT/staging.sqlite" 2>"$err" <<'PY'
+import hashlib
+import sqlite3
+import sys
+
+import relationship_graph
+from evidence_index import configure, create_schema
+from relationship_graph import DEFAULT_POLICY, Event
+
+
+connection = sqlite3.connect(sys.argv[1])
+configure(connection)
+create_schema(connection)
+connection.commit()
+connection.execute("PRAGMA foreign_keys=OFF")
+encoded_policy = relationship_graph.canonical_json(DEFAULT_POLICY).decode("utf-8")
+connection.execute(
+    "INSERT INTO relationship_policies VALUES (?,?,?,?)",
+    (
+        "default-v1", 1,
+        hashlib.sha256(encoded_policy.encode("utf-8")).hexdigest(),
+        encoded_policy,
+    ),
+)
+evidence = "{}"
+evidence_id = relationship_graph._evidence_id(evidence)
+connection.execute(
+    "INSERT INTO relationship_evidence VALUES (?,?,?)",
+    ("default-v1", evidence_id, evidence),
+)
+edges = [
+    (
+        "default-v1", f"L{index:04d}", f"R{index:04d}",
+        10_000 - index, "link", evidence_id,
+    )
+    for index in range(1_001)
+]
+connection.executemany(
+    "INSERT INTO relationship_edges VALUES (?,?,?,?,?,?)", edges
+)
+events = [
+    Event(event_id, "2026-08-26T00:00:00Z", None, None, None, (), "missing")
+    for edge in edges for event_id in edge[1:3]
+]
+
+
+class RejectingComponents:
+    def __init__(self, _events):
+        pass
+
+    def join(self, _left, _right):
+        return False
+
+
+relationship_graph._events = lambda _connection: events
+relationship_graph._candidate_ids = lambda *_args, **_kwargs: iter(())
+relationship_graph.Components = RejectingComponents
+relationship_graph._replace_episodes = lambda *_args: 1
+statements = []
+connection.set_trace_callback(statements.append)
+relationship_graph.refresh_relationships_incremental(
+    connection, DEFAULT_POLICY, {"L0000"}
+)
+connection.set_trace_callback(None)
+assert connection.execute(
+    "SELECT COUNT(*) FROM relationship_edges "
+    "WHERE decision='component_conflict'"
+).fetchone()[0] == 1_001
+assert connection.execute(
+    "SELECT COUNT(*) FROM sqlite_temp_master "
+    "WHERE name='relationship_decision_updates'"
+).fetchone()[0] == 0
+targeted = [
+    " ".join(statement.lower().split())
+    for statement in statements
+    if statement.lower().startswith("update relationship_edges set decision=")
+]
+assert len(targeted) == 1_001
+assert all("left_event_id=" in item and "right_event_id=" in item for item in targeted)
+connection.close()
+PY
+  then
+    pass "1,001 decision差分を有限batchでstage・PK更新してtempを回収する"
+  else
+    cat "$err" >&2
+    fail "1,001 decision差分を有限batchでstage・PK更新してtempを回収する"
+  fi
+}
+
 test_repeated_requests_coalesce_and_one_run_is_bounded
 test_refresh_state_machine_is_finite_and_measured
 test_stale_refreshing_state_is_resumed_after_lock_reacquisition
@@ -950,6 +1052,7 @@ test_missing_or_tampered_seal_requires_explicit_full_rebuild
 test_observatory_hides_counts_until_authenticated_refresh_is_ready
 test_incremental_relationships_only_score_new_pairs_and_reuse_saved_links
 test_incremental_replays_prior_component_conflicts_in_global_order
+test_incremental_decision_staging_crosses_batch_boundary
 
 echo
 echo "Index freshness tests: $PASS passed, $FAIL failed"
