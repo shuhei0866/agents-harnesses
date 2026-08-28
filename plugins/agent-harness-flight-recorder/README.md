@@ -278,6 +278,9 @@ Incremental component replay uses a partial score-ordered index containing only
 `link` and `component_conflict` rows, then updates only decisions that actually
 changed. An authenticated pre-index v5 database receives this additive index in
 its next bounded refresh; no source or relationship evidence is discarded.
+The canonical evidence dictionary is read sequentially into a capped cache so
+ordinary refresh avoids one random disk lookup per candidate while retaining a
+bounded-memory fallback for unusually large custom-policy dictionaries.
 Observatory reports the local index allocation and its major components using
 writer-cached metrics; 5 GiB is `attention` and 8 GiB is `critical`. These
 states never delete source evidence automatically.

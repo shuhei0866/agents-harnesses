@@ -222,7 +222,11 @@ an explicit full rebuild; it is never silently accepted as current.
 Relationship component replay does not scan the complete negative-edge table.
 A managed partial index contains only `link` and `component_conflict` rows in
 policy and global-score order. Incremental refresh consumes that index, closes
-the cursor, and changes only decisions whose component constraint result moved.
+the cursor, and changes only decisions whose component constraint result moved;
+changed keys spill to a temporary SQLite table in 1,000-row Python batches.
+The normalized evidence dictionary is read sequentially once up to a fixed
+250,000-entry cache ceiling, with collision-checking point reads as the bounded
+fallback for larger custom-policy dictionaries.
 An authenticated schema-v5 database created before this additive index is
 accepted only in its exact legacy shape; the next bounded write creates the
 index transactionally and the new seal binds the resulting schema.

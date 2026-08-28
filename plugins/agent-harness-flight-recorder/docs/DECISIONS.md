@@ -544,7 +544,10 @@ Accepted decisions remain recorded when later superseded.
 - Decision: maintain a partial index over only `link` and
   `component_conflict` relationship rows. Incremental refresh replays those
   candidates in global score order, records only decisions that changed, and
-  updates those rows by full primary key after the read cursor is exhausted.
+  stages changed keys in a temporary table, then updates those rows by full
+  primary key after the read cursor is exhausted. Load the normalized evidence
+  dictionary once up to a fixed 250,000-entry memory ceiling; above that bound,
+  retain the slower authenticated per-key lookup rather than growing memory.
   Accept the authenticated pre-index v5 schema as an additive migration source
   and create the managed index inside the next bounded transaction.
 - Reason: sampling a real 21.6-million-edge refresh showed almost all CPU time
@@ -557,4 +560,6 @@ Accepted decisions remain recorded when later superseded.
   scan on their first bounded refresh; later component replay reads only the
   selective candidate set and writes only changed rows. Unknown database
   objects still fail closed, and removal or substitution of the managed index
-  remains detectable through the index seal.
+  remains detectable through the index seal. The bounded evidence cache removes
+  repeated random B-tree reads for the current approximately 90,000 canonical
+  evidence rows without making custom-policy memory use unbounded.

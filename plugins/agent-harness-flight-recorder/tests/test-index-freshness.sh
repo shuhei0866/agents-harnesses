@@ -775,10 +775,27 @@ relationship_graph.rebuild_relationships = forbidden_full_rebuild
 session_atlas.clear_session_atlas = lambda *_args, **_kwargs: None
 session_atlas.materialize_session_atlas = lambda *_args, **_kwargs: None
 
+statements = []
+connection.set_trace_callback(statements.append)
 incremental(connection, policy, {"new-d"})
+connection.set_trace_callback(None)
 
 assert scored
 assert all("new-d" in pair for pair in scored)
+normalized = [" ".join(statement.lower().split()) for statement in statements]
+evidence_reads = [
+    statement for statement in normalized
+    if statement.startswith(
+        "select evidence_id,evidence_json from relationship_evidence "
+        "where policy_version="
+    )
+]
+assert len(evidence_reads) == 1
+assert not any(
+    "from relationship_evidence where policy_version=" in statement
+    and "and evidence_id=" in statement
+    for statement in normalized
+)
 assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
 assert {
     row[1] for row in connection.execute("PRAGMA table_info(relationship_edges)")
@@ -871,6 +888,9 @@ relationship_graph._candidate_ids = (
 )
 relationship_graph.score_pair = lambda *_args: (100, "link", evidence)
 relationship_graph._replace_episodes = lambda *_args: 1
+# Force the bounded fallback and prove an existing evidence row is reused
+# without violating the unique canonical-evidence constraint.
+relationship_graph.MAX_INCREMENTAL_EVIDENCE_CACHE = 0
 
 statements = []
 connection.set_trace_callback(statements.append)
@@ -895,6 +915,10 @@ assert connection.execute(
 ).fetchone()[0] == 1
 normalized = [" ".join(statement.lower().split()) for statement in statements]
 assert not any("relationship_conflict_updates" in item for item in normalized)
+assert connection.execute(
+    "SELECT COUNT(*) FROM sqlite_temp_master "
+    "WHERE name='relationship_decision_updates'"
+).fetchone()[0] == 0
 assert not any(
     item.startswith("update relationship_edges set decision='link' where policy_version")
     and "left_event_id=" not in item
