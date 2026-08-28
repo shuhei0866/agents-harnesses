@@ -281,10 +281,13 @@ its next bounded refresh; no source or relationship evidence is discarded.
 The canonical evidence dictionary is read sequentially into a capped cache so
 ordinary refresh avoids one random disk lookup per candidate while retaining a
 bounded-memory fallback for unusually large custom-policy dictionaries.
-The old seal authenticates the input generation; foreign keys and SQLite
-integrity are checked once after all bounded writes. A matching writer
-generation proof avoids repeating that complete scan during the new seal, while
-manual or unproved seal issuance still performs full validation.
+The old seal authenticates the input generation. A v2 `full` seal starts a
+validation lineage; later bounded refreshes verify the exact schema, metadata,
+transaction safety settings, and immediate SQLite constraints, then bind the
+parent seal/database/generation into an `authenticated_delta` successor. A
+legacy v1 parent pays one final complete foreign-key and integrity scan. Manual,
+policy-wide, recovery, and unproved seal issuance still performs full
+validation.
 Observatory reports the local index allocation and its major components using
 writer-cached metrics; 5 GiB is `attention` and 8 GiB is `critical`. These
 states never delete source evidence automatically.

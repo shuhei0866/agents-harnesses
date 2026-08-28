@@ -178,10 +178,10 @@ value = json.loads(seal_path.read_text(encoding="utf-8"))
 assert set(value) == {
     "schema_version", "contract_version", "issued_at", "database",
     "index_schema", "source_inventory", "forget_inventory",
-    "relationship_projection", "integrity",
+    "relationship_projection", "validation", "integrity",
 }
 assert value["schema_version"] == 1
-assert value["contract_version"] == "authenticated-evidence-index-seal-v1"
+assert value["contract_version"] == "authenticated-evidence-index-seal-v2"
 assert set(value["database"]) == {
     "sha256", "size_bytes", "device", "inode", "mtime_ns", "mode",
     "vault_id", "generation",
@@ -213,6 +213,25 @@ assert set(value["relationship_projection"]) == {
 assert re.fullmatch(r"sha256:[0-9a-f]{64}", value["relationship_projection"]["generation"])
 assert value["relationship_projection"]["generation"] == identity["generation"]
 assert value["relationship_projection"]["policy_count"] >= 1
+assert set(value["validation"]) == {
+    "mode", "parent_seal_sha256", "parent_database_sha256",
+    "parent_generation",
+}
+assert value["validation"]["mode"] in {"full", "authenticated_delta"}
+if value["validation"]["mode"] == "full":
+    assert value["validation"]["parent_seal_sha256"] is None
+    assert value["validation"]["parent_database_sha256"] is None
+    assert value["validation"]["parent_generation"] is None
+else:
+    assert re.fullmatch(
+        r"sha256:[0-9a-f]{64}", value["validation"]["parent_seal_sha256"]
+    )
+    assert re.fullmatch(
+        r"sha256:[0-9a-f]{64}", value["validation"]["parent_database_sha256"]
+    )
+    assert re.fullmatch(
+        r"sha256:[0-9a-f]{64}", value["validation"]["parent_generation"]
+    )
 assert value["integrity"]["algorithm"] == "hmac-sha256"
 assert re.fullmatch(r"sha256:[0-9a-f]{64}", value["integrity"]["mac"])
 PY
@@ -945,6 +964,203 @@ PY
   fi
 }
 
+test_bounded_refresh_uses_parent_linked_delta_validation() {
+  echo "test_bounded_refresh_uses_parent_linked_delta_validation:"
+  local base="$TEST_ROOT/delta-lineage"
+  local state="$base/vault"
+  init_fixture "$base" || {
+    fail "delta lineage fixtureを構築できる"
+    return
+  }
+  record_event "$state" \
+    "49000000-0000-4000-8000-000000000099" \
+    "2026-08-13T00:02:00Z"
+  run_cli "$state" sync >/dev/null 2>&1 || {
+    fail "delta lineage fixtureを同期できる"
+    return
+  }
+  if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$state" <<'PY'
+import json
+import pathlib
+import sys
+
+import evidence_index
+from chunk_rotation import canonical_json
+from vault import vault_lock
+
+
+root = pathlib.Path(sys.argv[1])
+parent = evidence_index.load_index_seal(root)
+assert parent["contract_version"] == evidence_index.INDEX_SEAL_CONTRACT
+assert parent["validation"]["mode"] == "full"
+
+def forbidden_full_scan(_connection):
+    raise AssertionError("bounded v2 refresh repeated full database validation")
+
+evidence_index.validate_database = forbidden_full_scan
+with vault_lock(root):
+    more = evidence_index.rebuild_incremental_bounded(
+        root, max_chunks=2, max_events=5_000
+    )
+assert more is False
+current = evidence_index.load_index_seal(root)
+validation = current["validation"]
+assert validation["mode"] == "authenticated_delta"
+assert validation["parent_seal_sha256"] == evidence_index._sha256(
+    canonical_json(parent)
+)
+assert validation["parent_database_sha256"] == parent["database"]["sha256"]
+assert validation["parent_generation"] == parent["database"]["generation"]
+assert current["database"]["generation"] != parent["database"]["generation"]
+PY
+  then
+    pass "bounded v2 refreshは全表scanなしで親sealへdelta proofを連結する"
+  else
+    fail "bounded v2 refreshは全表scanなしで親sealへdelta proofを連結する"
+  fi
+}
+
+test_bounded_delta_rejects_foreign_key_fault_before_seal() {
+  echo "test_bounded_delta_rejects_foreign_key_fault_before_seal:"
+  local base="$TEST_ROOT/delta-fk-fault"
+  local state="$base/vault"
+  init_fixture "$base" || {
+    fail "delta FK fault fixtureを構築できる"
+    return
+  }
+  record_event "$state" \
+    "49000000-0000-4000-8000-000000000098" \
+    "2026-08-13T00:03:00Z"
+  run_cli "$state" sync >/dev/null 2>&1 || {
+    fail "delta FK fault fixtureを同期できる"
+    return
+  }
+  if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$state" <<'PY'
+import pathlib
+import sys
+
+import evidence_index
+import relationship_graph
+from vault import VaultError, vault_lock
+
+
+root = pathlib.Path(sys.argv[1])
+seal_path = root / evidence_index.INDEX_SEAL_PATH
+before = seal_path.read_bytes()
+
+def inject_invalid_edge(connection, policy, _new_event_ids):
+    connection.execute(
+        "INSERT INTO relationship_edges VALUES (?,?,?,?,?,?)",
+        (
+            policy["policy_version"],
+            "missing-event-a",
+            "missing-event-b",
+            1,
+            "link",
+            "sha256:" + "0" * 64,
+        ),
+    )
+
+relationship_graph.refresh_relationships_incremental = inject_invalid_edge
+with vault_lock(root):
+    try:
+        evidence_index.rebuild_incremental_bounded(
+            root, max_chunks=2, max_events=5_000
+        )
+    except VaultError:
+        pass
+    else:
+        raise AssertionError("invalid foreign-key delta received a seal")
+assert seal_path.read_bytes() == before
+
+connection = evidence_index._open_existing(
+    root / evidence_index.DATABASE_PATH, authenticated=True
+)
+try:
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute("PRAGMA ignore_check_constraints=ON")
+    try:
+        evidence_index.validate_authenticated_delta(connection)
+    except VaultError as error:
+        assert "ignore_check_constraints" in str(error)
+    else:
+        raise AssertionError("unsafe delta transaction setting was accepted")
+    connection.execute("ROLLBACK")
+finally:
+    connection.close()
+PY
+  then
+    pass "FK不整合deltaとunsafe transaction設定を拒否し新sealを発行しない"
+  else
+    fail "FK不整合deltaとunsafe transaction設定を拒否し新sealを発行しない"
+  fi
+}
+
+test_legacy_v1_parent_pays_one_full_validation() {
+  echo "test_legacy_v1_parent_pays_one_full_validation:"
+  local base="$TEST_ROOT/legacy-v1-lineage"
+  local state="$base/vault"
+  init_fixture "$base" || {
+    fail "legacy v1 lineage fixtureを構築できる"
+    return
+  }
+  record_event "$state" \
+    "49000000-0000-4000-8000-000000000097" \
+    "2026-08-13T00:04:00Z"
+  run_cli "$state" sync >/dev/null 2>&1 || {
+    fail "legacy v1 lineage fixtureを同期できる"
+    return
+  }
+  if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$state" <<'PY'
+import pathlib
+import sys
+
+import evidence_index
+from chunk_rotation import atomic_replace, canonical_json
+from vault import vault_lock
+
+
+root = pathlib.Path(sys.argv[1])
+seal = evidence_index.load_index_seal(root)
+seal.pop("validation")
+seal["contract_version"] = evidence_index.LEGACY_INDEX_SEAL_CONTRACT
+unsigned = {key: value for key, value in seal.items() if key != "integrity"}
+_config, key = evidence_index._authorized_seal_key(root)
+seal["integrity"]["mac"] = evidence_index._seal_mac(unsigned, key)
+atomic_replace(
+    root / evidence_index.INDEX_SEAL_PATH,
+    canonical_json(seal) + b"\n",
+)
+legacy = evidence_index.load_index_seal(root)
+assert legacy["contract_version"] == evidence_index.LEGACY_INDEX_SEAL_CONTRACT
+
+original = evidence_index.validate_database
+calls = []
+
+def tracked(connection):
+    calls.append(True)
+    original(connection)
+
+evidence_index.validate_database = tracked
+with vault_lock(root):
+    evidence_index.rebuild_incremental_bounded(
+        root, max_chunks=2, max_events=5_000
+    )
+assert calls == [True]
+current = evidence_index.load_index_seal(root)
+assert current["contract_version"] == evidence_index.INDEX_SEAL_CONTRACT
+assert current["validation"]["mode"] == "full"
+PY
+  then
+    pass "legacy v1 parentは一度だけfull validationしてv2 full proofへ移行する"
+  else
+    fail "legacy v1 parentは一度だけfull validationしてv2 full proofへ移行する"
+  fi
+}
+
 echo "=== Flight Recorder Authenticated Index Seal Tests ==="
 TESTS=(
   test_trusted_full_and_incremental_rebuild_emit_bound_seal
@@ -961,6 +1177,9 @@ TESTS=(
   test_purge_snapshots_database_and_seal_for_exact_rollback
   test_locked_sealed_query_revalidates_complete_database_identity
   test_seal_issuer_rejects_unvalidated_foreign_key_state
+  test_bounded_refresh_uses_parent_linked_delta_validation
+  test_bounded_delta_rejects_foreign_key_fault_before_seal
+  test_legacy_v1_parent_pays_one_full_validation
 )
 for test_name in "${TESTS[@]}"; do
   if [[ -z "${INDEX_SEAL_TEST_FILTER:-}" \
