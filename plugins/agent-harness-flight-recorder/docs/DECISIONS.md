@@ -560,14 +560,15 @@ Accepted decisions remain recorded when later superseded.
   every edge to find links, and then ran a table-wide `EXISTS` update even
   though only about 128 thousand rows were link candidates. One bounded unit
   consequently took about 52 minutes while memory remained below 200 MiB.
-- Consequence: all four decisions and their evidence remain unchanged and
-  auditable. Existing sealed v5 databases pay one authenticated index-build
-  scan on their first bounded refresh; later component replay reads only the
-  selective candidate set and writes only changed rows. Unknown database
-  objects still fail closed, and removal or substitution of the managed index
-  remains detectable through the index seal. The bounded evidence cache removes
-  repeated random B-tree reads for the current approximately 90,000 canonical
-  evidence rows without making custom-policy memory use unbounded.
+- Consequence: all four decision types and their evidence representation remain
+  auditable; only rows whose component constraint result changes are rewritten
+  by full primary key. Existing sealed v5 databases pay one authenticated
+  index-build scan on their first bounded refresh; later component replay reads
+  only the selective candidate set and writes only changed rows. Unknown
+  database objects still fail closed, and removal or substitution of the
+  managed index remains detectable through the index seal. The bounded evidence
+  cache removes repeated random B-tree reads for the current approximately
+  90,000 canonical evidence rows without making custom-policy memory use unbounded.
   This keeps the ordinary refresh trust boundary unchanged while removing
   multiple full scans of the 21-million-row edge table from every five-minute
   unit. Manual rebuild, recovery, and any other unproved seal issuer continue

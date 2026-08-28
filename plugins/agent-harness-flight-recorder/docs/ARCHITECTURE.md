@@ -201,14 +201,16 @@ Schema v5 separates immutable source projections from recomputable state:
 
 `rebuild-index` constructs a fresh user-only temporary database, validates
 foreign keys and SQLite integrity, fsyncs it, and atomically replaces the
-previous index. `--incremental` accepts only the exact current schema and adds
-unseen chunks in a transaction; known identical chunks are no-ops and
-immutable conflicts fail closed. Incremental rebuild authenticates and
-recomputes every stored policy version in that same transaction. Full rebuild
-restores only the bundled default view; custom views must be reapplied from
-their owner-held policy files. R1 does not migrate evidence rows in place.
-An unsupported schema is recovered through a full rebuild from canonical
-chunks, leaving encrypted evidence and decoded inputs untouched.
+previous index. `--incremental` accepts the exact current schema or the
+authenticated pre-index v5 legacy shape, and adds unseen chunks in a
+transaction; known identical chunks are no-ops and immutable conflicts fail
+closed. The supported legacy v5 shape receives the managed partial index in
+that bounded transaction. Incremental rebuild authenticates and recomputes
+every stored policy version in the same transaction. Full rebuild restores only
+the bundled default view; custom views must be reapplied from their owner-held
+policy files. R1 does not migrate evidence rows in place. A malformed state or
+pre-v5 schema is recovered through a full rebuild from canonical chunks,
+leaving encrypted evidence and decoded inputs untouched.
 
 Automatic refresh is coalesced and bounded. Rotation and synchronization mark
 `index/refresh-state.json` while already holding the Vault lock. The scheduler
@@ -216,8 +218,10 @@ then acquires its run lock, the dedicated refresh lock, and finally the Vault
 lock, and imports at most two chunks or 5,000 events per unit. If more source
 evidence remains, the seal binds only the authenticated imported horizon and
 ordinary reads fail closed until the next five-minute unit reaches the exact
-current source inventory. Missing, malformed, or pre-v5 index state requires
-an explicit full rebuild; it is never silently accepted as current.
+current source inventory. Missing or malformed state, or a pre-v5 schema,
+requires an explicit full rebuild; it is never silently accepted as current.
+The exact authenticated pre-index v5 shape is the sole legacy exception and is
+migrated transactionally by the next bounded write.
 
 Relationship component replay does not scan the complete negative-edge table.
 A managed partial index contains only `link` and `component_conflict` rows in
