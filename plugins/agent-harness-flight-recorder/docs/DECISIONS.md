@@ -548,6 +548,11 @@ Accepted decisions remain recorded when later superseded.
   primary key after the read cursor is exhausted. Load the normalized evidence
   dictionary once up to a fixed 250,000-entry memory ceiling; above that bound,
   retain the slower authenticated per-key lookup rather than growing memory.
+  Bounded refresh authenticates the old sealed generation before opening it,
+  runs foreign-key and SQLite integrity checks on the final transaction state,
+  and passes that exact generation as the proof for seal issuance. Do not repeat
+  the same complete-table checks during authenticated open or seal issuance;
+  seal issuance without a matching writer proof keeps the full checks.
   Accept the authenticated pre-index v5 schema as an additive migration source
   and create the managed index inside the next bounded transaction.
 - Reason: sampling a real 21.6-million-edge refresh showed almost all CPU time
@@ -563,3 +568,7 @@ Accepted decisions remain recorded when later superseded.
   remains detectable through the index seal. The bounded evidence cache removes
   repeated random B-tree reads for the current approximately 90,000 canonical
   evidence rows without making custom-policy memory use unbounded.
+  This keeps the ordinary refresh trust boundary unchanged while removing
+  multiple full scans of the 21-million-row edge table from every five-minute
+  unit. Manual rebuild, recovery, and any other unproved seal issuer continue
+  to pay the complete validation cost and fail closed.

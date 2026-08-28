@@ -1042,6 +1042,39 @@ PY
   fi
 }
 
+test_authenticated_open_defers_full_integrity_scan_to_writer_boundary() {
+  echo "test_authenticated_open_defers_full_integrity_scan_to_writer_boundary:"
+  local err="$TEST_ROOT/open-validation.err"
+  if PYTHONPATH="$PLUGIN_DIR/scripts" python3 - "$TEST_ROOT/open.sqlite" 2>"$err" <<'PY'
+import pathlib
+import sys
+
+import evidence_index
+
+
+path = pathlib.Path(sys.argv[1])
+connection = evidence_index.sqlite3.connect(path, isolation_level=None)
+evidence_index.configure(connection)
+evidence_index.create_schema(connection)
+connection.close()
+
+
+def forbidden(_connection):
+    raise AssertionError("authenticated open repeated a full integrity scan")
+
+
+evidence_index.validate_database = forbidden
+writable = evidence_index._open_existing(path, authenticated=True)
+writable.close()
+PY
+  then
+    pass "認証済みopenは全表integrity scanを重ねずwriter完了境界へ委ねる"
+  else
+    cat "$err" >&2
+    fail "認証済みopenは全表integrity scanを重ねずwriter完了境界へ委ねる"
+  fi
+}
+
 test_repeated_requests_coalesce_and_one_run_is_bounded
 test_refresh_state_machine_is_finite_and_measured
 test_stale_refreshing_state_is_resumed_after_lock_reacquisition
@@ -1053,6 +1086,7 @@ test_observatory_hides_counts_until_authenticated_refresh_is_ready
 test_incremental_relationships_only_score_new_pairs_and_reuse_saved_links
 test_incremental_replays_prior_component_conflicts_in_global_order
 test_incremental_decision_staging_crosses_batch_boundary
+test_authenticated_open_defers_full_integrity_scan_to_writer_boundary
 
 echo
 echo "Index freshness tests: $PASS passed, $FAIL failed"

@@ -230,6 +230,11 @@ fallback for larger custom-policy dictionaries.
 An authenticated schema-v5 database created before this additive index is
 accepted only in its exact legacy shape; the next bounded write creates the
 index transactionally and the new seal binds the resulting schema.
+The old generation is authenticated through its existing seal before bounded
+mutation. The writer validates foreign keys and SQLite integrity after all
+derived changes, records the resulting generation, and only that matching
+in-process generation proof may skip a duplicate full scan while issuing the
+new seal. Seal issuance without this proof performs complete validation.
 Rotation shares the 5,000-event ceiling and splits a larger detached inbox job
 before immutable publication. Legacy larger chunks are admitted through the
 schema-v5 full rebuild, so the current producer cannot create a source unit
