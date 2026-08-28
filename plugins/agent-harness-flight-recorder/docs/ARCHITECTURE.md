@@ -218,6 +218,14 @@ evidence remains, the seal binds only the authenticated imported horizon and
 ordinary reads fail closed until the next five-minute unit reaches the exact
 current source inventory. Missing, malformed, or pre-v5 index state requires
 an explicit full rebuild; it is never silently accepted as current.
+
+Relationship component replay does not scan the complete negative-edge table.
+A managed partial index contains only `link` and `component_conflict` rows in
+policy and global-score order. Incremental refresh consumes that index, closes
+the cursor, and changes only decisions whose component constraint result moved.
+An authenticated schema-v5 database created before this additive index is
+accepted only in its exact legacy shape; the next bounded write creates the
+index transactionally and the new seal binds the resulting schema.
 Rotation shares the 5,000-event ceiling and splits a larger detached inbox job
 before immutable publication. Legacy larger chunks are admitted through the
 schema-v5 full rebuild, so the current producer cannot create a source unit

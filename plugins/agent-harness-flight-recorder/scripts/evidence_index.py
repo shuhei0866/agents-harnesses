@@ -191,6 +191,11 @@ CREATE TABLE relationship_edges (
         REFERENCES relationship_evidence(policy_version, evidence_id)
         ON UPDATE RESTRICT ON DELETE RESTRICT
 ) WITHOUT ROWID;
+CREATE INDEX relationship_edges_link_candidates
+ON relationship_edges (
+    policy_version, score DESC, left_event_id, right_event_id, decision
+)
+WHERE decision IN ('link', 'component_conflict');
 CREATE TABLE episodes (
     policy_version TEXT NOT NULL,
     episode_id TEXT NOT NULL,
@@ -1280,6 +1285,16 @@ def create_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def ensure_incremental_indexes(connection: sqlite3.Connection) -> None:
+    """Install additive v5 indexes needed by bounded incremental refresh."""
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS relationship_edges_link_candidates "
+        "ON relationship_edges ( policy_version, score DESC, left_event_id, "
+        "right_event_id, decision ) WHERE decision IN "
+        "('link', 'component_conflict')"
+    )
+
+
 def insert_chunk(connection: sqlite3.Connection, chunk: Chunk) -> None:
     connection.execute(
         "INSERT INTO source_chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1434,6 +1449,13 @@ def expected_signature() -> dict[str, object]:
         connection.close()
 
 
+def legacy_incremental_signature() -> dict[str, object]:
+    """Return the authenticated v5 shape from before the additive link index."""
+    signature = expected_signature()
+    del signature["sql"][("index", "relationship_edges_link_candidates")]
+    return signature
+
+
 def _check_existing_database(path: Path) -> tuple[int, int, int, int]:
     try:
         metadata = path.lstat()
@@ -1461,7 +1483,8 @@ def _validate_current_database(connection: sqlite3.Connection) -> None:
         raise VaultError(
             "evidence index journal mode is unsupported; run a full rebuild"
         )
-    if _schema_signature(connection) != expected_signature():
+    signature = _schema_signature(connection)
+    if signature not in (expected_signature(), legacy_incremental_signature()):
         raise VaultError(
             "evidence index schema is unsupported; run a full rebuild"
         )
@@ -1691,6 +1714,7 @@ def rebuild_incremental(root: Path, chunks: list[Chunk]) -> tuple[int, int]:
         validate_source_projection(connection, chunks, exact=False)
         load_stored_policies(connection)
         connection.execute("BEGIN IMMEDIATE")
+        ensure_incremental_indexes(connection)
         for chunk in chunks:
             if _existing_chunk(connection, chunk):
                 continue
@@ -1769,6 +1793,7 @@ def rebuild_incremental_bounded(
             row[0] for chunk in selected for row in chunk.event_rows
         }
         connection.execute("BEGIN IMMEDIATE")
+        ensure_incremental_indexes(connection)
         for chunk in selected:
             insert_chunk(connection, chunk)
         expected = [

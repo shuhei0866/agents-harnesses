@@ -679,6 +679,10 @@ connection.executescript(
         FOREIGN KEY(policy_version, evidence_id)
             REFERENCES relationship_evidence(policy_version, evidence_id)
     );
+    CREATE INDEX relationship_edges_link_candidates
+    ON relationship_edges(
+        policy_version, score DESC, left_event_id, right_event_id, decision
+    ) WHERE decision IN ('link', 'component_conflict');
     CREATE TABLE episodes(
         policy_version TEXT NOT NULL,
         episode_id TEXT NOT NULL,
@@ -868,9 +872,12 @@ relationship_graph._candidate_ids = (
 relationship_graph.score_pair = lambda *_args: (100, "link", evidence)
 relationship_graph._replace_episodes = lambda *_args: 1
 
+statements = []
+connection.set_trace_callback(statements.append)
 relationship_graph.refresh_relationships_incremental(
     connection, DEFAULT_POLICY, {"E"}
 )
+connection.set_trace_callback(None)
 decisions = dict(connection.execute(
     "SELECT left_event_id || right_event_id,decision "
     "FROM relationship_edges ORDER BY left_event_id,right_event_id"
@@ -882,9 +889,24 @@ assert decisions == {
     "CD": "link",
 }
 assert connection.execute(
-    "SELECT COUNT(*) FROM sqlite_temp_master "
-    "WHERE name='relationship_conflict_updates'"
-).fetchone()[0] == 0
+    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' "
+    "AND name='relationship_edges_link_candidates' "
+    "AND lower(sql) LIKE '%where decision in%component_conflict%'"
+).fetchone()[0] == 1
+normalized = [" ".join(statement.lower().split()) for statement in statements]
+assert not any("relationship_conflict_updates" in item for item in normalized)
+assert not any(
+    item.startswith("update relationship_edges set decision='link' where policy_version")
+    and "left_event_id=" not in item
+    for item in normalized
+)
+assert not any("where policy_version='default-v1' and exists" in item for item in normalized)
+targeted = [
+    item for item in normalized
+    if item.startswith("update relationship_edges set decision=")
+]
+assert len(targeted) == 2
+assert all("left_event_id=" in item and "right_event_id=" in item for item in targeted)
 PY
   then
     pass "増分でも旧conflictを含む全link候補をglobal順で再判定する"

@@ -575,51 +575,34 @@ def refresh_relationships_incremental(
             edge_batch,
         )
 
-    # Component conflicts are a derived consequence of the global score order,
-    # not a permanent raw pair classification. New high-scoring edges can
-    # change that order, so restore every prior conflict to its raw ``link``
-    # state before replaying all saved links.
-    connection.execute(
-        "UPDATE relationship_edges SET decision='link' "
-        "WHERE policy_version=? AND decision='component_conflict'",
-        (version,),
-    )
-    connection.execute(
-        "CREATE TEMP TABLE IF NOT EXISTS relationship_conflict_updates ("
-        "left_event_id TEXT NOT NULL,right_event_id TEXT NOT NULL,"
-        "PRIMARY KEY(left_event_id,right_event_id)) WITHOUT ROWID"
-    )
-    connection.execute("DELETE FROM relationship_conflict_updates")
+    # Component conflicts are a derived consequence of the global score order.
+    # Replay only the partial-indexed raw link candidates, then update the
+    # small set whose derived decision actually changed by primary key.
     components = Components(events)
     link_rows = connection.execute(
-        "SELECT score,left_event_id,right_event_id FROM relationship_edges "
-        "WHERE policy_version=? AND decision='link' "
+        "SELECT score,left_event_id,right_event_id,decision "
+        "FROM relationship_edges INDEXED BY relationship_edges_link_candidates "
+        "WHERE policy_version=? "
+        "AND decision IN ('link','component_conflict') "
         "ORDER BY score DESC,left_event_id,right_event_id",
         (version,),
     )
-    conflict_batch = []
-    for _score, left_id, right_id in link_rows:
-        if not components.join(left_id, right_id):
-            conflict_batch.append((left_id, right_id))
-        if len(conflict_batch) >= 1_000:
-            connection.executemany(
-                "INSERT INTO relationship_conflict_updates VALUES (?,?)",
-                conflict_batch,
-            )
-            conflict_batch.clear()
-    if conflict_batch:
-        connection.executemany(
-            "INSERT INTO relationship_conflict_updates VALUES (?,?)",
-            conflict_batch,
+    decision_batch = []
+    for _score, left_id, right_id, previous_decision in link_rows:
+        desired = (
+            "link" if components.join(left_id, right_id)
+            else "component_conflict"
         )
-    connection.execute(
-        "UPDATE relationship_edges SET decision='component_conflict' "
-        "WHERE policy_version=? AND EXISTS ("
-        "SELECT 1 FROM relationship_conflict_updates AS update_row "
-        "WHERE update_row.left_event_id=relationship_edges.left_event_id "
-        "AND update_row.right_event_id=relationship_edges.right_event_id)",
-        (version,),
-    )
-    connection.execute("DROP TABLE relationship_conflict_updates")
+        if desired != previous_decision:
+            decision_batch.append(
+                (desired, version, left_id, right_id, previous_decision)
+            )
+    if decision_batch:
+        connection.executemany(
+            "UPDATE relationship_edges SET decision=? "
+            "WHERE policy_version=? AND left_event_id=? "
+            "AND right_event_id=? AND decision=?",
+            decision_batch,
+        )
     episode_count = _replace_episodes(connection, version, events, components)
     return pair_count, episode_count
