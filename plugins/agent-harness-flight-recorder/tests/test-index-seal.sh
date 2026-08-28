@@ -900,6 +900,51 @@ PY
   fi
 }
 
+test_seal_issuer_rejects_unvalidated_foreign_key_state() {
+  echo "test_seal_issuer_rejects_unvalidated_foreign_key_state:"
+  local base="$TEST_ROOT/issuer-validation"
+  local state="$base/vault"
+  init_fixture "$base" || {
+    fail "seal issuer validation fixtureを構築できる"
+    return
+  }
+  if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$state" <<'PY'
+import pathlib
+import sqlite3
+import sys
+
+import evidence_index
+from vault import VaultError, vault_lock
+
+
+root = pathlib.Path(sys.argv[1])
+seal_path = root / evidence_index.INDEX_SEAL_PATH
+before = seal_path.read_bytes()
+connection = sqlite3.connect(root / evidence_index.DATABASE_PATH)
+connection.execute("PRAGMA foreign_keys=OFF")
+connection.execute(
+    "INSERT INTO episode_members VALUES (?,?,?,?)",
+    ("default-v1", "missing-episode", "missing-event", 0),
+)
+connection.commit()
+connection.close()
+with vault_lock(root):
+    try:
+        evidence_index.issue_index_seal(root)
+    except VaultError as error:
+        assert "foreign key" in str(error).lower()
+    else:
+        raise AssertionError("unvalidated foreign-key state received a seal")
+assert seal_path.read_bytes() == before
+PY
+  then
+    pass "seal issuerはwriter proofなしのFK不整合DBを署名しない"
+  else
+    fail "seal issuerはwriter proofなしのFK不整合DBを署名しない"
+  fi
+}
+
 echo "=== Flight Recorder Authenticated Index Seal Tests ==="
 TESTS=(
   test_trusted_full_and_incremental_rebuild_emit_bound_seal
@@ -915,6 +960,7 @@ TESTS=(
   test_typed_episode_api_checks_source_before_and_after_outside_long_lock
   test_purge_snapshots_database_and_seal_for_exact_rollback
   test_locked_sealed_query_revalidates_complete_database_identity
+  test_seal_issuer_rejects_unvalidated_foreign_key_state
 )
 for test_name in "${TESTS[@]}"; do
   if [[ -z "${INDEX_SEAL_TEST_FILTER:-}" \

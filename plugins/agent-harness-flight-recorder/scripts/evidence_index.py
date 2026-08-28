@@ -191,6 +191,11 @@ CREATE TABLE relationship_edges (
         REFERENCES relationship_evidence(policy_version, evidence_id)
         ON UPDATE RESTRICT ON DELETE RESTRICT
 ) WITHOUT ROWID;
+CREATE INDEX relationship_edges_link_candidates
+ON relationship_edges (
+    policy_version, score DESC, left_event_id, right_event_id, decision
+)
+WHERE decision IN ('link', 'component_conflict');
 CREATE TABLE episodes (
     policy_version TEXT NOT NULL,
     episode_id TEXT NOT NULL,
@@ -545,14 +550,25 @@ def _reject_duplicate_json_keys(
 
 
 def issue_index_seal(
-    root: Path, source_horizon_paths: set[str] | None = None
+    root: Path,
+    source_horizon_paths: set[str] | None = None,
+    *,
+    writer_validated_generation: str | None = None,
 ) -> dict[str, Any]:
     """Issue a seal while the caller holds the Vault lock."""
     database_path = root / DATABASE_PATH
     identity_before = _check_existing_database(database_path)
-    connection = _open_readonly(database_path)
+    connection = _open_readonly(
+        database_path,
+        full_validation=writer_validated_generation is None,
+    )
     try:
         generation = read_database_generation(connection)
+        if (
+            writer_validated_generation is not None
+            and generation != writer_validated_generation
+        ):
+            raise VaultError("writer validation generation changed before seal")
         schema_inventory = _schema_inventory(connection)
         relationship_inventory = _relationship_inventory(connection)
         event_count = connection.execute(
@@ -1280,6 +1296,16 @@ def create_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def ensure_incremental_indexes(connection: sqlite3.Connection) -> None:
+    """Install additive v5 indexes needed by bounded incremental refresh."""
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS relationship_edges_link_candidates "
+        "ON relationship_edges ( policy_version, score DESC, left_event_id, "
+        "right_event_id, decision ) WHERE decision IN "
+        "('link', 'component_conflict')"
+    )
+
+
 def insert_chunk(connection: sqlite3.Connection, chunk: Chunk) -> None:
     connection.execute(
         "INSERT INTO source_chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1434,6 +1460,13 @@ def expected_signature() -> dict[str, object]:
         connection.close()
 
 
+def legacy_incremental_signature() -> dict[str, object]:
+    """Return the authenticated v5 shape from before the additive link index."""
+    signature = expected_signature()
+    del signature["sql"][("index", "relationship_edges_link_candidates")]
+    return signature
+
+
 def _check_existing_database(path: Path) -> tuple[int, int, int, int]:
     try:
         metadata = path.lstat()
@@ -1455,13 +1488,16 @@ def _check_existing_database(path: Path) -> tuple[int, int, int, int]:
     )
 
 
-def _validate_current_database(connection: sqlite3.Connection) -> None:
+def _validate_current_database(
+    connection: sqlite3.Connection, *, full_validation: bool
+) -> None:
     mode = connection.execute("PRAGMA journal_mode").fetchone()
     if mode is None or str(mode[0]).lower() != "delete":
         raise VaultError(
             "evidence index journal mode is unsupported; run a full rebuild"
         )
-    if _schema_signature(connection) != expected_signature():
+    signature = _schema_signature(connection)
+    if signature not in (expected_signature(), legacy_incremental_signature()):
         raise VaultError(
             "evidence index schema is unsupported; run a full rebuild"
         )
@@ -1474,10 +1510,13 @@ def _validate_current_database(connection: sqlite3.Connection) -> None:
         raise VaultError(
             "evidence index metadata is unsupported; run a full rebuild"
         )
-    validate_database(connection)
+    if full_validation:
+        validate_database(connection)
 
 
-def _open_readonly(path: Path) -> sqlite3.Connection:
+def _open_readonly(
+    path: Path, *, full_validation: bool = True
+) -> sqlite3.Connection:
     _check_existing_database(path)
     connection: sqlite3.Connection | None = None
     try:
@@ -1489,7 +1528,9 @@ def _open_readonly(path: Path) -> sqlite3.Connection:
         connection.execute("PRAGMA query_only = ON")
         connection.execute("PRAGMA trusted_schema = OFF")
         connection.execute("PRAGMA foreign_keys = ON")
-        _validate_current_database(connection)
+        _validate_current_database(
+            connection, full_validation=full_validation
+        )
         return connection
     except VaultError:
         if connection is not None:
@@ -1503,9 +1544,13 @@ def _open_readonly(path: Path) -> sqlite3.Connection:
         ) from error
 
 
-def _open_existing(path: Path) -> sqlite3.Connection:
+def _open_existing(
+    path: Path, *, authenticated: bool = False
+) -> sqlite3.Connection:
     validated_identity = _check_existing_database(path)
-    readonly = _open_readonly(path)
+    readonly = _open_readonly(
+        path, full_validation=not authenticated
+    )
     readonly.close()
     if _check_existing_database(path) != validated_identity:
         raise VaultError("evidence index changed during validation")
@@ -1517,7 +1562,9 @@ def _open_existing(path: Path) -> sqlite3.Connection:
             isolation_level=None,
         )
         configure(connection)
-        _validate_current_database(connection)
+        _validate_current_database(
+            connection, full_validation=not authenticated
+        )
         return connection
     except VaultError:
         if connection is not None:
@@ -1679,7 +1726,7 @@ def rebuild_full(root: Path, chunks: list[Chunk]) -> tuple[int, int]:
 
 def rebuild_incremental(root: Path, chunks: list[Chunk]) -> tuple[int, int]:
     target = root / DATABASE_PATH
-    connection = _open_existing(target)
+    connection = _open_existing(target, authenticated=True)
     added_chunks = 0
     added_events = 0
     try:
@@ -1691,6 +1738,7 @@ def rebuild_incremental(root: Path, chunks: list[Chunk]) -> tuple[int, int]:
         validate_source_projection(connection, chunks, exact=False)
         load_stored_policies(connection)
         connection.execute("BEGIN IMMEDIATE")
+        ensure_incremental_indexes(connection)
         for chunk in chunks:
             if _existing_chunk(connection, chunk):
                 continue
@@ -1740,7 +1788,7 @@ def rebuild_incremental_bounded(
         raise VaultError("incremental refresh bounds are invalid")
     chunks = load_chunks(root)
     target = root / DATABASE_PATH
-    connection = _open_existing(target)
+    connection = _open_existing(target, authenticated=True)
     try:
         from index_storage import cache_index_storage_metrics
         from relationship_graph import (
@@ -1769,6 +1817,7 @@ def rebuild_incremental_bounded(
             row[0] for chunk in selected for row in chunk.event_rows
         }
         connection.execute("BEGIN IMMEDIATE")
+        ensure_incremental_indexes(connection)
         for chunk in selected:
             insert_chunk(connection, chunk)
         expected = [
@@ -1783,7 +1832,7 @@ def rebuild_incremental_bounded(
         for policy in policies:
             refresh_relationships_incremental(connection, policy, new_event_ids)
         cache_index_storage_metrics(connection)
-        _write_database_generation(connection)
+        generation = _write_database_generation(connection)
         validate_database(connection)
         connection.execute("COMMIT")
     except (sqlite3.Error, VaultError) as error:
@@ -1801,7 +1850,11 @@ def rebuild_incremental_bounded(
     finally:
         os.close(descriptor)
     horizon_paths = {chunk.provenance_row[1] for chunk in expected}
-    issue_index_seal(root, horizon_paths)
+    issue_index_seal(
+        root,
+        horizon_paths,
+        writer_validated_generation=generation,
+    )
     return len(selected) < len(pending)
 
 
@@ -1846,7 +1899,9 @@ def rebuild_relationship_views(root: Path, policy_path: Path | None) -> None:
             root, source_may_advance=False
         )
         chunks = load_chunks(root)
-        connection = _open_existing(root / DATABASE_PATH)
+        connection = _open_existing(
+            root / DATABASE_PATH, authenticated=True
+        )
         try:
             validate_source_projection(connection, chunks, exact=True)
             connection.execute("BEGIN IMMEDIATE")
@@ -1855,7 +1910,7 @@ def rebuild_relationship_views(root: Path, policy_path: Path | None) -> None:
             from index_storage import cache_index_storage_metrics
 
             cache_index_storage_metrics(connection)
-            _write_database_generation(connection)
+            generation = _write_database_generation(connection)
             validate_database(connection)
             connection.execute("COMMIT")
         except (sqlite3.Error, VaultError) as error:
@@ -1872,7 +1927,9 @@ def rebuild_relationship_views(root: Path, policy_path: Path | None) -> None:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
-        issue_index_seal(root)
+        issue_index_seal(
+            root, writer_validated_generation=generation
+        )
         print(
             "rebuild-relationships: "
             f"policy={policy['policy_version']} edges={edges} episodes={episodes}"

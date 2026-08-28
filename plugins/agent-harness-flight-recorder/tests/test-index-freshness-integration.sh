@@ -110,7 +110,17 @@ import evidence_index
 import index_storage
 
 index_storage.cache_index_storage_metrics = lambda _connection: None
-evidence_index.rebuild_index(pathlib.Path(sys.argv[1]), incremental=False)
+root = pathlib.Path(sys.argv[1])
+evidence_index.rebuild_index(root, incremental=False)
+
+# Simulate an authenticated v5 database created before the additive partial
+# index existed. The next bounded refresh must migrate it in place.
+connection = evidence_index._open_existing(root / evidence_index.DATABASE_PATH)
+try:
+    connection.execute("DROP INDEX relationship_edges_link_candidates")
+finally:
+    connection.close()
+evidence_index.issue_index_seal(root)
 PY
     cat "$base/rebuild.err" >&2
     fail "empty authenticated baseline indexを構築できる"
@@ -181,11 +191,17 @@ def tracked_provider(actual_root):
 
 
 evidence_index.load_chunks = tracked_provider
-index_freshness.rebuild_incremental_bounded = (
-    lambda actual_root, *, max_chunks, max_events: real_rebuild(
-        actual_root, max_chunks=max_chunks, max_events=max_events
-    )
-)
+def observed_rebuild(actual_root, *, max_chunks, max_events):
+    try:
+        return real_rebuild(
+            actual_root, max_chunks=max_chunks, max_events=max_events
+        )
+    except Exception as error:
+        print(f"bounded rebuild detail: {error!r}", file=sys.stderr)
+        raise
+
+
+index_freshness.rebuild_incremental_bounded = observed_rebuild
 
 
 def database_projection():
@@ -208,10 +224,30 @@ def database_projection():
 
 
 assert database_projection() == (0, 0, set())
+legacy = sqlite3.connect(
+    f"file:{root / evidence_index.DATABASE_PATH}?mode=ro", uri=True
+)
+try:
+    assert legacy.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='index' "
+        "AND name='relationship_edges_link_candidates'"
+    ).fetchone()[0] == 0
+finally:
+    legacy.close()
 first = index_freshness.run_pending_refresh(root)
 assert first["state"] == "refresh_required", first
 assert first["diagnostic_code"] == "source_inventory_drift"
 assert database_projection()[0:2] == (2, 2)
+indexed = sqlite3.connect(
+    f"file:{root / evidence_index.DATABASE_PATH}?mode=ro", uri=True
+)
+try:
+    assert indexed.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='index' "
+        "AND name='relationship_edges_link_candidates'"
+    ).fetchone()[0] == 1
+finally:
+    indexed.close()
 first_seal = evidence_index.load_index_seal(root)
 assert first_seal["source_inventory"]["chunk_count"] == 2
 assert first_seal["source_inventory"]["event_count"] == 2

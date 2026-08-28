@@ -537,3 +537,39 @@ Accepted decisions remain recorded when later superseded.
   pre-v5 state is `full_rebuild_required`; there is no implicit legacy
   fallback. A successful manual full or incremental rebuild alone may return
   the state to `ready`, while failed rebuilds preserve the prior diagnostic.
+
+## D-20260828-33: Replay component decisions through a selective index
+
+- Status: accepted
+- Decision: maintain a partial index over only `link` and
+  `component_conflict` relationship rows. Incremental refresh replays those
+  candidates in global score order, records only decisions that changed, and
+  stages changed keys in a temporary table, then updates those rows by full
+  primary key after the read cursor is exhausted. Load the normalized evidence
+  dictionary once up to a fixed 250,000-entry memory ceiling; above that bound,
+  retain the slower authenticated per-key lookup rather than growing memory.
+  Bounded refresh authenticates the old sealed generation before opening it,
+  runs foreign-key and SQLite integrity checks on the final transaction state,
+  and passes that exact generation as the proof for seal issuance. Do not repeat
+  the same complete-table checks during authenticated open or seal issuance;
+  seal issuance without a matching writer proof keeps the full checks.
+  Accept the authenticated pre-index v5 schema as an additive migration source
+  and create the managed index inside the next bounded transaction.
+- Reason: sampling a real 21.6-million-edge refresh showed almost all CPU time
+  in SQLite B-tree seeks. The prior implementation reset conflicts, scanned
+  every edge to find links, and then ran a table-wide `EXISTS` update even
+  though only about 128 thousand rows were link candidates. One bounded unit
+  consequently took about 52 minutes while memory remained below 200 MiB.
+- Consequence: all four decision types and their evidence representation remain
+  auditable; only rows whose component constraint result changes are rewritten
+  by full primary key. Existing sealed v5 databases pay one authenticated
+  index-build scan on their first bounded refresh; later component replay reads
+  only the selective candidate set and writes only changed rows. Unknown
+  database objects still fail closed, and removal or substitution of the
+  managed index remains detectable through the index seal. The bounded evidence
+  cache removes repeated random B-tree reads for the current approximately
+  90,000 canonical evidence rows without making custom-policy memory use unbounded.
+  This keeps the ordinary refresh trust boundary unchanged while removing
+  multiple full scans of the 21-million-row edge table from every five-minute
+  unit. Manual rebuild, recovery, and any other unproved seal issuer continue
+  to pay the complete validation cost and fail closed.

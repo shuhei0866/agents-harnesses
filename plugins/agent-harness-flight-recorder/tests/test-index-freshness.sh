@@ -679,6 +679,10 @@ connection.executescript(
         FOREIGN KEY(policy_version, evidence_id)
             REFERENCES relationship_evidence(policy_version, evidence_id)
     );
+    CREATE INDEX relationship_edges_link_candidates
+    ON relationship_edges(
+        policy_version, score DESC, left_event_id, right_event_id, decision
+    ) WHERE decision IN ('link', 'component_conflict');
     CREATE TABLE episodes(
         policy_version TEXT NOT NULL,
         episode_id TEXT NOT NULL,
@@ -771,10 +775,27 @@ relationship_graph.rebuild_relationships = forbidden_full_rebuild
 session_atlas.clear_session_atlas = lambda *_args, **_kwargs: None
 session_atlas.materialize_session_atlas = lambda *_args, **_kwargs: None
 
+statements = []
+connection.set_trace_callback(statements.append)
 incremental(connection, policy, {"new-d"})
+connection.set_trace_callback(None)
 
 assert scored
 assert all("new-d" in pair for pair in scored)
+normalized = [" ".join(statement.lower().split()) for statement in statements]
+evidence_reads = [
+    statement for statement in normalized
+    if statement.startswith(
+        "select evidence_id,evidence_json from relationship_evidence "
+        "where policy_version="
+    )
+]
+assert len(evidence_reads) == 1
+assert not any(
+    "from relationship_evidence where policy_version=" in statement
+    and "and evidence_id=" in statement
+    for statement in normalized
+)
 assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
 assert {
     row[1] for row in connection.execute("PRAGMA table_info(relationship_edges)")
@@ -860,17 +881,27 @@ events = [
     Event("C", "2026-08-26T00:00:02Z", None, "task-2", None, (), "missing"),
     Event("D", "2026-08-26T00:00:03Z", None, None, None, (), "missing"),
     Event("E", "2026-08-26T00:00:04Z", None, "task-2", None, (), "missing"),
+    Event("F", "2026-08-26T00:00:05Z", None, "task-2", None, (), "missing"),
 ]
 relationship_graph._events = lambda _connection: events
 relationship_graph._candidate_ids = (
-    lambda _events, _policy, _new_event_ids=None: iter([("B", "E")])
+    lambda _events, _policy, _new_event_ids=None: iter([
+        ("B", "E"), ("B", "F")
+    ])
 )
-relationship_graph.score_pair = lambda *_args: (100, "link", evidence)
+new_evidence = '{"new":true}'
+relationship_graph.score_pair = lambda *_args: (100, "link", new_evidence)
 relationship_graph._replace_episodes = lambda *_args: 1
+# Fill the cache with the existing row, then return the same new evidence from
+# two candidates. The first insert must switch later misses to point lookup.
+relationship_graph.MAX_INCREMENTAL_EVIDENCE_CACHE = 1
 
+statements = []
+connection.set_trace_callback(statements.append)
 relationship_graph.refresh_relationships_incremental(
-    connection, DEFAULT_POLICY, {"E"}
+    connection, DEFAULT_POLICY, {"E", "F"}
 )
+connection.set_trace_callback(None)
 decisions = dict(connection.execute(
     "SELECT left_event_id || right_event_id,decision "
     "FROM relationship_edges ORDER BY left_event_id,right_event_id"
@@ -879,18 +910,168 @@ assert decisions == {
     "AB": "component_conflict",
     "BD": "link",
     "BE": "link",
+    "BF": "link",
     "CD": "link",
 }
+
+assert connection.execute(
+    "SELECT COUNT(*) FROM relationship_evidence WHERE policy_version=?",
+    ("default-v1",),
+).fetchone()[0] == 2
+assert connection.execute(
+    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' "
+    "AND name='relationship_edges_link_candidates' "
+    "AND lower(sql) LIKE '%where decision in%component_conflict%'"
+).fetchone()[0] == 1
+normalized = [" ".join(statement.lower().split()) for statement in statements]
+assert not any("relationship_conflict_updates" in item for item in normalized)
 assert connection.execute(
     "SELECT COUNT(*) FROM sqlite_temp_master "
-    "WHERE name='relationship_conflict_updates'"
+    "WHERE name='relationship_decision_updates'"
 ).fetchone()[0] == 0
+assert not any(
+    item.startswith("update relationship_edges set decision='link' where policy_version")
+    and "left_event_id=" not in item
+    for item in normalized
+)
+assert not any("where policy_version='default-v1' and exists" in item for item in normalized)
+targeted = [
+    item for item in normalized
+    if item.startswith("update relationship_edges set decision=")
+]
+assert len(targeted) == 2
+assert all("left_event_id=" in item and "right_event_id=" in item for item in targeted)
 PY
   then
     pass "増分でも旧conflictを含む全link候補をglobal順で再判定する"
   else
     cat "$err" >&2
     fail "増分でも旧conflictを含む全link候補をglobal順で再判定する"
+  fi
+}
+
+test_incremental_decision_staging_crosses_batch_boundary() {
+  echo "test_incremental_decision_staging_crosses_batch_boundary:"
+  local err="$TEST_ROOT/decision-staging.err"
+  if PYTHONPATH="$PLUGIN_DIR/scripts" python3 - "$TEST_ROOT/staging.sqlite" 2>"$err" <<'PY'
+import hashlib
+import sqlite3
+import sys
+
+import relationship_graph
+from evidence_index import configure, create_schema
+from relationship_graph import DEFAULT_POLICY, Event
+
+
+connection = sqlite3.connect(sys.argv[1])
+configure(connection)
+create_schema(connection)
+connection.commit()
+connection.execute("PRAGMA foreign_keys=OFF")
+encoded_policy = relationship_graph.canonical_json(DEFAULT_POLICY).decode("utf-8")
+connection.execute(
+    "INSERT INTO relationship_policies VALUES (?,?,?,?)",
+    (
+        "default-v1", 1,
+        hashlib.sha256(encoded_policy.encode("utf-8")).hexdigest(),
+        encoded_policy,
+    ),
+)
+evidence = "{}"
+evidence_id = relationship_graph._evidence_id(evidence)
+connection.execute(
+    "INSERT INTO relationship_evidence VALUES (?,?,?)",
+    ("default-v1", evidence_id, evidence),
+)
+edges = [
+    (
+        "default-v1", f"L{index:04d}", f"R{index:04d}",
+        10_000 - index, "link", evidence_id,
+    )
+    for index in range(1_001)
+]
+connection.executemany(
+    "INSERT INTO relationship_edges VALUES (?,?,?,?,?,?)", edges
+)
+events = [
+    Event(event_id, "2026-08-26T00:00:00Z", None, None, None, (), "missing")
+    for edge in edges for event_id in edge[1:3]
+]
+
+
+class RejectingComponents:
+    def __init__(self, _events):
+        pass
+
+    def join(self, _left, _right):
+        return False
+
+
+relationship_graph._events = lambda _connection: events
+relationship_graph._candidate_ids = lambda *_args, **_kwargs: iter(())
+relationship_graph.Components = RejectingComponents
+relationship_graph._replace_episodes = lambda *_args: 1
+statements = []
+connection.set_trace_callback(statements.append)
+relationship_graph.refresh_relationships_incremental(
+    connection, DEFAULT_POLICY, {"L0000"}
+)
+connection.set_trace_callback(None)
+assert connection.execute(
+    "SELECT COUNT(*) FROM relationship_edges "
+    "WHERE decision='component_conflict'"
+).fetchone()[0] == 1_001
+assert connection.execute(
+    "SELECT COUNT(*) FROM sqlite_temp_master "
+    "WHERE name='relationship_decision_updates'"
+).fetchone()[0] == 0
+targeted = [
+    " ".join(statement.lower().split())
+    for statement in statements
+    if statement.lower().startswith("update relationship_edges set decision=")
+]
+assert len(targeted) == 1_001
+assert all("left_event_id=" in item and "right_event_id=" in item for item in targeted)
+connection.close()
+PY
+  then
+    pass "1,001 decision差分を有限batchでstage・PK更新してtempを回収する"
+  else
+    cat "$err" >&2
+    fail "1,001 decision差分を有限batchでstage・PK更新してtempを回収する"
+  fi
+}
+
+test_authenticated_open_defers_full_integrity_scan_to_writer_boundary() {
+  echo "test_authenticated_open_defers_full_integrity_scan_to_writer_boundary:"
+  local err="$TEST_ROOT/open-validation.err"
+  if PYTHONPATH="$PLUGIN_DIR/scripts" python3 - "$TEST_ROOT/open.sqlite" 2>"$err" <<'PY'
+import pathlib
+import sys
+
+import evidence_index
+
+
+path = pathlib.Path(sys.argv[1])
+connection = evidence_index.sqlite3.connect(path, isolation_level=None)
+evidence_index.configure(connection)
+evidence_index.create_schema(connection)
+connection.close()
+
+
+def forbidden(_connection):
+    raise AssertionError("authenticated open repeated a full integrity scan")
+
+
+evidence_index.validate_database = forbidden
+writable = evidence_index._open_existing(path, authenticated=True)
+writable.close()
+PY
+  then
+    pass "認証済みopenは全表integrity scanを重ねずwriter完了境界へ委ねる"
+  else
+    cat "$err" >&2
+    fail "認証済みopenは全表integrity scanを重ねずwriter完了境界へ委ねる"
   fi
 }
 
@@ -904,6 +1085,8 @@ test_missing_or_tampered_seal_requires_explicit_full_rebuild
 test_observatory_hides_counts_until_authenticated_refresh_is_ready
 test_incremental_relationships_only_score_new_pairs_and_reuse_saved_links
 test_incremental_replays_prior_component_conflicts_in_global_order
+test_incremental_decision_staging_crosses_batch_boundary
+test_authenticated_open_defers_full_integrity_scan_to_writer_boundary
 
 echo
 echo "Index freshness tests: $PASS passed, $FAIL failed"

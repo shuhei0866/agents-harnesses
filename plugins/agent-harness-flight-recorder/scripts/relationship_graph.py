@@ -37,6 +37,8 @@ DEFAULT_POLICY: dict[str, Any] = {
     "hard_veto": {"contradictory_task_ids": True},
 }
 
+MAX_INCREMENTAL_EVIDENCE_CACHE = 250_000
+
 
 @dataclass(frozen=True)
 class Event:
@@ -533,7 +535,18 @@ def refresh_relationships_incremental(
     ).fetchone()
     if "evidence_id" not in edge_columns or evidence_table is None:
         raise VaultError("relationship schema requires a full index rebuild")
-    evidence_cache: dict[str, str] = {}
+    # The normalized evidence dictionary is small relative to the edge table.
+    # Load it once in primary-key order so candidate scoring does not perform a
+    # random B-tree lookup for every pair.
+    evidence_rows = list(connection.execute(
+        "SELECT evidence_id,evidence_json FROM relationship_evidence "
+        "WHERE policy_version=? ORDER BY evidence_id LIMIT ?",
+        (version, MAX_INCREMENTAL_EVIDENCE_CACHE + 1),
+    ))
+    evidence_cache_complete = (
+        len(evidence_rows) <= MAX_INCREMENTAL_EVIDENCE_CACHE
+    )
+    evidence_cache = dict(evidence_rows) if evidence_cache_complete else {}
     edge_batch = []
     pair_count = 0
     for left_id, right_id in _candidate_ids(events, policy, new_event_ids):
@@ -545,19 +558,26 @@ def refresh_relationships_incremental(
         if prior is not None and prior != evidence:
             raise VaultError("relationship evidence digest collision")
         if prior is None:
-            row = connection.execute(
-                "SELECT evidence_json FROM relationship_evidence "
-                "WHERE policy_version=? AND evidence_id=?",
-                (version, evidence_id),
-            ).fetchone()
-            if row is not None and row[0] != evidence:
-                raise VaultError("relationship evidence digest collision")
+            row = None
+            if not evidence_cache_complete:
+                row = connection.execute(
+                    "SELECT evidence_json FROM relationship_evidence "
+                    "WHERE policy_version=? AND evidence_id=?",
+                    (version, evidence_id),
+                ).fetchone()
+                if row is not None and row[0] != evidence:
+                    raise VaultError("relationship evidence digest collision")
             if row is None:
                 connection.execute(
                     "INSERT INTO relationship_evidence VALUES (?, ?, ?)",
                     (version, evidence_id, evidence),
                 )
-            evidence_cache[evidence_id] = evidence
+            if len(evidence_cache) < MAX_INCREMENTAL_EVIDENCE_CACHE:
+                evidence_cache[evidence_id] = evidence
+            else:
+                # New rows beyond the preload ceiling are not represented in
+                # memory, so every later miss must authenticate against SQLite.
+                evidence_cache_complete = False
         edge_batch.append(
             (version, left_id, right_id, score, decision, evidence_id)
         )
@@ -575,51 +595,70 @@ def refresh_relationships_incremental(
             edge_batch,
         )
 
-    # Component conflicts are a derived consequence of the global score order,
-    # not a permanent raw pair classification. New high-scoring edges can
-    # change that order, so restore every prior conflict to its raw ``link``
-    # state before replaying all saved links.
+    # Component conflicts are a derived consequence of the global score order.
+    # Replay only the partial-indexed raw link candidates, then update the
+    # small set whose derived decision actually changed by primary key.
+    components = Components(events)
     connection.execute(
-        "UPDATE relationship_edges SET decision='link' "
-        "WHERE policy_version=? AND decision='component_conflict'",
-        (version,),
-    )
-    connection.execute(
-        "CREATE TEMP TABLE IF NOT EXISTS relationship_conflict_updates ("
-        "left_event_id TEXT NOT NULL,right_event_id TEXT NOT NULL,"
+        "CREATE TEMP TABLE IF NOT EXISTS relationship_decision_updates ("
+        "desired_decision TEXT NOT NULL,left_event_id TEXT NOT NULL,"
+        "right_event_id TEXT NOT NULL,previous_decision TEXT NOT NULL,"
         "PRIMARY KEY(left_event_id,right_event_id)) WITHOUT ROWID"
     )
-    connection.execute("DELETE FROM relationship_conflict_updates")
-    components = Components(events)
+    connection.execute("DELETE FROM relationship_decision_updates")
     link_rows = connection.execute(
-        "SELECT score,left_event_id,right_event_id FROM relationship_edges "
-        "WHERE policy_version=? AND decision='link' "
+        "SELECT score,left_event_id,right_event_id,decision "
+        "FROM relationship_edges INDEXED BY relationship_edges_link_candidates "
+        "WHERE policy_version=? "
+        "AND decision IN ('link','component_conflict') "
         "ORDER BY score DESC,left_event_id,right_event_id",
         (version,),
     )
-    conflict_batch = []
-    for _score, left_id, right_id in link_rows:
-        if not components.join(left_id, right_id):
-            conflict_batch.append((left_id, right_id))
-        if len(conflict_batch) >= 1_000:
-            connection.executemany(
-                "INSERT INTO relationship_conflict_updates VALUES (?,?)",
-                conflict_batch,
-            )
-            conflict_batch.clear()
-    if conflict_batch:
-        connection.executemany(
-            "INSERT INTO relationship_conflict_updates VALUES (?,?)",
-            conflict_batch,
+    decision_batch = []
+    for _score, left_id, right_id, previous_decision in link_rows:
+        desired = (
+            "link" if components.join(left_id, right_id)
+            else "component_conflict"
         )
-    connection.execute(
-        "UPDATE relationship_edges SET decision='component_conflict' "
-        "WHERE policy_version=? AND EXISTS ("
-        "SELECT 1 FROM relationship_conflict_updates AS update_row "
-        "WHERE update_row.left_event_id=relationship_edges.left_event_id "
-        "AND update_row.right_event_id=relationship_edges.right_event_id)",
-        (version,),
-    )
-    connection.execute("DROP TABLE relationship_conflict_updates")
+        if desired != previous_decision:
+            decision_batch.append(
+                (desired, left_id, right_id, previous_decision)
+            )
+        if len(decision_batch) >= 1_000:
+            connection.executemany(
+                "INSERT INTO relationship_decision_updates VALUES (?,?,?,?)",
+                decision_batch,
+            )
+            decision_batch.clear()
+    if decision_batch:
+        connection.executemany(
+            "INSERT INTO relationship_decision_updates VALUES (?,?,?,?)",
+            decision_batch,
+        )
+    decision_batch = []
+    for desired, left_id, right_id, previous in connection.execute(
+        "SELECT desired_decision,left_event_id,right_event_id,"
+        "previous_decision FROM relationship_decision_updates "
+        "ORDER BY left_event_id,right_event_id"
+    ):
+        decision_batch.append(
+            (desired, version, left_id, right_id, previous)
+        )
+        if len(decision_batch) >= 1_000:
+            connection.executemany(
+                "UPDATE relationship_edges SET decision=? "
+                "WHERE policy_version=? AND left_event_id=? "
+                "AND right_event_id=? AND decision=?",
+                decision_batch,
+            )
+            decision_batch.clear()
+    if decision_batch:
+        connection.executemany(
+            "UPDATE relationship_edges SET decision=? "
+            "WHERE policy_version=? AND left_event_id=? "
+            "AND right_event_id=? AND decision=?",
+            decision_batch,
+        )
+    connection.execute("DROP TABLE relationship_decision_updates")
     episode_count = _replace_episodes(connection, version, events, components)
     return pair_count, episode_count
