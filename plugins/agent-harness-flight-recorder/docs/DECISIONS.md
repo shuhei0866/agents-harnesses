@@ -573,3 +573,32 @@ Accepted decisions remain recorded when later superseded.
   multiple full scans of the 21-million-row edge table from every five-minute
   unit. Manual rebuild, recovery, and any other unproved seal issuer continue
   to pay the complete validation cost and fail closed.
+
+## D-20260829-34: Chain bounded validation from an authenticated parent seal
+
+- Status: accepted
+- Decision: issue seal contract v3 with an HMAC-protected writer-validation
+  lineage. A fully validated rebuild starts the lineage. A bounded successor
+  may replace vault-wide `foreign_key_check` and `integrity_check` with a linear
+  SQLite `quick_check` only after authenticating a v3 parent and verifying,
+  inside the write transaction, the
+  exact schema and metadata plus `foreign_keys=ON`, immediate constraints,
+  `trusted_schema=OFF`, `synchronous=FULL`, and DELETE journaling. The successor
+  binds the exact parent seal digest, database digest, generation, and physical
+  check mode. A v1/v2 parent performs one final full validation and emits a v3
+  `full` seal. Manual rebuilds, policy-wide rewrites, recovery, and proofless
+  seal issuance retain complete validation.
+- Reason: after selective replay, a warm 233-event unit took 2m52s, but two
+  ordinary cold units still took 13m49s and 15m31s. Sampling showed SQLite
+  rereading the 4.8-GB, 21.6-million-edge database during the final global
+  checks. The authenticated parent was already the output of a trusted writer,
+  and SQLite immediate constraints plus atomic FULL-synchronous commit preserve
+  relational validity for the managed delta. `quick_check` retains a complete
+  physical page-format pass, while rescanning unchanged parent foreign keys and
+  index/table contents did not add a distinct per-delta guarantee.
+- Consequence: ordinary bounded refresh cost follows the changed evidence plus
+  the required linear page check and streaming database digest instead of two
+  global relational cross-checks. The seal exposes whether the generation was fully or incrementally
+  validated and its exact parent. Fault-injected foreign-key writes roll back
+  before seal issuance, unsafe transaction settings fail closed, and legacy or
+  unproved writers cannot enter the delta lineage without a full scan.

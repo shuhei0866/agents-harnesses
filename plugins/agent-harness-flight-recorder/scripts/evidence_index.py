@@ -47,7 +47,9 @@ from vault import (
 
 DATABASE_PATH = Path("index/vault.sqlite")
 INDEX_SEAL_PATH = Path("index/index-seal.json")
-INDEX_SEAL_CONTRACT = "authenticated-evidence-index-seal-v1"
+LEGACY_INDEX_SEAL_CONTRACT = "authenticated-evidence-index-seal-v1"
+LEGACY_DELTA_INDEX_SEAL_CONTRACT = "authenticated-evidence-index-seal-v2"
+INDEX_SEAL_CONTRACT = "authenticated-evidence-index-seal-v3"
 MAX_INDEX_SEAL_BYTES = 64 * 1024
 FILE_DIGEST_CHUNK_BYTES = 1024 * 1024
 GENERATION_NAMESPACE = "authenticated_index_seal"
@@ -554,6 +556,8 @@ def issue_index_seal(
     source_horizon_paths: set[str] | None = None,
     *,
     writer_validated_generation: str | None = None,
+    writer_validation_mode: str = "full",
+    parent_seal: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Issue a seal while the caller holds the Vault lock."""
     database_path = root / DATABASE_PATH
@@ -583,6 +587,37 @@ def issue_index_seal(
     if _check_existing_database(database_path) != identity_before:
         raise VaultError("evidence index changed while sealing")
     metadata = database_path.stat()
+    if writer_validation_mode not in {"full", "authenticated_delta"}:
+        raise VaultError("writer validation mode is invalid")
+    if writer_validation_mode == "authenticated_delta":
+        if (
+            writer_validated_generation is None
+            or parent_seal is None
+            or parent_seal.get("contract_version") != INDEX_SEAL_CONTRACT
+        ):
+            raise VaultError("authenticated delta validation lineage is invalid")
+        parent_database = parent_seal.get("database")
+        if not isinstance(parent_database, dict):
+            raise VaultError("authenticated delta parent database is invalid")
+        if load_index_seal(root) != parent_seal:
+            raise VaultError("authenticated delta parent seal changed")
+        validation = {
+            "mode": "authenticated_delta",
+            "database_check": "quick_check",
+            "parent_seal_sha256": _sha256(canonical_json(parent_seal)),
+            "parent_database_sha256": parent_database.get("sha256"),
+            "parent_generation": parent_database.get("generation"),
+        }
+    else:
+        if parent_seal is not None:
+            raise VaultError("full validation must not declare a parent seal")
+        validation = {
+            "mode": "full",
+            "database_check": "integrity_check",
+            "parent_seal_sha256": None,
+            "parent_database_sha256": None,
+            "parent_generation": None,
+        }
     unsigned = {
         "schema_version": 1,
         "contract_version": INDEX_SEAL_CONTRACT,
@@ -601,6 +636,7 @@ def issue_index_seal(
         "source_inventory": source_inventory,
         "forget_inventory": _forget_inventory(root),
         "relationship_projection": relationship_inventory,
+        "validation": validation,
     }
     seal = {
         **unsigned,
@@ -668,7 +704,10 @@ def _is_sha256(value: object) -> bool:
 
 
 def _valid_index_seal_shape(value: dict[str, Any]) -> bool:
-    if set(value) != {
+    contract = value.get("contract_version")
+    if not isinstance(contract, str):
+        return False
+    expected_keys = {
         "schema_version",
         "contract_version",
         "issued_at",
@@ -678,11 +717,15 @@ def _valid_index_seal_shape(value: dict[str, Any]) -> bool:
         "forget_inventory",
         "relationship_projection",
         "integrity",
-    }:
+    }
+    if contract in {INDEX_SEAL_CONTRACT, LEGACY_DELTA_INDEX_SEAL_CONTRACT}:
+        expected_keys.add("validation")
+    elif contract != LEGACY_INDEX_SEAL_CONTRACT:
+        return False
+    if set(value) != expected_keys:
         return False
     if (
         value.get("schema_version") != 1
-        or value.get("contract_version") != INDEX_SEAL_CONTRACT
         or not isinstance(value.get("issued_at"), str)
     ):
         return False
@@ -784,6 +827,46 @@ def _valid_index_seal_shape(value: dict[str, Any]) -> bool:
         and _is_sha256(relationship.get("policy_inventory_sha256"))
     ):
         return False
+
+    if contract in {INDEX_SEAL_CONTRACT, LEGACY_DELTA_INDEX_SEAL_CONTRACT}:
+        validation = value.get("validation")
+        expected_validation_keys = {
+            "mode",
+            "parent_seal_sha256",
+            "parent_database_sha256",
+            "parent_generation",
+        }
+        if contract == INDEX_SEAL_CONTRACT:
+            expected_validation_keys.add("database_check")
+        if (
+            not isinstance(validation, dict)
+            or set(validation) != expected_validation_keys
+        ):
+            return False
+        mode = validation.get("mode")
+        parent_values = (
+            validation.get("parent_seal_sha256"),
+            validation.get("parent_database_sha256"),
+            validation.get("parent_generation"),
+        )
+        if mode == "full":
+            if parent_values != (None, None, None):
+                return False
+            if (
+                contract == INDEX_SEAL_CONTRACT
+                and validation.get("database_check") != "integrity_check"
+            ):
+                return False
+        elif mode == "authenticated_delta":
+            if not all(_is_sha256(item) for item in parent_values):
+                return False
+            if (
+                contract == INDEX_SEAL_CONTRACT
+                and validation.get("database_check") != "quick_check"
+            ):
+                return False
+        else:
+            return False
 
     integrity = value.get("integrity")
     return (
@@ -1028,7 +1111,7 @@ def read_sealed_query_locked(
 
 def _authenticate_existing_index_for_write(
     root: Path, *, source_may_advance: bool
-) -> None:
+) -> dict[str, Any]:
     """Authenticate the current DB/seal pair before any in-place mutation."""
     seal = load_index_seal(root)
     _sealed_database_identity(root, seal)
@@ -1038,6 +1121,7 @@ def _authenticate_existing_index_for_write(
         _validate_sealed_forget_inventory(root, seal)
     else:
         _validate_sealed_source_inventory(root, seal)
+    return seal
 
 
 def _json_text(value: object) -> str | None:
@@ -1429,6 +1513,40 @@ def validate_database(connection: sqlite3.Connection) -> None:
         raise VaultError("SQLite integrity validation failed")
 
 
+def validate_authenticated_delta(connection: sqlite3.Connection) -> None:
+    """Validate the bounded writer contract without rescanning sealed parent rows."""
+    if not connection.in_transaction:
+        raise VaultError("authenticated delta validation requires a transaction")
+    expected_pragmas = {
+        "foreign_keys": 1,
+        "defer_foreign_keys": 0,
+        "ignore_check_constraints": 0,
+        "trusted_schema": 0,
+        "synchronous": 2,
+    }
+    for pragma, expected in expected_pragmas.items():
+        row = connection.execute(f"PRAGMA {pragma}").fetchone()
+        if row != (expected,):
+            raise VaultError(
+                f"authenticated delta SQLite setting is unsafe: {pragma}"
+            )
+    mode = connection.execute("PRAGMA journal_mode").fetchone()
+    if mode is None or str(mode[0]).lower() != "delete":
+        raise VaultError("authenticated delta journal mode is unsafe")
+    if _schema_signature(connection) != expected_signature():
+        raise VaultError("authenticated delta schema changed")
+    metadata = tuple(
+        connection.execute(
+            "SELECT key, value FROM schema_metadata ORDER BY key"
+        )
+    )
+    if metadata != tuple(sorted(METADATA)):
+        raise VaultError("authenticated delta metadata changed")
+    quick = connection.execute("PRAGMA quick_check").fetchall()
+    if quick != [("ok",)]:
+        raise VaultError("authenticated delta SQLite quick check failed")
+
+
 def _schema_signature(connection: sqlite3.Connection) -> dict[str, object]:
     tables = {
         row[0]
@@ -1786,6 +1904,9 @@ def rebuild_incremental_bounded(
         or not 1 <= max_events <= 5_000
     ):
         raise VaultError("incremental refresh bounds are invalid")
+    parent_seal = _authenticate_existing_index_for_write(
+        root, source_may_advance=True
+    )
     chunks = load_chunks(root)
     target = root / DATABASE_PATH
     connection = _open_existing(target, authenticated=True)
@@ -1833,7 +1954,13 @@ def rebuild_incremental_bounded(
             refresh_relationships_incremental(connection, policy, new_event_ids)
         cache_index_storage_metrics(connection)
         generation = _write_database_generation(connection)
-        validate_database(connection)
+        delta_parent = (
+            parent_seal.get("contract_version") == INDEX_SEAL_CONTRACT
+        )
+        if delta_parent:
+            validate_authenticated_delta(connection)
+        else:
+            validate_database(connection)
         connection.execute("COMMIT")
     except (sqlite3.Error, VaultError) as error:
         if connection.in_transaction:
@@ -1854,6 +1981,10 @@ def rebuild_incremental_bounded(
         root,
         horizon_paths,
         writer_validated_generation=generation,
+        writer_validation_mode=(
+            "authenticated_delta" if delta_parent else "full"
+        ),
+        parent_seal=parent_seal if delta_parent else None,
     )
     return len(selected) < len(pending)
 
