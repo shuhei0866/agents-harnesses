@@ -181,7 +181,7 @@ assert set(value) == {
     "relationship_projection", "validation", "integrity",
 }
 assert value["schema_version"] == 1
-assert value["contract_version"] == "authenticated-evidence-index-seal-v2"
+assert value["contract_version"] == "authenticated-evidence-index-seal-v3"
 assert set(value["database"]) == {
     "sha256", "size_bytes", "device", "inode", "mtime_ns", "mode",
     "vault_id", "generation",
@@ -214,15 +214,17 @@ assert re.fullmatch(r"sha256:[0-9a-f]{64}", value["relationship_projection"]["ge
 assert value["relationship_projection"]["generation"] == identity["generation"]
 assert value["relationship_projection"]["policy_count"] >= 1
 assert set(value["validation"]) == {
-    "mode", "parent_seal_sha256", "parent_database_sha256",
+    "mode", "database_check", "parent_seal_sha256", "parent_database_sha256",
     "parent_generation",
 }
 assert value["validation"]["mode"] in {"full", "authenticated_delta"}
 if value["validation"]["mode"] == "full":
+    assert value["validation"]["database_check"] == "integrity_check"
     assert value["validation"]["parent_seal_sha256"] is None
     assert value["validation"]["parent_database_sha256"] is None
     assert value["validation"]["parent_generation"] is None
 else:
+    assert value["validation"]["database_check"] == "quick_check"
     assert re.fullmatch(
         r"sha256:[0-9a-f]{64}", value["validation"]["parent_seal_sha256"]
     )
@@ -996,7 +998,7 @@ assert parent["contract_version"] == evidence_index.INDEX_SEAL_CONTRACT
 assert parent["validation"]["mode"] == "full"
 
 def forbidden_full_scan(_connection):
-    raise AssertionError("bounded v2 refresh repeated full database validation")
+    raise AssertionError("bounded v3 refresh repeated full database validation")
 
 evidence_index.validate_database = forbidden_full_scan
 with vault_lock(root):
@@ -1015,9 +1017,9 @@ assert validation["parent_generation"] == parent["database"]["generation"]
 assert current["database"]["generation"] != parent["database"]["generation"]
 PY
   then
-    pass "bounded v2 refreshは全表scanなしで親sealへdelta proofを連結する"
+    pass "bounded v3 refreshはquick checkを残して親sealへdelta proofを連結する"
   else
-    fail "bounded v2 refreshは全表scanなしで親sealへdelta proofを連結する"
+    fail "bounded v3 refreshはquick checkを残して親sealへdelta proofを連結する"
   fi
 }
 
@@ -1155,9 +1157,9 @@ assert current["contract_version"] == evidence_index.INDEX_SEAL_CONTRACT
 assert current["validation"]["mode"] == "full"
 PY
   then
-    pass "legacy v1 parentは一度だけfull validationしてv2 full proofへ移行する"
+    pass "legacy v1 parentは一度だけfull validationしてv3 full proofへ移行する"
   else
-    fail "legacy v1 parentは一度だけfull validationしてv2 full proofへ移行する"
+    fail "legacy v1 parentは一度だけfull validationしてv3 full proofへ移行する"
   fi
 }
 

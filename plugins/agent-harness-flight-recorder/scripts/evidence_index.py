@@ -48,7 +48,8 @@ from vault import (
 DATABASE_PATH = Path("index/vault.sqlite")
 INDEX_SEAL_PATH = Path("index/index-seal.json")
 LEGACY_INDEX_SEAL_CONTRACT = "authenticated-evidence-index-seal-v1"
-INDEX_SEAL_CONTRACT = "authenticated-evidence-index-seal-v2"
+LEGACY_DELTA_INDEX_SEAL_CONTRACT = "authenticated-evidence-index-seal-v2"
+INDEX_SEAL_CONTRACT = "authenticated-evidence-index-seal-v3"
 MAX_INDEX_SEAL_BYTES = 64 * 1024
 FILE_DIGEST_CHUNK_BYTES = 1024 * 1024
 GENERATION_NAMESPACE = "authenticated_index_seal"
@@ -602,6 +603,7 @@ def issue_index_seal(
             raise VaultError("authenticated delta parent seal changed")
         validation = {
             "mode": "authenticated_delta",
+            "database_check": "quick_check",
             "parent_seal_sha256": _sha256(canonical_json(parent_seal)),
             "parent_database_sha256": parent_database.get("sha256"),
             "parent_generation": parent_database.get("generation"),
@@ -611,6 +613,7 @@ def issue_index_seal(
             raise VaultError("full validation must not declare a parent seal")
         validation = {
             "mode": "full",
+            "database_check": "integrity_check",
             "parent_seal_sha256": None,
             "parent_database_sha256": None,
             "parent_generation": None,
@@ -713,7 +716,7 @@ def _valid_index_seal_shape(value: dict[str, Any]) -> bool:
         "relationship_projection",
         "integrity",
     }
-    if contract == INDEX_SEAL_CONTRACT:
+    if contract in {INDEX_SEAL_CONTRACT, LEGACY_DELTA_INDEX_SEAL_CONTRACT}:
         expected_keys.add("validation")
     elif contract != LEGACY_INDEX_SEAL_CONTRACT:
         return False
@@ -823,14 +826,20 @@ def _valid_index_seal_shape(value: dict[str, Any]) -> bool:
     ):
         return False
 
-    if contract == INDEX_SEAL_CONTRACT:
+    if contract in {INDEX_SEAL_CONTRACT, LEGACY_DELTA_INDEX_SEAL_CONTRACT}:
         validation = value.get("validation")
-        if not isinstance(validation, dict) or set(validation) != {
+        expected_validation_keys = {
             "mode",
             "parent_seal_sha256",
             "parent_database_sha256",
             "parent_generation",
-        }:
+        }
+        if contract == INDEX_SEAL_CONTRACT:
+            expected_validation_keys.add("database_check")
+        if (
+            not isinstance(validation, dict)
+            or set(validation) != expected_validation_keys
+        ):
             return False
         mode = validation.get("mode")
         parent_values = (
@@ -841,8 +850,18 @@ def _valid_index_seal_shape(value: dict[str, Any]) -> bool:
         if mode == "full":
             if parent_values != (None, None, None):
                 return False
+            if (
+                contract == INDEX_SEAL_CONTRACT
+                and validation.get("database_check") != "integrity_check"
+            ):
+                return False
         elif mode == "authenticated_delta":
             if not all(_is_sha256(item) for item in parent_values):
+                return False
+            if (
+                contract == INDEX_SEAL_CONTRACT
+                and validation.get("database_check") != "quick_check"
+            ):
                 return False
         else:
             return False
@@ -1521,6 +1540,9 @@ def validate_authenticated_delta(connection: sqlite3.Connection) -> None:
     )
     if metadata != tuple(sorted(METADATA)):
         raise VaultError("authenticated delta metadata changed")
+    quick = connection.execute("PRAGMA quick_check").fetchall()
+    if quick != [("ok",)]:
+        raise VaultError("authenticated delta SQLite quick check failed")
 
 
 def _schema_signature(connection: sqlite3.Connection) -> dict[str, object]:

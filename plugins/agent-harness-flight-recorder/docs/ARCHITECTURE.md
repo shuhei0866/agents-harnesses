@@ -235,16 +235,19 @@ An authenticated schema-v5 database created before this additive index is
 accepted only in its exact legacy shape; the next bounded write creates the
 index transactionally and the new seal binds the resulting schema.
 The old generation is authenticated through its existing seal before bounded
-mutation. A v2 seal forms a validation lineage: after the initial fully
+mutation. A v3 seal forms a validation lineage: after the initial fully
 validated generation, the bounded writer verifies the exact managed schema and
 metadata plus immediate foreign-key/check enforcement, trusted-schema mode,
-FULL synchronization, and DELETE journaling inside the transaction. SQLite
-then atomically commits the constrained delta, the writer fsyncs and hashes the
-result, and the new HMAC-protected seal binds the parent seal digest, parent
-database digest, and parent generation. A legacy v1 parent pays one final full
-foreign-key and SQLite-integrity scan before entering the v2 lineage. Manual,
-policy-wide, recovery, and otherwise unproved seal issuance still performs
-complete validation.
+FULL synchronization, and DELETE journaling inside the transaction. A linear
+SQLite `quick_check` still visits every page to reject latent physical damage;
+the authenticated parent plus immediate constraints carry forward the more
+expensive foreign-key and index/table consistency proof. SQLite then atomically
+commits the constrained delta, the writer fsyncs and hashes the result, and the
+new HMAC-protected seal binds the parent seal digest, parent database digest,
+and parent generation. A legacy v1/v2 parent pays one final full foreign-key and
+SQLite-integrity scan before entering the v3 lineage. Manual, policy-wide,
+recovery, and otherwise unproved seal issuance still performs complete
+validation.
 Rotation shares the 5,000-event ceiling and splits a larger detached inbox job
 before immutable publication. Legacy larger chunks are admitted through the
 schema-v5 full rebuild, so the current producer cannot create a source unit
@@ -269,9 +272,10 @@ owner-only `index/index-seal.json`. The bounded seal binds the database file
 identity and digest, index schema, source inventory, forget inventory,
 relationship policy inventory, projection generation, and writer-validation
 lineage. Its canonical body is authenticated with `hmac-sha256` using the Vault
-correlation key. A `full` v2 seal starts a lineage. Each
+correlation key. A `full` v3 seal starts a lineage. Each
 `authenticated_delta` successor names the exact parent seal, database digest,
-and generation, so a bounded writer cannot silently claim an unrelated parent.
+and generation, and records its `quick_check`, so a bounded writer cannot
+silently claim an unrelated parent or bless an unread damaged page.
 
 A sealed Card read remains fail-closed but does not repeat that complete work.
 In short Vault-lock sections before and after the query, it authenticates the
