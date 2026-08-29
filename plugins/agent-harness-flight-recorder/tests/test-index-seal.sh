@@ -1163,6 +1163,47 @@ PY
   fi
 }
 
+test_non_string_seal_contract_fails_closed() {
+  echo "test_non_string_seal_contract_fails_closed:"
+  local base="$TEST_ROOT/non-string-contract"
+  local state="$base/vault"
+  init_fixture "$base" || {
+    fail "non-string contract fixtureを構築できる"
+    return
+  }
+  if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts" \
+    python3 - "$state" <<'PY'
+import json
+import pathlib
+import sys
+
+import evidence_index
+from vault import VaultError
+
+
+root = pathlib.Path(sys.argv[1])
+path = root / evidence_index.INDEX_SEAL_PATH
+for malformed in ([], {}):
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value["contract_version"] = malformed
+    path.write_text(
+        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    try:
+        evidence_index.load_index_seal(root)
+    except VaultError:
+        pass
+    else:
+        raise AssertionError("non-string seal contract was accepted")
+PY
+  then
+    pass "配列/オブジェクトcontract_versionを型例外なしでfail closedにする"
+  else
+    fail "配列/オブジェクトcontract_versionを型例外なしでfail closedにする"
+  fi
+}
+
 echo "=== Flight Recorder Authenticated Index Seal Tests ==="
 TESTS=(
   test_trusted_full_and_incremental_rebuild_emit_bound_seal
@@ -1182,6 +1223,7 @@ TESTS=(
   test_bounded_refresh_uses_parent_linked_delta_validation
   test_bounded_delta_rejects_foreign_key_fault_before_seal
   test_legacy_v1_parent_pays_one_full_validation
+  test_non_string_seal_contract_fails_closed
 )
 for test_name in "${TESTS[@]}"; do
   if [[ -z "${INDEX_SEAL_TEST_FILTER:-}" \

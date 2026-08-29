@@ -705,6 +705,8 @@ def _is_sha256(value: object) -> bool:
 
 def _valid_index_seal_shape(value: dict[str, Any]) -> bool:
     contract = value.get("contract_version")
+    if not isinstance(contract, str):
+        return False
     expected_keys = {
         "schema_version",
         "contract_version",
