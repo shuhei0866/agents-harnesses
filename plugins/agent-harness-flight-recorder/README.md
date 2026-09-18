@@ -731,6 +731,17 @@ controls.
 
 ## Local development
 
+### Retrieval measurement pilot
+
+[`docs/RETRIEVAL_MEASUREMENT.md`](docs/RETRIEVAL_MEASUREMENT.md) describes the
+local `scripts/flight-recorder-retrieval` entry point. It snapshots registered
+conversation text and existing summaries, records normal searches, and runs
+sampled baseline/summary-assisted comparisons in a bounded background worker.
+Only meaningful differences enter the review report. Citation access, explicit
+feedback, blinded answer-assessment packets, and fixed retrieval regression
+cases remain separate measurements. It makes no provider calls and never
+pushes conversation text or experiment records into the Vault.
+
 Claude Code can load the plugin directly for one session:
 
 ```bash
