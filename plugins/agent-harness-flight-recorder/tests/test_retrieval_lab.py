@@ -34,6 +34,58 @@ class RetrievalLabTests(unittest.TestCase):
     def create(self, manifest=None):
         return lab.create_lab(self.root, manifest or self.manifest)
 
+    def test_refresh_preserves_pending_comparison_and_historical_evidence(self):
+        self.create()
+        old = lab.search(self.root, "quasar", sample_rate=1)
+        citation = old["hits"][0]["citation_id"]
+        update = {"schema_version": 1, "documents": [document(text="New current evidence", summaries=["newtopic"])]}
+        published = lab.publish_snapshot(self.root, update)
+        self.assertNotEqual(published["snapshot_id"], old["snapshot_id"])
+        self.assertTrue(published["changed"])
+        self.assertEqual(lab.search(self.root, "quasar", sample_rate=0)["hits"], [])
+        self.assertEqual(lab.drain(self.root)["processed"], 1)
+        stored = self.stored_query(old["request_id"])
+        self.assertEqual(json.loads(stored["shadow"])["snapshot_id"], old["snapshot_id"])
+        self.assertEqual(lab.read_citation(self.root, citation, old["request_id"])["text"], document()["text"])
+        answer = lab.record_answer(self.root, old["request_id"], "baseline", "old answer", [citation])
+        self.assertTrue(answer["citation_resolution"][citation])
+        packet = lab.review_packet(self.root, old["request_id"])
+        self.assertEqual(packet["candidates"][0]["citations"][0]["text"], document()["text"])
+
+    def test_invalid_refresh_leaves_current_and_history_unchanged(self):
+        self.create()
+        old = lab._snapshot(self.root)
+        with self.assertRaises(ValueError):
+            lab.publish_snapshot(self.root, {"schema_version": 1, "documents": []})
+        self.assertEqual(lab._snapshot(self.root), old)
+        self.assertEqual(lab._snapshot(self.root, old["snapshot_id"]), old)
+
+    def test_legacy_snapshot_fallback_and_multiple_refreshes(self):
+        self.create()
+        original = lab._snapshot(self.root)
+        self.assertEqual(lab._snapshot(self.root, original["snapshot_id"]), original)
+        for word in ("second", "third"):
+            lab.publish_snapshot(self.root, {"schema_version": 1, "documents": [document(text=word)]})
+        self.assertEqual(lab._snapshot(self.root, original["snapshot_id"]), original)
+        with self.assertRaises(ValueError):
+            lab._snapshot(self.root, "../snapshot")
+
+    def test_legacy_read_racing_first_publication_resolves_archived_generation(self):
+        self.create()
+        original = lab._snapshot(self.root)
+        original_reader = lab.safe_file
+        switched = False
+
+        def racing_read(path, maximum):
+            nonlocal switched
+            if Path(path).name == "snapshot.json" and not switched:
+                switched = True
+                lab.publish_snapshot(self.root, {"schema_version": 1, "documents": [document(text="new generation")]})
+            return original_reader(path, maximum)
+
+        with patch.object(lab, "safe_file", side_effect=racing_read):
+            self.assertEqual(lab._snapshot(self.root, original["snapshot_id"]), original)
+
     def test_cli_search_starts_detached_shadow_and_reports_difference(self):
         self.create()
         script = Path(__file__).resolve().parents[1] / "scripts" / "retrieval_lab.py"

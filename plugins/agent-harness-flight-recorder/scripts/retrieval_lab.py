@@ -6,6 +6,7 @@ import argparse
 from collections import Counter
 from contextlib import contextmanager
 import hashlib
+import fcntl
 import json
 import math
 import os
@@ -65,11 +66,27 @@ def _root(root):
     return root
 
 
-def _snapshot(root):
+def _snapshot(root, snapshot_id=None):
     root = _root(root)
-    value = json.loads(safe_file(root / "snapshot.json", MAX_SNAPSHOT_BYTES))
+    if snapshot_id is not None and (not isinstance(snapshot_id, str) or not re.fullmatch(r"[0-9a-f]{64}", snapshot_id)):
+        raise ValueError("invalid snapshot identifier")
+    path = root / "snapshot.json"
+    if snapshot_id is not None:
+        directory = root / "snapshots"
+        if directory.is_symlink():
+            raise ValueError("unsafe snapshot directory")
+        historical = directory / (snapshot_id + ".json")
+        if historical.exists() or historical.is_symlink():
+            path = historical
+    value = json.loads(safe_file(path, MAX_SNAPSHOT_BYTES))
+    # A legacy reader can race the first publication between checking the archive
+    # and opening current. Publication archives the old generation before switching.
+    if snapshot_id is not None and value.get("snapshot_id") != snapshot_id and path.name == "snapshot.json":
+        value = json.loads(safe_file(root / "snapshots" / (snapshot_id + ".json"), MAX_SNAPSHOT_BYTES))
     if value.get("schema_version") != 1 or value.get("snapshot_id") != digest(value.get("documents")):
         raise ValueError("snapshot identity mismatch")
+    if snapshot_id is not None and value["snapshot_id"] != snapshot_id:
+        raise ValueError("historical snapshot unavailable")
     return value
 
 
@@ -88,7 +105,7 @@ def _connect(root):
         db.close()
 
 
-def create_lab(root: Path, manifest: dict) -> dict:
+def _build_snapshot(manifest):
     if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
         raise ValueError("unsupported corpus schema")
     documents = manifest.get("documents")
@@ -124,6 +141,55 @@ def create_lab(root: Path, manifest: dict) -> dict:
     raw = canonical(value).encode()
     if len(raw) > MAX_SNAPSHOT_BYTES:
         raise ValueError("snapshot too large")
+    return value, raw
+
+
+def _atomic_snapshot_file(path, raw):
+    temporary = path.with_name("." + path.name + "." + uuid.uuid4().hex)
+    try:
+        fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def publish_snapshot(root, manifest):
+    """Publish a complete validated generation, retaining every previous corpus."""
+    value, raw = _build_snapshot(manifest)
+    root = _root(root)
+    lock_fd = os.open(root / ".snapshot.lock", os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(lock_fd, "r+b") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        previous = _snapshot(root)
+        directory = root / "snapshots"
+        directory.mkdir(mode=0o700, exist_ok=True)
+        _root(directory)
+        # Archive old first: a search racing the switch can always resolve its generation.
+        for generation, data in ((previous, canonical(previous).encode()), (value, raw)):
+            path = directory / (generation["snapshot_id"] + ".json")
+            if path.exists() or path.is_symlink():
+                _snapshot(root, generation["snapshot_id"])
+            else:
+                _atomic_snapshot_file(path, data)
+        _atomic_snapshot_file(root / "snapshot.json", raw)
+    return dict(snapshot_id=value["snapshot_id"], previous_snapshot_id=previous["snapshot_id"],
+                changed=value["snapshot_id"] != previous["snapshot_id"], documents=len(value["documents"]),
+                summary_documents=sum(bool(d["summaries"]) for d in value["documents"]),
+                import_report=value["import_report"])
+
+
+def create_lab(root: Path, manifest: dict) -> dict:
+    value, raw = _build_snapshot(manifest)
+    docs = value["documents"]
     root = Path(root).absolute()
     root = root.parent.resolve() / root.name
     root.mkdir(mode=0o700, parents=False, exist_ok=False)
@@ -229,7 +295,6 @@ def drain(root, max_jobs=5, max_seconds=10):
     if type(max_seconds) not in (int, float) or not math.isfinite(max_seconds) or not 0 < max_seconds <= 60:
         raise ValueError("shadow time budget must be >0 and <=60 seconds")
     deadline = time.monotonic() + max_seconds
-    snapshot = _snapshot(root)
     processed = failed = 0
     while processed + failed < max_jobs and time.monotonic() < deadline:
         with _connect(root) as db:
@@ -241,11 +306,12 @@ def drain(root, max_jobs=5, max_seconds=10):
             db.execute("UPDATE queries SET job_state='running',lease_until=? WHERE id=?", (time.time() + 120, row["id"]))
         error = None
         try:
-            if row["snapshot_id"] != snapshot["snapshot_id"] or row["version"] != VERSION:
+            snapshot = _snapshot(root, row["snapshot_id"])
+            if row["version"] != VERSION:
                 raise ValueError("comparison contract mismatch")
             arm = "baseline" if row["arm"] == "recorder" else "recorder"
             shadow = _retrieve(snapshot, row["query"], arm, row["limit_n"], deadline)
-        except (ValueError, TimeoutError) as exc:
+        except (ValueError, OSError, TimeoutError) as exc:
             error = "time_budget_exhausted" if isinstance(exc, TimeoutError) else "contract_mismatch"
         with _connect(root) as db:
             db.execute("UPDATE queries SET job_state=?,shadow=?,error_code=?,lease_until=NULL WHERE id=?",
@@ -280,7 +346,11 @@ def feedback(root, request_id, state):
 
 def read_citation(root, citation_id, request_id=None):
     started = time.perf_counter()
-    snapshot = _snapshot(root)
+    snapshot_id = None
+    if request_id is not None:
+        with _connect(root) as db:
+            snapshot_id = _row(db, request_id)["snapshot_id"]
+    snapshot = _snapshot(root, snapshot_id)
     for d in snapshot["documents"]:
         if d["citation_id"] != citation_id:
             continue
@@ -301,16 +371,14 @@ def record_answer(root, request_id, arm, text, citations):
         raise ValueError("invalid answer")
     if not isinstance(citations, list) or len(citations) > 20 or any(not isinstance(c, str) for c in citations):
         raise ValueError("invalid citations")
-    snapshot = _snapshot(root)
-    known = {d["citation_id"] for d in snapshot["documents"]}
-    answer = dict(text=text, citations=sorted(set(citations)), recorded_at=time.time(),
-                  citation_resolution={c: c in known for c in citations})
-    answer["answer_id"] = digest([snapshot["snapshot_id"], text, answer["citations"]])
     with _connect(root) as db:
         db.execute("BEGIN IMMEDIATE")
         row = _row(db, request_id)
-        if row["snapshot_id"] != snapshot["snapshot_id"]:
-            raise ValueError("answer snapshot mismatch")
+        snapshot = _snapshot(root, row["snapshot_id"])
+        known = {d["citation_id"] for d in snapshot["documents"]}
+        answer = dict(text=text, citations=sorted(set(citations)), recorded_at=time.time(),
+                      citation_resolution={c: c in known for c in citations})
+        answer["answer_id"] = digest([snapshot["snapshot_id"], text, answer["citations"]])
         available = {row["arm"]}
         if row["job_state"] == "complete":
             available.add(json.loads(row["shadow"])["arm"])
@@ -326,13 +394,11 @@ def record_answer(root, request_id, arm, text, citations):
 
 
 def review_packet(root, request_id):
-    snapshot = _snapshot(root)
-    docs = {d["citation_id"]: d for d in snapshot["documents"]}
     with _connect(root) as db:
         row = _row(db, request_id)
-        if row["snapshot_id"] != snapshot["snapshot_id"]:
-            raise ValueError("review snapshot mismatch")
         answers = json.loads(row["answers"])
+    snapshot = _snapshot(root, row["snapshot_id"])
+    docs = {d["citation_id"]: d for d in snapshot["documents"]}
     order = sorted(answers, key=lambda arm: digest([request_id, arm]))
     return dict(request_id=request_id, question=row["query"],
                 instruction="Judge relevance and support only from the cited original text. Missing evidence is unknown. Labels hide retrieval arms; summaries are not evidence.",

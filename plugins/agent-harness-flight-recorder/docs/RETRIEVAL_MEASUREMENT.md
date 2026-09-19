@@ -18,15 +18,16 @@ configuration adoption, or paid evaluation in this pilot.
 - Existing application session logs remain the original source.
 - Existing local Semantic Receipts remain the summary source.
 - A dedicated local lab contains `snapshot.json` and `measurements.sqlite`.
-  It is an immutable derived corpus plus a mutable measurement ledger, not a
-  replacement for either source. Create a new lab to change the corpus.
+  Each corpus generation is immutable, with a mutable measurement ledger.
+  Optional refresh archives generations under `snapshots/` before atomic publication.
+  Requests, queued shadows and evidence reads retain their original generation.
 - Lab directories are owner-only, have an ignore-all `.gitignore`, and must live
   **outside the Vault and code checkout**. Questions, answers, gold labels, and
   original conversation text must never be committed or pushed.
 - The importer reads only explicitly registered source logs and existing
   receipts. Freeze the corpus before running an experiment; do not register or
-  import evaluation sessions into its successor corpus. This exclusion is an
-  operator responsibility, not an automatic classifier.
+  import evaluation sessions into its successor corpus. For manually prepared corpora this exclusion is an operator responsibility.
+  The optional live importer below also detects known retrieval tool invocations.
 
 ## Prepare once
 
@@ -213,3 +214,53 @@ Run the contracts:
 bash tests/test-retrieval-lab.sh
 python3 -m unittest discover -s tests -p 'test_retrieval_snapshot.py'
 ```
+
+
+## Optional automatic conversation addition
+
+`retrieval_refresh.py` wraps the same CLI and starts a detached local refresh
+**after a successful search**, at most once per 15 minutes. It does not install a
+scheduler. Idle labs do no work. The initiating search uses the last valid corpus;
+new messages become searchable after the refresh finishes. This avoids adding
+collection latency to foreground retrieval. Fixed labs keep their existing behavior.
+
+Opt in by creating owner-only `refresh-config.json` inside the existing lab:
+
+```json
+{"schema_version":1,"roots":[
+  {"adapter":"claude-code","path":"/absolute/path/to/claude/projects"},
+  {"adapter":"codex","path":"/absolute/path/to/codex/sessions"}
+],"interval_seconds":900,"exclude_sessions":["evaluation-session-id"]}
+```
+
+Use `python3 scripts/retrieval_refresh.py --lab "$LAB" search 'earlier decision'`
+in your local command wrapper. `refresh --force` performs the initial import or
+an explicit retry; `refresh-status` shows counts, last success, and failures.
+Initial refresh scans configured roots; subsequent runs read changed files with
+a 60-second overlap, replacing those sources rather than appending duplicate windows.
+Changing config triggers a full recollection. Missing/deleted source files are not
+purged from earlier derived snapshots; refresh is addition/update, not retention cleanup.
+
+Only complete JSONL lines containing user/assistant text enter the corpus.
+Oversized conversational messages are omitted and counted; malformed sessions
+are quarantined as whole sources and counted, without stopping other imports. Tool
+output and reasoning are omitted. Entire conversations invoking known recall or
+measurement commands are excluded, including commands wrapped in tool code;
+subagent sessions are also excluded. Explicit `exclude_sessions` is required for
+other evaluation sessions or custom wrappers that the detector does not recognize.
+This is a conservative filter, not proof that every evaluation session is detectable.
+An already searched snapshot remains immutable even if a later refresh excludes a source.
+
+No new summaries or paid calls are generated. Optional `source_vault` points to
+registration metadata for mapping summaries from the old registered corpus;
+only identical source/span/text can inherit existing summaries. Newly added raw-only
+windows are identical across both search arms. Summary coverage must therefore be
+considered when interpreting recorder-versus-baseline differences.
+
+Collection and publication are bounded. An unstable read, oversized corpus or
+other import failure preserves the last good corpus and successful watermark;
+the next eligible search retries. A local lock prevents simultaneous refreshes.
+At 1 GiB of archived snapshots, automatic publication stops and `refresh-status`
+reports an error; archives are never silently deleted because measurements refer
+to them. Questions, content and errors containing raw paths/text are not logged by
+refresh status. All state remains owner-local, outside Git and the Vault.
