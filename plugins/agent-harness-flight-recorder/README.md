@@ -789,3 +789,8 @@ values, sync health, and forged source/relationship projections. The stable
 source contracts are in `schema/event-v1.schema.json`,
 `schema/event-v2.schema.json`, `schema/event-v3.schema.json`,
 `schema/vault-v1.schema.json`, and `schema/chunk-v1.schema.json`.
+
+The retrieval pilot also supports opt-in local conversation refresh after searches.
+It imports new Claude Code/Codex text without model calls, preserves historical
+measurement snapshots, and excludes known retrieval/evaluation sessions. See
+[automatic conversation addition](docs/RETRIEVAL_MEASUREMENT.md#optional-automatic-conversation-addition).
