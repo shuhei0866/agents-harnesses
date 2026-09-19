@@ -105,12 +105,12 @@ def _connect(root):
         db.close()
 
 
-def _build_snapshot(manifest):
+def _build_snapshot(manifest, *, allow_empty=False):
     if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
         raise ValueError("unsupported corpus schema")
     documents = manifest.get("documents")
-    if not isinstance(documents, list) or not 1 <= len(documents) <= MAX_DOCUMENTS:
-        raise ValueError("corpus requires 1..20000 documents")
+    if not isinstance(documents, list) or not (0 if allow_empty else 1) <= len(documents) <= MAX_DOCUMENTS:
+        raise ValueError("corpus document count outside supported range")
     unique = {}
     for item in documents:
         if not isinstance(item, dict):
@@ -164,7 +164,7 @@ def _atomic_snapshot_file(path, raw):
 
 def publish_snapshot(root, manifest):
     """Publish a complete validated generation, retaining every previous corpus."""
-    value, raw = _build_snapshot(manifest)
+    value, raw = _build_snapshot(manifest, allow_empty=True)
     root = _root(root)
     lock_fd = os.open(root / ".snapshot.lock", os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(lock_fd, "r+b") as lock:

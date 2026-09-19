@@ -74,5 +74,17 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual([d['text'] for d in lab._snapshot(self.root)['documents']], ['two'])
 
 
+    def test_all_sources_quarantined_publish_empty_current_corpus(self):
+        with patch.object(refresh, 'export_live', return_value=self.delta([doc('a', 'one')])):
+            refresh.refresh(self.root, force=True)
+        request = lab.search(self.root, 'one', sample_rate=0)
+        with patch.object(refresh, 'export_live', return_value=self.delta([], ['a'])):
+            result = refresh.refresh(self.root, force=True)
+        self.assertEqual(result['status'], 'updated')
+        self.assertEqual(lab.search(self.root, 'one', sample_rate=0)['hits'], [])
+        evidence = lab.read_citation(self.root, request['hits'][0]['citation_id'], request['request_id'])
+        self.assertEqual(evidence['text'], 'one')
+
+
 if __name__ == '__main__':
     unittest.main()

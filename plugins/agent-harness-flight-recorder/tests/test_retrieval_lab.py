@@ -56,7 +56,7 @@ class RetrievalLabTests(unittest.TestCase):
         self.create()
         old = lab._snapshot(self.root)
         with self.assertRaises(ValueError):
-            lab.publish_snapshot(self.root, {"schema_version": 1, "documents": []})
+            lab.publish_snapshot(self.root, {"schema_version": 1, "documents": [document(text="")]})
         self.assertEqual(lab._snapshot(self.root), old)
         self.assertEqual(lab._snapshot(self.root, old["snapshot_id"]), old)
 
