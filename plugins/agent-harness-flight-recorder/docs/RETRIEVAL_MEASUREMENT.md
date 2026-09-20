@@ -229,7 +229,8 @@ Opt in by creating owner-only `refresh-config.json` inside the existing lab:
 ```json
 {"schema_version":1,"roots":[
   {"adapter":"claude-code","path":"/absolute/path/to/claude/projects"},
-  {"adapter":"codex","path":"/absolute/path/to/codex/sessions"}
+  {"adapter":"codex","path":"/absolute/path/to/codex/sessions"},
+  {"adapter":"codex","path":"/absolute/path/to/codex/archived_sessions"}
 ],"interval_seconds":900,"exclude_sessions":["evaluation-session-id"]}
 ```
 
@@ -238,8 +239,14 @@ in your local command wrapper. `refresh --force` performs the initial import or
 an explicit retry; `refresh-status` shows counts, last success, and failures.
 Initial refresh scans configured roots; subsequent runs read changed files with
 a 60-second overlap, replacing those sources rather than appending duplicate windows.
-Changing config triggers a full recollection. Missing/deleted source files are not
-purged from earlier derived snapshots; refresh is addition/update, not retention cleanup.
+Changing config triggers a full recollection. Include `archived_sessions` explicitly
+alongside `sessions` to retain access when a Codex conversation is archived.
+The successful source inventory also detects new paths whose original mtime was
+preserved by a move. A complete scan retires vanished paths from the current
+corpus, preventing duplicate windows after archive/unarchive moves. If a configured
+root is missing, previously indexed paths are retained until a complete scan.
+Historical snapshots and request-bound citations remain unchanged; this is not
+secure erasure or retention cleanup.
 
 Only complete JSONL lines containing user/assistant text enter the corpus.
 Oversized conversational messages are omitted and counted; malformed sessions
@@ -256,6 +263,17 @@ registration metadata for mapping summaries from the old registered corpus;
 only identical source/span/text can inherit existing summaries. Newly added raw-only
 windows are identical across both search arms. Summary coverage must therefore be
 considered when interpreting recorder-versus-baseline differences.
+
+JSONL collection streams one record at a time, rather than loading entire logs.
+Limits are 256 MiB per source, 2 GiB actually read per refresh, and 8 MiB per raw
+record. A raw record above that limit quarantines its whole source: blindly
+skipping it could hide a retrieval/evaluation command. Subagent and evaluation
+sources stop reading as soon as exclusion is established. Late exclusion still
+discards all earlier messages from that source. The existing 100,000-character
+message/window, 20,000-document and 60 MiB manifest limits remain in force.
+Status reports `oversized_records` and `excluded_oversized_sessions` separately
+from oversized conversational text. File identity, size and modification time
+are checked around streamed reads, including early exclusions.
 
 Collection and publication are bounded. An unstable read, oversized corpus or
 other import failure preserves the last good corpus and successful watermark;

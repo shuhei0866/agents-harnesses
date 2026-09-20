@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -21,7 +22,7 @@ class RefreshTests(unittest.TestCase):
         self.root = Path(self.temp.name) / 'lab'
         lab.create_lab(self.root, dict(schema_version=1, documents=[doc('legacy', 'old')]))
         (self.root / 'refresh-config.json').write_text(json.dumps(dict(
-            schema_version=1, roots=[dict(adapter='codex', path=self.temp.name)],
+            schema_version=1, roots=[dict(adapter='codex', path=str(Path(self.temp.name).resolve()))],
             interval_seconds=900, exclude_sessions=[])))
 
     def delta(self, docs, removed=None):
@@ -84,6 +85,36 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual(lab.search(self.root, 'one', sample_rate=0)['hits'], [])
         evidence = lab.read_citation(self.root, request['hits'][0]['citation_id'], request['request_id'])
         self.assertEqual(evidence['text'], 'one')
+
+    def test_archive_move_with_preserved_mtime_replaces_current_but_keeps_old_citation(self):
+        source = Path(self.temp.name) / 'session.jsonl'
+        source.write_text(json.dumps(dict(type='response_item', payload=dict(type='message',
+            role='user', content=[dict(type='input_text', text='unique archived decision')])) ) + '\n')
+        os.utime(source, (10, 10))
+        refresh.refresh(self.root, force=True)
+        request = lab.search(self.root, 'unique archived decision', sample_rate=0)
+        archive = Path(self.temp.name) / 'archived_sessions'
+        archive.mkdir()
+        source.rename(archive / source.name)
+        result = refresh.refresh(self.root, force=True)
+        self.assertEqual(result['status'], 'updated')
+        self.assertEqual(result['documents'], 1)
+        current = lab.search(self.root, 'unique archived decision', sample_rate=0)
+        self.assertEqual(len(current['hits']), 1)
+        self.assertNotEqual(current['hits'][0]['source_id'], request['hits'][0]['source_id'])
+        old = lab.read_citation(self.root, request['hits'][0]['citation_id'], request['request_id'])
+        self.assertIn('unique archived decision', old['text'])
+
+    def test_incomplete_inventory_does_not_retire_previous_paths(self):
+        first = self.delta([doc('a', 'keep me')])
+        first.update(present_source_ids=['a'], inventory_complete=True)
+        with patch.object(refresh, 'export_live', return_value=first):
+            refresh.refresh(self.root, force=True)
+        missing = self.delta([])
+        missing.update(present_source_ids=[], inventory_complete=False)
+        with patch.object(refresh, 'export_live', return_value=missing):
+            result = refresh.refresh(self.root, force=True)
+        self.assertEqual(result['documents'], 1)
 
 
 if __name__ == '__main__':

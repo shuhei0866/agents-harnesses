@@ -12,14 +12,16 @@ import math
 import os
 from pathlib import Path
 import re
+import stat
 import time
 
-from retrieval_snapshot import _message, _read
+from retrieval_snapshot import _message
 
 MAX_FILES = 10_000
 MAX_ENTRIES = 100_000
-MAX_SOURCE_BYTES = 64 * 1024 * 1024
-MAX_TOTAL_BYTES = 512 * 1024 * 1024
+MAX_SOURCE_BYTES = 256 * 1024 * 1024
+MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
+MAX_LINE_BYTES = 8 * 1024 * 1024
 MAX_DOCUMENTS = 20_000
 MAX_DOCUMENT_CHARS = 100_000
 MAX_MANIFEST_BYTES = 60 * 1024 * 1024
@@ -132,14 +134,56 @@ def _discover(roots, report):
     return sorted(files, key=lambda item: (-item[0], item[1], str(item[2])))
 
 
+def _records(path: Path, report: dict):
+    """Stream bounded records; closing early is allowed only for excluded sources."""
+    if any(p.is_symlink() for p in (path, *path.parents)):
+        raise ValueError('unsafe input')
+    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid():
+            raise ValueError('unsafe input')
+        if before.st_size > MAX_SOURCE_BYTES:
+            raise ValueError('local source byte limit exceeded')
+        consumed = 0
+        try:
+            while True:
+                line = stream.readline(MAX_LINE_BYTES + 1)
+                if not line:
+                    break
+                consumed += len(line)
+                report['bytes_read'] += len(line)
+                if consumed > MAX_SOURCE_BYTES or report['bytes_read'] > MAX_TOTAL_BYTES:
+                    raise ValueError('local source byte limit exceeded')
+                if len(line) > MAX_LINE_BYTES:
+                    # Do not omit an unparsed record that might contain an
+                    # evaluation command; quarantine this entire source.
+                    report['oversized_records'] += 1
+                    yield None
+                    return
+                if not line.endswith(b'\n'):
+                    report['partial_sources'] += 1
+                    break
+                yield line
+        finally:
+            after = os.fstat(stream.fileno())
+            current = path.stat(follow_symlinks=False)
+            identity = lambda st: (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+            if identity(before) != identity(after) or identity(after) != identity(current):
+                raise ValueError('input changed')
+
+
 def export_live(roots: list[tuple[str, Path]], *, since: float,
                 exclude_sessions: list[str] | None = None,
-                now: float | None = None, settle_seconds: float = 0) -> dict:
+                now: float | None = None, settle_seconds: float = 0,
+                known_source_ids: list[str] | None = None) -> dict:
     """Export changed sources, preserving original line ranges and source IDs.
 
     `since` filters source modification times, not conversation timestamps. Each
     selected source replaces ALL its old windows. Caller must merge untouched
-    sources and remove `excluded_source_ids`; deletion detection is not provided.
+    sources and remove `excluded_source_ids`. A complete source inventory allows
+    the caller to retire moved/deleted paths from the current snapshot only.
+    Known source IDs let new archive paths bypass the mtime filter.
     With optional settling, deferred sources stay untouched in the caller.
     File/corpus limits and read races abort the whole update. Individual text
     lines over the consumer's character limit are omitted and explicitly counted;
@@ -165,17 +209,23 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                   excluded_subagent_sessions=0, excluded_retrieval_sessions=0,
                   missing_roots=0, symlinks_skipped=0, malformed_lines=0,
                   partial_sources=0, bytes_read=0, documents=0, manifest_bytes=0,
-                  omitted_oversized_lines=0, excluded_malformed_sessions=0)
+                  omitted_oversized_lines=0, excluded_malformed_sessions=0,
+                  oversized_records=0, excluded_oversized_sessions=0)
+    if known_source_ids is not None and (not isinstance(known_source_ids, list) or
+            any(not isinstance(item, str) for item in known_source_ids)):
+        raise ValueError('invalid known source identifiers')
+    known = set(known_source_ids) if known_source_ids is not None else None
     documents = []
     refreshed = []
     excluded = []
     try:
         files = _discover(roots, report)
-        for mtime, adapter, path, size in files:
-            if mtime < since:
+        present = [source_id(adapter, path) for _, adapter, path, _ in files]
+        for mtime, adapter, path, _size in files:
+            identity = source_id(adapter, path)
+            if mtime < since and (known is None or identity in known):
                 report['unchanged_sources'] += 1
                 continue
-            identity = source_id(adapter, path)
             reason = None
             if any(re.search(r'(?<![A-Za-z0-9])' + re.escape(item) + r'(?![A-Za-z0-9])', path.stem)
                    for item in exclusions):
@@ -189,38 +239,40 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
             if settle_seconds and now - mtime < settle_seconds:
                 report['deferred_sources'] += 1
                 continue
-            if size > MAX_SOURCE_BYTES or report['bytes_read'] + size > MAX_TOTAL_BYTES:
-                raise ValueError('local source byte limit exceeded')
-            raw = _read(path, MAX_SOURCE_BYTES)
-            report['bytes_read'] += len(raw)
-            if len(raw) > MAX_SOURCE_BYTES or report['bytes_read'] > MAX_TOTAL_BYTES:
-                raise ValueError('local source byte limit exceeded')
-            if raw and not raw.endswith(b'\n'):
-                report['partial_sources'] += 1
-            lines = raw.split(b'\n')[:-1]
             messages = []
-            for number, line in enumerate(lines, 1):
-                try:
-                    value = json.loads(line)
-                except (ValueError, RecursionError):
-                    # Unparseable complete lines could conceal a retrieval tool
-                    # call; quarantine the whole source rather than index contamination.
-                    report['malformed_lines'] += 1
-                    reason = 'malformed'
-                    continue
-                if not isinstance(value, dict):
-                    continue
-                found = _excluded(value, adapter, exclusions)
-                if found:
-                    reason = found
-                    break
-                message = _message(value, adapter)
-                if message:
-                    text = f'[line {number}] {message[0]}: {message[1]}'
-                    if len(text) > MAX_DOCUMENT_CHARS:
-                        report['omitted_oversized_lines'] += 1
-                    else:
-                        messages.append((number, text))
+            message_bytes = 0
+            line_count = 0
+            records = _records(path, report)
+            try:
+                for number, line in enumerate(records, 1):
+                    if line is None:
+                        reason = 'oversized'
+                        break
+                    line_count = number
+                    try:
+                        value = json.loads(line)
+                    except (ValueError, RecursionError):
+                        report['malformed_lines'] += 1
+                        reason = 'malformed'
+                        break
+                    if not isinstance(value, dict):
+                        continue
+                    found = _excluded(value, adapter, exclusions)
+                    if found:
+                        reason = found
+                        break
+                    message = _message(value, adapter)
+                    if message:
+                        text = f'[line {number}] {message[0]}: {message[1]}'
+                        if len(text) > MAX_DOCUMENT_CHARS:
+                            report['omitted_oversized_lines'] += 1
+                        else:
+                            message_bytes += len(json.dumps(text, ensure_ascii=True).encode())
+                            if message_bytes > MAX_MANIFEST_BYTES:
+                                raise ValueError('local snapshot size limit exceeded')
+                            messages.append((number, text))
+            finally:
+                records.close()
             if reason:
                 report[f'excluded_{reason}_sessions'] += 1
                 excluded.append(identity)
@@ -232,7 +284,7 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                 groups.setdefault((number - 1) // WINDOW_LINES, []).append((number, text))
             for window, items in groups.items():
                 start = window * WINDOW_LINES + 1
-                end = min(start + WINDOW_LINES - 1, len(lines))
+                end = min(start + WINDOW_LINES - 1, line_count)
                 # Preserve ordinary 40-line boundaries. Split unusually large
                 # windows between JSONL records, never truncate source text.
                 chunks = []
@@ -265,4 +317,5 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
     report['documents'] = len(documents)
     report['elapsed_ms'] = round((time.monotonic() - started) * 1000, 3)
     return dict(schema_version=1, documents=documents, import_report=report,
-                refreshed_source_ids=refreshed, excluded_source_ids=excluded)
+                refreshed_source_ids=refreshed, excluded_source_ids=excluded,
+                present_source_ids=present, inventory_complete=not report['missing_roots'])
