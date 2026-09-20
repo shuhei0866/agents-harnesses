@@ -100,6 +100,8 @@ def refresh(root, force=False):
             delta = export_live([(r['adapter'], Path(r['path'])) for r in config['roots']],
                                 since=state.get('since', 0) if state.get('config_id') == lab.digest(config) else 0, exclude_sessions=config.get('exclude_sessions', []),
                                 settle_seconds=0, known_source_ids=state.get('source_ids', []))
+            if delta.get('inventory_complete') is False and state.get('config_id') != lab.digest(config):
+                raise ValueError('incomplete inventory after config change')
             replaced = set(delta['refreshed_source_ids']) | set(delta['excluded_source_ids'])
             present = set(delta.get('present_source_ids', []))
             documents = ([d for d in current['documents'] if d['source_id'] not in replaced

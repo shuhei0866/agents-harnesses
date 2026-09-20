@@ -244,7 +244,9 @@ alongside `sessions` to retain access when a Codex conversation is archived.
 The successful source inventory also detects new paths whose original mtime was
 preserved by a move. A complete scan retires vanished paths from the current
 corpus, preventing duplicate windows after archive/unarchive moves. If a configured
-root is missing, previously indexed paths are retained until a complete scan.
+root is missing or a directory changes during the scan, previously indexed paths
+are retained until a complete scan. An incomplete scan after configuration changes
+keeps the entire last valid corpus and successful watermark.
 Historical snapshots and request-bound citations remain unchanged; this is not
 secure erasure or retention cleanup.
 

@@ -116,6 +116,26 @@ class RefreshTests(unittest.TestCase):
             result = refresh.refresh(self.root, force=True)
         self.assertEqual(result['documents'], 1)
 
+    def test_config_change_with_incomplete_inventory_keeps_snapshot_and_watermark(self):
+        first = self.delta([doc('a', 'keep me')])
+        first.update(present_source_ids=['a'], inventory_complete=True)
+        with patch.object(refresh, 'export_live', return_value=first):
+            refresh.refresh(self.root, force=True)
+        prior = refresh.status(self.root)
+        snapshot = lab._snapshot(self.root)
+        path = self.root / 'refresh-config.json'
+        config = json.loads(path.read_text())
+        config['roots'].append(dict(adapter='codex', path='/missing-archive'))
+        path.write_text(json.dumps(config))
+        partial = self.delta([doc('b', 'partial')])
+        partial.update(present_source_ids=['b'], inventory_complete=False)
+        with patch.object(refresh, 'export_live', return_value=partial):
+            result = refresh.refresh(self.root, force=True)
+        self.assertEqual(result['status'], 'error')
+        for key in ('source_ids', 'since', 'config_id', 'snapshot_id'):
+            self.assertEqual(result[key], prior[key])
+        self.assertEqual(lab._snapshot(self.root), snapshot)
+
 
 if __name__ == '__main__':
     unittest.main()

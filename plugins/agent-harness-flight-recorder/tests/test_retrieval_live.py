@@ -206,6 +206,22 @@ class LiveTests(unittest.TestCase):
         unchanged = live.export_live(self.roots, since=20, known_source_ids=after['present_source_ids'])
         self.assertEqual(unchanged['documents'], [])
 
+    def test_move_into_already_scanned_archive_marks_inventory_incomplete(self):
+        archive = self.root / 'archive'
+        archive.mkdir()
+        source = self.write(self.codex, 'moving.jsonl', encode(codex('preserve until rediscovered')))
+        original = live.os.scandir
+        def move_during_walk(directory):
+            if directory == self.codex and source.exists():
+                source.rename(archive / source.name)
+            return original(directory)
+        # Discovery is LIFO: the archive is enumerated before the active root.
+        with patch.object(live.os, 'scandir', side_effect=move_during_walk):
+            result = live.export_live([('codex', self.codex), ('codex', archive)], since=0)
+        self.assertEqual(result['documents'], [])
+        self.assertFalse(result['inventory_complete'])
+        self.assertGreater(result['import_report']['changed_directories'], 0)
+
     def test_duplicate_roots_do_not_duplicate_documents(self):
         self.write(self.claude, 'one.jsonl', encode(claude('one')))
         result = live.export_live(self.roots + [('claude-code', self.claude)], since=0)

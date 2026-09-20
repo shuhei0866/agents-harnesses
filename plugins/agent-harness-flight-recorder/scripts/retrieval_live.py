@@ -86,7 +86,12 @@ def _excluded(value: dict, adapter: str, exclusions: set[str]) -> str | None:
     return None
 
 
-def _discover(roots, report):
+def _directory_identity(path):
+    value = path.stat(follow_symlinks=False)
+    return (value.st_dev, value.st_ino, value.st_mode, value.st_mtime_ns, value.st_ctime_ns)
+
+
+def _discover(roots, report, *, directory_stamps=None):
     pending = []
     seen_dirs = set()
     seen_files = set()
@@ -111,6 +116,8 @@ def _discover(roots, report):
         if directory.is_symlink():
             report['symlinks_skipped'] += 1
             continue
+        if directory_stamps is not None:
+            directory_stamps[directory] = _directory_identity(directory)
         with os.scandir(directory) as entries:
             for entry in entries:
                 entries_seen += 1
@@ -219,7 +226,8 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
     refreshed = []
     excluded = []
     try:
-        files = _discover(roots, report)
+        directory_stamps = {}
+        files = _discover(roots, report, directory_stamps=directory_stamps)
         present = [source_id(adapter, path) for _, adapter, path, _ in files]
         for mtime, adapter, path, _size in files:
             identity = source_id(adapter, path)
@@ -314,8 +322,15 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
         # Own errors are generic; imported readers also deliberately use generic
         # errors. Do not include paths or contents in public diagnostics.
         raise ValueError('local refresh aborted: ' + str(error)) from None
+    changed_directories = 0
+    for directory, before in directory_stamps.items():
+        try:
+            changed_directories += _directory_identity(directory) != before
+        except OSError:
+            changed_directories += 1
+    report['changed_directories'] = changed_directories
     report['documents'] = len(documents)
     report['elapsed_ms'] = round((time.monotonic() - started) * 1000, 3)
     return dict(schema_version=1, documents=documents, import_report=report,
                 refreshed_source_ids=refreshed, excluded_source_ids=excluded,
-                present_source_ids=present, inventory_complete=not report['missing_roots'])
+                present_source_ids=present, inventory_complete=not report['missing_roots'] and not changed_directories)
