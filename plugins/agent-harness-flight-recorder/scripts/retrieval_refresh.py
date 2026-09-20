@@ -99,9 +99,13 @@ def refresh(root, force=False):
                 raise ValueError('snapshot archive budget exhausted')
             delta = export_live([(r['adapter'], Path(r['path'])) for r in config['roots']],
                                 since=state.get('since', 0) if state.get('config_id') == lab.digest(config) else 0, exclude_sessions=config.get('exclude_sessions', []),
-                                settle_seconds=0)
+                                settle_seconds=0, known_source_ids=state.get('source_ids', []))
+            if delta.get('inventory_complete') is False and state.get('config_id') != lab.digest(config):
+                raise ValueError('incomplete inventory after config change')
             replaced = set(delta['refreshed_source_ids']) | set(delta['excluded_source_ids'])
-            documents = ([d for d in current['documents'] if d['source_id'] not in replaced]
+            present = set(delta.get('present_source_ids', []))
+            documents = ([d for d in current['documents'] if d['source_id'] not in replaced
+                          and (not delta.get('inventory_complete', False) or d['source_id'] in present)]
                          if state.get('bootstrapped') and state.get('config_id') == lab.digest(config) else [])
             summaries = _summaries(root, current, config)
             for doc in delta['documents']:
@@ -110,7 +114,8 @@ def refresh(root, force=False):
             result = lab.publish_snapshot(root, dict(schema_version=1, documents=documents,
                                                      import_report=delta['import_report']))
             state.update(result, status='updated' if result['changed'] else 'unchanged',
-                         sources=len({d['source_id'] for d in documents}), bootstrapped=True, config_id=lab.digest(config), since=max(0, started - 60), last_success=time.time(),
+                         sources=len({d['source_id'] for d in documents}),
+                         source_ids=delta.get('present_source_ids', state.get('source_ids', [])), bootstrapped=True, config_id=lab.digest(config), since=max(0, started - 60), last_success=time.time(),
                          elapsed_ms=round((time.time() - started) * 1000), error_type=None)
         except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
             # Never publish partial collections or move the successful watermark.

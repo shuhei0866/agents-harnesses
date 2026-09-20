@@ -112,7 +112,7 @@ class LiveTests(unittest.TestCase):
                 with self.assertRaises(ValueError) as raised:
                     live.export_live(self.roots, since=0)
                 self.assertNotIn(str(self.root), str(raised.exception))
-        with patch.object(live, '_read', side_effect=OSError('private absolute path')):
+        with patch.object(live, '_records', side_effect=OSError('private absolute path')):
             with self.assertRaises(ValueError) as raised:
                 live.export_live(self.roots, since=0)
             self.assertNotIn('private absolute path', str(raised.exception))
@@ -147,6 +147,80 @@ class LiveTests(unittest.TestCase):
         self.assertEqual(result['import_report']['deferred_sources'], 1)
         result = live.export_live(self.roots, since=0, now=200, settle_seconds=60)
         self.assertEqual(len(result['refreshed_source_ids']), 1)
+
+    def test_archive_over_old_file_limit_is_streamed_with_original_line_numbers(self):
+        path = self.codex / 'archive.jsonl'
+        ignored = encode(dict(type='tool_result', text='x' * (1024 * 1024)))
+        with path.open('wb') as stream:
+            for _ in range(65):
+                stream.write(ignored)
+            stream.write(encode(codex('archived decision')))
+        result = live.export_live(self.roots, since=0)
+        self.assertGreater(result['import_report']['bytes_read'], 64 * 1024 * 1024)
+        self.assertEqual(len(result['documents']), 1)
+        self.assertIn('[line 66] user: archived decision', result['documents'][0]['text'])
+
+    def test_late_evaluation_record_discards_earlier_streamed_messages(self):
+        tool = dict(type='response_item', payload=dict(type='function_call', name='exec',
+                    arguments='recall-history search test'))
+        self.write(self.codex, 'late.jsonl', encode(*([codex('must disappear')] * 120), tool))
+        result = live.export_live(self.roots, since=0)
+        self.assertEqual(result['documents'], [])
+        self.assertEqual(result['import_report']['excluded_retrieval_sessions'], 1)
+
+    def test_oversized_json_record_quarantines_entire_source(self):
+        self.write(self.codex, 'large.jsonl', encode(codex('earlier'), codex('x' * 4096)))
+        with patch.object(live, 'MAX_LINE_BYTES', 1024):
+            result = live.export_live(self.roots, since=0)
+        self.assertEqual(result['documents'], [])
+        self.assertEqual(result['import_report']['excluded_oversized_sessions'], 1)
+        self.assertLess(result['import_report']['bytes_read'], 2000)
+
+    def test_changed_source_is_rejected_during_streaming(self):
+        path = self.write(self.codex, 'racing.jsonl', encode(codex('before')))
+        original = live._message
+        def mutate(value, adapter):
+            with path.open('ab') as stream:
+                stream.write(encode(codex('after')))
+            return original(value, adapter)
+        with patch.object(live, '_message', side_effect=mutate):
+            # Exclude after the first message to stop iteration, but still
+            # require the generator's final stability check on close.
+            records = live._records(path, dict(bytes_read=0, partial_sources=0, oversized_records=0))
+            next(records)
+            mutate({}, 'codex')
+            with self.assertRaisesRegex(ValueError, 'input changed'):
+                records.close()
+
+    def test_new_archive_path_bypasses_old_mtime_and_inventory_tracks_removal(self):
+        old = self.write(self.codex, 'old.jsonl', encode(codex('move me')))
+        os.utime(old, (10, 10))
+        before = live.export_live(self.roots, since=0)
+        new = self.codex / 'archived' / 'old.jsonl'
+        new.parent.mkdir()
+        old.rename(new)
+        after = live.export_live(self.roots, since=20, known_source_ids=before['present_source_ids'])
+        self.assertEqual(len(after['documents']), 1)
+        self.assertNotEqual(before['present_source_ids'], after['present_source_ids'])
+        self.assertTrue(after['inventory_complete'])
+        unchanged = live.export_live(self.roots, since=20, known_source_ids=after['present_source_ids'])
+        self.assertEqual(unchanged['documents'], [])
+
+    def test_move_into_already_scanned_archive_marks_inventory_incomplete(self):
+        archive = self.root / 'archive'
+        archive.mkdir()
+        source = self.write(self.codex, 'moving.jsonl', encode(codex('preserve until rediscovered')))
+        original = live.os.scandir
+        def move_during_walk(directory):
+            if directory == self.codex and source.exists():
+                source.rename(archive / source.name)
+            return original(directory)
+        # Discovery is LIFO: the archive is enumerated before the active root.
+        with patch.object(live.os, 'scandir', side_effect=move_during_walk):
+            result = live.export_live([('codex', self.codex), ('codex', archive)], since=0)
+        self.assertEqual(result['documents'], [])
+        self.assertFalse(result['inventory_complete'])
+        self.assertGreater(result['import_report']['changed_directories'], 0)
 
     def test_duplicate_roots_do_not_duplicate_documents(self):
         self.write(self.claude, 'one.jsonl', encode(claude('one')))

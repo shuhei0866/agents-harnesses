@@ -19,7 +19,7 @@ tables. Retrieval snapshots and normal query records are unaffected.
 
 ```sh
 scripts/flight-recorder-resume --lab "$LAB" mine \
-  --config "$LAB/refresh-config.json" --limit 10
+  --config "$LAB/resume-mining-config.json" --limit 10
 scripts/flight-recorder-resume --lab "$LAB" select SET_ID --file selections.json
 scripts/flight-recorder-resume --lab "$LAB" evaluate SELECTED_SET_ID \
   --max-cases 10 --max-calls 40 --budget-usd 3
@@ -28,6 +28,13 @@ scripts/flight-recorder-resume --lab "$LAB" evaluate SELECTED_SET_ID \
 scripts/flight-recorder-resume --lab "$LAB" report BATCH_ID
 scripts/flight-recorder-resume --lab "$LAB" memo BATCH_ID CASE_ID
 ```
+
+Create `resume-mining-config.json` with the same `roots` / `exclude_sessions`
+shape as the retrieval refresh config, selecting the sources for this pilot.
+The miner has its own 64 MiB/source and 512 MiB/scan bounds; it does not inherit
+the larger streaming recall limits. Keep a bounded mining config separate when
+normal recall includes large archives. Existing fixed-set evaluation and citation
+reads do not rescan the source roots.
 
 Mining reads only configured Claude Code/Codex roots. Each case requires a short
 explicit resumption cue, at least a 30-minute timestamp gap, preceding history,
