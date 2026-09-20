@@ -794,3 +794,7 @@ The retrieval pilot also supports opt-in local conversation refresh after search
 It imports new Claude Code/Codex text without model calls, preserves historical
 measurement snapshots, and excludes known retrieval/evaluation sessions. See
 [automatic conversation addition](docs/RETRIEVAL_MEASUREMENT.md#optional-automatic-conversation-addition).
+
+[Historical work-resumption replay](docs/RESUME_REPLAY.md) mines bounded interruption
+cases and compares next-action proposals with and without a cited resumption memo.
+Evaluation is explicit, tool-free, budgeted and cached; AI judgments remain provisional.

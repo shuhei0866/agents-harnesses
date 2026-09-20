@@ -27,7 +27,8 @@ WINDOW_LINES = 40
 ADAPTERS = {'claude-code', 'codex'}
 RETRIEVAL_COMMAND = re.compile(
     r'(?<![A-Za-z0-9_-])(?:recall-history|retrieval_lab\.py|retrieval_live\.py|'
-    r'retrieval_refresh\.py|flight-recorder-retrieval|retrieval-live)(?![A-Za-z0-9_-])'
+    r'retrieval_refresh\.py|flight-recorder-retrieval|retrieval-live|resume_replay\.py|'
+    r'resume_cases\.py|flight-recorder-resume)(?![A-Za-z0-9_-])'
 )
 
 

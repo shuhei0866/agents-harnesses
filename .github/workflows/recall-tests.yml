@@ -1,0 +1,21 @@
+name: Recall and Resume Tests
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+jobs:
+  recall-tests:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Test local recall and historical replay (synthetic, no model calls)
+        run: |
+          bash plugins/agent-harness-flight-recorder/tests/test-retrieval-lab.sh
+          bash plugins/agent-harness-flight-recorder/tests/test-resume-replay.sh
