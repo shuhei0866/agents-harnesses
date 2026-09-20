@@ -20,9 +20,10 @@ tables. Retrieval snapshots and normal query records are unaffected.
 ```sh
 scripts/flight-recorder-resume --lab "$LAB" mine \
   --config "$LAB/refresh-config.json" --limit 10
-scripts/flight-recorder-resume --lab "$LAB" evaluate SET_ID \
+scripts/flight-recorder-resume --lab "$LAB" select SET_ID --file selections.json
+scripts/flight-recorder-resume --lab "$LAB" evaluate SELECTED_SET_ID \
   --max-cases 10 --max-calls 40 --budget-usd 3
-scripts/flight-recorder-resume --lab "$LAB" evaluate SET_ID \
+scripts/flight-recorder-resume --lab "$LAB" evaluate SELECTED_SET_ID \
   --provider codex --max-cases 10 --max-calls 40 --budget-tokens 200000
 scripts/flight-recorder-resume --lab "$LAB" report BATCH_ID
 scripts/flight-recorder-resume --lab "$LAB" memo BATCH_ID CASE_ID
@@ -107,11 +108,19 @@ cost is invented. Provider conditions use separate caches and are never mixed in
 one comparison batch.
 
 
-### Screening gap-only candidates
+### Screening every mined candidate
+
+Every mined case, including an explicit-cue case, requires selection review before
+evaluation. A cue can refer to a different topic; it is not proof of continuity.
+`selections.json` maps reviewed case IDs to reasons, for example:
+
+```json
+{"sha256:case-id-from-mining":"The request resumes the pending action in the prefix."}
+```
 
 If explicit cues yield no cases, `mine --include-gap-candidates` offers same-session
-human requests following a >=30-minute gap. These are **candidates**, not confirmed
-work resumptions. `evaluate` refuses them until screened. Inspect prefix history
+human requests following a >=30-minute gap. These too are **candidates**, not confirmed
+work resumptions. `evaluate` refuses all unscreened mined cases. Inspect prefix history
 and the resumption request, without reading the holdout outcome. Exclude topic
 changes, closing acknowledgements and other evaluation sessions.
 
