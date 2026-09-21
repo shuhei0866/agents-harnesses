@@ -7,7 +7,8 @@ AI コーディングエージェント（Claude Code / Codex）の生産性を�
 ```
 agents-harnesses/
 ├── packs/
-│   └── git-safety/               # Git事故防止の導入パック
+│   ├── git-safety/               # Git事故防止の導入パック
+│   └── exploration-budget/       # 探索セッションに時間予算・台帳・境界フックを与えるパック
 ├── plugins/
 │   └── agent-harness-flight-recorder/ # Claude Code / Codex 共通の観測プラグイン
 ├── claude-code/
@@ -59,6 +60,21 @@ force push、merge済みPR branchへのpush、`.worktrees/`の再帰削除は遮
 
 詳しい前提条件、モード、アンインストール方法は
 [Git Safety Pack README](packs/git-safety/README.md) を参照してください。
+
+## Exploration Budget Pack — ゴールの代わりに時間予算と方針を渡す
+
+探索型のセッション（ゴールを固定すると早期に収束してしまう作業）に、時間予算と人が書いた方針を渡し、
+Stop hook が境界で残り時間と直近の収率を返して続けさせます。停止は予算の満了か収率の低下で外側が決めます。
+
+```bash
+PACK="$PWD/packs/exploration-budget"
+"$PACK/bin/exploration-budget" run --budget 60m --policy-file policy.md --dry-run
+"$PACK/bin/exploration-budget" run --budget 60m --policy-file policy.md
+"$PACK/bin/exploration-budget" report
+```
+
+台帳・hook・runner の役割、配線、停止条件、Claude Code の連続 block 上限の実測は
+[Exploration Budget Pack README](packs/exploration-budget/README.md) を参照してください。
 
 ## Claude Code
 

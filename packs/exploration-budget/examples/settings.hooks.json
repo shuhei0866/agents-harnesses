@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/agents-harnesses/packs/exploration-budget/bin/exploration-budget hook stop"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/agents-harnesses/packs/exploration-budget/bin/exploration-budget hook post-tool"
+          }
+        ]
+      }
+    ]
+  }
+}
