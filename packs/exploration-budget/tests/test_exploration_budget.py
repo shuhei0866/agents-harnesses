@@ -453,10 +453,6 @@ class Runner(FakeClaudeCase):
         self.assertIn("--resume-active", proc.stderr)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class Evaluator(FakeClaudeCase):
     def eval_env(self, reply: str | None, **extra: str) -> dict:
         env = self.env(FAKE_LOG=str(self.log), FAKE_CLI=str(CLI), **extra)
@@ -484,6 +480,8 @@ class Evaluator(FakeClaudeCase):
         self.assertIn("--output-format", argv)
         self.assertEqual(argv[argv.index("--tools") + 1], "")
         self.assertIn("--strict-mcp-config", argv)
+        self.assertEqual(json.loads(argv[argv.index("--settings") + 1]), {"disableAllHooks": True},
+                         "利用者の他の hook も評価者の会話へ割り込ませない")
         self.assertEqual(calls[0]["disable"], "1", "評価者の子では hook を止める")
         prompt = argv[argv.index("-p") + 1]
         self.assertIn(POLICY, prompt)
@@ -511,6 +509,36 @@ class Evaluator(FakeClaudeCase):
         prompt = argv[argv.index("-p") + 1]
         self.assertIn("候補は 2 件。", prompt, "成果物の本文を渡す")
         self.assertIn("読めない、または存在しない", prompt)
+
+    def test_relative_artifact_resolves_against_recording_cwd(self) -> None:
+        self.start()
+        sub = self.project / "sub"
+        (self.project / "out").mkdir()
+        (self.project / "out" / "REPORT.md").write_text("本体側の古い報告", encoding="utf-8")
+        (sub / "out").mkdir()
+        (sub / "out" / "REPORT.md").write_text("作業ディレクトリ側の報告", encoding="utf-8")
+        # --workdir 相当の場所から相対で記録（runner の子と同じく --project-dir は台帳の場所を指す）
+        self.cli("artifact", "out/REPORT.md", "--project-dir", str(self.project), cwd=sub)
+        proc = self.cli("evaluate", "--claude-cmd", self.fake_cmd(), env=self.eval_env('{"rejections": []}'))
+        prompt = self.evaluator_calls()[0]["argv"]
+        prompt = prompt[prompt.index("-p") + 1]
+        self.assertIn("作業ディレクトリ側の報告", prompt)
+        self.assertNotIn("本体側の古い報告", prompt)
+        artifacts = self.report_json()["artifacts"]
+        self.assertEqual(Path(artifacts[0]["cwd"]).resolve(), sub.resolve())
+
+    def test_large_artifact_is_read_as_capped_prefix(self) -> None:
+        self.start()
+        (self.project / "out").mkdir()
+        big = self.project / "out" / "log.txt"
+        big.write_text("x" * 30000 + "\nTAIL-MARKER-END", encoding="utf-8")
+        self.cli("artifact", "out/log.txt")
+        self.cli("evaluate", "--claude-cmd", self.fake_cmd(), env=self.eval_env('{"rejections": []}'))
+        argv = self.evaluator_calls()[0]["argv"]
+        prompt = argv[argv.index("-p") + 1]
+        self.assertNotIn("TAIL-MARKER-END", prompt, "上限を超えた末尾は渡さない")
+        self.assertIn("…（以下省略）", prompt)
+        self.assertLess(prompt.count("x"), 6100)
 
     def test_fenced_json_reply_is_parsed(self) -> None:
         self.start()
@@ -612,3 +640,7 @@ class Evaluator(FakeClaudeCase):
         data = json.loads(self.cli("report", "--json", env=self.run_env()).stdout)
         self.assertGreaterEqual(len(data["evaluations"]), 1)
         self.assertTrue(all(e["trigger"] == "round" for e in data["evaluations"]))
+
+
+if __name__ == "__main__":
+    unittest.main()

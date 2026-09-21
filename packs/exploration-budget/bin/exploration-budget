@@ -150,7 +150,7 @@ CREATE TABLE IF NOT EXISTS touches(
 );
 CREATE TABLE IF NOT EXISTS artifacts(
   id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, at INTEGER NOT NULL,
-  path TEXT NOT NULL, kind TEXT, note TEXT
+  path TEXT NOT NULL, kind TEXT, note TEXT, cwd TEXT
 );
 CREATE TABLE IF NOT EXISTS roots(
   id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, at INTEGER NOT NULL,
@@ -188,6 +188,14 @@ class Ledger:
         self.db = sqlite3.connect(str(self.path))
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """既存の台帳に後から足した列を補う（CREATE TABLE IF NOT EXISTS は既存表を変えない）。"""
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(artifacts)").fetchall()}
+        if "cwd" not in columns:
+            self.db.execute("ALTER TABLE artifacts ADD COLUMN cwd TEXT")
+            self.db.commit()
 
     # session
     def active(self) -> sqlite3.Row | None:
@@ -275,10 +283,13 @@ class Ledger:
         closed["checkpoint_id"] = int(cur.lastrowid)
         return closed
 
-    def artifact(self, sid: int, path: str, kind: str | None, note: str | None) -> None:
+    def artifact(self, sid: int, path: str, kind: str | None, note: str | None,
+                 cwd: str | None = None) -> None:
+        """成果物を記録する。相対パスは記録した cwd で解決するため、cwd も残す
+        （--workdir が --project-dir と違うとき、台帳側で解決すると別ファイルを読む）。"""
         self.db.execute(
-            "INSERT INTO artifacts(session_id, at, path, kind, note) VALUES (?,?,?,?,?)",
-            (sid, now(), path, kind, note),
+            "INSERT INTO artifacts(session_id, at, path, kind, note, cwd) VALUES (?,?,?,?,?,?)",
+            (sid, now(), path, kind, note, cwd),
         )
         self.db.commit()
 
@@ -759,21 +770,27 @@ def evaluator_input(ledger: Ledger, session: sqlite3.Row) -> str:
     for row in ledger.list_rows("artifacts", sid):
         path = Path(row["path"])
         if not path.is_absolute():
-            path = Path(ledger.project_dir) / path
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            seen_paths[row["path"]] = "（読めない、または存在しない）"
-            continue
-        if len(text.encode("utf-8")) > ARTIFACT_EXCERPT_BYTES:
-            text = text.encode("utf-8")[:ARTIFACT_EXCERPT_BYTES].decode("utf-8", errors="ignore") + "\n…（以下省略）"
-        seen_paths[row["path"]] = text
+            # 記録した cwd で解決する。古い行（cwd 無し）は台帳の project_dir で解決する
+            path = Path(row["cwd"] or ledger.project_dir) / path
+        seen_paths[row["path"]] = read_artifact_excerpt(path)
     if seen_paths:
         blocks = [f"### {name}\n{body}" for name, body in seen_paths.items()]
         parts.append("## 成果物の現在の本文\n" + "\n\n".join(blocks))
     else:
         parts.append("## 成果物\n（記録された成果物は無い）")
     return "\n\n".join(parts)
+
+
+def read_artifact_excerpt(path: Path) -> str:
+    """成果物の先頭だけを読む。大きなログやデータを丸ごと読まない（上限 + 1 バイトで打ち切りを検出）。"""
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(ARTIFACT_EXCERPT_BYTES + 1)
+    except OSError:
+        return "（読めない、または存在しない）"
+    truncated = len(data) > ARTIFACT_EXCERPT_BYTES
+    text = data[:ARTIFACT_EXCERPT_BYTES].decode("utf-8", errors="replace")
+    return text + ("\n…（以下省略）" if truncated else "")
 
 
 def parse_rejections(text: str) -> tuple[list[str], bool]:
@@ -810,7 +827,10 @@ def run_evaluator(ledger: Ledger, session: sqlite3.Row, trigger: str, checkpoint
     cmd = evaluator_command(claude_cmd)
     chosen_model = evaluator_model(model)
     prompt = EVALUATOR_FRAME + "\n\n" + evaluator_input(ledger, session)
-    argv = cmd + ["-p", prompt, "--output-format", "json", "--tools", "", "--strict-mcp-config"]
+    # 道具なし・MCP なし・hook 全停止。利用者の他の Stop/prompt hook が評価者の会話へ割り込むと、
+    # 手番が増えたり出力が JSON でなくなったりする（session-cards の distill と同じ隔離）
+    argv = cmd + ["-p", prompt, "--output-format", "json", "--tools", "", "--strict-mcp-config",
+                  "--settings", json.dumps({"disableAllHooks": True})]
     if chosen_model:
         argv += ["--model", chosen_model]
     env = dict(os.environ)
@@ -1071,7 +1091,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
 def cmd_artifact(args: argparse.Namespace) -> int:
     ledger = Ledger(canonical_dir(args.project_dir))
     session = require_active(ledger)
-    ledger.artifact(int(session["id"]), args.path, args.kind, args.note)
+    ledger.artifact(int(session["id"]), args.path, args.kind, args.note, canonical_dir(os.getcwd()))
     print(f"{TAG} artifact: {args.path}")
     return 0
 
