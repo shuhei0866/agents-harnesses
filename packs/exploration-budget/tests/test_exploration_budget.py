@@ -154,6 +154,19 @@ class Sessions(Base):
         self.cli("verdict", "known", "n1")
         self.assertEqual(self.report_json()["unjudged_novel"], [])
 
+    def test_verdict_if_new_skips_seen_entities(self) -> None:
+        self.cli("verdict", "known", "a")
+        out = json.loads(self.cli("verdict", "rejected", "--if-new", "--json", "a", "b", "c").stdout)
+        self.assertEqual(out["recorded"], ["b", "c"])
+        self.assertEqual(out["skipped"], ["a"])
+        self.start()
+        self.cli("touch", "d")
+        text = self.cli("verdict", "deferred", "--if-new", "d", "e").stdout
+        self.assertIn("記録 1 / 既出で省略 1", text)
+        self.assertEqual(self.cli("touch", "a", "b", "e").stdout, "seen\ta\nseen\tb\nseen\te\n")
+        dup = json.loads(self.cli("verdict", "known", "--if-new", "--json", "f", "f").stdout)
+        self.assertEqual((dup["recorded"], dup["skipped"]), (["f"], ["f"]), "同じ呼び出し内の重複も 1 回だけ記録する")
+
     def test_checkpoint_closes_interval(self) -> None:
         self.start()
         self.cli("touch", "x")
@@ -333,8 +346,21 @@ class Runner(Base):
         self.assertEqual(self.calls(), [])
         self.assertIn("round 1 のプロンプト", proc.stdout)
         self.assertIn(POLICY, proc.stdout)
-        status = json.loads(self.cli("status", "--json", env=env).stdout)
-        self.assertEqual(status["progress"]["budget"], 600, "dry-run でも session は開始される")
+        self.assertIn("残り 10分", proc.stdout)
+        self.assertIn("台帳は空", proc.stdout)
+        status = self.cli("status", env=env, check=False)
+        self.assertEqual(status.returncode, 1, "dry-run は session を作らない（次の run が active で止まらない）")
+        self.assertEqual(list((self.home / "active").glob("*.json")) if (self.home / "active").exists() else [], [])
+
+    def test_dry_run_with_active_session_shows_real_prompt(self) -> None:
+        self.start("30m")
+        self.cli("touch", "n1")
+        env = self.run_env()
+        env["EXPLORATION_BUDGET_NOW"] = str(self.now)
+        proc = self.cli("run", "--dry-run", "--claude-cmd", f"{sys.executable} {self.fake}", env=env)
+        self.assertIn("引き継ぐ前提", proc.stdout)
+        self.assertIn("対象 1 (新規 1)", proc.stdout)
+        self.assertEqual(self.calls(), [])
 
     def test_workdir_is_separate_from_ledger_identity(self) -> None:
         sub = self.project / "sub"
