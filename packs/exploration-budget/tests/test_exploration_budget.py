@@ -129,6 +129,31 @@ class Sessions(Base):
         self.assertEqual(self.cli("touch", "d").stdout, "seen\td\n")
         self.assertEqual(self.report_json()["unjudged_novel"], ["c"])
 
+    def test_similar_paths_get_separate_ledgers(self) -> None:
+        dash = self.project / "a-b"
+        underscore = self.project / "a_b"
+        dash.mkdir()
+        underscore.mkdir()
+        self.cli("start", "--budget", "60m", "--policy", POLICY, cwd=dash)
+        self.cli("start", "--budget", "60m", "--policy", POLICY, cwd=underscore, )
+        self.assertEqual(len(list((self.home / "active").glob("*.json"))), 2)
+        self.cli("touch", "shared", cwd=dash)
+        self.assertEqual(self.cli("touch", "shared", cwd=underscore).stdout, "novel\tshared\n",
+                         "別の台帳なので既出にならない")
+        out = json.loads(self.hook("stop", cwd=underscore).stdout)
+        self.assertEqual(out["decision"], "block")
+        report = json.loads(self.cli("report", "--json", cwd=underscore).stdout)
+        self.assertEqual(Path(report["session"]["project_dir"]).resolve(), underscore.resolve())
+
+    def test_report_verdict_instruction_matches_parser(self) -> None:
+        self.start()
+        self.cli("touch", "n1")
+        report = self.cli("report").stdout
+        self.assertIn("verdict known|unknown|rejected|deferred <id>", report)
+        self.assertNotIn("verdict <id> known", report)
+        self.cli("verdict", "known", "n1")
+        self.assertEqual(self.report_json()["unjudged_novel"], [])
+
     def test_checkpoint_closes_interval(self) -> None:
         self.start()
         self.cli("touch", "x")
@@ -301,12 +326,33 @@ class Runner(Base):
         self.assertIn("ended (error)", proc.stdout)
 
     def test_dry_run_does_not_call_claude(self) -> None:
+        env = self.run_env()
+        env["EXPLORATION_BUDGET_NOW"] = str(self.now)  # dry-run は時計を進めないので固定してよい
         proc = self.cli("run", "--budget", "10m", "--policy", POLICY, "--dry-run",
-                        "--claude-cmd", f"{sys.executable} {self.fake}", env=self.run_env())
+                        "--claude-cmd", f"{sys.executable} {self.fake}", env=env)
         self.assertEqual(self.calls(), [])
         self.assertIn("round 1 のプロンプト", proc.stdout)
         self.assertIn(POLICY, proc.stdout)
-        self.assertIn("残り 10分", self.cli("status", env=self.run_env()).stdout, "dry-run でも session は開始される")
+        status = json.loads(self.cli("status", "--json", env=env).stdout)
+        self.assertEqual(status["progress"]["budget"], 600, "dry-run でも session は開始される")
+
+    def test_workdir_is_separate_from_ledger_identity(self) -> None:
+        sub = self.project / "sub"
+        proc = self.cli("run", "--budget", "1s", "--policy", POLICY, "--project-dir", str(self.project),
+                        "--claude-cmd", f"{sys.executable} {self.fake}",
+                        env=self.run_env(sleep="0.2"), cwd=sub)
+        calls = self.calls()
+        self.assertGreaterEqual(len(calls), 1, proc.stdout)
+        self.assertEqual(Path(calls[0]["cwd"]).resolve(), sub.resolve(), "claude は起動した cwd で動く")
+        report = json.loads(self.cli("report", "--json", env=self.run_env()).stdout)
+        self.assertEqual(Path(report["session"]["project_dir"]).resolve(), self.project.resolve(), "台帳は --project-dir")
+
+    def test_workdir_outside_project_dir_is_refused(self) -> None:
+        proc = self.cli("run", "--budget", "1s", "--policy", POLICY, "--workdir", str(self.other),
+                        "--claude-cmd", f"{sys.executable} {self.fake}", env=self.run_env(), check=False)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("配下ではない", proc.stderr)
+        self.assertEqual(self.calls(), [])
 
     def test_refuses_to_run_over_active_session_without_flag(self) -> None:
         self.start()

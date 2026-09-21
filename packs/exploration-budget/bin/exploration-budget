@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -59,7 +60,10 @@ def canonical_dir(path: str | os.PathLike[str]) -> str:
 
 
 def slug(project_dir: str) -> str:
-    return re.sub(r"[^A-Za-z0-9]+", "-", project_dir).strip("-") or "root"
+    """台帳ディレクトリ名。読める部分だけでは /a-b と /a_b が衝突するので、正規化パスのハッシュを付ける。"""
+    readable = re.sub(r"[^A-Za-z0-9]+", "-", project_dir).strip("-")[-48:].strip("-") or "root"
+    digest = hashlib.sha256(project_dir.encode("utf-8")).hexdigest()[:12]
+    return f"{readable}-{digest}"
 
 
 def is_within(cwd: str, project_dir: str) -> bool:
@@ -183,7 +187,8 @@ class Ledger:
     # session
     def active(self) -> sqlite3.Row | None:
         return self.db.execute(
-            "SELECT * FROM sessions WHERE status='active' ORDER BY id DESC LIMIT 1"
+            "SELECT * FROM sessions WHERE status='active' AND project_dir=? ORDER BY id DESC LIMIT 1",
+            (self.project_dir,),
         ).fetchone()
 
     def session(self, sid: int) -> sqlite3.Row | None:
@@ -494,7 +499,7 @@ def render_report(ledger: Ledger, session: sqlite3.Row) -> str:
     if unjudged:
         shown = ", ".join(unjudged[:20]) + (" …" if len(unjudged) > 20 else "")
         lines.append(f"未判定の新規対象 {len(unjudged)} 件: {shown}")
-        lines.append(f"判定の記録: `{cli_path()} verdict <id> known|unknown|rejected|deferred`")
+        lines.append(f"判定の記録: `{cli_path()} verdict known|unknown|rejected|deferred <id> [<id> ...]`")
     return "\n".join(lines)
 
 
@@ -619,6 +624,13 @@ def log(message: str) -> None:
 
 def cmd_run(args: argparse.Namespace) -> int:
     project_dir = canonical_dir(args.project_dir)
+    # 台帳の単位（--project-dir）と claude を動かす場所（--workdir）は別。README の
+    # 「既出判定を本体と共有する」運用で、worktree から本体を書き換えないため。
+    workdir = canonical_dir(args.workdir or os.getcwd())
+    if not is_within(workdir, project_dir):
+        raise BudgetError(
+            f"--workdir {workdir} は --project-dir {project_dir} の配下ではない。"
+            " hook は cwd が台帳のディレクトリ配下にあるときだけ一致する")
     ledger = Ledger(project_dir)
     session = ledger.active()
     if session is None:
@@ -644,7 +656,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     env["EXPLORATION_BUDGET_RUNNER"] = "1"
 
     if args.dry_run:
-        print(f"{TAG} dry-run: project {project_dir}")
+        print(f"{TAG} dry-run: 台帳 {project_dir} / 作業ディレクトリ {workdir}")
         print(f"{TAG} claude: {' '.join(shlex.quote(c) for c in claude_cmd + ['-p', '<prompt>', '--output-format', 'json'] + extra)}")
         print(f"{TAG} ログ: {run_dir}")
         print("--- round 1 のプロンプト ---")
@@ -676,7 +688,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         (run_dir / f"round-{round_no}.prompt.md").write_text(prompt, encoding="utf-8")
         log(f"round {round_no}: 残り {fmt_duration(p['remaining'])}、claude を起動")
         try:
-            proc = subprocess.run(cmd, cwd=project_dir, stdin=subprocess.DEVNULL,
+            proc = subprocess.run(cmd, cwd=workdir, stdin=subprocess.DEVNULL,
                                   capture_output=True, text=True, env=env)
         except OSError as exc:
             failures += 1
@@ -916,6 +928,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("run", parents=[common], help="予算が尽きるまで claude -p を round で回す")
     add_session_options(p)
     p.add_argument("--resume-active", action="store_true", help="active な session を引き継ぐ")
+    p.add_argument("--workdir", help="claude を動かすディレクトリ（既定: 今の cwd）。--project-dir の配下であること")
     p.add_argument("--claude-cmd", help="claude の起動コマンド（既定: claude、環境変数 EXPLORATION_BUDGET_CLAUDE_CMD）")
     p.add_argument("--claude-arg", action="append", help="claude へ渡す追加引数（繰り返し可）")
     p.add_argument("--model")

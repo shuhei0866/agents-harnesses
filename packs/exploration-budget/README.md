@@ -94,7 +94,9 @@ projects/<slug>/ledger.sqlite           # 台帳
 projects/<slug>/runs/<session>/round-N.prompt.md / .out.json / .err.log
 ```
 
-Git には置きません。`<slug>` はプロジェクトの絶対パスから作るので、worktree は別の台帳になります。既出判定を本体と共有したいときは `--project-dir` で本体のディレクトリを指してください。hook は cwd がその配下にあれば一致します。
+Git には置きません。`<slug>` はプロジェクトの絶対パスの読める部分に、正規化したパスのハッシュを付けたものです（`/a-b` と `/a_b` が同じ台帳にならないため）。worktree は別の台帳になります。既出判定を本体と共有したいときは `--project-dir` で本体のディレクトリを指してください。hook は cwd がその配下にあれば一致します。
+
+`run` は claude を「起動した cwd」（または `--workdir`）で動かし、台帳の単位である `--project-dir` とは分けています。worktree から本体の台帳を使う場合も、claude が書き換えるのは worktree です。`--workdir` は `--project-dir` の配下でなければ起動を拒みます。
 
 ## 環境変数
 
