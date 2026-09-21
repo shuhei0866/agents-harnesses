@@ -1,0 +1,21 @@
+name: Exploration Budget Pack Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  exploration-budget-tests:
+    # ロジックは Python 3 にあり、wrapper は bash 3.2 でも動く。hook と runner は
+    # macOS の対話環境で使うことが多いので、GNU/BSD の両系統で回す。
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Exploration Budget Pack tests
+        run: bash packs/exploration-budget/tests/test-exploration-budget.sh

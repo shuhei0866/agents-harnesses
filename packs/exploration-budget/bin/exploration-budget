@@ -1,0 +1,949 @@
+#!/usr/bin/env python3
+"""exploration-budget: 探索型セッションに時間予算・台帳・境界フックを与える。
+
+設計の要点（詳細は README.md）:
+- ゴールには終端状態があり、方針には無い。終端状態を消せば、残る停止条件は予算だけになる。
+- エージェントは時間を知覚できない。予算は境界（停止しようとした瞬間、しきい値の通過）でだけ見せる。
+- 何に触れ、何が新規で、何を作ったかは台帳が持ち、フック・runner・報告は全部それを読む。
+- 早期停止はエージェントの自己判断ではなく、外側の計測ルール（予算の満了、収率の低下）で決める。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+PRODUCT = "agents-harnesses/exploration-budget"
+VERSION = "0.1.0"
+TAG = "[exploration-budget]"
+DEFAULT_YIELD_WINDOW = 3
+DEFAULT_MAX_BLOCKS = 200
+DEFAULT_THRESHOLDS = "50,80"
+DEFAULT_MAX_ROUNDS = 50
+DEFAULT_MAX_FAILURES = 3
+DEFAULT_BLOCK_CAP = 100
+VERDICTS = ("known", "unknown", "rejected", "deferred")
+
+
+class BudgetError(RuntimeError):
+    """利用者に見せる、状態を壊さないエラー。"""
+
+
+# --- 環境 ---------------------------------------------------------------
+
+
+def now() -> int:
+    override = os.environ.get("EXPLORATION_BUDGET_NOW")
+    return int(float(override)) if override else int(time.time())
+
+
+def data_root() -> Path:
+    override = os.environ.get("EXPLORATION_BUDGET_HOME")
+    if override:
+        return Path(override).expanduser()
+    base = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share")))
+    return base / "agents-harnesses" / "exploration-budget"
+
+
+def canonical_dir(path: str | os.PathLike[str]) -> str:
+    return str(Path(path).expanduser().resolve())
+
+
+def slug(project_dir: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "-", project_dir).strip("-") or "root"
+
+
+def is_within(cwd: str, project_dir: str) -> bool:
+    return cwd == project_dir or cwd.startswith(project_dir.rstrip(os.sep) + os.sep)
+
+
+def parse_budget(text: str) -> int:
+    """'60m' / '1h30m' / '45s' / '90'（分）を秒にする。"""
+    raw = text.strip().lower()
+    if re.fullmatch(r"\d+", raw):
+        seconds = int(raw) * 60
+    else:
+        seconds = 0
+        pos = 0
+        for match in re.finditer(r"(\d+)\s*([hms])", raw):
+            if match.start() != pos:
+                seconds = 0
+                break
+            seconds += int(match.group(1)) * {"h": 3600, "m": 60, "s": 1}[match.group(2)]
+            pos = match.end()
+        if pos != len(raw):
+            seconds = 0
+    if seconds <= 0:
+        raise BudgetError(f"予算を解釈できない: {text!r}（例: 60m, 1h30m, 45s, 90=分）")
+    return seconds
+
+
+def fmt_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}時間" + (f"{minutes}分" if minutes else "")
+    if minutes:
+        return f"{minutes}分" if secs == 0 else f"{minutes}分{secs:02d}秒"
+    return f"{secs}秒"
+
+
+def fmt_clock(ts: int | None) -> str:
+    if not ts:
+        return "-"
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def cli_path() -> str:
+    return str(Path(sys.argv[0]).resolve())
+
+
+def parse_thresholds(text: str) -> list[int]:
+    values = sorted({int(v) for v in re.split(r"[,\s]+", text.strip()) if v})
+    for value in values:
+        if not 1 <= value <= 100:
+            raise BudgetError(f"しきい値は 1〜100 のパーセント: {text!r}")
+    return values
+
+
+# --- 台帳 ---------------------------------------------------------------
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS sessions(
+  id INTEGER PRIMARY KEY,
+  project_dir TEXT NOT NULL,
+  started_at INTEGER NOT NULL,
+  budget_seconds INTEGER NOT NULL,
+  policy TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  ended_at INTEGER,
+  ended_by TEXT,
+  end_reason TEXT,
+  claude_session_id TEXT,
+  yield_window INTEGER NOT NULL DEFAULT 3,
+  max_blocks INTEGER NOT NULL DEFAULT 200,
+  thresholds TEXT NOT NULL DEFAULT '50,80',
+  blocks INTEGER NOT NULL DEFAULT 0,
+  rounds INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS checkpoints(
+  id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, at INTEGER NOT NULL,
+  note TEXT, touch_wm INTEGER NOT NULL, artifact_wm INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS touches(
+  id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, at INTEGER NOT NULL,
+  entity TEXT NOT NULL, kind TEXT, root TEXT, note TEXT, novel INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS artifacts(
+  id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, at INTEGER NOT NULL,
+  path TEXT NOT NULL, kind TEXT, note TEXT
+);
+CREATE TABLE IF NOT EXISTS roots(
+  id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, at INTEGER NOT NULL,
+  axis TEXT NOT NULL, value TEXT NOT NULL, brief TEXT, source TEXT
+);
+CREATE TABLE IF NOT EXISTS verdicts(
+  id INTEGER PRIMARY KEY, at INTEGER NOT NULL, entity TEXT NOT NULL,
+  verdict TEXT NOT NULL, note TEXT, session_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS announcements(
+  id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, threshold INTEGER NOT NULL, at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_touches_entity ON touches(entity);
+CREATE INDEX IF NOT EXISTS idx_verdicts_entity ON verdicts(entity);
+"""
+
+
+def active_dir() -> Path:
+    return data_root() / "active"
+
+
+class Ledger:
+    """プロジェクト（ディレクトリ）ごとに 1 つの SQLite。session をまたいで既出判定を持つ。"""
+
+    def __init__(self, project_dir: str):
+        self.project_dir = project_dir
+        self.dir = data_root() / "projects" / slug(project_dir)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.path = self.dir / "ledger.sqlite"
+        self.db = sqlite3.connect(str(self.path))
+        self.db.row_factory = sqlite3.Row
+        self.db.executescript(SCHEMA)
+
+    # session
+    def active(self) -> sqlite3.Row | None:
+        return self.db.execute(
+            "SELECT * FROM sessions WHERE status='active' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+    def session(self, sid: int) -> sqlite3.Row | None:
+        return self.db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
+
+    def start(self, budget_seconds: int, policy: str, yield_window: int, max_blocks: int,
+              thresholds: str) -> sqlite3.Row:
+        current = self.active()
+        if current is not None:
+            raise BudgetError(
+                f"session #{current['id']} が active（開始 {fmt_clock(current['started_at'])}）。"
+                " 続けるならそのまま、やめるなら `end --reason` を先に実行する"
+            )
+        cur = self.db.execute(
+            "INSERT INTO sessions(project_dir, started_at, budget_seconds, policy, yield_window,"
+            " max_blocks, thresholds) VALUES (?,?,?,?,?,?,?)",
+            (self.project_dir, now(), budget_seconds, policy.strip(), yield_window, max_blocks, thresholds),
+        )
+        self.db.commit()
+        self._write_marker()
+        return self.session(cur.lastrowid)
+
+    def end(self, sid: int, by: str, reason: str | None = None) -> bool:
+        row = self.session(sid)
+        if row is None or row["status"] != "active":
+            return False
+        self.db.execute(
+            "UPDATE sessions SET status='ended', ended_at=?, ended_by=?, end_reason=? WHERE id=?",
+            (now(), by, reason, sid),
+        )
+        self.db.commit()
+        self._remove_marker()
+        return True
+
+    def set_claude_session(self, sid: int, claude_session_id: str) -> None:
+        self.db.execute("UPDATE sessions SET claude_session_id=? WHERE id=?", (claude_session_id, sid))
+        self.db.commit()
+
+    def bump(self, sid: int, column: str) -> None:
+        if column not in ("blocks", "rounds"):
+            raise ValueError(column)
+        self.db.execute(f"UPDATE sessions SET {column}={column}+1 WHERE id=?", (sid,))
+        self.db.commit()
+
+    def _write_marker(self) -> None:
+        active_dir().mkdir(parents=True, exist_ok=True)
+        marker = active_dir() / f"{slug(self.project_dir)}.json"
+        marker.write_text(json.dumps({"project_dir": self.project_dir}, ensure_ascii=False))
+
+    def _remove_marker(self) -> None:
+        marker = active_dir() / f"{slug(self.project_dir)}.json"
+        if marker.exists():
+            marker.unlink()
+
+    # 記録
+    def seen(self, entity: str) -> bool:
+        if self.db.execute("SELECT 1 FROM touches WHERE entity=? LIMIT 1", (entity,)).fetchone():
+            return True
+        return bool(self.db.execute("SELECT 1 FROM verdicts WHERE entity=? LIMIT 1", (entity,)).fetchone())
+
+    def touch(self, sid: int, entity: str, kind: str | None, root: str | None, note: str | None) -> bool:
+        novel = not self.seen(entity)
+        self.db.execute(
+            "INSERT INTO touches(session_id, at, entity, kind, root, note, novel) VALUES (?,?,?,?,?,?,?)",
+            (sid, now(), entity, kind, root, note, int(novel)),
+        )
+        self.db.commit()
+        return novel
+
+    def checkpoint(self, sid: int, note: str | None) -> dict:
+        closed = self.delta(sid)
+        touch_wm = self._max_id("touches", sid)
+        artifact_wm = self._max_id("artifacts", sid)
+        self.db.execute(
+            "INSERT INTO checkpoints(session_id, at, note, touch_wm, artifact_wm) VALUES (?,?,?,?,?)",
+            (sid, now(), note, touch_wm, artifact_wm),
+        )
+        self.db.commit()
+        return closed
+
+    def artifact(self, sid: int, path: str, kind: str | None, note: str | None) -> None:
+        self.db.execute(
+            "INSERT INTO artifacts(session_id, at, path, kind, note) VALUES (?,?,?,?,?)",
+            (sid, now(), path, kind, note),
+        )
+        self.db.commit()
+
+    def root(self, sid: int, axis: str, value: str, brief: str | None, source: str | None) -> None:
+        self.db.execute(
+            "INSERT INTO roots(session_id, at, axis, value, brief, source) VALUES (?,?,?,?,?,?)",
+            (sid, now(), axis, value, brief, source),
+        )
+        self.db.commit()
+
+    def verdict(self, entity: str, verdict: str, note: str | None, sid: int | None) -> None:
+        self.db.execute(
+            "INSERT INTO verdicts(at, entity, verdict, note, session_id) VALUES (?,?,?,?,?)",
+            (now(), entity, verdict, note, sid),
+        )
+        self.db.commit()
+
+    # 集計
+    def _max_id(self, table: str, sid: int) -> int:
+        row = self.db.execute(f"SELECT COALESCE(MAX(id),0) AS m FROM {table} WHERE session_id=?", (sid,)).fetchone()
+        return int(row["m"])
+
+    def last_checkpoint(self, sid: int) -> sqlite3.Row | None:
+        return self.db.execute(
+            "SELECT * FROM checkpoints WHERE session_id=? ORDER BY id DESC LIMIT 1", (sid,)
+        ).fetchone()
+
+    def _count(self, table: str, sid: int, low: int, high: int | None = None, novel_only: bool = False) -> int:
+        sql = f"SELECT COUNT(*) AS c FROM {table} WHERE session_id=? AND id>?"
+        params: list = [sid, low]
+        if high is not None:
+            sql += " AND id<=?"
+            params.append(high)
+        if novel_only:
+            sql += " AND novel=1"
+        return int(self.db.execute(sql, params).fetchone()["c"])
+
+    def delta(self, sid: int) -> dict:
+        session = self.session(sid)
+        cp = self.last_checkpoint(sid)
+        touch_wm = int(cp["touch_wm"]) if cp else 0
+        artifact_wm = int(cp["artifact_wm"]) if cp else 0
+        since = int(cp["at"]) if cp else int(session["started_at"])
+        return {
+            "touches": self._count("touches", sid, touch_wm),
+            "novel": self._count("touches", sid, touch_wm, novel_only=True),
+            "artifacts": self._count("artifacts", sid, artifact_wm),
+            "seconds": max(0, now() - since),
+        }
+
+    def totals(self, sid: int) -> dict:
+        return {
+            "touches": self._count("touches", sid, 0),
+            "novel": self._count("touches", sid, 0, novel_only=True),
+            "artifacts": self._count("artifacts", sid, 0),
+            "checkpoints": int(self.db.execute(
+                "SELECT COUNT(*) AS c FROM checkpoints WHERE session_id=?", (sid,)).fetchone()["c"]),
+            "roots": int(self.db.execute(
+                "SELECT COUNT(*) AS c FROM roots WHERE session_id=?", (sid,)).fetchone()["c"]),
+        }
+
+    def intervals(self, sid: int) -> list[dict]:
+        rows = self.db.execute(
+            "SELECT * FROM checkpoints WHERE session_id=? ORDER BY id", (sid,)).fetchall()
+        result = []
+        prev_touch = 0
+        prev_artifact = 0
+        for row in rows:
+            result.append({
+                "at": int(row["at"]),
+                "note": row["note"],
+                "touches": self._count("touches", sid, prev_touch, int(row["touch_wm"])),
+                "novel": self._count("touches", sid, prev_touch, int(row["touch_wm"]), novel_only=True),
+                "artifacts": self._count("artifacts", sid, prev_artifact, int(row["artifact_wm"])),
+            })
+            prev_touch = int(row["touch_wm"])
+            prev_artifact = int(row["artifact_wm"])
+        return result
+
+    def yield_collapsed(self, session: sqlite3.Row) -> bool:
+        """外側の停止ルール: 直近 K checkpoint の新規が全部 0。
+
+        台帳が空のときは発火しない。触れた対象が 1 件も無い「新規 0」は収率ゼロではなく
+        未計測であり、そこで止めると「終わった感」による早期停止が測定の顔をして戻ってくる。
+        """
+        window = int(session["yield_window"])
+        if window <= 0:
+            return False
+        if self._count("touches", int(session["id"]), 0) == 0:
+            return False
+        spans = self.intervals(int(session["id"]))
+        if len(spans) < window:
+            return False
+        return all(span["novel"] == 0 for span in spans[-window:])
+
+    def unjudged_novel(self, sid: int) -> list[str]:
+        rows = self.db.execute(
+            "SELECT DISTINCT entity FROM touches WHERE session_id=? AND novel=1"
+            " AND entity NOT IN (SELECT entity FROM verdicts) ORDER BY id", (sid,)).fetchall()
+        return [row["entity"] for row in rows]
+
+    def list_rows(self, table: str, sid: int) -> list[sqlite3.Row]:
+        return self.db.execute(f"SELECT * FROM {table} WHERE session_id=? ORDER BY id", (sid,)).fetchall()
+
+    def announced(self, sid: int) -> set[int]:
+        rows = self.db.execute("SELECT threshold FROM announcements WHERE session_id=?", (sid,)).fetchall()
+        return {int(row["threshold"]) for row in rows}
+
+    def announce(self, sid: int, threshold: int) -> None:
+        self.db.execute(
+            "INSERT INTO announcements(session_id, threshold, at) VALUES (?,?,?)", (sid, threshold, now()))
+        self.db.commit()
+
+
+def find_active(cwd: str) -> tuple[Ledger, sqlite3.Row] | None:
+    """hook は cwd しか知らない。active マーカーのうち cwd を含む最長の project_dir を選ぶ。"""
+    cwd = canonical_dir(cwd)
+    best: str | None = None
+    if not active_dir().is_dir():
+        return None
+    for marker in sorted(active_dir().glob("*.json")):
+        try:
+            project_dir = json.loads(marker.read_text()).get("project_dir")
+        except (OSError, ValueError):
+            continue
+        if project_dir and is_within(cwd, project_dir) and (best is None or len(project_dir) > len(best)):
+            best = project_dir
+    if best is None:
+        return None
+    ledger = Ledger(best)
+    session = ledger.active()
+    if session is None:
+        ledger._remove_marker()  # 取り残されたマーカー
+        return None
+    return ledger, session
+
+
+# --- 進捗の計算と文面 -----------------------------------------------------
+
+
+def progress(session: sqlite3.Row) -> dict:
+    budget = int(session["budget_seconds"])
+    end_at = int(session["ended_at"]) if session["ended_at"] else now()
+    elapsed = max(0, end_at - int(session["started_at"]))
+    return {
+        "budget": budget,
+        "elapsed": elapsed,
+        "remaining": max(0, budget - elapsed),
+        "percent": min(100, elapsed * 100 // budget) if budget else 100,
+    }
+
+
+def facts(ledger: Ledger, session: sqlite3.Row) -> list[str]:
+    sid = int(session["id"])
+    p = progress(session)
+    d = ledger.delta(sid)
+    t = ledger.totals(sid)
+    lines = [
+        f"{TAG} 予算 {fmt_duration(p['budget'])} / 経過 {fmt_duration(p['elapsed'])}"
+        f" / 残り {fmt_duration(p['remaining'])} ({p['percent']}%)",
+        f"直近 checkpoint 以降: 触れた対象 {d['touches']} (新規 {d['novel']})"
+        f" / 成果物 {d['artifacts']} / 経過 {fmt_duration(d['seconds'])}",
+        f"セッション累計: 対象 {t['touches']} (新規 {t['novel']}) / checkpoint {t['checkpoints']}"
+        f" / 成果物 {t['artifacts']} / 根 {t['roots']}",
+    ]
+    if t["touches"] == 0 and t["checkpoints"] == 0:
+        lines.append("台帳は空。触れた対象と一区切りを記録しないと、収率は測れない。")
+    return lines
+
+
+def record_instructions() -> str:
+    cli = cli_path()
+    return (
+        "記録の仕方:\n"
+        f"- 触れた対象: `{cli} touch <id> [--kind <種類>] [--root <根>]`（新規か既出かを返す）\n"
+        f"- 一区切り: `{cli} checkpoint --note \"<何を終えたか>\"`\n"
+        f"- 成果物: `{cli} artifact <path> [--kind <種類>]`\n"
+        f"- 探索の根を変えたとき: `{cli} root <軸> <値> --brief \"<一行>\"`\n"
+        "停止は予算の満了か収率の低下で外側が判断する。"
+        f" 進めなくする真の blocker があるときだけ `{cli} end --reason \"<理由>\"` を実行する。"
+    )
+
+
+def compose(ledger: Ledger, session: sqlite3.Row, mode: str) -> str:
+    parts = ["\n".join(facts(ledger, session)), "方針:\n" + session["policy"].strip(), record_instructions()]
+    if mode == "round":
+        parts.append("残りの予算で、方針に沿って探索を続ける。台帳にある対象は既出なので、新規へ向かう。")
+    return "\n\n".join(parts)
+
+
+def render_status(ledger: Ledger, session: sqlite3.Row) -> str:
+    return "\n".join(facts(ledger, session))
+
+
+def render_report(ledger: Ledger, session: sqlite3.Row) -> str:
+    sid = int(session["id"])
+    p = progress(session)
+    t = ledger.totals(sid)
+    status = session["status"] + (f" ({session['ended_by']})" if session["ended_by"] else "")
+    lines = [
+        f"{TAG} session #{sid}  予算 {fmt_duration(p['budget'])}  開始 {fmt_clock(session['started_at'])}  状態 {status}",
+        f"消化 {fmt_duration(p['elapsed'])} ({p['percent']}%)  round {session['rounds']}  block {session['blocks']}",
+        f"触れた対象 {t['touches']} (新規 {t['novel']})  checkpoint {t['checkpoints']}"
+        f"  成果物 {t['artifacts']}  根 {t['roots']}",
+    ]
+    if session["ended_by"] == "agent":
+        lines.append(f"エージェントが {p['percent']}% の時点で終了した: {session['end_reason'] or '理由の記録なし'}")
+    elif session["ended_by"]:
+        lines.append(f"終了理由: {session['end_reason'] or session['ended_by']}")
+    spans = ledger.intervals(sid)
+    if spans:
+        lines.append("checkpoint ごとの新規: " + ", ".join(str(span["novel"]) for span in spans))
+    for row in ledger.list_rows("roots", sid):
+        extra = f" ({row['source']})" if row["source"] else ""
+        brief = f": {row['brief']}" if row["brief"] else ""
+        lines.append(f"根 {row['axis']}={row['value']}{extra}{brief}")
+    artifacts: dict[str, sqlite3.Row] = {}
+    for row in ledger.list_rows("artifacts", sid):
+        artifacts[row["path"]] = row  # 同じ path は最後の記録だけ載せる
+    for row in artifacts.values():
+        kind = f" ({row['kind']})" if row["kind"] else ""
+        lines.append(f"成果物 {row['path']}{kind}")
+    unjudged = ledger.unjudged_novel(sid)
+    if unjudged:
+        shown = ", ".join(unjudged[:20]) + (" …" if len(unjudged) > 20 else "")
+        lines.append(f"未判定の新規対象 {len(unjudged)} 件: {shown}")
+        lines.append(f"判定の記録: `{cli_path()} verdict <id> known|unknown|rejected|deferred`")
+    return "\n".join(lines)
+
+
+def report_json(ledger: Ledger, session: sqlite3.Row) -> dict:
+    sid = int(session["id"])
+    return {
+        "session": dict(session),
+        "progress": progress(session),
+        "totals": ledger.totals(sid),
+        "intervals": ledger.intervals(sid),
+        "roots": [dict(r) for r in ledger.list_rows("roots", sid)],
+        "artifacts": [dict(r) for r in ledger.list_rows("artifacts", sid)],
+        "unjudged_novel": ledger.unjudged_novel(sid),
+    }
+
+
+# --- hooks ----------------------------------------------------------------
+
+
+def read_payload() -> dict:
+    raw = sys.stdin.read()
+    if not raw.strip():
+        return {}
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def hook_stop(payload: dict) -> int:
+    if os.environ.get("EXPLORATION_BUDGET_DISABLE") == "1":
+        return 0
+    found = find_active(payload.get("cwd") or os.getcwd())
+    if found is None:
+        return 0
+    ledger, session = found
+    sid = int(session["id"])
+    claude_session_id = payload.get("session_id")
+    if claude_session_id and not session["claude_session_id"]:
+        ledger.set_claude_session(sid, str(claude_session_id))
+
+    # 注意: stop_hook_active=true でも素通ししない。他の Stop hook（レビュー検証など）は
+    # 無限ループ防止のために素通しするが、この hook は予算が尽きるまで繰り返し止めるのが仕事。
+    # ループの上限は「予算の満了」「収率の低下」「max_blocks」の 3 つで、いずれも台帳で測る。
+    # Claude Code 側にも連続 block の上限（既定 8、CLAUDE_CODE_STOP_HOOK_BLOCK_CAP）がある。
+    p = progress(session)
+    if p["remaining"] <= 0:
+        ledger.end(sid, "budget", "予算を使い切った")
+        return 0
+    if ledger.yield_collapsed(session):
+        ledger.end(sid, "yield", f"直近 {session['yield_window']} checkpoint で新規 0")
+        return 0
+    if int(session["blocks"]) >= int(session["max_blocks"]):
+        ledger.end(sid, "cap", f"block 上限 {session['max_blocks']} に到達")
+        return 0
+    ledger.bump(sid, "blocks")
+    session = ledger.session(sid)
+    print(json.dumps({"decision": "block", "reason": compose(ledger, session, "block")}, ensure_ascii=False))
+    return 0
+
+
+def hook_post_tool(payload: dict) -> int:
+    if os.environ.get("EXPLORATION_BUDGET_DISABLE") == "1":
+        return 0
+    found = find_active(payload.get("cwd") or os.getcwd())
+    if found is None:
+        return 0
+    ledger, session = found
+    sid = int(session["id"])
+    p = progress(session)
+    try:
+        thresholds = parse_thresholds(session["thresholds"])
+    except BudgetError:
+        return 0
+    done = ledger.announced(sid)
+    crossed = [t for t in thresholds if p["percent"] >= t and t not in done]
+    if not crossed:
+        return 0
+    for t in crossed:
+        ledger.announce(sid, t)
+    d = ledger.delta(sid)
+    message = (
+        f"{TAG} 経過 {max(crossed)}%: 残り {fmt_duration(p['remaining'])}。"
+        f" 直近 checkpoint 以降の新規 {d['novel']}、成果物 {d['artifacts']}。"
+    )
+    print(json.dumps({
+        "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": message}
+    }, ensure_ascii=False))
+    return 0
+
+
+# --- runner ---------------------------------------------------------------
+
+
+def load_policy(args: argparse.Namespace) -> str:
+    if getattr(args, "policy_file", None):
+        text = Path(args.policy_file).expanduser().read_text(encoding="utf-8")
+    else:
+        text = getattr(args, "policy", None) or ""
+    if not text.strip():
+        raise BudgetError("方針が空。--policy-file か --policy で渡す")
+    return text
+
+
+def parse_result(stdout: str) -> dict | None:
+    """claude -p --output-format json の出力を読む。前に別の行が混ざっていても最後の JSON 行を拾う。"""
+    candidates = [stdout] + [line for line in reversed(stdout.splitlines()) if line.strip()][:3]
+    for text in candidates:
+        try:
+            value = json.loads(text)
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def log(message: str) -> None:
+    print(f"{TAG} {message}", flush=True)
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    project_dir = canonical_dir(args.project_dir)
+    ledger = Ledger(project_dir)
+    session = ledger.active()
+    if session is None:
+        if not args.budget:
+            raise BudgetError("--budget が要る（例: --budget 60m）")
+        session = ledger.start(parse_budget(args.budget), load_policy(args), args.yield_window,
+                               args.max_blocks, args.thresholds)
+        log(f"session #{session['id']} を開始: 予算 {fmt_duration(session['budget_seconds'])}")
+    elif not args.resume_active:
+        raise BudgetError(
+            f"session #{session['id']} が active。続けるなら --resume-active、やめるなら `end --reason`")
+    sid = int(session["id"])
+    claude_cmd = shlex.split(args.claude_cmd or os.environ.get("EXPLORATION_BUDGET_CLAUDE_CMD") or "claude")
+    extra: list[str] = list(args.claude_arg or [])
+    if args.model:
+        extra += ["--model", args.model]
+    if args.skip_permissions:
+        extra.append("--dangerously-skip-permissions")
+    run_dir = ledger.dir / "runs" / str(sid)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env["CLAUDE_CODE_STOP_HOOK_BLOCK_CAP"] = str(args.block_cap)
+    env["EXPLORATION_BUDGET_RUNNER"] = "1"
+
+    if args.dry_run:
+        print(f"{TAG} dry-run: project {project_dir}")
+        print(f"{TAG} claude: {' '.join(shlex.quote(c) for c in claude_cmd + ['-p', '<prompt>', '--output-format', 'json'] + extra)}")
+        print(f"{TAG} ログ: {run_dir}")
+        print("--- round 1 のプロンプト ---")
+        print(compose(ledger, session, "round"))
+        return 0
+
+    failures = 0
+    while True:
+        session = ledger.session(sid)
+        if session["status"] != "active":
+            break
+        p = progress(session)
+        if p["remaining"] <= 0:
+            ledger.end(sid, "budget", "予算を使い切った")
+            break
+        if ledger.yield_collapsed(session):
+            ledger.end(sid, "yield", f"直近 {session['yield_window']} checkpoint で新規 0")
+            break
+        if int(session["rounds"]) >= args.max_rounds:
+            ledger.end(sid, "rounds", f"round 上限 {args.max_rounds} に到達")
+            break
+        ledger.bump(sid, "rounds")
+        session = ledger.session(sid)
+        round_no = int(session["rounds"])
+        prompt = compose(ledger, session, "round")
+        cmd = claude_cmd + ["-p", prompt, "--output-format", "json"] + extra
+        if session["claude_session_id"]:
+            cmd += ["--resume", session["claude_session_id"]]
+        (run_dir / f"round-{round_no}.prompt.md").write_text(prompt, encoding="utf-8")
+        log(f"round {round_no}: 残り {fmt_duration(p['remaining'])}、claude を起動")
+        try:
+            proc = subprocess.run(cmd, cwd=project_dir, stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True, env=env)
+        except OSError as exc:
+            failures += 1
+            log(f"round {round_no}: 起動失敗 {exc}")
+            if failures >= args.max_failures:
+                ledger.end(sid, "error", f"claude の起動に連続 {failures} 回失敗")
+                break
+            continue
+        (run_dir / f"round-{round_no}.out.json").write_text(proc.stdout, encoding="utf-8")
+        (run_dir / f"round-{round_no}.err.log").write_text(proc.stderr, encoding="utf-8")
+        result = parse_result(proc.stdout)
+        session = ledger.session(sid)
+        if result and result.get("session_id") and not session["claude_session_id"]:
+            ledger.set_claude_session(sid, str(result["session_id"]))
+        ok = proc.returncode == 0 and result is not None and not result.get("is_error")
+        if not ok:
+            failures += 1
+            log(f"round {round_no}: 失敗 (exit {proc.returncode})。stderr は {run_dir / f'round-{round_no}.err.log'}")
+            if failures >= args.max_failures:
+                ledger.end(sid, "error", f"round が連続 {failures} 回失敗")
+                break
+            continue
+        failures = 0
+        t = ledger.totals(sid)
+        log(f"round {round_no}: turns {result.get('num_turns')}, cost {result.get('total_cost_usd')},"
+            f" 累計 対象 {t['touches']} (新規 {t['novel']})")
+    print(render_report(ledger, ledger.session(sid)))
+    return 0
+
+
+# --- CLI ------------------------------------------------------------------
+
+
+def require_active(ledger: Ledger) -> sqlite3.Row:
+    session = ledger.active()
+    if session is None:
+        raise BudgetError("active な session が無い。`start --budget 60m --policy-file <file>` から始める")
+    return session
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    ledger = Ledger(canonical_dir(args.project_dir))
+    session = ledger.start(parse_budget(args.budget), load_policy(args), args.yield_window,
+                           args.max_blocks, args.thresholds)
+    if args.json:
+        print(json.dumps(report_json(ledger, session), ensure_ascii=False))
+    else:
+        print(f"{TAG} session #{session['id']} を開始した。台帳: {ledger.path}")
+        print(compose(ledger, session, "start"))
+    return 0
+
+
+def cmd_end(args: argparse.Namespace) -> int:
+    ledger = Ledger(canonical_dir(args.project_dir))
+    session = require_active(ledger)
+    by = "agent" if os.environ.get("EXPLORATION_BUDGET_RUNNER") == "1" or args.by == "agent" else args.by
+    ledger.end(int(session["id"]), by, args.reason)
+    print(render_report(ledger, ledger.session(int(session["id"]))))
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    ledger = Ledger(canonical_dir(args.project_dir))
+    session = require_active(ledger)
+    if args.json:
+        print(json.dumps(report_json(ledger, session), ensure_ascii=False))
+    else:
+        print(render_status(ledger, session))
+    return 0
+
+
+def cmd_touch(args: argparse.Namespace) -> int:
+    ledger = Ledger(canonical_dir(args.project_dir))
+    session = require_active(ledger)
+    results = {}
+    for entity in args.entity:
+        results[entity] = ledger.touch(int(session["id"]), entity, args.kind, args.root, args.note)
+    if args.json:
+        print(json.dumps({"novel": results}, ensure_ascii=False))
+    else:
+        for entity, novel in results.items():
+            print(f"{'novel' if novel else 'seen'}\t{entity}")
+    return 0
+
+
+def cmd_checkpoint(args: argparse.Namespace) -> int:
+    ledger = Ledger(canonical_dir(args.project_dir))
+    session = require_active(ledger)
+    closed = ledger.checkpoint(int(session["id"]), args.note)
+    print(f"{TAG} checkpoint: 触れた対象 {closed['touches']} (新規 {closed['novel']})"
+          f" / 成果物 {closed['artifacts']} / {fmt_duration(closed['seconds'])}")
+    return 0
+
+
+def cmd_artifact(args: argparse.Namespace) -> int:
+    ledger = Ledger(canonical_dir(args.project_dir))
+    session = require_active(ledger)
+    ledger.artifact(int(session["id"]), args.path, args.kind, args.note)
+    print(f"{TAG} artifact: {args.path}")
+    return 0
+
+
+def cmd_root(args: argparse.Namespace) -> int:
+    ledger = Ledger(canonical_dir(args.project_dir))
+    session = require_active(ledger)
+    ledger.root(int(session["id"]), args.axis, args.value, args.brief, args.source)
+    print(f"{TAG} root: {args.axis}={args.value}")
+    return 0
+
+
+def cmd_verdict(args: argparse.Namespace) -> int:
+    ledger = Ledger(canonical_dir(args.project_dir))
+    session = ledger.active()
+    sid = int(session["id"]) if session else None
+    if args.verdict not in VERDICTS:
+        raise BudgetError(f"判定は {', '.join(VERDICTS)} のどれか: {args.verdict!r}")
+    for entity in args.entity:
+        ledger.verdict(entity, args.verdict, args.note, sid)
+    print(f"{TAG} verdict {args.verdict}: {', '.join(args.entity)}")
+    return 0
+
+
+def cmd_delta(args: argparse.Namespace) -> int:
+    ledger = Ledger(canonical_dir(args.project_dir))
+    session = require_active(ledger)
+    d = ledger.delta(int(session["id"]))
+    if args.json:
+        print(json.dumps(d, ensure_ascii=False))
+    else:
+        print(f"{TAG} 直近 checkpoint 以降: 触れた対象 {d['touches']} (新規 {d['novel']})"
+              f" / 成果物 {d['artifacts']} / 経過 {fmt_duration(d['seconds'])}")
+    return 0
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    ledger = Ledger(canonical_dir(args.project_dir))
+    if args.session:
+        session = ledger.session(args.session)
+        if session is None:
+            raise BudgetError(f"session #{args.session} が無い")
+    else:
+        session = ledger.active() or ledger.db.execute(
+            "SELECT * FROM sessions ORDER BY id DESC LIMIT 1").fetchone()
+        if session is None:
+            raise BudgetError("session がまだ無い")
+    if args.json:
+        print(json.dumps(report_json(ledger, session), ensure_ascii=False))
+    else:
+        print(render_report(ledger, session))
+    return 0
+
+
+def cmd_hook(args: argparse.Namespace) -> int:
+    payload = read_payload()
+    try:
+        if args.event == "stop":
+            return hook_stop(payload)
+        return hook_post_tool(payload)
+    except Exception as exc:  # hook は fail-open。会話を止めない
+        print(f"{TAG} hook error: {exc}", file=sys.stderr)
+        return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--project-dir", default=os.getcwd(), help="台帳の単位になるディレクトリ（既定: cwd）")
+    parser = argparse.ArgumentParser(prog="exploration-budget", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--version", action="version", version=f"{PRODUCT} {VERSION}")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def add_session_options(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--budget", help="時間予算（60m, 1h30m, 45s, 90=分）")
+        p.add_argument("--policy-file", help="方針を書いたファイル")
+        p.add_argument("--policy", help="方針の本文")
+        p.add_argument("--yield-window", type=int, default=DEFAULT_YIELD_WINDOW,
+                       help=f"新規 0 が続いたら止める checkpoint 数（既定 {DEFAULT_YIELD_WINDOW}、0 で無効）")
+        p.add_argument("--max-blocks", type=int, default=DEFAULT_MAX_BLOCKS,
+                       help=f"Stop hook が block する回数の上限（既定 {DEFAULT_MAX_BLOCKS}）")
+        p.add_argument("--thresholds", default=DEFAULT_THRESHOLDS,
+                       help=f"経過率の告知点（既定 {DEFAULT_THRESHOLDS}）")
+
+    p = sub.add_parser("start", parents=[common], help="予算と方針を持つ session を開始する")
+    add_session_options(p)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_start, budget_required=True)
+
+    p = sub.add_parser("end", parents=[common], help="session を終了する（真の blocker のときだけ）")
+    p.add_argument("--reason", help="終了の理由（報告に載る）")
+    p.add_argument("--by", default="cli", choices=("cli", "agent"), help="誰が終えたか")
+    p.set_defaults(func=cmd_end)
+
+    p = sub.add_parser("status", parents=[common], help="経過・残り・直近の収率")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("touch", parents=[common], help="触れた対象を記録する（新規か既出かを返す）")
+    p.add_argument("entity", nargs="+")
+    p.add_argument("--kind")
+    p.add_argument("--root")
+    p.add_argument("--note")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_touch)
+
+    p = sub.add_parser("checkpoint", parents=[common], help="一区切りを記録する")
+    p.add_argument("--note")
+    p.set_defaults(func=cmd_checkpoint)
+
+    p = sub.add_parser("artifact", parents=[common], help="成果物を記録する")
+    p.add_argument("path")
+    p.add_argument("--kind")
+    p.add_argument("--note")
+    p.set_defaults(func=cmd_artifact)
+
+    p = sub.add_parser("root", parents=[common], help="探索の根（軸と値）を記録する")
+    p.add_argument("axis")
+    p.add_argument("value")
+    p.add_argument("--brief")
+    p.add_argument("--source")
+    p.set_defaults(func=cmd_root)
+
+    p = sub.add_parser("verdict", parents=[common], help="人の判定を記録する（朝の入力）")
+    p.add_argument("verdict", help=" | ".join(VERDICTS))
+    p.add_argument("entity", nargs="+")
+    p.add_argument("--note")
+    p.set_defaults(func=cmd_verdict)
+
+    p = sub.add_parser("delta", parents=[common], help="直近 checkpoint 以降の集計")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_delta)
+
+    p = sub.add_parser("report", parents=[common], help="session の報告（朝に読む）")
+    p.add_argument("--session", type=int)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_report)
+
+    p = sub.add_parser("run", parents=[common], help="予算が尽きるまで claude -p を round で回す")
+    add_session_options(p)
+    p.add_argument("--resume-active", action="store_true", help="active な session を引き継ぐ")
+    p.add_argument("--claude-cmd", help="claude の起動コマンド（既定: claude、環境変数 EXPLORATION_BUDGET_CLAUDE_CMD）")
+    p.add_argument("--claude-arg", action="append", help="claude へ渡す追加引数（繰り返し可）")
+    p.add_argument("--model")
+    p.add_argument("--skip-permissions", action="store_true", help="--dangerously-skip-permissions を付ける")
+    p.add_argument("--max-rounds", type=int, default=DEFAULT_MAX_ROUNDS)
+    p.add_argument("--max-failures", type=int, default=DEFAULT_MAX_FAILURES)
+    p.add_argument("--block-cap", type=int, default=DEFAULT_BLOCK_CAP,
+                   help=f"子 claude の CLAUDE_CODE_STOP_HOOK_BLOCK_CAP（既定 {DEFAULT_BLOCK_CAP}）")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("hook", help="Claude Code hook の入口（stdin に JSON）")
+    p.add_argument("event", choices=("stop", "post-tool"))
+    p.set_defaults(func=cmd_hook)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if getattr(args, "budget_required", False) and not args.budget:
+        parser.error("--budget が要る（例: --budget 60m）")
+    try:
+        return int(args.func(args))
+    except BudgetError as exc:
+        print(f"{TAG} {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
