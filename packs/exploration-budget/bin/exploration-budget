@@ -505,6 +505,12 @@ def progress(session: sqlite3.Row) -> dict:
     }
 
 
+def clock_line(started_at: int, budget_seconds: int) -> str:
+    """エージェントは時計を持たない。観測時刻を推測で書かせないために現在時刻を事実として渡す。"""
+    return (f"時計: 現在 {fmt_clock(now())}（開始 {fmt_clock(started_at)}、満了予定 {fmt_clock(started_at + budget_seconds)}）。"
+            "観測時刻や修正時刻はこの時計で書き、推測しない。")
+
+
 def facts(ledger: Ledger, session: sqlite3.Row) -> list[str]:
     sid = int(session["id"])
     p = progress(session)
@@ -513,6 +519,7 @@ def facts(ledger: Ledger, session: sqlite3.Row) -> list[str]:
     lines = [
         f"{TAG} 予算 {fmt_duration(p['budget'])} / 経過 {fmt_duration(p['elapsed'])}"
         f" / 残り {fmt_duration(p['remaining'])} ({p['percent']}%)",
+        clock_line(int(session["started_at"]), int(session["budget_seconds"])),
         f"直近 checkpoint 以降: 触れた対象 {d['touches']} (新規 {d['novel']})"
         f" / 成果物 {d['artifacts']} / 経過 {fmt_duration(d['seconds'])}",
         f"セッション累計: 対象 {t['touches']} (新規 {t['novel']}) / checkpoint {t['checkpoints']}"
@@ -572,6 +579,7 @@ def compose_preview(budget_seconds: int, policy: str) -> str:
     """session を作らずに、開始直後の文面を組み立てる（dry-run 用）。"""
     lines = [
         f"{TAG} 予算 {fmt_duration(budget_seconds)} / 経過 0秒 / 残り {fmt_duration(budget_seconds)} (0%)",
+        clock_line(now(), budget_seconds),
         "直近 checkpoint 以降: 触れた対象 0 (新規 0) / 成果物 0 / 経過 0秒",
         "セッション累計: 対象 0 (新規 0) / checkpoint 0 / 成果物 0 / 根 0",
         "台帳は空。触れた対象と一区切りを記録しないと、収率は測れない。",
@@ -730,7 +738,7 @@ def hook_post_tool(payload: dict) -> int:
         ledger.announce(sid, t)
     d = ledger.delta(sid)
     message = (
-        f"{TAG} 経過 {max(crossed)}%: 残り {fmt_duration(p['remaining'])}。"
+        f"{TAG} 経過 {max(crossed)}%: 残り {fmt_duration(p['remaining'])}（現在 {fmt_clock(now())}）。"
         f" 直近 checkpoint 以降の新規 {d['novel']}、成果物 {d['artifacts']}。"
     )
     print(json.dumps({
@@ -1069,7 +1077,7 @@ def cmd_checkpoint(args: argparse.Namespace) -> int:
     closed = ledger.checkpoint(int(session["id"]), args.note)
     if not args.json:
         print(f"{TAG} checkpoint: 触れた対象 {closed['touches']} (新規 {closed['novel']})"
-              f" / 成果物 {closed['artifacts']} / {fmt_duration(closed['seconds'])}", flush=True)
+              f" / 成果物 {closed['artifacts']} / {fmt_duration(closed['seconds'])} / 現在 {fmt_clock(now())}", flush=True)
     row = None
     if args.evaluate or os.environ.get("EXPLORATION_BUDGET_EVALUATE") == "1":
         # 一区切りの直後、次の糸を選ぶ前に却下理由が届くように同期で呼ぶ
