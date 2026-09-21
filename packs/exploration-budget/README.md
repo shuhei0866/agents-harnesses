@@ -67,7 +67,7 @@ hook と runner が返す文面に、そのまま書いてあります。
 
 | コマンド | 意味 |
 |---|---|
-| `touch <id> [--kind k] [--root r]` | 触れた対象を記録する。`novel` か `seen` を返す |
+| `touch <id> --kind candidate\|considered [--root r]` | 触れた対象を記録する。`novel` か `seen` を返す。候補として保存したものは `candidate`、検討しただけの母集団は `considered`。report の未判定一覧は candidate だけを並べる |
 | `checkpoint --note "<何を終えたか>"` | 一区切り。収率はこの区切りごとに数える |
 | `artifact <path> [--kind k]` | 成果物を記録する |
 | `root <軸> <値> --brief "<一行>"` | 探索の根を変えたことを記録する |
@@ -80,7 +80,7 @@ hook と runner が返す文面に、そのまま書いてあります。
 | ended_by | 誰が | 条件 |
 |---|---|---|
 | `budget` | hook / runner | 予算を使い切った |
-| `yield` | hook / runner | 直近 `--yield-window` 回（既定 3）の checkpoint で新規が全部 0。触れた対象が 1 件も無いときは発火しない |
+| `yield` | hook / runner | 「探索した」（触れた対象が 1 件以上ある）直近 `--yield-window` 回（既定 3）の checkpoint で新規が全部 0。触れていない区切り（反証・整理・報告）は数えず、窓も途切れさせない |
 | `cap` | hook | Stop hook の block が `--max-blocks`（既定 200）に達した |
 | `agent` | エージェント | `end --reason` を実行した。報告に「N% の時点で終了した: 理由」と出る |
 | `rounds` / `error` | runner | round 上限、または claude の起動・実行が連続で失敗した |

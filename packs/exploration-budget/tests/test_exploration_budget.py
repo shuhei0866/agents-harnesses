@@ -240,18 +240,49 @@ class StopHook(Base):
         self.assertIn("ended (budget)", report)
         self.assertNotIn("エージェントが", report)
 
-    def test_yield_collapse_needs_touches(self) -> None:
+    def test_yield_collapse_counts_only_explored_checkpoints(self) -> None:
         self.start("60m", "--yield-window", "2")
         for _ in range(3):
             self.cli("checkpoint")
         self.assertIn('"block"', self.hook("stop").stdout, "空の台帳では収率ゼロと見なさない")
         self.cli("touch", "a")
         self.cli("checkpoint")
-        self.assertIn('"block"', self.hook("stop").stdout, "直近の checkpoint に新規がある")
+        self.assertIn('"block"', self.hook("stop").stdout, "直近の探索した区切りに新規がある")
+        for _ in range(3):
+            self.cli("checkpoint")  # 反証・整理・報告: 触れていない区切りは数えない
+        self.assertIn('"block"', self.hook("stop").stdout, "触れていない区切りでは収率を測れない")
+        self.cli("touch", "a")
+        self.cli("checkpoint")  # 探索したが既出だけ
+        self.cli("touch", "a", "b")
+        self.cli("checkpoint")  # b は新規なので窓が途切れる
+        self.assertIn('"block"', self.hook("stop").stdout)
+        self.cli("touch", "b")
         self.cli("checkpoint")
+        self.cli("checkpoint")  # 触れていない区切り（数えない）
+        self.cli("touch", "a")
         self.cli("checkpoint")
-        self.assertEqual(self.hook("stop").stdout, "", "直近 2 checkpoint の新規 0 で外側が止める")
+        self.assertEqual(self.hook("stop").stdout, "", "探索した直近 2 区切りが新規 0 で外側が止める")
         self.assertIn("ended (yield)", self.cli("report").stdout)
+
+    def test_report_lists_candidates_not_population(self) -> None:
+        self.start()
+        self.cli("touch", "pop-1", "pop-2", "pop-3", "--kind", "considered")
+        self.cli("touch", "cand-1", "cand-2", "--kind", "candidate")
+        report = self.cli("report").stdout
+        self.assertIn("未判定の候補 2 件: cand-1, cand-2", report)
+        self.assertNotIn("pop-1", report)
+        self.assertIn("候補以外の新規 3 件は一覧に出さない", report)
+        self.assertIn("触れた対象の種類: considered 3 / candidate 2", report)
+        data = self.report_json()
+        self.assertEqual(data["unjudged_candidates"], ["cand-1", "cand-2"])
+        self.assertEqual(len(data["unjudged_novel"]), 5)
+        self.assertEqual(data["touch_kinds"], {"considered": 3, "candidate": 2})
+
+    def test_report_falls_back_to_all_novel_without_candidate_kind(self) -> None:
+        self.start()
+        self.cli("touch", "x", "y")
+        report = self.cli("report").stdout
+        self.assertIn("未判定の新規対象 2 件: x, y", report)
 
     def test_block_cap(self) -> None:
         self.start("60m", "--max-blocks", "2")

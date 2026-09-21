@@ -376,26 +376,35 @@ class Ledger:
         return result
 
     def yield_collapsed(self, session: sqlite3.Row) -> bool:
-        """外側の停止ルール: 直近 K checkpoint の新規が全部 0。
+        """外側の停止ルール: 「探索した」直近 K checkpoint の新規が全部 0。
 
-        台帳が空のときは発火しない。触れた対象が 1 件も無い「新規 0」は収率ゼロではなく
-        未計測であり、そこで止めると「終わった感」による早期停止が測定の顔をして戻ってくる。
+        数えるのは触れた対象が 1 件以上ある区切りだけ。触れていない区切り（反証・整理・報告）は
+        収率ゼロではなく未計測なので、数えず、窓も途切れさせない。台帳が空なら発火しない。
+        そこで止めると「終わった感」による早期停止が測定の顔をして戻ってくる。
         """
         window = int(session["yield_window"])
         if window <= 0:
             return False
-        if self._count("touches", int(session["id"]), 0) == 0:
+        explored = [span for span in self.intervals(int(session["id"])) if span["touches"] > 0]
+        if len(explored) < window:
             return False
-        spans = self.intervals(int(session["id"]))
-        if len(spans) < window:
-            return False
-        return all(span["novel"] == 0 for span in spans[-window:])
+        return all(span["novel"] == 0 for span in explored[-window:])
 
-    def unjudged_novel(self, sid: int) -> list[str]:
-        rows = self.db.execute(
-            "SELECT DISTINCT entity FROM touches WHERE session_id=? AND novel=1"
-            " AND entity NOT IN (SELECT entity FROM verdicts) ORDER BY id", (sid,)).fetchall()
+    def unjudged_novel(self, sid: int, kind: str | None = None) -> list[str]:
+        sql = ("SELECT DISTINCT entity FROM touches WHERE session_id=? AND novel=1"
+               " AND entity NOT IN (SELECT entity FROM verdicts)")
+        params: list = [sid]
+        if kind is not None:
+            sql += " AND kind=?"
+            params.append(kind)
+        rows = self.db.execute(sql + " ORDER BY id", params).fetchall()
         return [row["entity"] for row in rows]
+
+    def touch_kinds(self, sid: int) -> dict[str, int]:
+        rows = self.db.execute(
+            "SELECT COALESCE(kind, '') AS kind, COUNT(DISTINCT entity) AS c FROM touches"
+            " WHERE session_id=? GROUP BY kind ORDER BY c DESC", (sid,)).fetchall()
+        return {row["kind"]: int(row["c"]) for row in rows}
 
     def list_rows(self, table: str, sid: int) -> list[sqlite3.Row]:
         return self.db.execute(f"SELECT * FROM {table} WHERE session_id=? ORDER BY id", (sid,)).fetchall()
@@ -470,7 +479,7 @@ def record_instructions() -> str:
     cli = cli_path()
     return (
         "記録の仕方:\n"
-        f"- 触れた対象: `{cli} touch <id> [--kind <種類>] [--root <根>]`（新規か既出かを返す）\n"
+        f"- 触れた対象: `{cli} touch <id> --kind candidate|considered [--root <根>]`（新規か既出かを返す。候補として保存したものだけ candidate）\n"
         f"- 一区切り: `{cli} checkpoint --note \"<何を終えたか>\"`\n"
         f"- 成果物: `{cli} artifact <path> [--kind <種類>]`\n"
         f"- 探索の根を変えたとき: `{cli} root <軸> <値> --brief \"<一行>\"`\n"
@@ -531,10 +540,20 @@ def render_report(ledger: Ledger, session: sqlite3.Row) -> str:
     for row in artifacts.values():
         kind = f" ({row['kind']})" if row["kind"] else ""
         lines.append(f"成果物 {row['path']}{kind}")
-    unjudged = ledger.unjudged_novel(sid)
+    kinds = ledger.touch_kinds(sid)
+    if len(kinds) > 1 or (kinds and "" not in kinds):
+        lines.append("触れた対象の種類: " + " / ".join(f"{k or '(種類なし)'} {v}" for k, v in kinds.items()))
+    # 朝に判定するのは候補（kind=candidate）だけ。検討した母集団まで並べると判定が埋もれる
+    candidates = ledger.unjudged_novel(sid, "candidate")
+    unjudged = candidates if candidates else ledger.unjudged_novel(sid)
     if unjudged:
+        label = "未判定の候補" if candidates else "未判定の新規対象"
         shown = ", ".join(unjudged[:20]) + (" …" if len(unjudged) > 20 else "")
-        lines.append(f"未判定の新規対象 {len(unjudged)} 件: {shown}")
+        lines.append(f"{label} {len(unjudged)} 件: {shown}")
+        if candidates:
+            others = len(ledger.unjudged_novel(sid)) - len(candidates)
+            if others > 0:
+                lines.append(f"候補以外の新規 {others} 件は一覧に出さない（`report --json` の unjudged_novel にある）")
         lines.append(f"判定の記録: `{cli_path()} verdict known|unknown|rejected|deferred <id> [<id> ...]`")
     return "\n".join(lines)
 
@@ -549,6 +568,8 @@ def report_json(ledger: Ledger, session: sqlite3.Row) -> dict:
         "roots": [dict(r) for r in ledger.list_rows("roots", sid)],
         "artifacts": [dict(r) for r in ledger.list_rows("artifacts", sid)],
         "unjudged_novel": ledger.unjudged_novel(sid),
+        "unjudged_candidates": ledger.unjudged_novel(sid, "candidate"),
+        "touch_kinds": ledger.touch_kinds(sid),
     }
 
 
