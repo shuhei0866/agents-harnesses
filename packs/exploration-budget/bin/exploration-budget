@@ -391,13 +391,24 @@ class Ledger:
         return all(span["novel"] == 0 for span in explored[-window:])
 
     def unjudged_novel(self, sid: int, kind: str | None = None) -> list[str]:
-        sql = ("SELECT DISTINCT entity FROM touches WHERE session_id=? AND novel=1"
-               " AND entity NOT IN (SELECT entity FROM verdicts)")
+        """この session で新規だった未判定の対象。entity 単位で判定する。
+
+        「新規」はその entity のどれかの touch が novel=1、「種類」はどれかの touch がその kind。
+        considered として触れてから candidate に再分類すると 2 行目は novel=0 になるので、
+        同じ行に両方を要求すると候補が消える。
+        """
+        sql = (
+            "SELECT t.entity AS entity, MIN(t.id) AS first_id FROM touches t"
+            " WHERE t.session_id=? AND t.entity NOT IN (SELECT entity FROM verdicts)"
+            " AND EXISTS (SELECT 1 FROM touches n WHERE n.session_id=t.session_id"
+            "             AND n.entity=t.entity AND n.novel=1)"
+        )
         params: list = [sid]
         if kind is not None:
-            sql += " AND kind=?"
+            sql += (" AND EXISTS (SELECT 1 FROM touches k WHERE k.session_id=t.session_id"
+                    "             AND k.entity=t.entity AND k.kind=?)")
             params.append(kind)
-        rows = self.db.execute(sql + " ORDER BY id", params).fetchall()
+        rows = self.db.execute(sql + " GROUP BY t.entity ORDER BY first_id", params).fetchall()
         return [row["entity"] for row in rows]
 
     def touch_kinds(self, sid: int) -> dict[str, int]:
@@ -543,17 +554,22 @@ def render_report(ledger: Ledger, session: sqlite3.Row) -> str:
     kinds = ledger.touch_kinds(sid)
     if len(kinds) > 1 or (kinds and "" not in kinds):
         lines.append("触れた対象の種類: " + " / ".join(f"{k or '(種類なし)'} {v}" for k, v in kinds.items()))
-    # 朝に判定するのは候補（kind=candidate）だけ。検討した母集団まで並べると判定が埋もれる
-    candidates = ledger.unjudged_novel(sid, "candidate")
-    unjudged = candidates if candidates else ledger.unjudged_novel(sid)
+    # 朝に判定するのは候補（kind=candidate）だけ。検討した母集団まで並べると判定が埋もれる。
+    # 候補を全部判定し終えても母集団へ戻らないよう、fallback は「candidate の記録が無い session」に限る
+    uses_candidate_kind = "candidate" in kinds
+    candidates = ledger.unjudged_novel(sid, "candidate") if uses_candidate_kind else []
+    unjudged = candidates if uses_candidate_kind else ledger.unjudged_novel(sid)
+    if uses_candidate_kind and not candidates:
+        lines.append("未判定の候補なし")
     if unjudged:
-        label = "未判定の候補" if candidates else "未判定の新規対象"
+        label = "未判定の候補" if uses_candidate_kind else "未判定の新規対象"
         shown = ", ".join(unjudged[:20]) + (" …" if len(unjudged) > 20 else "")
         lines.append(f"{label} {len(unjudged)} 件: {shown}")
-        if candidates:
-            others = len(ledger.unjudged_novel(sid)) - len(candidates)
-            if others > 0:
-                lines.append(f"候補以外の新規 {others} 件は一覧に出さない（`report --json` の unjudged_novel にある）")
+    if uses_candidate_kind:
+        others = len(ledger.unjudged_novel(sid)) - len(candidates)
+        if others > 0:
+            lines.append(f"候補以外の新規 {others} 件は一覧に出さない（`report --json` の unjudged_novel にある）")
+    if unjudged:
         lines.append(f"判定の記録: `{cli_path()} verdict known|unknown|rejected|deferred <id> [<id> ...]`")
     return "\n".join(lines)
 

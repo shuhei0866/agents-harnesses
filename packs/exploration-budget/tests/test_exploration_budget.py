@@ -278,6 +278,28 @@ class StopHook(Base):
         self.assertEqual(len(data["unjudged_novel"]), 5)
         self.assertEqual(data["touch_kinds"], {"considered": 3, "candidate": 2})
 
+    def test_reclassified_candidate_stays_in_candidate_list(self) -> None:
+        self.start()
+        self.cli("touch", "x", "y", "--kind", "considered")
+        self.cli("touch", "x", "--kind", "candidate")  # 再分類。2 行目は seen なので novel=0
+        report = self.cli("report").stdout
+        self.assertIn("未判定の候補 1 件: x", report)
+        self.assertNotIn("未判定の候補 1 件: y", report)
+        data = self.report_json()
+        self.assertEqual(data["unjudged_candidates"], ["x"])
+        self.assertEqual(sorted(data["unjudged_novel"]), ["x", "y"])
+
+    def test_fully_judged_candidates_do_not_fall_back_to_population(self) -> None:
+        self.start()
+        self.cli("touch", "pop-1", "pop-2", "--kind", "considered")
+        self.cli("touch", "cand-1", "--kind", "candidate")
+        self.cli("verdict", "known", "cand-1")
+        report = self.cli("report").stdout
+        self.assertIn("未判定の候補なし", report)
+        self.assertNotIn("pop-1", report)
+        self.assertIn("候補以外の新規 2 件は一覧に出さない", report)
+        self.assertEqual(self.report_json()["unjudged_candidates"], [])
+
     def test_report_falls_back_to_all_novel_without_candidate_kind(self) -> None:
         self.start()
         self.cli("touch", "x", "y")
