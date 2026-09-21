@@ -290,6 +290,29 @@ class Ledger:
         )
         self.db.commit()
 
+    def verdicts_if_new(self, entities: list[str], verdict: str, note: str | None,
+                        sid: int | None) -> tuple[list[str], list[str]]:
+        """既出を飛ばして判定を記録する。確認と挿入を 1 つの書き込みトランザクションで行い、
+        並走する別プロセスとの間で同じ対象を二重に記録しない（BEGIN IMMEDIATE で書き手を直列化）。"""
+        recorded: list[str] = []
+        skipped: list[str] = []
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            for entity in entities:
+                if self.seen(entity):
+                    skipped.append(entity)
+                    continue
+                self.db.execute(
+                    "INSERT INTO verdicts(at, entity, verdict, note, session_id) VALUES (?,?,?,?,?)",
+                    (now(), entity, verdict, note, sid),
+                )
+                recorded.append(entity)
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+        return recorded, skipped
+
     # 集計
     def _max_id(self, table: str, sid: int) -> int:
         row = self.db.execute(f"SELECT COALESCE(MAX(id),0) AS m FROM {table} WHERE session_id=?", (sid,)).fetchone()
@@ -463,6 +486,19 @@ def compose(ledger: Ledger, session: sqlite3.Row, mode: str) -> str:
     return "\n\n".join(parts)
 
 
+def compose_preview(budget_seconds: int, policy: str) -> str:
+    """session を作らずに、開始直後の文面を組み立てる（dry-run 用）。"""
+    lines = [
+        f"{TAG} 予算 {fmt_duration(budget_seconds)} / 経過 0秒 / 残り {fmt_duration(budget_seconds)} (0%)",
+        "直近 checkpoint 以降: 触れた対象 0 (新規 0) / 成果物 0 / 経過 0秒",
+        "セッション累計: 対象 0 (新規 0) / checkpoint 0 / 成果物 0 / 根 0",
+        "台帳は空。触れた対象と一区切りを記録しないと、収率は測れない。",
+    ]
+    parts = ["\n".join(lines), "方針:\n" + policy.strip(), record_instructions(),
+             "残りの予算で、方針に沿って探索を続ける。台帳にある対象は既出なので、新規へ向かう。"]
+    return "\n\n".join(parts)
+
+
 def render_status(ledger: Ledger, session: sqlite3.Row) -> str:
     return "\n".join(facts(ledger, session))
 
@@ -633,35 +669,40 @@ def cmd_run(args: argparse.Namespace) -> int:
             " hook は cwd が台帳のディレクトリ配下にあるときだけ一致する")
     ledger = Ledger(project_dir)
     session = ledger.active()
-    if session is None:
-        if not args.budget:
-            raise BudgetError("--budget が要る（例: --budget 60m）")
-        session = ledger.start(parse_budget(args.budget), load_policy(args), args.yield_window,
-                               args.max_blocks, args.thresholds)
-        log(f"session #{session['id']} を開始: 予算 {fmt_duration(session['budget_seconds'])}")
-    elif not args.resume_active:
+    if session is None and not args.budget:
+        raise BudgetError("--budget が要る（例: --budget 60m）")
+    if session is not None and not args.resume_active and not args.dry_run:
         raise BudgetError(
             f"session #{session['id']} が active。続けるなら --resume-active、やめるなら `end --reason`")
-    sid = int(session["id"])
     claude_cmd = shlex.split(args.claude_cmd or os.environ.get("EXPLORATION_BUDGET_CLAUDE_CMD") or "claude")
     extra: list[str] = list(args.claude_arg or [])
     if args.model:
         extra += ["--model", args.model]
     if args.skip_permissions:
         extra.append("--dangerously-skip-permissions")
+
+    if args.dry_run:
+        # 状態を作らない。session が無ければ方針と予算から round 1 の文面を組み立てて見せるだけ
+        print(f"{TAG} dry-run: 台帳 {project_dir} / 作業ディレクトリ {workdir}")
+        print(f"{TAG} claude: {' '.join(shlex.quote(c) for c in claude_cmd + ['-p', '<prompt>', '--output-format', 'json'] + extra)}")
+        print("--- round 1 のプロンプト ---")
+        if session is None:
+            print(compose_preview(parse_budget(args.budget), load_policy(args)))
+        else:
+            print(f"{TAG} active な session #{session['id']} を引き継ぐ前提の文面")
+            print(compose(ledger, session, "round"))
+        return 0
+
+    if session is None:
+        session = ledger.start(parse_budget(args.budget), load_policy(args), args.yield_window,
+                               args.max_blocks, args.thresholds)
+        log(f"session #{session['id']} を開始: 予算 {fmt_duration(session['budget_seconds'])}")
+    sid = int(session["id"])
     run_dir = ledger.dir / "runs" / str(sid)
     run_dir.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env["CLAUDE_CODE_STOP_HOOK_BLOCK_CAP"] = str(args.block_cap)
     env["EXPLORATION_BUDGET_RUNNER"] = "1"
-
-    if args.dry_run:
-        print(f"{TAG} dry-run: 台帳 {project_dir} / 作業ディレクトリ {workdir}")
-        print(f"{TAG} claude: {' '.join(shlex.quote(c) for c in claude_cmd + ['-p', '<prompt>', '--output-format', 'json'] + extra)}")
-        print(f"{TAG} ログ: {run_dir}")
-        print("--- round 1 のプロンプト ---")
-        print(compose(ledger, session, "round"))
-        return 0
 
     failures = 0
     while True:
@@ -805,14 +846,12 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     sid = int(session["id"]) if session else None
     if args.verdict not in VERDICTS:
         raise BudgetError(f"判定は {', '.join(VERDICTS)} のどれか: {args.verdict!r}")
-    recorded = []
-    skipped = []
-    for entity in args.entity:
-        if args.if_new and ledger.seen(entity):
-            skipped.append(entity)
-            continue
-        ledger.verdict(entity, args.verdict, args.note, sid)
-        recorded.append(entity)
+    if args.if_new:
+        recorded, skipped = ledger.verdicts_if_new(args.entity, args.verdict, args.note, sid)
+    else:
+        recorded, skipped = list(args.entity), []
+        for entity in args.entity:
+            ledger.verdict(entity, args.verdict, args.note, sid)
     if args.json:
         print(json.dumps({"verdict": args.verdict, "recorded": recorded, "skipped": skipped}, ensure_ascii=False))
     elif args.if_new:
