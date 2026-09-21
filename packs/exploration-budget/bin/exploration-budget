@@ -150,7 +150,7 @@ CREATE TABLE IF NOT EXISTS touches(
 );
 CREATE TABLE IF NOT EXISTS artifacts(
   id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, at INTEGER NOT NULL,
-  path TEXT NOT NULL, kind TEXT, note TEXT
+  path TEXT NOT NULL, kind TEXT, note TEXT, cwd TEXT
 );
 CREATE TABLE IF NOT EXISTS roots(
   id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, at INTEGER NOT NULL,
@@ -162,6 +162,11 @@ CREATE TABLE IF NOT EXISTS verdicts(
 );
 CREATE TABLE IF NOT EXISTS announcements(
   id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, threshold INTEGER NOT NULL, at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS evaluations(
+  id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, at INTEGER NOT NULL,
+  checkpoint_id INTEGER, trigger_kind TEXT NOT NULL, model TEXT,
+  rejections TEXT NOT NULL, raw TEXT, cost REAL
 );
 CREATE INDEX IF NOT EXISTS idx_touches_entity ON touches(entity);
 CREATE INDEX IF NOT EXISTS idx_verdicts_entity ON verdicts(entity);
@@ -183,6 +188,14 @@ class Ledger:
         self.db = sqlite3.connect(str(self.path))
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """既存の台帳に後から足した列を補う（CREATE TABLE IF NOT EXISTS は既存表を変えない）。"""
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(artifacts)").fetchall()}
+        if "cwd" not in columns:
+            self.db.execute("ALTER TABLE artifacts ADD COLUMN cwd TEXT")
+            self.db.commit()
 
     # session
     def active(self) -> sqlite3.Row | None:
@@ -262,17 +275,21 @@ class Ledger:
         closed = self.delta(sid)
         touch_wm = self._max_id("touches", sid)
         artifact_wm = self._max_id("artifacts", sid)
-        self.db.execute(
+        cur = self.db.execute(
             "INSERT INTO checkpoints(session_id, at, note, touch_wm, artifact_wm) VALUES (?,?,?,?,?)",
             (sid, now(), note, touch_wm, artifact_wm),
         )
         self.db.commit()
+        closed["checkpoint_id"] = int(cur.lastrowid)
         return closed
 
-    def artifact(self, sid: int, path: str, kind: str | None, note: str | None) -> None:
+    def artifact(self, sid: int, path: str, kind: str | None, note: str | None,
+                 cwd: str | None = None) -> None:
+        """成果物を記録する。相対パスは記録した cwd で解決するため、cwd も残す
+        （--workdir が --project-dir と違うとき、台帳側で解決すると別ファイルを読む）。"""
         self.db.execute(
-            "INSERT INTO artifacts(session_id, at, path, kind, note) VALUES (?,?,?,?,?)",
-            (sid, now(), path, kind, note),
+            "INSERT INTO artifacts(session_id, at, path, kind, note, cwd) VALUES (?,?,?,?,?,?)",
+            (sid, now(), path, kind, note, cwd),
         )
         self.db.commit()
 
@@ -420,6 +437,26 @@ class Ledger:
     def list_rows(self, table: str, sid: int) -> list[sqlite3.Row]:
         return self.db.execute(f"SELECT * FROM {table} WHERE session_id=? ORDER BY id", (sid,)).fetchall()
 
+    def last_explored_interval(self, sid: int) -> dict | None:
+        """触れた対象が 1 件以上ある直近の区切り。反証・整理だけの区切りは探索ではないので飛ばす。"""
+        explored = [span for span in self.intervals(sid) if span["touches"] > 0]
+        return explored[-1] if explored else None
+
+    def add_evaluation(self, sid: int, checkpoint_id: int | None, trigger: str, model: str | None,
+                       rejections: list[str], raw: str, cost: float | None) -> sqlite3.Row:
+        cur = self.db.execute(
+            "INSERT INTO evaluations(session_id, at, checkpoint_id, trigger_kind, model, rejections, raw, cost)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (sid, now(), checkpoint_id, trigger, model, json.dumps(rejections, ensure_ascii=False),
+             raw[:8192], cost),
+        )
+        self.db.commit()
+        return self.db.execute("SELECT * FROM evaluations WHERE id=?", (cur.lastrowid,)).fetchone()
+
+    def latest_evaluation(self, sid: int) -> sqlite3.Row | None:
+        return self.db.execute(
+            "SELECT * FROM evaluations WHERE session_id=? ORDER BY id DESC LIMIT 1", (sid,)).fetchone()
+
     def announced(self, sid: int) -> set[int]:
         rows = self.db.execute("SELECT threshold FROM announcements WHERE session_id=?", (sid,)).fetchall()
         return {int(row["threshold"]) for row in rows}
@@ -499,8 +536,33 @@ def record_instructions() -> str:
     )
 
 
+def evaluation_rejections(row: sqlite3.Row | None) -> list[str]:
+    if row is None:
+        return []
+    try:
+        value = json.loads(row["rejections"])
+    except (TypeError, ValueError):
+        return []
+    return [str(item) for item in value] if isinstance(value, list) else []
+
+
+def guidance_sections(ledger: Ledger, session: sqlite3.Row) -> list[str]:
+    """次の指示は生成せず合成する。計測ルールによる舵（決定論）と、評価者の却下理由（判断）だけを差し込む。"""
+    sid = int(session["id"])
+    sections: list[str] = []
+    explored = ledger.last_explored_interval(sid)
+    if explored is not None and explored["novel"] == 0:
+        sections.append("直近の探索した区切りは新規 0。方針に書かれた根の引き直しに従う。")
+    rejections = evaluation_rejections(ledger.latest_evaluation(sid))
+    if rejections:
+        sections.append("前回の評価（却下のみ）:\n" + "\n".join(f"- {item}" for item in rejections))
+    return sections
+
+
 def compose(ledger: Ledger, session: sqlite3.Row, mode: str) -> str:
-    parts = ["\n".join(facts(ledger, session)), "方針:\n" + session["policy"].strip(), record_instructions()]
+    parts = ["\n".join(facts(ledger, session))]
+    parts.extend(guidance_sections(ledger, session))
+    parts += ["方針:\n" + session["policy"].strip(), record_instructions()]
     if mode == "round":
         parts.append("残りの予算で、方針に沿って探索を続ける。台帳にある対象は既出なので、新規へ向かう。")
     return "\n\n".join(parts)
@@ -551,6 +613,10 @@ def render_report(ledger: Ledger, session: sqlite3.Row) -> str:
     for row in artifacts.values():
         kind = f" ({row['kind']})" if row["kind"] else ""
         lines.append(f"成果物 {row['path']}{kind}")
+    for row in ledger.list_rows("evaluations", sid):
+        rejections = evaluation_rejections(row)
+        body = " / ".join(rejections) if rejections else "却下なし"
+        lines.append(f"評価 {fmt_clock(row['at'])} ({row['trigger_kind']}): {body}")
     kinds = ledger.touch_kinds(sid)
     if len(kinds) > 1 or (kinds and "" not in kinds):
         lines.append("触れた対象の種類: " + " / ".join(f"{k or '(種類なし)'} {v}" for k, v in kinds.items()))
@@ -586,7 +652,15 @@ def report_json(ledger: Ledger, session: sqlite3.Row) -> dict:
         "unjudged_novel": ledger.unjudged_novel(sid),
         "unjudged_candidates": ledger.unjudged_novel(sid, "candidate"),
         "touch_kinds": ledger.touch_kinds(sid),
+        "evaluations": [evaluation_json(r) for r in ledger.list_rows("evaluations", sid)],
     }
+
+
+def evaluation_json(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["trigger"] = data.pop("trigger_kind")
+    data["rejections"] = evaluation_rejections(row)
+    return data
 
 
 # --- hooks ----------------------------------------------------------------
@@ -665,6 +739,133 @@ def hook_post_tool(payload: dict) -> int:
     return 0
 
 
+# --- 評価者 ---------------------------------------------------------------
+
+EVALUATOR_FRAME = """あなたは探索セッションの評価者で、計画者ではない。
+入力は「方針」「台帳の事実」「直近の一区切り（checkpoint）」「成果物の現在の本文」。
+仕事は一つ。直近の一区切りで行われたことのうち、方針の外にあるもの、または方針が増やせと言う量を増やしていないものを、方針の該当する文に結び付けて却下理由として挙げる。
+出力は次の JSON オブジェクトだけ。前後に説明を付けない。
+{"rejections": ["<何をしたか → 方針のどの文に反するか、または何を増やしていないか>", "..."]}
+却下するものが無ければ {"rejections": []} と返す。
+褒めない。方針の文を新しく書かない。次にやることを提案しない。事実と方針の照合だけを書く。"""
+
+ARTIFACT_EXCERPT_BYTES = 6000
+EVALUATION_INTERVALS = 3
+
+
+def evaluator_input(ledger: Ledger, session: sqlite3.Row) -> str:
+    sid = int(session["id"])
+    parts = ["## 方針\n" + session["policy"].strip(), "## 台帳の事実\n" + "\n".join(facts(ledger, session))]
+    spans = ledger.intervals(sid)[-EVALUATION_INTERVALS:]
+    if spans:
+        lines = []
+        for index, span in enumerate(spans, 1):
+            note = f" note: {span['note']}" if span["note"] else ""
+            lines.append(f"- 区切り {index}/{len(spans)} {fmt_clock(span['at'])}: 触れた対象 {span['touches']}"
+                         f" (新規 {span['novel']}) / 成果物 {span['artifacts']}{note}")
+        parts.append("## 直近の一区切り（古い順）\n" + "\n".join(lines))
+    else:
+        parts.append("## 直近の一区切り\n（checkpoint はまだ無い）")
+    seen_paths: dict[str, str] = {}
+    for row in ledger.list_rows("artifacts", sid):
+        path = Path(row["path"])
+        if not path.is_absolute():
+            # 記録した cwd で解決する。古い行（cwd 無し）は台帳の project_dir で解決する
+            path = Path(row["cwd"] or ledger.project_dir) / path
+        seen_paths[row["path"]] = read_artifact_excerpt(path)
+    if seen_paths:
+        blocks = [f"### {name}\n{body}" for name, body in seen_paths.items()]
+        parts.append("## 成果物の現在の本文\n" + "\n\n".join(blocks))
+    else:
+        parts.append("## 成果物\n（記録された成果物は無い）")
+    return "\n\n".join(parts)
+
+
+def read_artifact_excerpt(path: Path) -> str:
+    """成果物の先頭だけを読む。大きなログやデータを丸ごと読まない（上限 + 1 バイトで打ち切りを検出）。"""
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(ARTIFACT_EXCERPT_BYTES + 1)
+    except OSError:
+        return "（読めない、または存在しない）"
+    truncated = len(data) > ARTIFACT_EXCERPT_BYTES
+    text = data[:ARTIFACT_EXCERPT_BYTES].decode("utf-8", errors="replace")
+    return text + ("\n…（以下省略）" if truncated else "")
+
+
+def parse_rejections(text: str) -> tuple[list[str], bool]:
+    """評価者の返答から {"rejections": [...]} を取り出す。コードフェンスや前後の文章は許す。"""
+    candidates = [text.strip()]
+    fenced = re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.S)
+    candidates = fenced + candidates
+    first = text.find("{")
+    last = text.rfind("}")
+    if first != -1 and last > first:
+        candidates.append(text[first:last + 1])
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(value, dict) and isinstance(value.get("rejections"), list):
+            return [str(item).strip() for item in value["rejections"] if str(item).strip()], True
+    return [], False
+
+
+def evaluator_command(claude_cmd: str | None) -> list[str]:
+    return shlex.split(claude_cmd or os.environ.get("EXPLORATION_BUDGET_CLAUDE_CMD") or "claude")
+
+
+def evaluator_model(model: str | None) -> str | None:
+    return model or os.environ.get("EXPLORATION_BUDGET_EVALUATOR_MODEL") or None
+
+
+def run_evaluator(ledger: Ledger, session: sqlite3.Row, trigger: str, checkpoint_id: int | None,
+                  claude_cmd: str | None, model: str | None) -> sqlite3.Row:
+    """評価者を 1 回呼び、却下理由だけを台帳に残す。ツール無し・hook 無しの claude -p。"""
+    sid = int(session["id"])
+    cmd = evaluator_command(claude_cmd)
+    chosen_model = evaluator_model(model)
+    prompt = EVALUATOR_FRAME + "\n\n" + evaluator_input(ledger, session)
+    # 道具なし・MCP なし・hook 全停止。利用者の他の Stop/prompt hook が評価者の会話へ割り込むと、
+    # 手番が増えたり出力が JSON でなくなったりする（session-cards の distill と同じ隔離）
+    argv = cmd + ["-p", prompt, "--output-format", "json", "--tools", "", "--strict-mcp-config",
+                  "--settings", json.dumps({"disableAllHooks": True})]
+    if chosen_model:
+        argv += ["--model", chosen_model]
+    env = dict(os.environ)
+    env["EXPLORATION_BUDGET_DISABLE"] = "1"  # 評価者の停止で hook が走らないように
+    env["CLAUDE_SESSION_CARDS_DISABLE"] = "1"
+    env.pop("EXPLORATION_BUDGET_EVALUATE", None)
+    try:
+        proc = subprocess.run(argv, cwd=ledger.project_dir, stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, env=env)
+    except OSError as exc:
+        print(f"{TAG} 評価者を起動できない: {exc}", file=sys.stderr)
+        return ledger.add_evaluation(sid, checkpoint_id, trigger, chosen_model, [], f"起動失敗: {exc}", None)
+    result = parse_result(proc.stdout)
+    reply = result.get("result") if result and isinstance(result.get("result"), str) else proc.stdout
+    cost = result.get("total_cost_usd") if result and isinstance(result.get("total_cost_usd"), (int, float)) else None
+    if proc.returncode != 0 or result is None or result.get("is_error"):
+        print(f"{TAG} 評価者の呼び出しに失敗 (exit {proc.returncode})。却下なしとして扱う", file=sys.stderr)
+        return ledger.add_evaluation(sid, checkpoint_id, trigger, chosen_model, [],
+                                     (proc.stdout or "") + (proc.stderr or ""), cost)
+    rejections, parsed = parse_rejections(reply or "")
+    if not parsed:
+        print(f"{TAG} 評価者の返答を JSON として解釈できない。却下なしとして扱う（raw は台帳に残す）", file=sys.stderr)
+    return ledger.add_evaluation(sid, checkpoint_id, trigger, chosen_model, rejections, reply or "", cost)
+
+
+def print_evaluation(row: sqlite3.Row) -> None:
+    rejections = evaluation_rejections(row)
+    if rejections:
+        print(f"{TAG} 評価（却下のみ）:")
+        for item in rejections:
+            print(f"- {item}")
+    else:
+        print(f"{TAG} 評価: 却下なし")
+
+
 # --- runner ---------------------------------------------------------------
 
 
@@ -740,6 +941,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     env = dict(os.environ)
     env["CLAUDE_CODE_STOP_HOOK_BLOCK_CAP"] = str(args.block_cap)
     env["EXPLORATION_BUDGET_RUNNER"] = "1"
+    if args.evaluate_on_checkpoint:
+        # 子の checkpoint が評価者を呼ぶ。評価者の起動コマンドとモデルも子へ渡す
+        env["EXPLORATION_BUDGET_EVALUATE"] = "1"
+        env["EXPLORATION_BUDGET_CLAUDE_CMD"] = " ".join(shlex.quote(c) for c in claude_cmd)
+        if args.evaluator_model:
+            env["EXPLORATION_BUDGET_EVALUATOR_MODEL"] = args.evaluator_model
 
     failures = 0
     while True:
@@ -793,6 +1000,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         t = ledger.totals(sid)
         log(f"round {round_no}: turns {result.get('num_turns')}, cost {result.get('total_cost_usd')},"
             f" 累計 対象 {t['touches']} (新規 {t['novel']})")
+        if args.evaluate_on_round and ledger.session(sid)["status"] == "active":
+            row = run_evaluator(ledger, ledger.session(sid), "round", None,
+                                " ".join(shlex.quote(c) for c in claude_cmd), args.evaluator_model)
+            log(f"round {round_no}: 評価 却下 {len(evaluation_rejections(row))} 件")
     print(render_report(ledger, ledger.session(sid)))
     return 0
 
@@ -857,14 +1068,30 @@ def cmd_checkpoint(args: argparse.Namespace) -> int:
     session = require_active(ledger)
     closed = ledger.checkpoint(int(session["id"]), args.note)
     print(f"{TAG} checkpoint: 触れた対象 {closed['touches']} (新規 {closed['novel']})"
-          f" / 成果物 {closed['artifacts']} / {fmt_duration(closed['seconds'])}")
+          f" / 成果物 {closed['artifacts']} / {fmt_duration(closed['seconds'])}", flush=True)
+    if args.evaluate or os.environ.get("EXPLORATION_BUDGET_EVALUATE") == "1":
+        # 一区切りの直後、次の糸を選ぶ前に却下理由が届くように同期で呼ぶ
+        row = run_evaluator(ledger, ledger.session(int(session["id"])), "checkpoint",
+                            closed["checkpoint_id"], args.claude_cmd, args.evaluator_model)
+        print_evaluation(row)
+    return 0
+
+
+def cmd_evaluate(args: argparse.Namespace) -> int:
+    ledger = Ledger(canonical_dir(args.project_dir))
+    session = require_active(ledger)
+    row = run_evaluator(ledger, session, "manual", None, args.claude_cmd, args.evaluator_model)
+    if args.json:
+        print(json.dumps(evaluation_json(row), ensure_ascii=False))
+    else:
+        print_evaluation(row)
     return 0
 
 
 def cmd_artifact(args: argparse.Namespace) -> int:
     ledger = Ledger(canonical_dir(args.project_dir))
     session = require_active(ledger)
-    ledger.artifact(int(session["id"]), args.path, args.kind, args.note)
+    ledger.artifact(int(session["id"]), args.path, args.kind, args.note, canonical_dir(os.getcwd()))
     print(f"{TAG} artifact: {args.path}")
     return 0
 
@@ -982,7 +1209,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("checkpoint", parents=[common], help="一区切りを記録する")
     p.add_argument("--note")
+    p.add_argument("--evaluate", action="store_true",
+                   help="記録の直後に評価者を呼び、却下理由を返す（環境変数 EXPLORATION_BUDGET_EVALUATE=1 でも同じ）")
+    p.add_argument("--evaluator-model", help="評価者のモデル（環境変数 EXPLORATION_BUDGET_EVALUATOR_MODEL）")
+    p.add_argument("--claude-cmd", help="評価者の起動コマンド（既定: claude、環境変数 EXPLORATION_BUDGET_CLAUDE_CMD）")
     p.set_defaults(func=cmd_checkpoint)
+
+    p = sub.add_parser("evaluate", parents=[common], help="評価者を呼び、直近の一区切りへの却下理由だけを返す")
+    p.add_argument("--evaluator-model", help="評価者のモデル（環境変数 EXPLORATION_BUDGET_EVALUATOR_MODEL）")
+    p.add_argument("--claude-cmd", help="評価者の起動コマンド（既定: claude、環境変数 EXPLORATION_BUDGET_CLAUDE_CMD）")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_evaluate)
 
     p = sub.add_parser("artifact", parents=[common], help="成果物を記録する")
     p.add_argument("path")
@@ -1025,6 +1262,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-permissions", action="store_true", help="--dangerously-skip-permissions を付ける")
     p.add_argument("--max-rounds", type=int, default=DEFAULT_MAX_ROUNDS)
     p.add_argument("--max-failures", type=int, default=DEFAULT_MAX_FAILURES)
+    p.add_argument("--evaluate-on-checkpoint", action="store_true",
+                   help="子の checkpoint ごとに評価者を呼ぶ（EXPLORATION_BUDGET_EVALUATE=1 を子へ渡す）")
+    p.add_argument("--evaluate-on-round", action="store_true", help="round が終わるたびに評価者を呼ぶ")
+    p.add_argument("--evaluator-model", help="評価者のモデル（既定: claude の既定）")
     p.add_argument("--block-cap", type=int, default=DEFAULT_BLOCK_CAP,
                    help=f"子 claude の CLAUDE_CODE_STOP_HOOK_BLOCK_CAP（既定 {DEFAULT_BLOCK_CAP}）")
     p.add_argument("--dry-run", action="store_true")
