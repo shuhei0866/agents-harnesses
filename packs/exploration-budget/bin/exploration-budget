@@ -1067,12 +1067,22 @@ def cmd_checkpoint(args: argparse.Namespace) -> int:
     ledger = Ledger(canonical_dir(args.project_dir))
     session = require_active(ledger)
     closed = ledger.checkpoint(int(session["id"]), args.note)
-    print(f"{TAG} checkpoint: 触れた対象 {closed['touches']} (新規 {closed['novel']})"
-          f" / 成果物 {closed['artifacts']} / {fmt_duration(closed['seconds'])}", flush=True)
+    if not args.json:
+        print(f"{TAG} checkpoint: 触れた対象 {closed['touches']} (新規 {closed['novel']})"
+              f" / 成果物 {closed['artifacts']} / {fmt_duration(closed['seconds'])}", flush=True)
+    row = None
     if args.evaluate or os.environ.get("EXPLORATION_BUDGET_EVALUATE") == "1":
         # 一区切りの直後、次の糸を選ぶ前に却下理由が届くように同期で呼ぶ
         row = run_evaluator(ledger, ledger.session(int(session["id"])), "checkpoint",
                             closed["checkpoint_id"], args.claude_cmd, args.evaluator_model)
+    if args.json:
+        # 人向けの行の代わりに 1 つの JSON。評価者を呼んだときはその結果も同じオブジェクトに載せる
+        print(json.dumps({
+            "checkpoint_id": closed["checkpoint_id"],
+            "closed": {key: closed[key] for key in ("touches", "novel", "artifacts", "seconds")},
+            "evaluation": evaluation_json(row) if row is not None else None,
+        }, ensure_ascii=False))
+    elif row is not None:
         print_evaluation(row)
     return 0
 
@@ -1213,6 +1223,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="記録の直後に評価者を呼び、却下理由を返す（環境変数 EXPLORATION_BUDGET_EVALUATE=1 でも同じ）")
     p.add_argument("--evaluator-model", help="評価者のモデル（環境変数 EXPLORATION_BUDGET_EVALUATOR_MODEL）")
     p.add_argument("--claude-cmd", help="評価者の起動コマンド（既定: claude、環境変数 EXPLORATION_BUDGET_CLAUDE_CMD）")
+    p.add_argument("--json", action="store_true",
+                   help="人向けの行の代わりに checkpoint_id・閉じた区間の集計・評価者の結果（呼ばなければ null）を 1 つの JSON で返す")
     p.set_defaults(func=cmd_checkpoint)
 
     p = sub.add_parser("evaluate", parents=[common], help="評価者を呼び、直近の一区切りへの却下理由だけを返す")

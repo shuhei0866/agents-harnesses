@@ -189,6 +189,16 @@ class Sessions(Base):
         self.assertEqual(len(intervals), 1)
         self.assertEqual((intervals[0]["touches"], intervals[0]["novel"], intervals[0]["artifacts"]), (1, 1, 1))
 
+    def test_checkpoint_json_returns_id_and_closed_interval(self) -> None:
+        self.start()
+        self.cli("touch", "x")
+        proc = self.cli("checkpoint", "--json", "--note", "x")
+        data = json.loads(proc.stdout)  # 人向けの行が混ざっていれば読めない
+        self.assertIsInstance(data["checkpoint_id"], int)
+        self.assertEqual((data["closed"]["touches"], data["closed"]["novel"], data["closed"]["artifacts"]), (1, 1, 0))
+        self.assertIsNone(data["evaluation"], "評価者を呼んでいなければ null")
+        self.assertEqual(self.report_json()["intervals"][0]["note"], "x", "台帳への記録は人向けの形と同じ")
+
     def test_report_lists_each_artifact_once(self) -> None:
         self.start()
         self.cli("artifact", "out/a.md", "--kind", "draft")
@@ -574,6 +584,17 @@ class Evaluator(FakeClaudeCase):
         data = self.report_json()
         self.assertEqual([e["checkpoint_id"] for e in data["evaluations"]], [1, 2], "環境変数でも同じ")
         self.assertEqual(len(self.evaluator_calls()), 2)
+
+    def test_checkpoint_json_carries_evaluation(self) -> None:
+        self.start()
+        self.cli("touch", "a")
+        env = self.eval_env('{"rejections": ["x"]}')
+        proc = self.cli("checkpoint", "--json", "--evaluate", "--claude-cmd", self.fake_cmd(), env=env)
+        data = json.loads(proc.stdout)  # 人向けの行も評価の行も混ざらない
+        self.assertEqual(data["evaluation"]["rejections"], ["x"])
+        self.assertEqual(data["evaluation"]["checkpoint_id"], data["checkpoint_id"])
+        self.assertEqual(data["evaluation"]["trigger"], "checkpoint")
+        self.assertEqual(len(self.evaluator_calls()), 1)
 
     def test_compose_carries_latest_rejections_only(self) -> None:
         self.start()
