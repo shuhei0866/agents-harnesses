@@ -228,6 +228,11 @@ class StopHook(Base):
         self.assertIn(POLICY, reason)
         self.assertIn("touch", reason)
         self.assertIn("台帳は空", reason)
+        import datetime as _dt
+        clock = _dt.datetime.fromtimestamp(self.now).strftime("%Y-%m-%d %H:%M")
+        end = _dt.datetime.fromtimestamp(self.now + 3600).strftime("%Y-%m-%d %H:%M")
+        self.assertIn(f"時計: 現在 {clock}（開始 {clock}、満了予定 {end}）", reason, "エージェントに現在時刻を事実として渡す")
+        self.assertIn("推測しない", reason)
         for word in ("急", "早く", "hurry"):
             self.assertNotIn(word, reason)
         session = self.status_json()["session"]
