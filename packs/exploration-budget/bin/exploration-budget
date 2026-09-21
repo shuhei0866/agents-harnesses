@@ -805,9 +805,20 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     sid = int(session["id"]) if session else None
     if args.verdict not in VERDICTS:
         raise BudgetError(f"判定は {', '.join(VERDICTS)} のどれか: {args.verdict!r}")
+    recorded = []
+    skipped = []
     for entity in args.entity:
+        if args.if_new and ledger.seen(entity):
+            skipped.append(entity)
+            continue
         ledger.verdict(entity, args.verdict, args.note, sid)
-    print(f"{TAG} verdict {args.verdict}: {', '.join(args.entity)}")
+        recorded.append(entity)
+    if args.json:
+        print(json.dumps({"verdict": args.verdict, "recorded": recorded, "skipped": skipped}, ensure_ascii=False))
+    elif args.if_new:
+        print(f"{TAG} verdict {args.verdict}: 記録 {len(recorded)} / 既出で省略 {len(skipped)}")
+    else:
+        print(f"{TAG} verdict {args.verdict}: {', '.join(recorded)}")
     return 0
 
 
@@ -914,6 +925,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("verdict", help=" | ".join(VERDICTS))
     p.add_argument("entity", nargs="+")
     p.add_argument("--note")
+    p.add_argument("--if-new", action="store_true",
+                   help="既に触れた・判定済みの対象は飛ばす（外部の台帳から既出を流し込むとき用）")
+    p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_verdict)
 
     p = sub.add_parser("delta", parents=[common], help="直近 checkpoint 以降の集計")

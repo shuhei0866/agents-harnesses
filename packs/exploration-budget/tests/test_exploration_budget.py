@@ -154,6 +154,17 @@ class Sessions(Base):
         self.cli("verdict", "known", "n1")
         self.assertEqual(self.report_json()["unjudged_novel"], [])
 
+    def test_verdict_if_new_skips_seen_entities(self) -> None:
+        self.cli("verdict", "known", "a")
+        out = json.loads(self.cli("verdict", "rejected", "--if-new", "--json", "a", "b", "c").stdout)
+        self.assertEqual(out["recorded"], ["b", "c"])
+        self.assertEqual(out["skipped"], ["a"])
+        self.start()
+        self.cli("touch", "d")
+        text = self.cli("verdict", "deferred", "--if-new", "d", "e").stdout
+        self.assertIn("記録 1 / 既出で省略 1", text)
+        self.assertEqual(self.cli("touch", "a", "b", "e").stdout, "seen\ta\nseen\tb\nseen\te\n")
+
     def test_checkpoint_closes_interval(self) -> None:
         self.start()
         self.cli("touch", "x")
