@@ -68,7 +68,7 @@ hook と runner が返す文面に、そのまま書いてあります。
 | コマンド | 意味 |
 |---|---|
 | `touch <id> --kind candidate\|considered [--root r]` | 触れた対象を記録する。`novel` か `seen` を返す。候補として保存したものは `candidate`、検討しただけの母集団は `considered`。report の未判定一覧は candidate だけを並べる |
-| `checkpoint --note "<何を終えたか>"` | 一区切り。収率はこの区切りごとに数える |
+| `checkpoint --note "<何を終えたか>" [--json]` | 一区切り。収率はこの区切りごとに数える。`--json` は人向けの行の代わりに `checkpoint_id`、閉じた区間の集計 `closed`（touches・novel・artifacts・seconds）、評価者の結果 `evaluation`（`--evaluate` でなければ null）を 1 つの JSON で返す |
 | `artifact <path> [--kind k]` | 成果物を記録する |
 | `root <軸> <値> --brief "<一行>"` | 探索の根を変えたことを記録する |
 | `status` / `delta` | 経過・残り・直近の収率 |
