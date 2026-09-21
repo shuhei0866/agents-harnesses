@@ -25,8 +25,16 @@ FAKE_CLAUDE = textwrap.dedent(
             "argv": sys.argv[1:],
             "cap": os.environ.get("CLAUDE_CODE_STOP_HOOK_BLOCK_CAP"),
             "runner": os.environ.get("EXPLORATION_BUDGET_RUNNER"),
+            "evaluate": os.environ.get("EXPLORATION_BUDGET_EVALUATE"),
+            "disable": os.environ.get("EXPLORATION_BUDGET_DISABLE"),
             "cwd": os.getcwd(),
         }) + "\\n")
+    if "--tools" in sys.argv:
+        # 評価者として呼ばれた: ツール無し。環境変数の返答をそのまま result に入れて返す
+        print(json.dumps({"session_id": "fake-eval", "num_turns": 1, "is_error": False,
+                          "total_cost_usd": 0.002,
+                          "result": os.environ.get("FAKE_EVAL_REPLY", '{"rejections": []}')}))
+        sys.exit(0)
     n = sum(1 for _ in open(log, encoding="utf-8"))
     action = os.environ.get("FAKE_ACTION", "touch")
     cli = os.environ["FAKE_CLI"]
@@ -341,7 +349,9 @@ class PostToolHook(Base):
         self.assertEqual(self.hook("post-tool", env=env).stdout, "")
 
 
-class Runner(Base):
+class FakeClaudeCase(Base):
+    """偽 claude を使うテストの共通部品。テストは持たない。"""
+
     def setUp(self) -> None:
         super().setUp()
         self.fake = Path(self.tmp.name) / "fake-claude.py"
@@ -357,6 +367,8 @@ class Runner(Base):
             return []
         return [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
 
+
+class Runner(FakeClaudeCase):
     def test_loops_with_resume_until_budget(self) -> None:
         proc = self.cli("run", "--budget", "2s", "--policy", POLICY, "--claude-cmd",
                         f"{sys.executable} {self.fake}", "--block-cap", "33", env=self.run_env())
@@ -443,3 +455,160 @@ class Runner(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Evaluator(FakeClaudeCase):
+    def eval_env(self, reply: str | None, **extra: str) -> dict:
+        env = self.env(FAKE_LOG=str(self.log), FAKE_CLI=str(CLI), **extra)
+        if reply is not None:
+            env["FAKE_EVAL_REPLY"] = reply
+        return env
+
+    def fake_cmd(self) -> str:
+        return f"{sys.executable} {self.fake}"
+
+    def evaluator_calls(self) -> list[dict]:
+        return [call for call in self.calls() if "--tools" in call["argv"]]
+
+    def test_evaluate_stores_and_prints_rejections(self) -> None:
+        self.start()
+        self.cli("touch", "a")
+        self.cli("checkpoint", "--note", "実装に手を付けた")
+        env = self.eval_env('{"rejections": ["実装に手を付けた → 方針「実装は方針の外」に反する"]}')
+        proc = self.cli("evaluate", "--claude-cmd", self.fake_cmd(), env=env)
+        self.assertIn("評価（却下のみ）", proc.stdout)
+        self.assertIn("実装は方針の外", proc.stdout)
+        calls = self.evaluator_calls()
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]["argv"]
+        self.assertIn("--output-format", argv)
+        self.assertEqual(argv[argv.index("--tools") + 1], "")
+        self.assertIn("--strict-mcp-config", argv)
+        self.assertEqual(calls[0]["disable"], "1", "評価者の子では hook を止める")
+        prompt = argv[argv.index("-p") + 1]
+        self.assertIn(POLICY, prompt)
+        self.assertIn("実装に手を付けた", prompt, "直近の checkpoint の note を渡す")
+        self.assertIn("評価者で、計画者ではない", prompt)
+        data = self.report_json()
+        self.assertEqual(len(data["evaluations"]), 1)
+        self.assertEqual(data["evaluations"][0]["trigger"], "manual")
+        self.assertEqual(data["evaluations"][0]["rejections"], ["実装に手を付けた → 方針「実装は方針の外」に反する"])
+        self.assertIsNone(data["evaluations"][0]["checkpoint_id"])
+
+    def test_evaluate_reads_artifacts_and_uses_model_option(self) -> None:
+        self.start()
+        (self.project / "out").mkdir()
+        (self.project / "out" / "REPORT.md").write_text("# 報告\n候補は 2 件。", encoding="utf-8")
+        self.cli("artifact", "out/REPORT.md", "--kind", "report")
+        self.cli("artifact", "out/missing.md")
+        env = self.eval_env('{"rejections": []}')
+        proc = self.cli("evaluate", "--json", "--claude-cmd", self.fake_cmd(), "--evaluator-model", "judge-x", env=env)
+        row = json.loads(proc.stdout)
+        self.assertEqual(row["rejections"], [])
+        self.assertEqual(row["model"], "judge-x")
+        argv = self.evaluator_calls()[0]["argv"]
+        self.assertEqual(argv[argv.index("--model") + 1], "judge-x")
+        prompt = argv[argv.index("-p") + 1]
+        self.assertIn("候補は 2 件。", prompt, "成果物の本文を渡す")
+        self.assertIn("読めない、または存在しない", prompt)
+
+    def test_fenced_json_reply_is_parsed(self) -> None:
+        self.start()
+        reply = "評価します。\n```json\n{\"rejections\": [\"根拠が 1 件\"]}\n```\n以上です。"
+        proc = self.cli("evaluate", "--claude-cmd", self.fake_cmd(), env=self.eval_env(reply))
+        self.assertIn("根拠が 1 件", proc.stdout)
+        self.assertEqual(self.report_json()["evaluations"][0]["rejections"], ["根拠が 1 件"])
+
+    def test_garbage_reply_means_no_rejections_with_warning(self) -> None:
+        self.start()
+        proc = self.cli("evaluate", "--claude-cmd", self.fake_cmd(), env=self.eval_env("well, it depends"))
+        self.assertIn("却下なし", proc.stdout)
+        self.assertIn("解釈できない", proc.stderr)
+        row = self.report_json()["evaluations"][0]
+        self.assertEqual(row["rejections"], [])
+        self.assertEqual(row["raw"], "well, it depends")
+
+    def test_checkpoint_evaluate_links_checkpoint_and_prints_after_line(self) -> None:
+        self.start()
+        self.cli("touch", "a")
+        env = self.eval_env('{"rejections": ["既出の近傍を撫で直した"]}')
+        proc = self.cli("checkpoint", "--note", "一巡目", "--evaluate", "--claude-cmd", self.fake_cmd(), env=env)
+        lines = [line for line in proc.stdout.splitlines() if line.strip()]
+        self.assertTrue(lines[0].startswith("[exploration-budget] checkpoint:"), lines)
+        self.assertIn("既出の近傍を撫で直した", proc.stdout)
+        data = self.report_json()
+        self.assertEqual(data["evaluations"][0]["trigger"], "checkpoint")
+        self.assertEqual(data["evaluations"][0]["checkpoint_id"], 1)
+        self.cli("touch", "b")
+        env["EXPLORATION_BUDGET_EVALUATE"] = "1"
+        env["EXPLORATION_BUDGET_CLAUDE_CMD"] = self.fake_cmd()
+        self.cli("checkpoint", "--note", "二巡目", env=env)
+        data = self.report_json()
+        self.assertEqual([e["checkpoint_id"] for e in data["evaluations"]], [1, 2], "環境変数でも同じ")
+        self.assertEqual(len(self.evaluator_calls()), 2)
+
+    def test_compose_carries_latest_rejections_only(self) -> None:
+        self.start()
+        self.cli("touch", "a")
+        self.cli("checkpoint")
+        self.cli("evaluate", "--claude-cmd", self.fake_cmd(),
+                 env=self.eval_env('{"rejections": ["候補の根拠が 1 件しかない"]}'))
+        reason = json.loads(self.hook("stop").stdout)["reason"]
+        self.assertIn("前回の評価（却下のみ）", reason)
+        self.assertIn("- 候補の根拠が 1 件しかない", reason)
+        self.assertLess(reason.index("前回の評価"), reason.index("方針:"), "事実の後、方針の前")
+        self.cli("evaluate", "--claude-cmd", self.fake_cmd(), env=self.eval_env('{"rejections": []}'))
+        reason = json.loads(self.hook("stop").stdout)["reason"]
+        self.assertNotIn("前回の評価", reason)
+
+    def test_steer_line_follows_last_explored_interval(self) -> None:
+        self.start()
+        self.cli("touch", "a")
+        self.cli("checkpoint")
+        self.assertNotIn("新規 0。", json.loads(self.hook("stop").stdout)["reason"])
+        self.cli("touch", "a")
+        self.cli("checkpoint")  # 探索したが既出だけ
+        self.cli("checkpoint")  # 整理の区切り（触れていない）は無視する
+        reason = json.loads(self.hook("stop").stdout)["reason"]
+        self.assertIn("直近の探索した区切りは新規 0。方針に書かれた根の引き直しに従う。", reason)
+        self.cli("touch", "b")
+        self.cli("checkpoint")
+        self.assertNotIn("新規 0。", json.loads(self.hook("stop").stdout)["reason"])
+
+    def test_report_lists_evaluations(self) -> None:
+        self.start()
+        self.cli("evaluate", "--claude-cmd", self.fake_cmd(), env=self.eval_env('{"rejections": []}'))
+        self.cli("evaluate", "--claude-cmd", self.fake_cmd(), env=self.eval_env('{"rejections": ["a", "b"]}'))
+        report = self.cli("report").stdout
+        self.assertIn("(manual): 却下なし", report)
+        self.assertIn("(manual): a / b", report)
+
+    def test_runner_evaluate_on_checkpoint_passes_env_to_child(self) -> None:
+        env = self.run_env()
+        env["FAKE_EVAL_REPLY"] = '{"rejections": ["round の途中で整理に逃げた"]}'
+        proc = self.cli("run", "--budget", "2s", "--policy", POLICY, "--evaluate-on-checkpoint",
+                        "--evaluator-model", "judge-y", "--claude-cmd", self.fake_cmd(), env=env)
+        calls = self.calls()
+        work = [c for c in calls if "--tools" not in c["argv"]]
+        self.assertGreaterEqual(len(work), 2, proc.stdout)
+        self.assertEqual(work[0]["evaluate"], "1")
+        evaluations = self.evaluator_calls()
+        self.assertGreaterEqual(len(evaluations), 1, "子の checkpoint が評価者を呼ぶ")
+        argv = evaluations[0]["argv"]
+        self.assertEqual(argv[argv.index("--model") + 1], "judge-y")
+        data = json.loads(self.cli("report", "--json", env=self.run_env()).stdout)
+        self.assertTrue(all(e["trigger"] == "checkpoint" for e in data["evaluations"]))
+        self.assertEqual(data["evaluations"][0]["rejections"], ["round の途中で整理に逃げた"])
+        second_prompt = work[1]["argv"][work[1]["argv"].index("-p") + 1]
+        self.assertIn("前回の評価（却下のみ）", second_prompt, "次の round の文面に却下理由が載る")
+        self.assertIn("round の途中で整理に逃げた", second_prompt)
+
+    def test_runner_evaluate_on_round(self) -> None:
+        env = self.run_env()
+        env["FAKE_EVAL_REPLY"] = '{"rejections": []}'
+        proc = self.cli("run", "--budget", "2s", "--policy", POLICY, "--evaluate-on-round",
+                        "--claude-cmd", self.fake_cmd(), env=env)
+        self.assertIn("評価 却下 0 件", proc.stdout)
+        data = json.loads(self.cli("report", "--json", env=self.run_env()).stdout)
+        self.assertGreaterEqual(len(data["evaluations"]), 1)
+        self.assertTrue(all(e["trigger"] == "round" for e in data["evaluations"]))
