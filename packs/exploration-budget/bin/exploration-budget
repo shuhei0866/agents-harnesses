@@ -24,7 +24,7 @@ from datetime import datetime
 from pathlib import Path
 
 PRODUCT = "agents-harnesses/exploration-budget"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 TAG = "[exploration-budget]"
 DEFAULT_YIELD_WINDOW = 3
 DEFAULT_MAX_BLOCKS = 200
@@ -33,6 +33,15 @@ DEFAULT_MAX_ROUNDS = 50
 DEFAULT_MAX_FAILURES = 3
 DEFAULT_BLOCK_CAP = 100
 VERDICTS = ("known", "unknown", "rejected", "deferred")
+# 朝の回答（policy の 5 値）→ 欲の hunger を動かす量。負が餌。関心が薄い・判断できないは記録だけで動かさない
+RESPONSES = {
+    "knew": ("知っていた", -0.10),
+    "interesting": ("知らないが面白い", -0.20),
+    "delighted": ("関係が分かって嬉しい", -0.40),
+    "low-interest": ("今回は関心が薄い", 0.0),
+    "undecided": ("判断できない", 0.0),
+}
+DEFAULT_HUNGER = 0.8
 
 
 class BudgetError(RuntimeError):
@@ -142,11 +151,11 @@ CREATE TABLE IF NOT EXISTS sessions(
 );
 CREATE TABLE IF NOT EXISTS checkpoints(
   id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, at INTEGER NOT NULL,
-  note TEXT, touch_wm INTEGER NOT NULL, artifact_wm INTEGER NOT NULL
+  note TEXT, touch_wm INTEGER NOT NULL, artifact_wm INTEGER NOT NULL, want_id INTEGER
 );
 CREATE TABLE IF NOT EXISTS touches(
   id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, at INTEGER NOT NULL,
-  entity TEXT NOT NULL, kind TEXT, root TEXT, note TEXT, novel INTEGER NOT NULL
+  entity TEXT NOT NULL, kind TEXT, root TEXT, note TEXT, novel INTEGER NOT NULL, want_id INTEGER
 );
 CREATE TABLE IF NOT EXISTS artifacts(
   id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, at INTEGER NOT NULL,
@@ -167,6 +176,15 @@ CREATE TABLE IF NOT EXISTS evaluations(
   id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, at INTEGER NOT NULL,
   checkpoint_id INTEGER, trigger_kind TEXT NOT NULL, model TEXT,
   rejections TEXT NOT NULL, raw TEXT, cost REAL
+);
+CREATE TABLE IF NOT EXISTS wants(
+  id INTEGER PRIMARY KEY, created_at INTEGER NOT NULL, text TEXT NOT NULL, anchor TEXT,
+  hunger REAL NOT NULL DEFAULT 0.8, parent_id INTEGER, source TEXT NOT NULL DEFAULT 'human',
+  status TEXT NOT NULL DEFAULT 'open', session_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS want_events(
+  id INTEGER PRIMARY KEY, want_id INTEGER NOT NULL, at INTEGER NOT NULL, source TEXT NOT NULL,
+  delta REAL NOT NULL, response TEXT, entity TEXT, evidence TEXT, session_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_touches_entity ON touches(entity);
 CREATE INDEX IF NOT EXISTS idx_verdicts_entity ON verdicts(entity);
@@ -192,10 +210,15 @@ class Ledger:
 
     def _migrate(self) -> None:
         """既存の台帳に後から足した列を補う（CREATE TABLE IF NOT EXISTS は既存表を変えない）。"""
-        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(artifacts)").fetchall()}
-        if "cwd" not in columns:
-            self.db.execute("ALTER TABLE artifacts ADD COLUMN cwd TEXT")
-            self.db.commit()
+        for table, column, decl in (("artifacts", "cwd", "TEXT"),
+                                    ("touches", "want_id", "INTEGER"),
+                                    ("checkpoints", "want_id", "INTEGER")):
+            columns = {row["name"] for row in self.db.execute(f"PRAGMA table_info({table})").fetchall()}
+            if column not in columns:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        # 列が揃ってから index を張る（SCHEMA の時点では古い台帳に want_id が無い）
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_touches_want ON touches(want_id)")
+        self.db.commit()
 
     # session
     def active(self) -> sqlite3.Row | None:
@@ -262,22 +285,23 @@ class Ledger:
             return True
         return bool(self.db.execute("SELECT 1 FROM verdicts WHERE entity=? LIMIT 1", (entity,)).fetchone())
 
-    def touch(self, sid: int, entity: str, kind: str | None, root: str | None, note: str | None) -> bool:
+    def touch(self, sid: int, entity: str, kind: str | None, root: str | None, note: str | None,
+              want_id: int | None = None) -> bool:
         novel = not self.seen(entity)
         self.db.execute(
-            "INSERT INTO touches(session_id, at, entity, kind, root, note, novel) VALUES (?,?,?,?,?,?,?)",
-            (sid, now(), entity, kind, root, note, int(novel)),
+            "INSERT INTO touches(session_id, at, entity, kind, root, note, novel, want_id) VALUES (?,?,?,?,?,?,?,?)",
+            (sid, now(), entity, kind, root, note, int(novel), want_id),
         )
         self.db.commit()
         return novel
 
-    def checkpoint(self, sid: int, note: str | None) -> dict:
+    def checkpoint(self, sid: int, note: str | None, want_id: int | None = None) -> dict:
         closed = self.delta(sid)
         touch_wm = self._max_id("touches", sid)
         artifact_wm = self._max_id("artifacts", sid)
         cur = self.db.execute(
-            "INSERT INTO checkpoints(session_id, at, note, touch_wm, artifact_wm) VALUES (?,?,?,?,?)",
-            (sid, now(), note, touch_wm, artifact_wm),
+            "INSERT INTO checkpoints(session_id, at, note, touch_wm, artifact_wm, want_id) VALUES (?,?,?,?,?,?)",
+            (sid, now(), note, touch_wm, artifact_wm, want_id),
         )
         self.db.commit()
         closed["checkpoint_id"] = int(cur.lastrowid)
@@ -309,14 +333,31 @@ class Ledger:
 
     def verdicts_if_new(self, entities: list[str], verdict: str, note: str | None,
                         sid: int | None) -> tuple[list[str], list[str]]:
-        """既出を飛ばして判定を記録する。確認と挿入を 1 つの書き込みトランザクションで行い、
-        並走する別プロセスとの間で同じ対象を二重に記録しない（BEGIN IMMEDIATE で書き手を直列化）。"""
+        recorded, skipped, _ = self.record_verdicts(entities, verdict, note, sid, if_new=True)
+        return recorded, skipped
+
+    def record_verdicts(self, entities: list[str], verdict: str, note: str | None, sid: int | None, *,
+                        if_new: bool = False, response: str | None = None,
+                        feeds: int | None = None) -> tuple[list[str], list[str], list[dict]]:
+        """判定と、回答による欲の出来事を 1 つの書き込みトランザクションで記録する。
+
+        途中で欲が解決できなければ全部戻す。半分だけ書かれた判定を打ち直すと、欲が二重に餌を受けて
+        順位が狂うため。`if_new` は既出を飛ばす（並走する別プロセスとの二重記録も BEGIN IMMEDIATE で防ぐ）。
+        `response` があれば、対象ごとに `feeds`（無ければその対象に最後に付いた欲）へ出来事を足す。
+        """
         recorded: list[str] = []
         skipped: list[str] = []
+        fed: list[dict] = []
+        delta = RESPONSES[response][1] if response else 0.0
         self.db.execute("BEGIN IMMEDIATE")
         try:
+            if feeds is not None and self.want(feeds) is None:
+                raise BudgetError(f"欲 #{feeds} は無い（`want list` で確認）")
             for entity in entities:
-                if self.seen(entity):
+                if entity in recorded or entity in skipped:
+                    skipped.append(entity)
+                    continue
+                if if_new and self.seen(entity):
                     skipped.append(entity)
                     continue
                 self.db.execute(
@@ -324,11 +365,129 @@ class Ledger:
                     (now(), entity, verdict, note, sid),
                 )
                 recorded.append(entity)
+                if response is None:
+                    continue
+                want_id = feeds if feeds is not None else self.want_for_entity(entity)
+                if want_id is None:
+                    raise BudgetError(f"{entity} にはどの欲も付いていない。--feeds <want id> で指定する")
+                if self.want(want_id) is None:
+                    raise BudgetError(f"{entity} に付いた欲 #{want_id} は無い。--feeds <want id> で指定する")
+                self.db.execute(
+                    "INSERT INTO want_events(want_id, at, source, delta, response, entity, evidence, session_id)"
+                    " VALUES (?,?,?,?,?,?,?,?)", (want_id, now(), "human", delta, response, entity, note, sid))
+                fed.append({"entity": entity, "want_id": want_id, "delta": delta})
             self.db.commit()
         except Exception:
             self.db.rollback()
             raise
-        return recorded, skipped
+        for item in fed:
+            item["hunger"] = self.hunger(item["want_id"])
+        return recorded, skipped, fed
+
+    # 欲: 人が蒔く、完了できない問い。verdicts と同じく session をまたぐ。
+    def add_want(self, text: str, anchor: str | None, hunger: float, parent_id: int | None,
+                 source: str, sid: int | None, if_new: bool = False) -> tuple[sqlite3.Row, bool]:
+        """欲を蒔く。`if_new` は同じ文の開いた欲があれば足さない（確認と挿入を 1 つの書き込みにする）。"""
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            if if_new:
+                existing = self.open_want_by_text(text)
+                if existing is not None:
+                    self.db.commit()
+                    return existing, False
+            if parent_id is not None and self.want(parent_id) is None:
+                raise BudgetError(f"親の欲 #{parent_id} は無い")
+            cur = self.db.execute(
+                "INSERT INTO wants(created_at, text, anchor, hunger, parent_id, source, session_id)"
+                " VALUES (?,?,?,?,?,?,?)", (now(), text.strip(), anchor, hunger, parent_id, source, sid))
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+        return self.want(int(cur.lastrowid)), True
+
+    def close_want(self, want_id: int, status: str) -> None:
+        if self.want(want_id) is None:
+            raise BudgetError(f"欲 #{want_id} は無い（`want list` で確認）")
+        self.db.execute("UPDATE wants SET status=? WHERE id=?", (status, want_id))
+        self.db.commit()
+
+    def want(self, want_id: int) -> sqlite3.Row | None:
+        return self.db.execute("SELECT * FROM wants WHERE id=?", (want_id,)).fetchone()
+
+    def open_want_by_text(self, text: str) -> sqlite3.Row | None:
+        return self.db.execute(
+            "SELECT * FROM wants WHERE status='open' AND text=? ORDER BY id LIMIT 1", (text.strip(),)).fetchone()
+
+    def wants(self, status: str | None = "open") -> list[sqlite3.Row]:
+        if status is None:
+            return self.db.execute("SELECT * FROM wants ORDER BY id").fetchall()
+        return self.db.execute("SELECT * FROM wants WHERE status=? ORDER BY id", (status,)).fetchall()
+
+    def feed_want(self, want_id: int, delta: float, source: str, response: str | None,
+                  entity: str | None, evidence: str | None, sid: int | None) -> None:
+        if self.want(want_id) is None:
+            raise BudgetError(f"欲 #{want_id} は無い（`want list` で確認）")
+        self.db.execute(
+            "INSERT INTO want_events(want_id, at, source, delta, response, entity, evidence, session_id)"
+            " VALUES (?,?,?,?,?,?,?,?)", (want_id, now(), source, delta, response, entity, evidence, sid))
+        self.db.commit()
+
+    def hunger(self, want_id: int) -> float:
+        """蒔いたときの hunger に出来事（餌は負、飢えは正）を足したもの。0〜1 に収める。"""
+        row = self.want(want_id)
+        total = self.db.execute(
+            "SELECT COALESCE(SUM(delta),0) AS s FROM want_events WHERE want_id=?", (want_id,)).fetchone()["s"]
+        return round(max(0.0, min(1.0, float(row["hunger"]) + float(total))), 4)
+
+    def want_events(self, want_id: int) -> list[sqlite3.Row]:
+        return self.db.execute("SELECT * FROM want_events WHERE want_id=? ORDER BY id", (want_id,)).fetchall()
+
+    def want_service(self, sid: int, want_id: int) -> dict:
+        """この session でその欲に仕えた量。触れた対象（distinct）、うち候補、区切り。"""
+        def count(sql: str) -> int:
+            return int(self.db.execute(sql, (sid, want_id)).fetchone()["c"])
+        return {
+            "touches": count("SELECT COUNT(DISTINCT entity) AS c FROM touches WHERE session_id=? AND want_id=?"),
+            "candidates": count("SELECT COUNT(DISTINCT entity) AS c FROM touches"
+                                " WHERE session_id=? AND want_id=? AND kind='candidate'"),
+            "checkpoints": count("SELECT COUNT(*) AS c FROM checkpoints WHERE session_id=? AND want_id=?"),
+        }
+
+    def hungriest_want(self, sid: int | None) -> sqlite3.Row | None:
+        """開いている欲のうち hunger が最大のもの。同点なら、この session で仕えた量が少ない方、次に古い方。"""
+        rows = self.wants("open")
+        if not rows:
+            return None
+
+        def key(row: sqlite3.Row) -> tuple:
+            served = self.want_service(sid, int(row["id"]))["touches"] if sid is not None else 0
+            return (-self.hunger(int(row["id"])), served, int(row["id"]))
+        return sorted(rows, key=key)[0]
+
+    def latest_unjudged_candidate(self, sid: int, want_id: int | None) -> str | None:
+        """朝の 1 問の候補: その欲に付いた最新の未判定候補（この session で新規）。欲を指定しなければ session 全体。"""
+        # unjudged_novel と同じく entity 単位で見る。候補である行と欲が付いた行が別でも消えないように
+        sql = ("SELECT t.entity AS entity, MAX(t.id) AS last_id FROM touches t"
+               " WHERE t.session_id=? AND t.entity NOT IN (SELECT entity FROM verdicts)"
+               " AND EXISTS (SELECT 1 FROM touches n WHERE n.session_id=t.session_id"
+               "             AND n.entity=t.entity AND n.novel=1)"
+               " AND EXISTS (SELECT 1 FROM touches k WHERE k.session_id=t.session_id"
+               "             AND k.entity=t.entity AND k.kind='candidate')")
+        params: list = [sid]
+        if want_id is not None:
+            sql += (" AND EXISTS (SELECT 1 FROM touches w WHERE w.session_id=t.session_id"
+                    "             AND w.entity=t.entity AND w.want_id=?)")
+            params.append(want_id)
+        row = self.db.execute(sql + " GROUP BY t.entity ORDER BY last_id DESC LIMIT 1", params).fetchone()
+        return row["entity"] if row else None
+
+    def want_for_entity(self, entity: str) -> int | None:
+        """その対象に最後に付いた欲。verdict --response が --feeds を省いたときの推定に使う。"""
+        row = self.db.execute(
+            "SELECT want_id FROM touches WHERE entity=? AND want_id IS NOT NULL ORDER BY id DESC LIMIT 1",
+            (entity,)).fetchone()
+        return int(row["want_id"]) if row else None
 
     # 集計
     def _max_id(self, table: str, sid: int) -> int:
@@ -534,13 +693,45 @@ def record_instructions() -> str:
     cli = cli_path()
     return (
         "記録の仕方:\n"
-        f"- 触れた対象: `{cli} touch <id> --kind candidate|considered [--root <根>]`（新規か既出かを返す。候補として保存したものだけ candidate）\n"
-        f"- 一区切り: `{cli} checkpoint --note \"<何を終えたか>\"`\n"
+        f"- 触れた対象: `{cli} touch <id> --kind candidate|considered [--root <根>] [--want <欲の id>]`（新規か既出かを返す。候補として保存したものだけ candidate）\n"
+        f"- 一区切り: `{cli} checkpoint --note \"<何を終えたか>\" [--want <欲の id>]`\n"
         f"- 成果物: `{cli} artifact <path> [--kind <種類>]`\n"
         f"- 探索の根を変えたとき: `{cli} root <軸> <値> --brief \"<一行>\"`\n"
         "停止は予算の満了か収率の低下で外側が判断する。"
         f" 進めなくする真の blocker があるときだけ `{cli} end --reason \"<理由>\"` を実行する。"
     )
+
+
+def fmt_want(ledger: Ledger, row: sqlite3.Row, sid: int | None) -> str:
+    anchor = f"anchor: {row['anchor']}" if row["anchor"] else "anchor なし"
+    served = ""
+    if sid is not None:
+        s = ledger.want_service(sid, int(row["id"]))
+        served = f" / この session で候補 {s['candidates']}・区切り {s['checkpoints']}"
+    return f"#{row['id']}「{row['text']}」（{anchor} / hunger {ledger.hunger(int(row['id'])):.2f}{served}）"
+
+
+def wants_section(ledger: Ledger, sid: int | None) -> str | None:
+    """欲: 人が蒔いた完了できない問い。いちばん飢えているものを先頭に置く。餌は朝の判定で届く。"""
+    rows = ledger.wants("open")
+    if not rows:
+        return None
+    top = ledger.hungriest_want(sid)
+    lines = ["欲（人が蒔いた、完了できない問い。仕えている欲を touch / checkpoint の `--want <id>` に付ける）:",
+             "- いちばん飢えている: " + fmt_want(ledger, top, sid)]
+    lines += ["- " + fmt_want(ledger, row, sid) for row in rows if int(row["id"]) != int(top["id"])]
+    last = ledger.db.execute(
+        "SELECT e.*, w.text AS text FROM want_events e JOIN wants w ON w.id=e.want_id"
+        " WHERE w.status='open' ORDER BY e.id DESC LIMIT 1").fetchone()
+    if last is None:
+        lines.append("餌は朝の判定（verdict --response）で届く。まだ届いていない。")
+    elif last["response"]:
+        label = RESPONSES.get(last["response"], (last["response"], 0.0))[0]
+        lines.append(f"直近の回答: #{last['want_id']}「{last['text']}」に {label}（{fmt_clock(last['at'])}）")
+    else:
+        lines.append(f"直近の記録: #{last['want_id']}「{last['text']}」に {float(last['delta']):+.2f}"
+                     f"（{last['source']}、{fmt_clock(last['at'])}）")
+    return "\n".join(lines)
 
 
 def evaluation_rejections(row: sqlite3.Row | None) -> list[str]:
@@ -559,7 +750,11 @@ def guidance_sections(ledger: Ledger, session: sqlite3.Row) -> list[str]:
     sections: list[str] = []
     explored = ledger.last_explored_interval(sid)
     if explored is not None and explored["novel"] == 0:
-        sections.append("直近の探索した区切りは新規 0。方針に書かれた根の引き直しに従う。")
+        line = "直近の探索した区切りは新規 0。方針に書かれた根の引き直しに従う。"
+        top = ledger.hungriest_want(sid)
+        if top is not None:
+            line += f" 引き直しは、いちばん飢えている欲 #{top['id']}（{top['anchor'] or top['text']}）から。"
+        sections.append(line)
     rejections = evaluation_rejections(ledger.latest_evaluation(sid))
     if rejections:
         sections.append("前回の評価（却下のみ）:\n" + "\n".join(f"- {item}" for item in rejections))
@@ -568,6 +763,9 @@ def guidance_sections(ledger: Ledger, session: sqlite3.Row) -> list[str]:
 
 def compose(ledger: Ledger, session: sqlite3.Row, mode: str) -> str:
     parts = ["\n".join(facts(ledger, session))]
+    wants = wants_section(ledger, int(session["id"]))
+    if wants:
+        parts.append(wants)
     parts.extend(guidance_sections(ledger, session))
     parts += ["方針:\n" + session["policy"].strip(), record_instructions()]
     if mode == "round":
@@ -575,8 +773,8 @@ def compose(ledger: Ledger, session: sqlite3.Row, mode: str) -> str:
     return "\n\n".join(parts)
 
 
-def compose_preview(budget_seconds: int, policy: str) -> str:
-    """session を作らずに、開始直後の文面を組み立てる（dry-run 用）。"""
+def compose_preview(budget_seconds: int, policy: str, ledger: Ledger | None = None) -> str:
+    """session を作らずに、開始直後の文面を組み立てる（dry-run 用）。欲は台帳にあれば載せる。"""
     lines = [
         f"{TAG} 予算 {fmt_duration(budget_seconds)} / 経過 0秒 / 残り {fmt_duration(budget_seconds)} (0%)",
         clock_line(now(), budget_seconds),
@@ -584,8 +782,12 @@ def compose_preview(budget_seconds: int, policy: str) -> str:
         "セッション累計: 対象 0 (新規 0) / checkpoint 0 / 成果物 0 / 根 0",
         "台帳は空。触れた対象と一区切りを記録しないと、収率は測れない。",
     ]
-    parts = ["\n".join(lines), "方針:\n" + policy.strip(), record_instructions(),
-             "残りの予算で、方針に沿って探索を続ける。台帳にある対象は既出なので、新規へ向かう。"]
+    parts = ["\n".join(lines)]
+    wants = wants_section(ledger, None) if ledger is not None else None
+    if wants:
+        parts.append(wants)
+    parts += ["方針:\n" + policy.strip(), record_instructions(),
+              "残りの予算で、方針に沿って探索を続ける。台帳にある対象は既出なので、新規へ向かう。"]
     return "\n\n".join(parts)
 
 
@@ -615,6 +817,10 @@ def render_report(ledger: Ledger, session: sqlite3.Row) -> str:
         extra = f" ({row['source']})" if row["source"] else ""
         brief = f": {row['brief']}" if row["brief"] else ""
         lines.append(f"根 {row['axis']}={row['value']}{extra}{brief}")
+    for row in ledger.wants("open"):
+        events = ledger.want_events(int(row["id"]))
+        fed = sum(1 for e in events if float(e["delta"]) < 0)
+        lines.append(f"欲 {fmt_want(ledger, row, sid)} 餌 {fed} 回 / 回答 {len(events)} 件")
     artifacts: dict[str, sqlite3.Row] = {}
     for row in ledger.list_rows("artifacts", sid):
         artifacts[row["path"]] = row  # 同じ path は最後の記録だけ載せる
@@ -643,9 +849,47 @@ def render_report(ledger: Ledger, session: sqlite3.Row) -> str:
         others = len(ledger.unjudged_novel(sid)) - len(candidates)
         if others > 0:
             lines.append(f"候補以外の新規 {others} 件は一覧に出さない（`report --json` の unjudged_novel にある）")
+    question = morning_question(ledger, sid)
+    if question is not None:
+        how = "いちばん飢えている欲に付いた最新の未判定候補" if question["chosen_by"] == "want" \
+            else "欲に付いた候補が無いので、session の最新の未判定候補"
+        lines.append(f"今朝の1問: {question['entity']} → 答えれば欲 #{question['want_id']}「{question['want_text']}」が動く"
+                     f"（仮の選び方: {how}。動く欲はその対象に最後に付いた欲）")
+        lines.append(f"答え方: `{cli_path()} verdict known|unknown|rejected|deferred {question['entity']}"
+                     f" --feeds {question['want_id']} --response {'|'.join(RESPONSES)}`")
     if unjudged:
         lines.append(f"判定の記録: `{cli_path()} verdict known|unknown|rejected|deferred <id> [<id> ...]`")
     return "\n".join(lines)
+
+
+def morning_question(ledger: Ledger, sid: int) -> dict | None:
+    """朝に 1 つだけ聞く候補。verdict が付けば、いちばん飢えている欲が動くもの。
+    評価者を使わない仮の選び方: その欲に付いた最新の未判定候補。無ければ session の最新の未判定候補。"""
+    top = ledger.hungriest_want(sid)
+    if top is None:
+        return None
+    entity = ledger.latest_unjudged_candidate(sid, int(top["id"]))
+    chosen_by = "want"
+    if entity is None:
+        entity = ledger.latest_unjudged_candidate(sid, None)
+        chosen_by = "fallback"
+    if entity is None:
+        return None
+    # 動く欲は「その対象に最後に付いた欲」。verdict --response が --feeds 無しで推定するものと同じにする
+    want_id = ledger.want_for_entity(entity)
+    want = ledger.want(want_id) if want_id is not None else None
+    if want is None:
+        want_id, want = int(top["id"]), top
+    return {"entity": entity, "want_id": int(want_id), "want_text": want["text"], "chosen_by": chosen_by}
+
+
+def want_json(ledger: Ledger, row: sqlite3.Row, sid: int | None) -> dict:
+    data = dict(row)
+    data["hunger_now"] = ledger.hunger(int(row["id"]))
+    data["events"] = [dict(e) for e in ledger.want_events(int(row["id"]))]
+    if sid is not None:
+        data["service"] = ledger.want_service(sid, int(row["id"]))
+    return data
 
 
 def report_json(ledger: Ledger, session: sqlite3.Row) -> dict:
@@ -661,6 +905,8 @@ def report_json(ledger: Ledger, session: sqlite3.Row) -> dict:
         "unjudged_candidates": ledger.unjudged_novel(sid, "candidate"),
         "touch_kinds": ledger.touch_kinds(sid),
         "evaluations": [evaluation_json(r) for r in ledger.list_rows("evaluations", sid)],
+        "wants": [want_json(ledger, r, sid) for r in ledger.wants("open")],
+        "morning_question": morning_question(ledger, sid),
     }
 
 
@@ -933,7 +1179,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"{TAG} claude: {' '.join(shlex.quote(c) for c in claude_cmd + ['-p', '<prompt>', '--output-format', 'json'] + extra)}")
         print("--- round 1 のプロンプト ---")
         if session is None:
-            print(compose_preview(parse_budget(args.budget), load_policy(args)))
+            print(compose_preview(parse_budget(args.budget), load_policy(args), ledger))
         else:
             print(f"{TAG} active な session #{session['id']} を引き継ぐ前提の文面")
             print(compose(ledger, session, "round"))
@@ -1019,6 +1265,15 @@ def cmd_run(args: argparse.Namespace) -> int:
 # --- CLI ------------------------------------------------------------------
 
 
+def require_want(ledger: Ledger, want_id: int | None) -> None:
+    """--want は エージェントが打つ id なので取り違えを前提に、存在しない・閉じた欲は受けない。"""
+    if want_id is None:
+        return
+    row = ledger.want(want_id)
+    if row is None or row["status"] != "open":
+        raise BudgetError(f"欲 #{want_id} は無いか閉じている（`want list` で確認）")
+
+
 def require_active(ledger: Ledger) -> sqlite3.Row:
     session = ledger.active()
     if session is None:
@@ -1061,8 +1316,9 @@ def cmd_touch(args: argparse.Namespace) -> int:
     ledger = Ledger(canonical_dir(args.project_dir))
     session = require_active(ledger)
     results = {}
+    require_want(ledger, args.want)
     for entity in args.entity:
-        results[entity] = ledger.touch(int(session["id"]), entity, args.kind, args.root, args.note)
+        results[entity] = ledger.touch(int(session["id"]), entity, args.kind, args.root, args.note, args.want)
     if args.json:
         print(json.dumps({"novel": results}, ensure_ascii=False))
     else:
@@ -1074,7 +1330,8 @@ def cmd_touch(args: argparse.Namespace) -> int:
 def cmd_checkpoint(args: argparse.Namespace) -> int:
     ledger = Ledger(canonical_dir(args.project_dir))
     session = require_active(ledger)
-    closed = ledger.checkpoint(int(session["id"]), args.note)
+    require_want(ledger, args.want)
+    closed = ledger.checkpoint(int(session["id"]), args.note, args.want)
     if not args.json:
         print(f"{TAG} checkpoint: 触れた対象 {closed['touches']} (新規 {closed['novel']})"
               f" / 成果物 {closed['artifacts']} / {fmt_duration(closed['seconds'])} / 現在 {fmt_clock(now())}", flush=True)
@@ -1128,19 +1385,60 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     sid = int(session["id"]) if session else None
     if args.verdict not in VERDICTS:
         raise BudgetError(f"判定は {', '.join(VERDICTS)} のどれか: {args.verdict!r}")
-    if args.if_new:
-        recorded, skipped = ledger.verdicts_if_new(args.entity, args.verdict, args.note, sid)
-    else:
-        recorded, skipped = list(args.entity), []
-        for entity in args.entity:
-            ledger.verdict(entity, args.verdict, args.note, sid)
+    if args.feeds is not None and not args.response:
+        raise BudgetError("--feeds は --response と一緒に使う（回答が無いと欲は動かない）")
+    # 判定と回答は 1 つのトランザクション。欲が解決できなければ何も書かない（打ち直しで二重に餌を受けないため）
+    recorded, skipped, fed = ledger.record_verdicts(
+        args.entity, args.verdict, args.note, sid, if_new=args.if_new, response=args.response, feeds=args.feeds)
     if args.json:
-        print(json.dumps({"verdict": args.verdict, "recorded": recorded, "skipped": skipped}, ensure_ascii=False))
+        print(json.dumps({"verdict": args.verdict, "recorded": recorded, "skipped": skipped, "fed": fed},
+                         ensure_ascii=False))
     elif args.if_new:
         print(f"{TAG} verdict {args.verdict}: 記録 {len(recorded)} / 既出で省略 {len(skipped)}")
     else:
-        print(f"{TAG} verdict {args.verdict}: {', '.join(recorded)}")
+        print(f"{TAG} verdict {args.verdict}: {', '.join(recorded) or '（記録なし）'}")
+    if fed and not args.json:
+        for item in fed:
+            print(f"{TAG} 欲 #{item['want_id']} に {RESPONSES[args.response][0]}（{item['delta']:+.2f}）"
+                  f" → hunger {item['hunger']:.2f}")
     return 0
+
+
+def cmd_want(args: argparse.Namespace) -> int:
+    ledger = Ledger(canonical_dir(args.project_dir))
+    session = ledger.active()
+    sid = int(session["id"]) if session else None
+    if args.want_command == "add":
+        if not 0.0 <= args.hunger <= 1.0:
+            raise BudgetError(f"--hunger は 0〜1（{args.hunger}）")
+        row, created = ledger.add_want(args.text, args.anchor, args.hunger, args.parent, args.source, sid,
+                                       if_new=args.if_new)
+        if args.json:
+            print(json.dumps({"want": want_json(ledger, row, sid), "created": created}, ensure_ascii=False))
+        else:
+            print(f"{TAG} want {'追加' if created else '既存'}: {fmt_want(ledger, row, sid)}")
+        return 0
+    if args.want_command == "close":
+        ledger.close_want(args.id, args.status)
+        print(f"{TAG} want #{args.id}: {args.status}")
+        return 0
+    if args.want_command == "list":
+        rows = ledger.wants(None if args.all else "open")
+        if args.json:
+            print(json.dumps({"wants": [want_json(ledger, r, sid) for r in rows]}, ensure_ascii=False))
+        else:
+            top = ledger.hungriest_want(sid)
+            for row in rows:
+                mark = " ←いちばん飢えている" if top is not None and int(row["id"]) == int(top["id"]) else ""
+                print(f"{fmt_want(ledger, row, sid)} [{row['status']}]{mark}")
+            if not rows:
+                print(f"{TAG} 欲は無い（`want add \"<問い>\" --anchor <生活文脈>` で蒔く）")
+        return 0
+    if args.want_command == "feed":
+        ledger.feed_want(args.id, args.delta, args.source, None, None, args.evidence, sid)
+        print(f"{TAG} 欲 #{args.id} に {args.delta:+.2f}（{args.source}） → hunger {ledger.hunger(args.id):.2f}")
+        return 0
+    raise BudgetError(f"want の副コマンドが不明: {args.want_command}")
 
 
 def cmd_delta(args: argparse.Namespace) -> int:
@@ -1222,11 +1520,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--kind")
     p.add_argument("--root")
     p.add_argument("--note")
+    p.add_argument("--want", type=int, help="仕えている欲の id（`want list`）")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_touch)
 
     p = sub.add_parser("checkpoint", parents=[common], help="一区切りを記録する")
     p.add_argument("--note")
+    p.add_argument("--want", type=int, help="この区切りで仕えた欲の id")
     p.add_argument("--evaluate", action="store_true",
                    help="記録の直後に評価者を呼び、却下理由を返す（環境変数 EXPLORATION_BUDGET_EVALUATE=1 でも同じ）")
     p.add_argument("--evaluator-model", help="評価者のモデル（環境変数 EXPLORATION_BUDGET_EVALUATOR_MODEL）")
@@ -1260,8 +1560,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--note")
     p.add_argument("--if-new", action="store_true",
                    help="既に触れた・判定済みの対象は飛ばす（外部の台帳から既出を流し込むとき用）")
+    p.add_argument("--response", choices=tuple(RESPONSES),
+                   help="朝の回答（5 値）。欲の hunger を動かす: " + ", ".join(f"{k}={v[0]}" for k, v in RESPONSES.items()))
+    p.add_argument("--feeds", type=int, help="回答で動かす欲の id（省くと、その対象に最後に付いた欲）")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_verdict)
+
+    # 親には common を付けない。付けると `want --project-dir X add` が副コマンド側の既定値で上書きされ、cwd の台帳へ黙って書く
+    p = sub.add_parser("want", help="欲（人が蒔く、完了できない問い）を扱う。--project-dir は副コマンドの後に付ける")
+    wsub = p.add_subparsers(dest="want_command", required=True)
+    w = wsub.add_parser("add", parents=[common], help="欲を蒔く")
+    w.add_argument("text", help="問いの文。完了できる文（N 人見つける）にしない")
+    w.add_argument("--anchor", help="錨にする生活文脈（時代・場・人）。根の引き直しはここから")
+    w.add_argument("--hunger", type=float, default=DEFAULT_HUNGER, help=f"飢えの度合い 0〜1（既定 {DEFAULT_HUNGER}）")
+    w.add_argument("--parent", type=int, help="この欲を産んだ欲の id")
+    w.add_argument("--source", default="human")
+    w.add_argument("--if-new", action="store_true", help="同じ文の欲が開いていれば足さない")
+    w.add_argument("--json", action="store_true")
+    w = wsub.add_parser("list", parents=[common], help="欲を並べる")
+    w.add_argument("--all", action="store_true", help="閉じた欲も出す")
+    w.add_argument("--json", action="store_true")
+    w = wsub.add_parser("feed", parents=[common], help="欲に出来事を記録する（負が餌、正が飢え）")
+    w.add_argument("id", type=int)
+    w.add_argument("--delta", type=float, required=True)
+    w.add_argument("--source", default="cli")
+    w.add_argument("--evidence")
+    w = wsub.add_parser("close", parents=[common], help="欲を閉じる（文面と順位から外れる）")
+    w.add_argument("id", type=int)
+    w.add_argument("--status", default="closed", choices=("closed", "fed", "starved"))
+    p.set_defaults(func=cmd_want)
 
     p = sub.add_parser("delta", parents=[common], help="直近 checkpoint 以降の集計")
     p.add_argument("--json", action="store_true")
