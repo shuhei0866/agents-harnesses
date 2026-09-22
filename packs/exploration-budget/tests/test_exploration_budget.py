@@ -668,5 +668,176 @@ class Evaluator(FakeClaudeCase):
         self.assertTrue(all(e["trigger"] == "round" for e in data["evaluations"]))
 
 
+
+
+class Wants(Base):
+    """欲: 人が蒔いた完了できない問い。文面の先頭近くに載り、根の引き直し先になり、朝の回答で動く。"""
+
+    def seed(self) -> None:
+        self.cli("want", "add", "学生時代の同級生で地図に無い人", "--anchor", "学生時代", "--hunger", "0.6")
+        self.cli("want", "add", "旧友 A の今のアカウント", "--anchor", "地元の中学校", "--hunger", "0.9")
+
+    def test_add_list_and_if_new(self) -> None:
+        self.seed()
+        again = json.loads(self.cli("want", "add", "旧友 A の今のアカウント", "--if-new", "--json").stdout)
+        self.assertFalse(again["created"])
+        self.assertEqual(again["want"]["id"], 2)
+        listed = json.loads(self.cli("want", "list", "--json").stdout)["wants"]
+        self.assertEqual([w["id"] for w in listed], [1, 2])
+        self.assertEqual(listed[1]["hunger_now"], 0.9)
+        text = self.cli("want", "list").stdout
+        self.assertIn("#2「旧友 A の今のアカウント」", text)
+        self.assertIn("←いちばん飢えている", text.splitlines()[1])
+
+    def test_compose_leads_with_hungriest_want_and_redraws_from_its_anchor(self) -> None:
+        self.start()
+        self.assertNotIn("欲（", json.loads(self.hook("stop").stdout)["reason"], "欲が無ければ欲の節は載らない")
+        self.seed()
+        reason = json.loads(self.hook("stop").stdout)["reason"]
+        self.assertIn("いちばん飢えている: #2「旧友 A の今のアカウント」（anchor: 地元の中学校 / hunger 0.90", reason)
+        self.assertIn("--want <id>", reason)
+        self.assertIn("まだ届いていない", reason)
+        self.assertLess(reason.index("欲（"), reason.index("方針:"), "欲は方針より前に載る")
+        self.assertLess(reason.index("残り 1時間"), reason.index("欲（"), "事実は欲より前")
+        self.cli("touch", "a", "--want", "2")
+        self.cli("checkpoint", "--want", "2")
+        self.cli("touch", "a", "--want", "2")
+        self.cli("checkpoint", "--want", "2")  # 既出だけ → 新規 0
+        reason = json.loads(self.hook("stop").stdout)["reason"]
+        self.assertIn("引き直しは、いちばん飢えている欲 #2（地元の中学校）から。", reason)
+        self.assertIn("この session で候補 0・区切り 2", reason)
+
+    def test_touch_and_checkpoint_tag_the_want_and_report_shows_service(self) -> None:
+        self.start()
+        self.seed()
+        self.cli("touch", "c1", "--kind", "candidate", "--want", "2")
+        self.cli("touch", "p1", "--kind", "considered", "--want", "2")
+        self.cli("checkpoint", "--note", "枝 1", "--want", "2")
+        report = self.report_json()
+        w2 = next(w for w in report["wants"] if w["id"] == 2)
+        self.assertEqual(w2["service"], {"touches": 2, "candidates": 1, "checkpoints": 1})
+        self.assertIn("欲 #2「旧友 A の今のアカウント」", self.cli("report").stdout)
+
+    def test_morning_question_prefers_candidate_tagged_to_hungriest_want(self) -> None:
+        self.start()
+        self.seed()
+        self.cli("touch", "x1", "--kind", "candidate", "--want", "1")
+        self.assertEqual(self.report_json()["morning_question"],
+                         {"entity": "x1", "want_id": 1, "want_text": "学生時代の同級生で地図に無い人", "chosen_by": "fallback"},
+                         "fallback でも、動く欲はその対象に最後に付いた欲（--feeds 無しの推定と同じ）")
+        self.cli("touch", "y1", "y2", "--kind", "candidate", "--want", "2")
+        q = self.report_json()["morning_question"]
+        self.assertEqual((q["entity"], q["chosen_by"]), ("y2", "want"))
+        report = self.cli("report").stdout
+        self.assertIn("今朝の1問: y2 → 答えれば欲 #2", report)
+        self.assertIn("verdict known|unknown|rejected|deferred y2 --feeds 2 --response knew|interesting|delighted|low-interest|undecided", report)
+        self.cli("touch", "y2", "--kind", "candidate", "--want", "1")  # 別の欲で触り直すと、動く欲もそちらへ
+        self.assertEqual(self.report_json()["morning_question"]["want_id"], 1)
+        self.cli("touch", "y2", "--want", "2")
+        self.cli("verdict", "known", "y2", "--response", "knew")  # 0.9 → 0.8、まだ #2 がいちばん飢えている
+        self.assertEqual(self.report_json()["morning_question"]["entity"], "y1", "判定済みは問わない")
+        self.cli("verdict", "known", "y1", "--response", "delighted")  # 0.8 → 0.4、#1 (0.6) が前に出る
+        q = self.report_json()["morning_question"]
+        self.assertEqual((q["entity"], q["want_id"]), ("x1", 1), "餌で順位が入れ替わると問う候補も変わる")
+
+    def test_response_feeds_want_and_infers_it_from_the_touch(self) -> None:
+        self.start()
+        self.seed()
+        self.cli("touch", "y1", "--kind", "candidate", "--want", "2")
+        out = json.loads(self.cli("verdict", "known", "y1", "--response", "delighted", "--json").stdout)
+        self.assertEqual(out["fed"], [{"entity": "y1", "want_id": 2, "delta": -0.4, "hunger": 0.5}])
+        text = self.cli("verdict", "deferred", "z9", "--feeds", "1", "--response", "low-interest").stdout
+        self.assertIn("欲 #1 に 今回は関心が薄い（+0.00） → hunger 0.60", text)
+        proc = self.cli("verdict", "known", "nobody", "--response", "knew", check=False)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("どの欲も付いていない", proc.stderr)
+        proc = self.cli("verdict", "known", "y1", "--feeds", "2", check=False)
+        self.assertEqual(proc.returncode, 1, "--feeds だけでは欲は動かない")
+        listed = json.loads(self.cli("want", "list", "--json").stdout)["wants"]
+        self.assertEqual([w["hunger_now"] for w in listed], [0.6, 0.5])
+        self.assertEqual(json.loads(self.cli("want", "list", "--json").stdout)["wants"][1]["events"][0]["response"], "delighted")
+        reason = json.loads(self.hook("stop").stdout)["reason"]
+        self.assertIn("直近の回答: #1「学生時代の同級生で地図に無い人」に 今回は関心が薄い", reason, "最新の回答が載る")
+        self.assertIn("いちばん飢えている: #1", reason, "餌で順位が入れ替わる")
+
+    def test_hunger_is_clamped_and_feed_needs_existing_want(self) -> None:
+        self.seed()
+        self.cli("want", "feed", "2", "--delta", "-2")
+        self.assertEqual(json.loads(self.cli("want", "list", "--json").stdout)["wants"][1]["hunger_now"], 0.0)
+        proc = self.cli("want", "feed", "9", "--delta", "-0.1", check=False)
+        self.assertEqual(proc.returncode, 1)
+
+    def test_dry_run_preview_carries_wants(self) -> None:
+        self.seed()
+        proc = self.cli("run", "--budget", "10m", "--policy", POLICY, "--dry-run", "--claude-cmd", "true")
+        self.assertIn("いちばん飢えている: #2", proc.stdout)
+        self.assertLess(proc.stdout.index("欲（"), proc.stdout.index("方針:"))
+
+    def test_verdict_with_response_is_atomic(self) -> None:
+        self.start()
+        self.seed()
+        self.cli("touch", "t1", "--kind", "candidate", "--want", "2")
+        proc = self.cli("verdict", "known", "t1", "nowant", "--response", "knew", check=False)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("nowant にはどの欲も付いていない", proc.stderr)
+        report = self.report_json()
+        self.assertEqual(report["unjudged_candidates"], ["t1"], "途中で失敗したら判定も書かれない")
+        self.assertEqual(report["wants"][1]["events"], [], "途中で失敗したら餌も残らない")
+        proc = self.cli("verdict", "known", "t1", "--feeds", "9", "--response", "knew", check=False)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("欲 #9 は無い", proc.stderr)
+        self.assertEqual(self.report_json()["unjudged_candidates"], ["t1"])
+        proc = self.cli("verdict", "known", "t1", "--feeds", "2", check=False)
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(self.report_json()["unjudged_candidates"], ["t1"], "--feeds 単独は書く前に落ちる")
+        out = json.loads(self.cli("verdict", "known", "t1", "nowant", "--feeds", "2", "--response", "knew",
+                                  "--if-new", "--json").stdout)
+        self.assertEqual((out["recorded"], out["skipped"]), (["nowant"], ["t1"]), "--if-new は触れた t1 を飛ばす")
+        self.assertEqual((out["fed"][0]["want_id"], out["fed"][0]["hunger"]), (2, 0.8), "飛ばした対象は餌にならない")
+
+    def test_touch_and_checkpoint_refuse_unknown_or_closed_want(self) -> None:
+        self.start()
+        self.seed()
+        proc = self.cli("touch", "a", "--want", "9", check=False)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("欲 #9 は無いか閉じている", proc.stderr)
+        self.assertEqual(self.report_json()["totals"]["touches"], 0)
+        proc = self.cli("checkpoint", "--want", "9", check=False)
+        self.assertEqual(proc.returncode, 1)
+        self.cli("want", "close", "2")
+        proc = self.cli("touch", "a", "--want", "2", check=False)
+        self.assertEqual(proc.returncode, 1)
+        reason = json.loads(self.hook("stop").stdout)["reason"]
+        self.assertNotIn("旧友 A", reason, "閉じた欲は文面から外れる")
+        self.assertIn("いちばん飢えている: #1", reason)
+        self.assertIn("#2", self.cli("want", "list", "--all").stdout)
+        self.assertNotIn("#2", self.cli("want", "list").stdout)
+
+    def test_want_project_dir_goes_after_the_subcommand(self) -> None:
+        self.cli("want", "add", "別の台帳の欲", "--project-dir", str(self.other))
+        self.assertIn("別の台帳の欲", self.cli("want", "list", "--project-dir", str(self.other)).stdout)
+        self.assertNotIn("別の台帳の欲", self.cli("want", "list").stdout, "cwd の台帳には書かれない")
+        proc = self.cli("want", "--project-dir", str(self.other), "add", "前置", check=False)
+        self.assertEqual(proc.returncode, 2, "前置形は黙って cwd へ書かず、引数エラーで落ちる")
+        proc = self.cli("want", "add", "問い", "--hunger", "5", check=False)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("0〜1", proc.stderr)
+
+    def test_hunger_ties_are_exact_and_candidate_rows_may_differ_from_want_rows(self) -> None:
+        self.cli("want", "add", "A", "--hunger", "0.4")
+        self.cli("want", "add", "B", "--hunger", "0.6")
+        self.cli("want", "feed", "2", "--delta", "-0.2")
+        listed = json.loads(self.cli("want", "list", "--json").stdout)["wants"]
+        self.assertEqual([w["hunger_now"] for w in listed], [0.4, 0.4], "浮動小数点の誤差で同着が崩れない")
+        self.start()
+        self.assertIn("いちばん飢えている: #1", json.loads(self.hook("stop").stdout)["reason"], "同点は古い方")
+        self.assertIn("直近の記録: #2「B」に -0.20（cli、", json.loads(self.hook("stop").stdout)["reason"])
+        self.cli("want", "feed", "2", "--delta", "-0.1")  # B を 0.3 にして A を明確な先頭にする
+        self.cli("touch", "c", "--kind", "considered", "--want", "1")
+        self.cli("touch", "c", "--kind", "candidate")  # 候補への再分類には --want が無い
+        q = self.report_json()["morning_question"]
+        self.assertEqual((q["entity"], q["want_id"], q["chosen_by"]), ("c", 1, "want"))
+
+
 if __name__ == "__main__":
     unittest.main()
