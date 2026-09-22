@@ -370,8 +370,11 @@ class Ledger:
                 want_id = feeds if feeds is not None else self.want_for_entity(entity)
                 if want_id is None:
                     raise BudgetError(f"{entity} にはどの欲も付いていない。--feeds <want id> で指定する")
-                if self.want(want_id) is None:
+                row = self.want(want_id)
+                if row is None:
                     raise BudgetError(f"{entity} に付いた欲 #{want_id} は無い。--feeds <want id> で指定する")
+                if feeds is None and row["status"] != "open":
+                    raise BudgetError(f"{entity} に最後に付いた欲 #{want_id} は閉じている。--feeds <want id> で指定する")
                 self.db.execute(
                     "INSERT INTO want_events(want_id, at, source, delta, response, entity, evidence, session_id)"
                     " VALUES (?,?,?,?,?,?,?,?)", (want_id, now(), "human", delta, response, entity, note, sid))
@@ -875,10 +878,11 @@ def morning_question(ledger: Ledger, sid: int) -> dict | None:
         chosen_by = "fallback"
     if entity is None:
         return None
-    # 動く欲は「その対象に最後に付いた欲」。verdict --response が --feeds 無しで推定するものと同じにする
+    # 動く欲は「その対象に最後に付いた欲」。verdict --response が --feeds 無しで推定するものと同じにする。
+    # 閉じた欲は文面と順位から外れているので、ここでも使わず、いちばん飢えている欲に戻す
     want_id = ledger.want_for_entity(entity)
     want = ledger.want(want_id) if want_id is not None else None
-    if want is None:
+    if want is None or want["status"] != "open":
         want_id, want = int(top["id"]), top
     return {"entity": entity, "want_id": int(want_id), "want_text": want["text"], "chosen_by": chosen_by}
 

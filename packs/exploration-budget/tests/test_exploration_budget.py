@@ -838,6 +838,21 @@ class Wants(Base):
         q = self.report_json()["morning_question"]
         self.assertEqual((q["entity"], q["want_id"], q["chosen_by"]), ("c", 1, "want"))
 
+    def test_closed_want_is_not_revived_by_the_morning_question(self) -> None:
+        self.start()
+        self.seed()
+        self.cli("touch", "c1", "--kind", "candidate", "--want", "2")
+        self.cli("want", "close", "2")
+        q = self.report_json()["morning_question"]
+        self.assertEqual((q["entity"], q["want_id"], q["chosen_by"]), ("c1", 1, "fallback"), "閉じた欲には戻さず、飢えている欲へ")
+        self.assertIn("--feeds 1 ", self.cli("report").stdout)
+        proc = self.cli("verdict", "known", "c1", "--response", "knew", check=False)
+        self.assertEqual(proc.returncode, 1, "推定が閉じた欲を指すなら黙って餌にせず落ちる")
+        self.assertIn("閉じている", proc.stderr)
+        self.assertEqual(self.report_json()["unjudged_candidates"], ["c1"])
+        self.cli("verdict", "known", "c1", "--feeds", "1", "--response", "knew")
+        self.assertEqual(json.loads(self.cli("want", "list", "--json").stdout)["wants"][0]["hunger_now"], 0.5)
+
 
 if __name__ == "__main__":
     unittest.main()
