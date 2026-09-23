@@ -79,6 +79,10 @@ assert_valid_jsonl() {
   fi
 }
 
+# backlog-collect.sh の stderr は捨てない。以前は各テストが 2>/dev/null で
+# 捨てていたので、bash 3.2 で起動できなかったとき（local: -A: invalid option）も
+# set -e で黙って止まるだけで、原因がテストの出力から読めなかった (IAM-175)。
+
 # --- Setup: create a fake project with TODOs ---
 setup_todo_project() {
   local proj="$TMPDIR_TEST/todo-project"
@@ -110,7 +114,7 @@ test_todo_detection() {
   proj="$(setup_todo_project)"
 
   local output
-  output="$("$LIB_DIR/backlog-collect.sh" "$proj" --source=auto 2>/dev/null)"
+  output="$("$LIB_DIR/backlog-collect.sh" "$proj" --source=auto)"
 
   # Should find 3 items: TODO, FIXME, HACK
   assert_line_count "finds 3 TODO/FIXME/HACK items" "3" "$output"
@@ -127,7 +131,7 @@ test_todo_fields() {
   proj="$(setup_todo_project)"
 
   local output
-  output="$("$LIB_DIR/backlog-collect.sh" "$proj" --source=auto 2>/dev/null)"
+  output="$("$LIB_DIR/backlog-collect.sh" "$proj" --source=auto)"
 
   local first_line
   first_line="$(echo "$output" | head -1)"
@@ -148,7 +152,7 @@ test_empty_project() {
   echo "// clean code" > "$proj/src/clean.ts"
 
   local output
-  output="$("$LIB_DIR/backlog-collect.sh" "$proj" --source=auto 2>/dev/null)" || true
+  output="$("$LIB_DIR/backlog-collect.sh" "$proj" --source=auto)" || true
 
   assert_eq "empty project produces no output" "" "$output"
 }
@@ -165,7 +169,7 @@ test_manual_file() {
 JSONL
 
   local output
-  output="$("$LIB_DIR/backlog-collect.sh" "$proj" --source="$backlog_file" 2>/dev/null)"
+  output="$("$LIB_DIR/backlog-collect.sh" "$proj" --source="$backlog_file")"
 
   assert_line_count "reads 2 items from manual file" "2" "$output"
   assert_contains "has manual-1" '"manual-1"' "$output"
@@ -198,7 +202,7 @@ MOCK
   chmod +x "$mock_bin/npx"
 
   local output
-  output="$(PATH="$mock_bin:$PATH" "$LIB_DIR/backlog-collect.sh" "$proj" --source=auto 2>/dev/null)"
+  output="$(PATH="$mock_bin:$PATH" "$LIB_DIR/backlog-collect.sh" "$proj" --source=auto)"
 
   assert_contains "detects tsc error type" '"type":"tsc"' "$output"
   assert_contains "has TS2322 error" 'TS2322' "$output"
@@ -241,7 +245,7 @@ MOCK
   chmod +x "$mock_bin/npx"
 
   local output
-  output="$(PATH="$mock_bin:$PATH" "$LIB_DIR/backlog-collect.sh" "$proj" --source=auto 2>/dev/null)"
+  output="$(PATH="$mock_bin:$PATH" "$LIB_DIR/backlog-collect.sh" "$proj" --source=auto)"
 
   # First line should be high priority, last should be low
   local first_line last_line
@@ -283,10 +287,43 @@ MOCK
   chmod +x "$mock_bin/npx"
 
   local output
-  output="$(PATH="$mock_bin:$PATH" "$LIB_DIR/backlog-collect.sh" "$proj" --source=auto 2>/dev/null)"
+  output="$(PATH="$mock_bin:$PATH" "$LIB_DIR/backlog-collect.sh" "$proj" --source=auto)"
 
   # Should have exactly 1 item (deduplication removes the duplicate file:line)
   assert_line_count "dedup reduces to 1 item" "1" "$output"
+  # 同じ行の TODO (low) と tsc (high) では、優先度の高い tsc が残る
+  assert_contains "重複は優先度の高い方（tsc）を残す" '"type":"tsc"' "$output"
+}
+
+# --- Test: dedup treats only identical file:line keys as duplicates ---
+# bash 3.2 には連想配列が無いので、_dedup_items は既出のキーを文字列照合で
+# 探す (IAM-175)。部分一致や glob として一致すると、別の行を重複とみなして
+# 捨ててしまう。紛れやすいキーの組を並べ、残る id とその並びをそのまま比べる。
+test_dedup_exact_key() {
+  echo "test_dedup_exact_key:"
+  local proj="$TMPDIR_TEST/dedup-key-project"
+  mkdir -p "$proj"
+  local backlog_file="$TMPDIR_TEST/dedup-key.jsonl"
+  cat > "$backlog_file" <<'JSONL'
+{"id":"k1","type":"manual","file":"src/a.ts","line":10,"text":"a10","priority":"low"}
+{"id":"k2","type":"manual","file":"src/a.ts","line":1,"text":"a1","priority":"low"}
+{"id":"k3","type":"manual","file":"src/a.ts","line":1,"text":"a1 higher","priority":"high"}
+{"id":"k4","type":"manual","file":"src/b.ts","line":2,"text":"b2","priority":"medium"}
+{"id":"k5","type":"manual","file":"src/b.ts","line":2,"text":"b2 lower","priority":"low"}
+{"id":"k6","type":"manual","file":"my file.ts","line":3,"text":"space in path","priority":"low"}
+{"id":"k7","type":"manual","file":"file.ts","line":3,"text":"tail of k6 path","priority":"low"}
+{"id":"k8","type":"manual","file":"app/d/page.tsx","line":1,"text":"plain","priority":"low"}
+{"id":"k9","type":"manual","file":"app/[id]/page.tsx","line":1,"text":"brackets","priority":"low"}
+JSONL
+
+  local output
+  output="$("$LIB_DIR/backlog-collect.sh" "$proj" --source="$backlog_file")"
+
+  local ids
+  ids="$(echo "$output" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p' | tr '\n' ' ')"
+  # k2 は k3 (high) に負け、k5 は k4 (medium) に負ける。ほかは別のキーなので残る。
+  # 並びは high → medium → low で、同じ優先度の中は入力の順
+  assert_eq "同じ file:line だけを重複として扱う" "k3 k4 k1 k6 k7 k8 k9" "${ids% }"
 }
 
 # --- Test: --max-items limits output ---
@@ -304,7 +341,7 @@ test_max_items() {
   } > "$proj/src/many.ts"
 
   local output
-  output="$("$LIB_DIR/backlog-collect.sh" "$proj" --source=auto --max-items=3 2>/dev/null)" || true
+  output="$("$LIB_DIR/backlog-collect.sh" "$proj" --source=auto --max-items=3)" || true
 
   assert_line_count "max-items=3 limits to 3 items" "3" "$output"
 }
@@ -324,7 +361,7 @@ test_max_items_default() {
   } > "$proj/src/lots.ts"
 
   local output
-  output="$("$LIB_DIR/backlog-collect.sh" "$proj" --source=auto 2>/dev/null)" || true
+  output="$("$LIB_DIR/backlog-collect.sh" "$proj" --source=auto)" || true
 
   assert_line_count "default max-items=50 limits to 50 items" "50" "$output"
 }
@@ -338,6 +375,7 @@ test_manual_file
 test_tsc_errors
 test_priority_sort
 test_dedup
+test_dedup_exact_key
 test_max_items
 test_max_items_default
 
