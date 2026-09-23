@@ -194,8 +194,19 @@ _dedup_items() {
   # When duplicates exist, keep the one with highest priority.
   # Input: JSON Lines from stdin
   # Output: Deduplicated JSON Lines to stdout
-  local -A seen_keys=()
-  local -a lines_data=()
+  #
+  # macOS 標準の /bin/bash は 3.2 で、連想配列（local -A、bash 4 以降）が
+  # 使えない。そこでキーは lines_data と同じ添字の配列 keys_data に持つ。
+  # 既出かどうかは、改行で区切ったキーの列 seen との文字列照合で先に絞り、
+  # 当たったときだけ keys_data を完全一致で走査して添字を引く。文字列照合も
+  # seen の長さに比例するので、全体では件数の 2 乗に伸びる。ただし照合は bash の
+  # パターン照合の中で進むので、1 行ごとに配列を走査するより 1 桁速い（3.2 で
+  # 3000 件: 3.4 秒と 36.7 秒）。実行時間の大半は 1 行ごとに起動する sed が占め
+  # （330 行で 18 秒）、照合の 2 乗の項はそれを上回らない。区切りに改行を使うのは、
+  # パスには空白が入りうるが、1 行から取り出したキーに改行は入らないため。
+  local -a keys_data=() lines_data=()
+  local nl=$'\n'
+  local seen="$nl"
 
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
@@ -209,9 +220,22 @@ _dedup_items() {
 
     local key="${file_val}:${line_val}"
 
-    if [[ -n "${seen_keys[$key]+x}" ]]; then
+    # パターンの key は引用符で囲む。囲まないと app/[id]/page.tsx の [id] が
+    # glob の文字クラスになり、app/d/page.tsx のような別のパスにも一致する
+    local existing_idx=-1 i
+    case "$seen" in
+      *"$nl$key$nl"*)
+        for (( i = 0; i < ${#keys_data[@]}; i++ )); do
+          if [[ "${keys_data[i]}" == "$key" ]]; then
+            existing_idx=$i
+            break
+          fi
+        done
+        ;;
+    esac
+
+    if (( existing_idx >= 0 )); then
       # Duplicate - keep the one with higher priority
-      local existing_idx="${seen_keys[$key]}"
       local existing_priority
       existing_priority="$(echo "${lines_data[$existing_idx]}" | sed -n 's/.*"priority":"\([^"]*\)".*/\1/p')"
 
@@ -223,9 +247,9 @@ _dedup_items() {
         lines_data[$existing_idx]="$line"
       fi
     else
-      local idx="${#lines_data[@]}"
-      seen_keys[$key]="$idx"
+      keys_data+=("$key")
       lines_data+=("$line")
+      seen+="$key$nl"
     fi
   done
 
