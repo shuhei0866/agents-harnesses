@@ -8,10 +8,12 @@ GUARD="$SCRIPT_DIR/../lpass-guard.sh"
 
 PASS=0
 FAIL=0
-TMPDIR_TEST="$(mktemp -d)"
+TMPDIR_TEST="$(mktemp -d)" || { echo "一時ディレクトリを作れませんでした" >&2; exit 1; }
 
 cleanup() {
-  rm -rf "$TMPDIR_TEST"
+  if [ -n "${TMPDIR_TEST:-}" ] && [ -d "$TMPDIR_TEST" ]; then
+    rm -rf "$TMPDIR_TEST"
+  fi
 }
 trap cleanup EXIT
 
@@ -69,6 +71,27 @@ subprocess.run(['lpass', 'show', 'x'])
 EOF";                                                   assert_deny "python の heredoc で lpass を呼ぶ"
 
 echo ""
+echo "=== 引用符・エスケープで綴った lpass もブロックする ==="
+run_guard "lp''ass show Personal/Bank";                 assert_deny "空の引用符で分けた lp''ass"
+run_guard "'lpass' show Personal/Bank";                 assert_deny "単引用符で囲んだ 'lpass'"
+run_guard '"lpass" show --password Personal/Bank';      assert_deny "二重引用符で囲んだ \"lpass\""
+run_guard 'l\pass show x';                              assert_deny "バックスラッシュで分けた l\\pass"
+run_guard 'env lpass show x';                           assert_deny "env 経由"
+
+echo ""
+echo "=== パス付き・オプション付き・パイプのシェルとインタプリタもブロックする ==="
+run_guard "/bin/bash -c 'lpass show x'";                assert_deny "/bin/bash -c"
+run_guard "bash -e -c 'lpass show x'";                  assert_deny "bash -e -c"
+run_guard "bash --norc -c 'lpass show x'";              assert_deny "bash --norc -c"
+run_guard "echo 'lpass show x' | bash";                 assert_deny "パイプで bash に渡す"
+run_guard "bash <<< 'lpass show x'";                    assert_deny "here-string で bash に渡す"
+run_guard "ksh -c 'lpass show x'";                      assert_deny "ksh -c"
+run_guard "dash -c 'lpass show x'";                     assert_deny "dash -c"
+run_guard "bash -c 'lp\"\"ass show x'";                 assert_deny "別シェルの中で引用符で分けた lp\"\"ass"
+run_guard '/usr/bin/python3 -c "import os; os.system(\"lpass show x\")"'; assert_deny "/usr/bin/python3 -c"
+run_guard 'python3.12 -c "import os; os.system(\"lpass show x\")"';      assert_deny "python3.12 -c"
+
+echo ""
 echo "=== 読める範囲を広げない操作と、単なる言及は通す ==="
 run_guard 'lpass status';                               assert_pass "lpass status"
 run_guard 'lpass --version';                            assert_pass "lpass --version"
@@ -81,6 +104,7 @@ run_guard "cat <<'EOF'
 lpass show x
 EOF";                                                   assert_pass "cat に流す heredoc 本文"
 run_guard 'git status';                                 assert_pass "無関係なコマンド"
+run_guard 'bash claude-code/hooks/guardrails/tests/test-lpass-guard.sh'; assert_pass "ファイル名に含まれる lpass"
 
 echo ""
 echo "=== 結果: $PASS passed, $FAIL failed ==="

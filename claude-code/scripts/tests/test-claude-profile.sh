@@ -9,8 +9,8 @@ PROFILE="$SCRIPT_DIR/../claude-profile"
 
 PASS=0
 FAIL=0
-T="$(mktemp -d)"
-trap 'rm -rf "$T"' EXIT
+T="$(mktemp -d)" || { echo "一時ディレクトリを作れませんでした" >&2; exit 1; }
+trap 'if [ -n "${T:-}" ] && [ -d "$T" ]; then rm -rf "$T"; fi' EXIT
 
 # --- スタブ lpass: 呼び出しを記録し、決まった応答を返す ---
 cat > "$T/lpass" <<'STUB'
