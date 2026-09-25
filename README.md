@@ -157,6 +157,7 @@ Hooks は `settings.json` で設定する。シンボリックリンクではな
 | **worktree-rm-guard** | `guardrails/` | `.worktrees/` 配下への再帰 rm をブロックし、`git worktree remove` 経由に強制 |
 | **merged-pr-push-guard** | `guardrails/` | merge 済み PR の branch への push をブロック（孤児コミット防止） |
 | **migration-guard** | `guardrails/` | マイグレーション番号の重複を警告 |
+| **lpass-guard** | `guardrails/` | LastPass CLI（lpass）の直接実行をブロックし、保管庫の `Claude/` フォルダだけを読み書きする `scripts/claude-profile` 経由に限定 |
 | **discord-mention** | `discord-mention/` | Discord メッセージの `@username` を `<@USER_ID>` 形式に変換を促す |
 
 #### PostToolUse（ツール実行後の自動処理）

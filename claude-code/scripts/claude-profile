@@ -1,0 +1,113 @@
+#!/bin/bash
+# claude-profile: LastPass の Claude/ フォルダだけを読み書きする窓口
+#
+# エージェントは lpass を直接呼ばず（hooks/guardrails/lpass-guard.sh がブロックする）、
+# このスクリプトを通して、ユーザーが預けた個人情報（氏名・電話番号・住所・診察券番号など、
+# パスワードではないもの）だけを扱う。パスワードやカード番号は Claude/ に置かない。
+# ロック解除（lpass login）はユーザーが自分のターミナルで行う。
+#
+# 使い方:
+#   claude-profile status                  lpass にログインしているか
+#   claude-profile list                    Claude/ フォルダの項目名
+#   claude-profile get <項目> [<キー>]      項目のメモ全体、または「キー: 値」の値だけ
+#   claude-profile set <項目> < 値           項目を作成または上書き（標準入力をメモにする）
+#
+# 項目名は Claude/ からの相対名（例: 電話番号、診察券/MYデンタルクリニック渋谷）。
+# lpass add / edit は送信待ちキューに積むだけで、同期しないと保管庫に届かないことがある。
+# set は同期してキューが空になり、サーバーの一覧に載ったところまで確かめる。
+
+set -euo pipefail
+
+FOLDER="Claude"
+LPASS="${LPASS_BIN:-lpass}"
+QUEUE_DIR="${LPASS_HOME:-$HOME/.lpass}/upload-queue"
+SYNC_WAIT="${CLAUDE_PROFILE_SYNC_WAIT:-20}"
+
+die() {
+  echo "claude-profile: $*" >&2
+  exit 1
+}
+
+usage() {
+  sed -n '2,20p' "$0" | sed -E 's/^# ?//'
+}
+
+valid_name() {
+  local name="$1"
+  [ -n "$name" ] || die "項目名が空です"
+  case "$name" in
+    /*|*..*|*$'\n'*) die "項目名が不正です: $name" ;;
+  esac
+}
+
+require_login() {
+  "$LPASS" status -q >/dev/null 2>&1 \
+    || die "lpass にログインしていません。ユーザーが自分のターミナルで lpass login を実行してください"
+}
+
+list_names() {
+  "$LPASS" ls --sync=now "$FOLDER" 2>/dev/null \
+    | sed -E 's/[[:space:]]*\[id: [0-9]+\][[:space:]]*$//; s/[[:space:]]+$//'
+}
+
+exists() {
+  list_names | grep -Fxq "$FOLDER/$1"
+}
+
+wait_uploaded() {
+  local i
+  for i in $(seq 1 "$SYNC_WAIT"); do
+    "$LPASS" sync >/dev/null 2>&1 || true
+    if [ ! -d "$QUEUE_DIR" ] || [ -z "$(ls -A "$QUEUE_DIR" 2>/dev/null)" ]; then
+      return 0
+    fi
+    sleep 1
+  done
+  die "送信待ちキューが空になりません（${QUEUE_DIR}）。しばらくして lpass sync をやり直してください"
+}
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+
+case "$cmd" in
+  status)
+    "$LPASS" status
+    ;;
+  list)
+    require_login
+    list_names | sed -E "s#^${FOLDER}/##"
+    ;;
+  get)
+    require_login
+    [ $# -ge 1 ] || die "使い方: claude-profile get <項目> [<キー>]"
+    valid_name "$1"
+    notes=$("$LPASS" show --notes "$FOLDER/$1" 2>/dev/null) || die "項目が見つかりません: $FOLDER/$1"
+    if [ $# -ge 2 ]; then
+      printf '%s\n' "$notes" \
+        | awk -v k="$2" 'index($0, k ": ") == 1 { print substr($0, length(k) + 3); found = 1 } END { exit found ? 0 : 1 }' \
+        || die "キーが見つかりません: $2"
+    else
+      printf '%s\n' "$notes"
+    fi
+    ;;
+  set)
+    require_login
+    [ $# -ge 1 ] || die "使い方: claude-profile set <項目> < 値"
+    valid_name "$1"
+    value=$(cat)
+    [ -n "$value" ] || die "標準入力が空です"
+    if exists "$1"; then
+      printf '%s\n' "$value" | "$LPASS" edit --sync=now --non-interactive --notes "$FOLDER/$1" >/dev/null
+    else
+      printf 'URL: http://sn\nNotes:    # Add notes below this line.\n%s\n' "$value" \
+        | "$LPASS" add --sync=now --non-interactive "$FOLDER/$1" >/dev/null
+    fi
+    wait_uploaded
+    exists "$1" || die "保存後の一覧に見つかりません: $FOLDER/$1"
+    echo "保存しました: $FOLDER/$1"
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac
