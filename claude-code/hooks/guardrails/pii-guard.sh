@@ -61,10 +61,9 @@ fi
 
 # 2. 他の実在しそうなユーザーパス（プレースホルダー xxx, example, user 等は除外）
 OTHER_PATHS=$(echo "$ADDED" | grep -oE '/(Users|home)/[a-zA-Z][a-zA-Z0-9_-]{2,}' | \
-  grep -vi '/xxx\|/example\|/user\|/username\|/your\|/sal9000\|/root' | \
+  grep -viE '^/(Users|home)/(xxx|example|user|username|your|root)$' | \
   sort -u || true)
 if [ -n "$OTHER_PATHS" ]; then
-  # sal9000 はデバイス名なので除外済み
   # 自分のパスは上で検出済みなので除外
   OTHER_PATHS=$(echo "$OTHER_PATHS" | grep -v "/${REAL_USER}$" || true)
   if [ -n "$OTHER_PATHS" ]; then

@@ -17,3 +17,5 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run Git Safety Pack tests
         run: bash packs/git-safety/tests/test-git-safety.sh
+      - name: Check PII path detection
+        run: bash claude-code/hooks/guardrails/tests/test-pii-paths.sh
