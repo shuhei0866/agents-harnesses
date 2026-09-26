@@ -86,8 +86,7 @@ codex review --base {base_branch} 2>&1 | tee "$RESULT_FILE"
 
 # exec を使う場合（より自由な分析）
 codex exec \
-  --full-auto \
-  --sandbox read-only \
+  -s read-only \
   -o "$RESULT_FILE" \
   -C "{project_dir}" \
   "{生成したプロンプト}"
@@ -117,8 +116,7 @@ RESULT_FILE="/tmp/codex-$(date +%s)-impl.md"
 
 # 3. Codex を実行（バックグラウンド）
 codex exec \
-  --full-auto \
-  --sandbox workspace-write \
+  -s workspace-write \
   -o "$RESULT_FILE" \
   -C "$WORKTREE_DIR" \
   "{生成したプロンプト}"
@@ -132,8 +130,7 @@ codex exec \
 RESULT_FILE="/tmp/codex-$(date +%s)-analyze.md"
 
 codex exec \
-  --full-auto \
-  --sandbox read-only \
+  -s read-only \
   -o "$RESULT_FILE" \
   -C "{project_dir}" \
   "{生成したプロンプト}"
@@ -212,3 +209,6 @@ Claude Code が加える価値:
 - Codex の実行中もユーザーとの対話は継続する（非同期の利点）
 - `--json` オプションは通常不要。`-o` の自然言語レポートで十分
 - Codex 側にもスキル（TDD 等）があり、自動適用される。Claude Code 側から Codex のスキル使用を強制しない
+- `--full-auto` は `codex exec` から消えている（0.147.0 で無いことを確認。0.155.1 では `unexpected argument` で起動に失敗する）。sandbox は `-s read-only` / `-s workspace-write` で指定する
+- **`-C` は掘らせたいディレクトリまで絞る。** リポジトリのルートを渡すと `node_modules` や `.pnpm-store` を舐めて無出力のまま固着することがある（2026-08-18 に、あるリポジトリのルートを渡して 30 分固着した）。docs だけ読ませたいなら docs のパスを渡し、必要なら `--skip-git-repo-check` を添える
+- 15 分を超えて無出力なら固着を疑う。`ps aux | grep "[c]odex exec"` で生存を見て、待ち続けずに範囲を絞って投げ直す
