@@ -211,4 +211,5 @@ Claude Code が加える価値:
 - Codex 側にもスキル（TDD 等）があり、自動適用される。Claude Code 側から Codex のスキル使用を強制しない
 - `--full-auto` は `codex exec` から消えている（0.147.0 で無いことを確認。0.155.1 では `unexpected argument` で起動に失敗する）。sandbox は `-s read-only` / `-s workspace-write` で指定する
 - **`-C` は掘らせたいディレクトリまで絞る。** リポジトリのルートを渡すと `node_modules` や `.pnpm-store` を舐めて無出力のまま固着することがある（2026-08-18 に、あるリポジトリのルートを渡して 30 分固着した）。docs だけ読ませたいなら docs のパスを渡し、必要なら `--skip-git-repo-check` を添える
-- 15 分を超えて無出力なら固着を疑う。`ps aux | grep "[c]odex exec"` で生存を見て、待ち続けずに範囲を絞って投げ直す
+- 15 分を超えて無出力なら固着を疑う。生存は `pgrep -f "[c]odex exec"` で PID だけを見て確かめ、状態と経過時間が要るなら `ps -o pid=,stat=,etime= -p <PID>` で見る。`ps aux` はプロンプトを含む引数ごと表示するので、プロンプトに載せた値が transcript に残る
+- 待ち続けずに範囲を絞って投げ直す。その前に `kill <PID>` で先行の実行を止め、`pgrep` で消えたことを確かめる。止めずに投げ直すと、impl では二つの実行が同じ worktree に書き込む
