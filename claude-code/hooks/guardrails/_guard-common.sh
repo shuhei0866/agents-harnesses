@@ -1533,6 +1533,14 @@ guard_mask_command_substitutions() {
   '
 }
 
+# --- 判定の事前確認 ---
+# guard_respond が severity に対して deny を返すなら 0、allow（警告のみ）なら 1 を返す。
+# 「ブロックした」と書くかどうかを実際の判定に合わせて選ぶために使う。
+guard_respond_denies() {
+  local severity="$1"
+  [ "$severity" = "critical" ] || [ "${GUARD_LEVEL:-warn}" = "deny" ] || _is_force_deny
+}
+
 # --- レスポンス出力 ---
 # guard_respond severity tag message
 #   severity: "critical" | "advisory"
@@ -1548,7 +1556,7 @@ guard_respond() {
   message="${message//'\n'/$'\n'}"
 
   local decision
-  if [ "$severity" = "critical" ] || [ "${GUARD_LEVEL:-warn}" = "deny" ] || _is_force_deny; then
+  if guard_respond_denies "$severity"; then
     decision="deny"
   else
     decision="allow"

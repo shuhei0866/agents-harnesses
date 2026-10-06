@@ -147,7 +147,7 @@ Hooks は `settings.json` で設定する。シンボリックリンクではな
 
 | Hook | ディレクトリ | 説明 |
 |------|-------------|------|
-| **gh-guard** | `guardrails/` | PR の自己 approve・保護ブランチへの直接マージをブロック |
+| **gh-guard** | `guardrails/` | PR の自己 approve・main 向けの approve / マージを警告（`GUARD_LEVEL=deny` 等でブロック） |
 | **commit-guard** | `guardrails/` | main/develop への直接コミット、`--no-verify`、force push を防止 |
 | **secret-guard** | `guardrails/` | シークレットの平文出力（echo, printenv 等）をブロック |
 | **heredoc-guard** | `guardrails/` | heredoc 構文をブロックし、コピペ事故を防止 |
