@@ -99,7 +99,7 @@ run_bash_case() {
   before=$(repo_state)
   OUT=$(jq -n --arg c "$cmd" --arg cwd "$NEUTRAL" '{tool_input:{command:$c}, cwd:$cwd}' \
     | env -u CLAUDE_PROJECT_DIR -u GUARD_SKIP -u GUARD_LEVEL -u GUARD_FORCE_DENY -u GIT_WORKFLOW -u CLAUDE_CLOUD \
-        "${GUARD_ENVS[@]}" bash "$guard" 2>/dev/null)
+        ${GUARD_ENVS[@]+"${GUARD_ENVS[@]}"} bash "$guard" 2>/dev/null)
   parse_out
 
   # harness の模倣: deny 以外ならコマンドを実行する。
@@ -125,7 +125,7 @@ hello
 EOF"
   OUT=$(jq -n --arg c "$cmd" --arg cwd "$NEUTRAL" '{tool_input:{command:$c}, cwd:$cwd}' \
     | env -u CLAUDE_PROJECT_DIR -u GUARD_SKIP -u GUARD_LEVEL -u GUARD_FORCE_DENY -u GIT_WORKFLOW -u CLAUDE_CLOUD \
-        "${GUARD_ENVS[@]}" bash "$HEREDOC_GUARD" 2>/dev/null)
+        ${GUARD_ENVS[@]+"${GUARD_ENVS[@]}"} bash "$HEREDOC_GUARD" 2>/dev/null)
   parse_out
   if [ "$DECISION" != "deny" ]; then
     (cd "$NEUTRAL" && bash -c "$cmd" >/dev/null 2>&1) || true
@@ -144,7 +144,7 @@ run_write_case() {
   target="$REPO/src/new-file.txt"
   OUT=$(jq -n --arg f "$target" --arg cwd "$NEUTRAL" '{tool_input:{file_path:$f, content:"x"}, cwd:$cwd}' \
     | env -u CLAUDE_PROJECT_DIR -u GUARD_SKIP -u GUARD_LEVEL -u GUARD_FORCE_DENY -u GIT_WORKFLOW -u CLAUDE_CLOUD \
-        "${GUARD_ENVS[@]}" bash "$WORKTREE_GUARD" 2>/dev/null)
+        ${GUARD_ENVS[@]+"${GUARD_ENVS[@]}"} bash "$WORKTREE_GUARD" 2>/dev/null)
   parse_out
   if [ "$DECISION" != "deny" ]; then
     mkdir -p "$(dirname "$target")" && printf 'x' > "$target"

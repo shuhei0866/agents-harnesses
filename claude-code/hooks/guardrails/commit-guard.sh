@@ -5,7 +5,7 @@
 #   --no-verify によるフックスキップ、main/master への force push、develop ブランチ削除。
 # advisory（既定の GUARD_LEVEL=warn では警告のみで実行を止めない。GUARD_LEVEL=deny
 # または GUARD_FORCE_DENY=commit-guard のときだけブロックする）:
-#   メインワークツリーでの保護ブランチ (main/develop) への直接コミット、ブランチ切り替え、
+#   メインワークツリーでの保護ブランチ (main/master/develop) への直接コミット、ブランチ切り替え、
 #   main への直接マージ（hotfix 除く）、stash pop/apply。
 # advisory の検出文言はこの判定に合わせて「ブロックしました」/「警告のみで、実行は
 # 止めていません」を書き分ける（_commit_guard_respond）。
