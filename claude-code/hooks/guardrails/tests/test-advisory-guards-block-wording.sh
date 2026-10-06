@@ -13,7 +13,7 @@
 # ケースごとに確かめ、判定そのもの（warn → allow / deny → deny）も表明する。
 set -uo pipefail
 
-for required_cmd in bash dirname mktemp mkdir rm git jq env grep; do
+for required_cmd in bash dirname mktemp mkdir rm git jq env grep cat wc tr; do
   command -v "$required_cmd" >/dev/null 2>&1 || {
     printf 'required command is unavailable: %s\n' "$required_cmd" >&2
     exit 1
@@ -40,6 +40,15 @@ cleanup() {
   rm -rf "$TMPDIR_TEST"
 }
 trap cleanup EXIT
+
+# 入力のコマンド文字列にはパスを埋め込み、harness と同じく bash -c で実行する。パスにシェルの
+# メタ文字（$(...) など）が入ると再解釈されて実行されてしまうので、安全な文字だけのパスに限る。
+case "$TMPDIR_TEST" in
+  *[!A-Za-z0-9/._-]*)
+    printf 'temporary directory contains characters this test cannot embed: %s\n' "$TMPDIR_TEST" >&2
+    exit 1
+    ;;
+esac
 
 NEUTRAL="$TMPDIR_TEST/neutral"
 mkdir -p "$NEUTRAL"
