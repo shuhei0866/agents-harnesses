@@ -1,9 +1,14 @@
 #!/bin/bash
-# commit-guard: PreToolUse (Bash) - 危険な git 操作をブロック [L5]
+# commit-guard: PreToolUse (Bash) - 危険な git 操作をブロック・警告 [L5]
 #
-# メインワークツリーでの保護ブランチ (main/develop) への直接コミット、
-# --no-verify によるフックスキップ、force push、ブランチ切り替え、
-# main への直接マージ（hotfix 除く）、develop ブランチ削除などを検出してブロックする。
+# critical（GUARD_LEVEL に関係なく常にブロック）:
+#   --no-verify によるフックスキップ、main/master への force push、develop ブランチ削除。
+# advisory（既定の GUARD_LEVEL=warn では警告のみで実行を止めない。GUARD_LEVEL=deny
+# または GUARD_FORCE_DENY=commit-guard のときだけブロックする）:
+#   メインワークツリーでの保護ブランチ (main/develop) への直接コミット、ブランチ切り替え、
+#   main への直接マージ（hotfix 除く）、stash pop/apply。
+# advisory の検出文言はこの判定に合わせて「ブロックしました」/「警告のみで、実行は
+# 止めていません」を書き分ける（_commit_guard_respond）。
 # gh pr merge の判定は gh-guard.sh が担う（コマンドの分割と --repo / cd の解決を持つため）。
 
 set -uo pipefail
@@ -625,6 +630,29 @@ _commit_guard_check_universal_critical() {
 
 _commit_guard_check_universal_critical
 
+# --- ヘルパー: advisory の検出を判定に合わせた文言で応答する ---
+#
+# workflow advisory は既定の GUARD_LEVEL=warn では操作を止めない（permissionDecision=allow）。
+# それなのに「ブロックされています」と書くと、読んだ人や agent は操作が実行されなかったと
+# 信じ、実際には通ったコミットやマージを再試行しかねない。逆に、本当に止めたときの宣言も
+# 信用されなくなる。そこで gh-guard と同じく、「ブロック」と書くのは実際に deny するとき
+# だけにし、warn のときは実行を止めていないことを明記する。
+#
+# 対象リポジトリを特定できなかったときの advisory（下の 3 つ）はこのヘルパーを通さない。
+# あれは違反を検出したのではなく判定できなかった理由を述べる文言で、実行したか
+# どうかを主張していないので、deny でも warn でも同じ中立の文言のままで正しい。
+#
+# _commit_guard_respond <tag> <検出した操作> <対処法>
+_commit_guard_respond() {
+  local tag="$1" subject="$2" tail="$3" message=""
+  if guard_respond_denies "advisory"; then
+    message="${subject}をブロックしました。"
+  else
+    message="${subject}を検出しました。警告のみで、実行は止めていません。"
+  fi
+  guard_respond "advisory" "$tag" "${message}${tail}"
+}
+
 # --- workflow advisory: parser が記録した各 git invocation を target repo 単位で判定 ---
 if ! guard_is_trunk_direct; then
   ADVISORY_INDEX=0
@@ -656,23 +684,27 @@ if ! guard_is_trunk_direct; then
       commit)
         if { [ "$GIT_DIR" = "$GIT_COMMON_DIR" ] || [ "$GIT_DIR" = ".git" ]; } \
            && { [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ] || [ "$BRANCH" = "develop" ]; }; then
-          guard_respond "advisory" "コミット衛生ガード" "メインワークツリーの ${BRANCH} ブランチでの直接コミットはブロックされています。ブランチを作成して PR 経由でマージしてください。.claude/ の変更も含め、ワークツリーまたは別ブランチで作業してください。"
+          _commit_guard_respond "コミット衛生ガード" "メインワークツリーの ${BRANCH} ブランチでの直接コミット" \
+            "ブランチを作成して PR 経由でマージしてください。.claude/ の変更も含め、ワークツリーまたは別ブランチで作業してください。"
         fi
         ;;
       checkout|switch)
         if { [ "$GIT_DIR" = "$GIT_COMMON_DIR" ] || [ "$GIT_DIR" = ".git" ]; } \
            && [ "$ADVISORY_DETAIL" -ne 1 ]; then
-          guard_respond "advisory" "コミット衛生ガード" "メインワークツリーでの git checkout/switch はブロックされています。\`git worktree add\` でワークツリーを作成してください。未コミットの作業が消失するリスクがあります。（develop/main への切り替えは許可されています）"
+          _commit_guard_respond "コミット衛生ガード" "メインワークツリーでの git checkout/switch" \
+            "\`git worktree add\` でワークツリーを作成してください。未コミットの作業が消失するリスクがあります。（develop/main への切り替えは許可されています）"
         fi
         ;;
       merge)
         if [ "$ADVISORY_DETAIL" -ne 1 ] && { [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; }; then
-          guard_respond "advisory" "ブランチ戦略ガード" "main への直接マージはブロックされています。develop 経由でマージしてください。hotfix の場合は hotfix/* ブランチを使用してください。"
+          _commit_guard_respond "ブランチ戦略ガード" "main への直接マージ" \
+            "develop 経由でマージしてください。hotfix の場合は hotfix/* ブランチを使用してください。"
         fi
         ;;
       stash-pop|stash-apply)
         if [ "$GIT_DIR" = "$GIT_COMMON_DIR" ] || [ "$GIT_DIR" = ".git" ]; then
-          guard_respond "advisory" "コミット衛生ガード" "メインワークツリーでの git stash pop/apply はブロックされています。ワークツリー内で作業してください。"
+          _commit_guard_respond "コミット衛生ガード" "メインワークツリーでの git stash pop/apply" \
+            "ワークツリー内で作業してください。"
         fi
         ;;
     esac

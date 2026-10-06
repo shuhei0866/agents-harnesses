@@ -1,8 +1,12 @@
 #!/bin/bash
-# worktree-guard: PreToolUse (Write|Edit) - メインワークツリーでのファイル編集をブロック [L5]
+# worktree-guard: PreToolUse (Write|Edit) - メインワークツリーでのファイル編集を警告（GUARD_LEVEL=deny 等でブロック） [L5]
 #
-# メインワークツリー（リポジトリルート）でのファイル編集を技術的にブロックする。
-# ワークツリー内、または除外パス（.claude/, CLAUDE.md 等）への書き込みは許可。
+# メインワークツリー（リポジトリルート）でのファイル編集を検出する。
+# 判定は advisory であり、既定の GUARD_LEVEL=warn では警告のみで編集を止めない。
+# GUARD_LEVEL=deny または GUARD_FORCE_DENY=worktree-guard のときだけブロックする。
+# 文言はこの判定に合わせて「ブロックしました」/「警告のみで、実行は止めていません」を
+# 書き分ける。
+# ワークツリー内、または除外パス（.claude/, CLAUDE.md 等）への書き込みは対象外。
 #
 # project_root はファイルパス起点で特定する。Claude Code は cwd と異なるリポジトリの
 # ファイルを操作することがあり (例: cwd=my-skynet-hub で projects/student-portal/ 配下
@@ -113,5 +117,10 @@ case "$RELATIVE_PATH" in
   .github/*)         exit 0 ;;  # CI/CD 設定
 esac
 
-# メインワークツリーでの編集をブロック
-guard_respond "advisory" "ワークツリーガード" "メインワークツリーでのファイル編集はブロックされています。\n\n対処法: ユーザーに報告し、\`git worktree add .worktrees/<name> <branch>\` でワークツリーを作成してそこで作業してください。\n\n編集しようとしたファイル: ${RELATIVE_PATH}"
+# メインワークツリーでの編集を検出（既定では警告のみ、deny 設定ではブロック）
+if guard_respond_denies "advisory"; then
+  WORKTREE_MSG="メインワークツリーでのファイル編集をブロックしました。"
+else
+  WORKTREE_MSG="メインワークツリーでのファイル編集を検出しました。警告のみで、実行は止めていません。"
+fi
+guard_respond "advisory" "ワークツリーガード" "${WORKTREE_MSG}\n\n対処法: ユーザーに報告し、\`git worktree add .worktrees/<name> <branch>\` でワークツリーを作成してそこで作業してください。\n\n編集しようとしたファイル: ${RELATIVE_PATH}"
