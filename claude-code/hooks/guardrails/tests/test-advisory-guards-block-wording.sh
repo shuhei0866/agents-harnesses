@@ -27,7 +27,10 @@ WORKTREE_GUARD="$SCRIPT_DIR/../worktree-guard.sh"
 
 PASS=0
 FAIL=0
-TMPDIR_TEST="$(mktemp -d)" || exit 1
+# macOS の一時ディレクトリは /var が /private/var へのシンボリックリンクで、worktree-guard の
+# realpath -m（GNU のみ）による正規化が効かない。文言の検証がパス解決に左右されないよう、
+# 物理パスで作る（ガード側の正規化が macOS で効かない問題は別に扱う）。
+TMPDIR_TEST="$(cd "$(mktemp -d)" && pwd -P)" || exit 1
 FIXTURE_MARKER=".advisory-guards-wording-fixture"
 : > "$TMPDIR_TEST/$FIXTURE_MARKER"
 
@@ -169,19 +172,19 @@ assert_warn_case() {
   local label="$1" claims_block=0
   printf '%s' "$TEXT" | grep -q 'ブロック' && claims_block=1
   if [ "$DECISION" = "allow" ] && [ "$EXECUTED" -eq 1 ]; then
-    pass "$label（warn）は allow で、操作は実行される"
+    pass "${label}（warn）は allow で、操作は実行される"
   else
-    fail "$label（warn）は allow で、操作は実行される"
+    fail "${label}（warn）は allow で、操作は実行される"
   fi
   if [ -n "$TEXT" ] && [ "$claims_block" -eq 0 ]; then
-    pass "$label（warn）の文言はブロックと書かない"
+    pass "${label}（warn）の文言はブロックと書かない"
   else
-    fail "$label（warn）の文言はブロックと書かない"
+    fail "${label}（warn）の文言はブロックと書かない"
   fi
   if printf '%s' "$TEXT" | grep -q '実行は止めていません'; then
-    pass "$label（warn）は実行を止めていないと明記する"
+    pass "${label}（warn）は実行を止めていないと明記する"
   else
-    fail "$label（warn）は実行を止めていないと明記する"
+    fail "${label}（warn）は実行を止めていないと明記する"
   fi
 }
 
@@ -189,15 +192,15 @@ assert_warn_case() {
 assert_deny_case() {
   local label="$1" mode="$2"
   if [ "$DECISION" = "deny" ] && [ "$EXECUTED" -eq 0 ]; then
-    pass "$label（$mode）は deny で、操作は実行されない"
+    pass "${label}（${mode}）は deny で、操作は実行されない"
   else
-    fail "$label（$mode）は deny で、操作は実行されない"
+    fail "${label}（${mode}）は deny で、操作は実行されない"
   fi
   if printf '%s' "$TEXT" | grep -q 'ブロックしました' \
      && ! printf '%s' "$TEXT" | grep -q '実行は止めていません'; then
-    pass "$label（$mode）はブロックしたと書く"
+    pass "${label}（${mode}）はブロックしたと書く"
   else
-    fail "$label（$mode）はブロックしたと書く"
+    fail "${label}（${mode}）はブロックしたと書く"
   fi
 }
 
@@ -207,9 +210,9 @@ check_bash_op() {
   run_bash_case "$COMMIT_GUARD" "" "" "$cmd"
   assert_warn_case "$label"
   if printf '%s' "$TEXT" | grep -q -- "$subject"; then
-    pass "$label（warn）は何を検出したかを書く"
+    pass "${label}（warn）は何を検出したかを書く"
   else
-    fail "$label（warn）は何を検出したかを書く（/$subject/）"
+    fail "${label}（warn）は何を検出したかを書く（/$subject/）"
   fi
   run_bash_case "$COMMIT_GUARD" deny "" "$cmd"
   assert_deny_case "$label" "GUARD_LEVEL=deny"

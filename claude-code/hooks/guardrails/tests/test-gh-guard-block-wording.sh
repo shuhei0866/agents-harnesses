@@ -114,7 +114,7 @@ assert_declaration_matches() {
   if [ -n "$TEXT" ] && [ "$claims_block" -ne "$executed" ]; then
     pass "$desc"
   else
-    fail "$desc（ブロック宣言=$claims_block, 実行=$executed）"
+    fail "${desc}（ブロック宣言=$claims_block, 実行=${executed}）"
   fi
 }
 
@@ -123,7 +123,7 @@ assert_blocked() {
   if [ "$DECISION" = "deny" ] && [ ! -s "$OP_LOG" ]; then
     pass "$desc"
   else
-    fail "$desc（deny され、操作が実行されないこと）"
+    fail "${desc}（deny され、操作が実行されないこと）"
   fi
 }
 
@@ -132,7 +132,7 @@ assert_warned_and_executed() {
   if [ "$DECISION" = "allow" ] && [ -s "$OP_LOG" ]; then
     pass "$desc"
   else
-    fail "$desc（警告のみで操作は実行されること）"
+    fail "${desc}（警告のみで操作は実行されること）"
   fi
 }
 
@@ -141,14 +141,14 @@ assert_text() {
   if printf '%s' "$TEXT" | grep -q -- "$pattern"; then
     pass "$desc"
   else
-    fail "$desc（文言に /$pattern/ を含むこと）"
+    fail "${desc}（文言に /$pattern/ を含むこと）"
   fi
 }
 
 assert_no_text() {
   local desc="$1" pattern="$2"
   if printf '%s' "$TEXT" | grep -q -- "$pattern"; then
-    fail "$desc（文言に /$pattern/ を含まないこと）"
+    fail "${desc}（文言に /$pattern/ を含まないこと）"
   else
     pass "$desc"
   fi
