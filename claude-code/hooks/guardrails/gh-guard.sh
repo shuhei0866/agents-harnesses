@@ -1,16 +1,22 @@
 #!/bin/bash
-# gh-guard: PreToolUse (Bash) - PR 操作をブロック [L5]
+# gh-guard: PreToolUse (Bash) - PR 操作を検出して警告・ブロック [L5]
 #
-# ローカル環境: main 向け PR の approve/merge のみブロック。
+# 以下の「対象」は advisory であり、既定の GUARD_LEVEL=warn では警告のみで実行を
+# 止めない。GUARD_LEVEL=deny または GUARD_FORCE_DENY=gh-guard のときだけ deny する。
+# 文言はこの判定に合わせて「ブロックしました」/「警告のみで、実行は止めていません」を
+# 書き分ける（_gh_guard_respond）。
+#
+# ローカル環境: main 向け PR の approve/merge のみ対象。
 #               release/* → develop のマージは許可。
 #
 # クラウド環境 (CLAUDE_CLOUD=1):
-#   - 自己 approve（PR 作成者 = 現在のユーザー）: 全 PR をブロック
-#   - 代理 approve（PR 作成者 ≠ 現在のユーザー）: develop 向けのみ許可、main 向けはブロック
+#   - 自己 approve（PR 作成者 = 現在のユーザー）: 全 PR が対象
+#   - 代理 approve（PR 作成者 ≠ 現在のユーザー）: develop 向けのみ許可、main 向けは対象
 #   - merge は develop 向けのみ許可（独立レビュアー approve 確認後）。
-#   - main 向け merge は両環境でブロック。
+#   - main 向け merge は両環境で対象。
 #
-# 両環境共通: curl / gh api による GitHub approve API 直接呼び出しもブロック。
+# 両環境共通: curl / gh api による GitHub merge / approve API 直接呼び出しは
+# critical として常にブロックする。
 
 set -uo pipefail
 
@@ -441,6 +447,36 @@ _gh_guard_review_is_approve() {
   return 1
 }
 
+# --- ヘルパー: 判定に合わせた文言で応答する ---
+#
+# このガードの判定はすべて advisory であり、既定の GUARD_LEVEL=warn では操作を
+# 止めない（permissionDecision=allow）。それなのに「ブロックしました」と書くと、
+# 読んだ人や agent は操作が実行されなかったと信じ、実際には成功した操作を
+# 再試行しかねない。逆に、本当に止めたときの宣言も信用されなくなる。
+# そこで「ブロック」と書くのは実際に deny するときだけにし、warn のときは
+# 実行を止めていないことを明記する。ターゲットブランチを判定できなかったときは、
+# main 向けと確認できたときと区別して「判定できませんでした」と書く。
+#
+# _gh_guard_respond <対象（判定できたとき）> <操作名> <base|""> <補足>
+_gh_guard_respond() {
+  local subject="$1" action="$2" base="$3" tail="$4" message=""
+
+  if guard_respond_denies "advisory"; then
+    if [ "$base" = "__UNKNOWN__" ]; then
+      message="PR のターゲットブランチを判定できませんでした。main 向けの可能性があるため、安全側に倒して${action}をブロックしました。"
+    else
+      message="${subject}をブロックしました。"
+    fi
+  else
+    if [ "$base" = "__UNKNOWN__" ]; then
+      message="PR のターゲットブランチを判定できませんでした（main 向けの可能性があります）。警告のみで、${action}の実行は止めていません。"
+    else
+      message="${subject}を検出しました。警告のみで、実行は止めていません。"
+    fi
+  fi
+  guard_respond "advisory" "GH ガード" "${message} ${tail}"
+}
+
 if ! guard_is_trunk_direct; then
   GH_INDEX=0
   while [ "$GH_INDEX" -lt "${#_GH_GUARD_OPS[@]}" ]; do
@@ -460,25 +496,23 @@ if ! guard_is_trunk_direct; then
       if [ "$IS_CLOUD" = "1" ]; then
         if is_proxy_approve "$PR_TARGET" "$GH_SEGMENT" "$GH_DIR" "$GH_CONTEXT_UNKNOWN"; then
           if should_deny_approve "$BASE" "$GH_SEGMENT" "$GH_DIR"; then
-            REASON="main 向け PR は代理 approve でもブロックされています。"
-            [ "$BASE" = "__UNKNOWN__" ] && REASON="PR のターゲットブランチを確認できなかったため、安全のためブロックしました。"
-            guard_respond "advisory" "GH ガード" "${REASON} develop → main の昇格は人間が承認・実行してください。"
+            _gh_guard_respond "main 向け PR の代理 approve" "代理 approve" "$BASE" \
+              "develop → main の昇格は人間が承認・実行してください。"
           fi
         else
-          guard_respond "advisory" "GH ガード" "VPS 環境での自己 approve はブロックされています。代理 approve（PR 作成者と異なるアカウント）は develop 向け PR で許可されます。"
+          _gh_guard_respond "VPS 環境での自己 approve" "自己 approve" "" \
+            "代理 approve（PR 作成者と異なるアカウント）は develop 向け PR で許可されます。"
         fi
       elif should_deny_approve "$BASE" "$GH_SEGMENT" "$GH_DIR"; then
-        REASON="main 向け PR の approve はブロックされています。"
-        [ "$BASE" = "__UNKNOWN__" ] && REASON="PR のターゲットブランチを確認できなかったため、安全のためブロックしました。"
-        guard_respond "advisory" "GH ガード" "${REASON} develop → main の昇格は人間が承認・実行してください。"
+        _gh_guard_respond "main 向け PR の approve" "approve" "$BASE" \
+          "develop → main の昇格は人間が承認・実行してください。"
       fi
     elif [ "$GH_OP" = "merge" ]; then
       PR_TARGET=$(extract_pr_target "$GH_SEGMENT" "merge")
       BASE=$(get_pr_base "$PR_TARGET" "$GH_SEGMENT" "$GH_DIR" "$GH_CONTEXT_UNKNOWN")
       if should_deny_merge "$BASE" "$GH_SEGMENT" "$GH_DIR"; then
-        REASON="main 向け PR のマージはブロックされています。"
-        [ "$BASE" = "__UNKNOWN__" ] && REASON="PR のターゲットブランチを確認できなかったため、安全のためブロックしました。"
-        guard_respond "advisory" "GH ガード" "${REASON} develop → main の昇格は人間が実行してください。"
+        _gh_guard_respond "main 向け PR のマージ" "マージ" "$BASE" \
+          "develop → main の昇格は人間が実行してください。"
       fi
     fi
     GH_INDEX=$((GH_INDEX + 1))
