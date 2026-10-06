@@ -148,12 +148,12 @@ Hooks は `settings.json` で設定する。シンボリックリンクではな
 | Hook | ディレクトリ | 説明 |
 |------|-------------|------|
 | **gh-guard** | `guardrails/` | PR の自己 approve・main 向けの approve / マージを警告（`GUARD_LEVEL=deny` 等でブロック） |
-| **commit-guard** | `guardrails/` | main/develop への直接コミット、`--no-verify`、force push を防止 |
+| **commit-guard** | `guardrails/` | `--no-verify`、main/master への force push、develop 削除をブロック。メインワークツリーでの main/master/develop への直接コミット・branch 切り替え・main への直接マージ・stash pop/apply は警告（`GUARD_LEVEL=deny` 等でブロック） |
 | **secret-guard** | `guardrails/` | シークレットの平文出力（echo, printenv 等）をブロック |
-| **heredoc-guard** | `guardrails/` | heredoc 構文をブロックし、コピペ事故を防止 |
+| **heredoc-guard** | `guardrails/` | heredoc 構文を警告し、コピペ事故を防止（`GUARD_LEVEL=deny` 等でブロック） |
 | **pr-merge-ready-guard** | `guardrails/` | 未解決レビュースレッド・マージコンフリクトがある PR のマージを防止 |
 | **toolchain-guard** | `guardrails/` | sudo npm/node をブロック、gh 認証チェック |
-| **worktree-guard** | `guardrails/` | メインワークツリーでの直接編集を制限（worktree 分離を強制） |
+| **worktree-guard** | `guardrails/` | メインワークツリーでの直接編集を警告し、worktree 分離を促す（`GUARD_LEVEL=deny` 等でブロック） |
 | **worktree-rm-guard** | `guardrails/` | `.worktrees/` 配下への再帰 rm をブロックし、`git worktree remove` 経由に強制 |
 | **merged-pr-push-guard** | `guardrails/` | merge 済み PR の branch への push をブロック（孤児コミット防止） |
 | **migration-guard** | `guardrails/` | マイグレーション番号の重複を警告 |

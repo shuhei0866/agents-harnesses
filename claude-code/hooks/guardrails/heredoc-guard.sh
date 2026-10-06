@@ -1,8 +1,12 @@
 #!/bin/bash
-# heredoc-guard: PreToolUse (Bash) - heredoc 構文をブロック
+# heredoc-guard: PreToolUse (Bash) - heredoc 構文を警告（GUARD_LEVEL=deny 等でブロック）
 #
 # ユーザーがコピペする際に heredoc が正しく動作しないケースがあるため、
-# echo '...' | sudo tee や printf を使うよう強制する。
+# echo '...' | sudo tee や printf を使うよう促す。
+# 判定は advisory であり、既定の GUARD_LEVEL=warn では警告のみで実行を止めない。
+# GUARD_LEVEL=deny または GUARD_FORCE_DENY=heredoc-guard のときだけブロックする。
+# 文言はこの判定に合わせて「ブロックしました」/「警告のみで、実行は止めていません」を
+# 書き分ける。
 
 set -uo pipefail
 
@@ -23,7 +27,12 @@ fi
 
 # heredoc パターン検出: <<EOF, <<'EOF', <<"EOF", << 'CONF', <<-EOF など
 if echo "$COMMAND" | grep -qE '<<-?\s*'\''?\"?[A-Za-z_]+'\''?\"?\s*$'; then
-  guard_respond "advisory" "heredoc ガード" "heredoc (<<EOF) 構文はコピペ時に問題が発生するためブロックされています。代わりに echo '...' | sudo tee /path/to/file または printf を使用してください。"
+  if guard_respond_denies "advisory"; then
+    HEREDOC_MSG="heredoc (<<EOF) 構文はコピペ時に問題が発生するためブロックしました。"
+  else
+    HEREDOC_MSG="heredoc (<<EOF) 構文を検出しました（コピペ時に問題が発生します）。警告のみで、実行は止めていません。"
+  fi
+  guard_respond "advisory" "heredoc ガード" "${HEREDOC_MSG}代わりに echo '...' | sudo tee /path/to/file または printf を使用してください。"
 fi
 
 exit 0
