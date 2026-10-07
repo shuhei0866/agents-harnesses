@@ -63,6 +63,9 @@ PHYS="$TMPDIR_TEST/real"
 LINK="$TMPDIR_TEST/link"
 mkdir -p "$PHYS"
 ln -s "$PHYS" "$LINK"
+# / を指すリンク。経由すると、つないだパスの先頭が // になる。
+ROOTLINK="$TMPDIR_TEST/rootlink"
+ln -s / "$ROOTLINK"
 REPO="$PHYS/repo"
 GIT_ID=(-c user.email=t@t -c user.name=t)
 git init -q "$REPO"
@@ -150,6 +153,10 @@ for mode in native bsd-realpath; do
   expect_silent "${mode}" "リンク経由の linked worktree 内" "$LINK/repo/.worktrees/wt/src/new-file.txt"
   expect_silent "${mode}" "リンク経由の .claude/ 配下" "$LINK/repo/.claude/settings.json"
   expect_silent "${mode}" "リンク経由の CLAUDE.md" "$LINK/repo/CLAUDE.md"
+
+  echo "worktree-guard（${mode}）: 先頭が // になるパス"
+  expect_main_worktree "${mode}" "先頭が // のパス" "/${REPO}/src/new-file.txt" "src/new-file.txt"
+  expect_main_worktree "${mode}" "/ を指すリンク経由のパス" "${ROOTLINK}${REPO}/src/new-file.txt" "src/new-file.txt"
   expect_silent "${mode}" "リポジトリ外" "$NEUTRAL/outside.txt"
 done
 

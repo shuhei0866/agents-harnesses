@@ -31,6 +31,15 @@ _normalize_path() {
     *) path="$PWD/$path" ;;
   esac
   while :; do
+    # 先頭の // は POSIX では実装定義の意味を持ち、bash の cd・pwd はそのまま残す。git の表記
+    # （/ が 1 つ）と比べられるよう、先頭の連続した / を 1 つに畳む。入力が // で始まる場合も、
+    # / を指すリンクを辿り直して // ができた場合も、ここで揃う。
+    while :; do
+      case "$path" in
+        //*) path="${path#/}" ;;
+        *) break ;;
+      esac
+    done
     # 存在する最も近い祖先ディレクトリと、その下の残りの要素に分ける
     base="$path"
     rest=""
@@ -39,6 +48,13 @@ _normalize_path() {
       base=$(dirname "$base")
     done
     result=$(CDPATH= cd -P -- "$base" 2>/dev/null && pwd -P) || return 1
+    # / を指すリンクを cd -P で辿ると、bash は pwd -P の結果の先頭にも // を残すので、同じく畳む
+    while :; do
+      case "$result" in
+        //*) result="${result#/}" ;;
+        *) break ;;
+      esac
+    done
     # 残りの要素を 1 つずつつなぐ
     while [ -n "$rest" ]; do
       case "$rest" in
