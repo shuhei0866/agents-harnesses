@@ -9,11 +9,83 @@
 # ワークツリー内、または除外パス（.claude/, CLAUDE.md 等）への書き込みは対象外。
 #
 # project_root はファイルパス起点で特定する。Claude Code は cwd と異なるリポジトリの
-# ファイルを操作することがあり (例: cwd=my-skynet-hub で projects/student-portal/ 配下
+# ファイルを操作することがあり (例: cwd=repo-a で sub/repo-b/ 配下
 # を Edit する)、cwd 起点だと別リポジトリの harness.config が読まれて当該リポジトリの
 # GUARD_FORCE_DENY 等が無視されてしまうため。
 
 set -uo pipefail
+
+# _normalize_path PATH
+#   シンボリックリンクと . / .. を解決した絶対パスを出力する（存在しない要素があってもよい）。
+#   GNU の `realpath -m` 相当だが、macOS の BSD コマンドと /bin/bash 3.2 でも同じ結果になるよう、
+#   存在する最も近い祖先ディレクトリを `pwd -P` で解決し、残りの要素を 1 つずつつなぐ。
+#   途中の要素がシンボリックリンクなら readlink（オプションなし）で辿り直す。
+#   cd は -P で物理的に移動する（論理的な .. の処理だと、リンクの親に戻ってしまう）。
+#   git rev-parse --show-toplevel はシンボリックリンクを解決したパスを返すので、比較する
+#   パスはすべてこの関数で同じ表記にそろえる。解決できなければ 1 を返す。
+_normalize_path() {
+  local path="$1" base="" rest="" comp="" result="" target="" hops=0
+  [ -n "$path" ] || return 1
+  case "$path" in
+    /*) ;;
+    *) path="$PWD/$path" ;;
+  esac
+  while :; do
+    # 先頭の // は POSIX では実装定義の意味を持ち、bash の cd・pwd はそのまま残す。git の表記
+    # （/ が 1 つ）と比べられるよう、先頭の連続した / を 1 つに畳む。入力が // で始まる場合も、
+    # / を指すリンクを辿り直して // ができた場合も、ここで揃う。
+    while :; do
+      case "$path" in
+        //*) path="${path#/}" ;;
+        *) break ;;
+      esac
+    done
+    # 存在する最も近い祖先ディレクトリと、その下の残りの要素に分ける
+    base="$path"
+    rest=""
+    while [ ! -d "$base" ]; do
+      rest="$(basename "$base")${rest:+/$rest}"
+      base=$(dirname "$base")
+    done
+    result=$(CDPATH= cd -P -- "$base" 2>/dev/null && pwd -P) || return 1
+    # / を指すリンクを cd -P で辿ると、bash は pwd -P の結果の先頭にも // を残すので、同じく畳む
+    while :; do
+      case "$result" in
+        //*) result="${result#/}" ;;
+        *) break ;;
+      esac
+    done
+    # 残りの要素を 1 つずつつなぐ
+    while [ -n "$rest" ]; do
+      case "$rest" in
+        */*) comp="${rest%%/*}"; rest="${rest#*/}" ;;
+        *)   comp="$rest"; rest="" ;;
+      esac
+      case "$comp" in
+        ''|.) continue ;;
+        ..) result=$(dirname "$result"); continue ;;
+      esac
+      if [ "$result" = "/" ]; then
+        result="/$comp"
+      else
+        result="$result/$comp"
+      fi
+      # 循環したリンクは辿り続けず、40 回で打ち切ってそのままの表記を使う（realpath -m と同じ）
+      if [ -L "$result" ] && [ "$hops" -lt 40 ]; then
+        hops=$((hops + 1))
+        target=$(readlink "$result") || return 1
+        case "$target" in
+          /*) ;;
+          *) target="$(dirname "$result")/$target" ;;
+        esac
+        path="$target${rest:+/$rest}"
+        continue 2
+      fi
+    done
+    printf '%s\n' "$result"
+    return 0
+  done
+}
 
 INPUT=$(cat)
 
@@ -26,7 +98,7 @@ fi
 FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty')
 
 # パストラバーサル防止: .. を含むパスを正規化
-FILE_PATH=$(realpath -m "$FILE_PATH" 2>/dev/null || echo "$FILE_PATH")
+FILE_PATH=$(_normalize_path "$FILE_PATH" || echo "$FILE_PATH")
 
 if [ -z "${FILE_PATH:-}" ]; then
   exit 0
@@ -49,7 +121,7 @@ if [ -z "$PROJECT_ROOT" ]; then
 fi
 
 # パスを正規化
-PROJECT_ROOT=$(realpath -m "$PROJECT_ROOT" 2>/dev/null || echo "$PROJECT_ROOT")
+PROJECT_ROOT=$(_normalize_path "$PROJECT_ROOT" || echo "$PROJECT_ROOT")
 
 # CLAUDE_PROJECT_DIR をファイル所属リポジトリで上書き
 # (_guard-common.sh が harness.config を探索する際にこの値を使う)
@@ -81,12 +153,13 @@ while IFS= read -r line; do
   case "$line" in
     worktree\ *)
       WT_PATH="${line#worktree }"
-      # メインワークツリーはスキップ
-      if [ "$WT_PATH" = "$PROJECT_ROOT" ]; then
+      # ワークツリーパスも正規化してから比較（パストラバーサル対策）
+      WT_PATH_NORMALIZED=$(_normalize_path "$WT_PATH" || echo "$WT_PATH")
+      # メインワークツリーはスキップ（正規化後に比べる。表記がずれたまま素通りすると、
+      # 下の判定でメインワークツリー配下のファイルをすべて許可してしまう）
+      if [ "$WT_PATH_NORMALIZED" = "$PROJECT_ROOT" ]; then
         continue
       fi
-      # ワークツリーパスも正規化してから比較（パストラバーサル対策）
-      WT_PATH_NORMALIZED=$(realpath -m "$WT_PATH" 2>/dev/null || echo "$WT_PATH")
       # ファイルがこのワークツリー内にある場合は許可
       case "$FILE_PATH" in
         "$WT_PATH_NORMALIZED"/*)

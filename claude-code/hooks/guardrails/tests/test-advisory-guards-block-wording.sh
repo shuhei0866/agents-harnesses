@@ -27,9 +27,9 @@ WORKTREE_GUARD="$SCRIPT_DIR/../worktree-guard.sh"
 
 PASS=0
 FAIL=0
-# macOS の一時ディレクトリは /var が /private/var へのシンボリックリンクで、worktree-guard の
-# realpath -m（GNU のみ）による正規化が効かない。文言の検証がパス解決に左右されないよう、
-# 物理パスで作る（ガード側の正規化が macOS で効かない問題は別に扱う）。
+# 文言の検証をパス解決から切り離すため、一時ディレクトリは物理パスで作る（macOS では /var が
+# /private/var へのシンボリックリンク）。シンボリックリンク経由のパスの扱いは、
+# test-worktree-guard-path-normalization.sh が固定している。
 TMPDIR_TEST="$(cd "$(mktemp -d)" && pwd -P)" || exit 1
 FIXTURE_MARKER=".advisory-guards-wording-fixture"
 : > "$TMPDIR_TEST/$FIXTURE_MARKER"
