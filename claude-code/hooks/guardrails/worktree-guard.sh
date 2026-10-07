@@ -9,7 +9,7 @@
 # ワークツリー内、または除外パス（.claude/, CLAUDE.md 等）への書き込みは対象外。
 #
 # project_root はファイルパス起点で特定する。Claude Code は cwd と異なるリポジトリの
-# ファイルを操作することがあり (例: cwd=my-skynet-hub で projects/student-portal/ 配下
+# ファイルを操作することがあり (例: cwd=repo-a で sub/repo-b/ 配下
 # を Edit する)、cwd 起点だと別リポジトリの harness.config が読まれて当該リポジトリの
 # GUARD_FORCE_DENY 等が無視されてしまうため。
 
