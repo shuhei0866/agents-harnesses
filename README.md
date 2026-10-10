@@ -87,7 +87,7 @@ PACK="$PWD/packs/exploration-budget"
 | **review-loop** | 4-5 並列レビュアーによる収束型コードレビューループ。新規指摘 0 件で収束 | `/review-loop` |
 | **review-now** | 独立コンテキストでの単発コードレビュー。PR 前のクイックチェックに | `/review-now` |
 | **review-pr** | 既存の PR を独立コンテキストでレビューし、結果を PR コメントとして投稿 | `/review-pr` |
-| **delegate-review-to-codex** | Codex CLI (gpt-5.3-codex) による独立コードレビュー。`/review-now` と並列で多角的レビュー | `/codex-review` |
+| **delegate-review-to-codex** | 共通指示と固定対象を stdin で Codex CLI へ渡す独立レビュー。`/codex review` も利用 | `/codex-review` |
 
 #### release/ — リリース系
 

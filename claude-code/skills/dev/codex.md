@@ -42,9 +42,10 @@ $ARGUMENTS
 
 ### 最重要原則: 指示粒度はタスク種別で変える
 
-実験により判明した最適パターン:
+タスク種別に応じた渡し方:
 
-- **review / analyze** → **曖昧に任せる。** 観点を絞りすぎない。Codex はドメイン知識を自由に活用し、指示が曖昧なほど深い分析を出す。
+- **review** → 対象と欠陥の判断基準を明示する。`../review/review-loop.md` の「レビュアーへ渡す入力」に従い、共通契約・変更に応じた確認経路・反証・未確認範囲を実プロンプトへ含める。発見すべき答えは先に与えない。
+- **analyze** → 調べる問い・対象・制約を明示し、仮説や分析方法は Codex に委ねる。
 - **impl** → **中粒度。** 「何を」「なぜ」「制約」を伝え、「どう実装するか」は指定しない。詳細仕様は Codex のドメイン知識を殺す。
 
 ### プロンプト構造
@@ -67,6 +68,8 @@ $ARGUMENTS
 3. **スコープは明確にする。** 対象ファイル・ディレクトリの範囲は示す
 4. **制約は具体的に。** 「既存 I/F を変えない」「外部ライブラリ追加不可」など
 
+review では上の短い構造だけで済ませず、共通契約を含む入力を組み立てる。参照先はこのファイルの実体からの相対パスで解決する（インストールが symlink ならリンク元をたどる）。親の会話で読んだだけの規則は Codex に届かない。
+
 ## Step 3: 実行
 
 ### 共通の事前確認
@@ -77,24 +80,9 @@ codex --version  # CLI の存在確認
 
 ### review モードの実行
 
-```bash
-# 結果ファイルのパスを生成
-RESULT_FILE="/tmp/codex-$(date +%s)-review.md"
+`../review/delegate-review-to-codex.md` の準備・stdin 実行・結果確認を使う。`/codex review` の引数なしは staged / unstaged / untracked、`--base <ref>` は固定した基準 commit と HEAD の差分。対象を委譲先へ明記し、委譲先の既定値で main 差分へ変えない。
 
-# ビルトイン review を使う場合（diff ベースのレビュー）
-codex review --base {base_branch} 2>&1 | tee "$RESULT_FILE"
-
-# exec を使う場合（より自由な分析）
-codex exec \
-  -s read-only \
-  -o "$RESULT_FILE" \
-  -C "{project_dir}" \
-  "{生成したプロンプト}"
-```
-
-**使い分け:**
-- `codex review` — diff が明確な場合（PR、ブランチ差分）
-- `codex exec` — ファイルやディレクトリ全体の分析
+変更単位の review も `codex exec -s read-only` に共通本文と固定対象を stdin で渡す。生成した指示が消える素の `codex review --base ...` へ切り替えない。PR は固定 head、staged は index を読める状態にする。`-C` はその対象の repository root とし、caller / consumer を読めない下位フォルダへ狭めない。
 
 **バックグラウンド実行:** Bash ツールの `run_in_background: true` を使用する。
 完了通知が届くまで、ユーザーとの対話を継続できる。
@@ -140,13 +128,13 @@ codex exec \
 
 ## Step 4: 結果の受信と評価
 
-バックグラウンドタスクの完了通知を受けたら、結果ファイルを読む:
+バックグラウンドタスクの完了通知を受けたら、実行時に控えた結果ファイルの絶対パスを Read 等へ渡す。review では委譲手順が表示した `result.md` のパスを使う。前の Bash 呼び出しの `$RESULT_FILE` が別の呼び出しへ残るとは仮定しない。
 
-```bash
-cat "$RESULT_FILE"
-```
+### review の評価
 
-### review / analyze の評価
+`review-loop.md` の「単発レビューの出力」を保って返す。まずプロセスの終了状態・最終出力・対象 SHA / scope と確認範囲を照合する。timeout・空出力・資料不足を指摘ゼロへ変換しない。指摘は現行コードで反証を検討し、採用しない場合もその理由を残す。未確認範囲と完了状態を要約で落とさない。
+
+### analyze の評価
 
 1. **結果ファイルを読む** — Codex の自然言語レポート
 2. **設計文脈と照合** — ユーザーとの対話で決まったことと矛盾する指摘がないか
@@ -210,6 +198,6 @@ Claude Code が加える価値:
 - `--json` オプションは通常不要。`-o` の自然言語レポートで十分
 - Codex 側にもスキル（TDD 等）があり、自動適用される。Claude Code 側から Codex のスキル使用を強制しない
 - `--full-auto` は `codex exec` から消えている（0.147.0 で無いことを確認。0.155.1 では `unexpected argument` で起動に失敗する）。sandbox は `-s read-only` / `-s workspace-write` で指定する
-- **`-C` は掘らせたいディレクトリまで絞る。** リポジトリのルートを渡すと `node_modules` や `.pnpm-store` を舐めて無出力のまま固着することがある（2026-08-18 に、あるリポジトリのルートを渡して 30 分固着した）。docs だけ読ませたいなら docs のパスを渡し、必要なら `--skip-git-repo-check` を添える
+- **analyze の `-C` は調査対象に合わせる。** review は同じ版の repository root を使い、差分から関連経路へ絞って検索する。依存キャッシュ・生成物を無差別に読ませず、関連する実装や仕様が必要な場合だけ参照する
 - 15 分を超えて無出力なら固着を疑う。生存は `pgrep -f "[c]odex exec"` で PID だけを見て確かめ、状態と経過時間が要るなら `ps -o pid=,stat=,etime= -p <PID>` で見る。`ps aux` はプロンプトを含む引数ごと表示するので、プロンプトに載せた値が transcript に残る
 - 待ち続けずに範囲を絞って投げ直す。その前に `kill <PID>` で先行の実行を止め、`pgrep` で消えたことを確かめる。止めずに投げ直すと、impl では二つの実行が同じ worktree に書き込む
