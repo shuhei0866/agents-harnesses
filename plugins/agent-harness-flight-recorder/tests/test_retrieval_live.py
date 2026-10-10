@@ -45,6 +45,29 @@ class LiveTests(unittest.TestCase):
         path.write_bytes(raw)
         return path
 
+    def test_generated_sessions_excluded_but_human_corrections_retained(self):
+        handoff = ('あなたは作業セッションの引き継ぎカードを書く係。\n'
+                   '## 現在地\n## 次の一手\n<transcript>\n'
+                   'User: 違う、前の判断を使って\n</transcript>')
+        evaluation = ('あなたは探索セッションの評価者で、計画者ではない。\n'
+                      '却下するものが無ければ {"rejections": []} と返す。\n'
+                      '## 方針\n方針\n## 台帳の事実\n事実')
+        for root, encode_message in [(self.claude, claude), (self.codex, codex)]:
+            self.write(root, 'handoff.jsonl', encode(encode_message(handoff),
+                       encode_message('generated answer', 'assistant')))
+            self.write(root, 'evaluator.jsonl', encode(encode_message(evaluation)))
+            self.write(root, 'human.jsonl', encode(encode_message('違う、前の判断を使って')))
+            self.write(root, 'quoted.jsonl', encode(encode_message('このプロンプトを直して\n' + handoff)))
+            self.write(root, 'later.jsonl', encode(encode_message('この設計を説明して'),
+                       encode_message(handoff)))
+        result = live.export_live(self.roots, since=0)
+        self.assertEqual(result['import_report']['excluded_generated_sessions'], 4)
+        self.assertEqual(len(result['excluded_source_ids']), 4)
+        self.assertEqual(len(result['documents']), 6)
+        self.assertNotIn('generated answer', str(result['documents']))
+        self.assertTrue(any('[line 1] user: 違う' in d['text'] for d in result['documents']))
+        self.assertFalse(live.generated_session_prompt('あなたは作業セッションの引き継ぎカードを書く係。'))
+
     def test_complete_conversational_lines_keep_citations_and_stable_ids(self):
         p = self.write(self.claude, 'one.jsonl', encode(claude('first'), {'type':'tool', 'text':'hidden'},
                         claude('answer', 'assistant')) + b'{"partial":')
