@@ -286,6 +286,10 @@ diff の変更点を 1 つずつ取り、その変更を説明しているスペ
 
 issue がない場合:
 {"severity":"none","title":"Spec compliant — all requirements implemented correctly"}
+
+最後に coverage レコードを必ず 1 件出す（issue とは別レコード）:
+{"type":"coverage","target":"基準SHAとscope","completion":"complete|incomplete","reviewed":["path: 確認した契約"],"unreviewed":[{"path":"対象pathまたは契約","reason":"未確認の理由"}],"verification":"静的確認・実行した検査等"}
+complete は担当範囲の確認が完了し unreviewed が空の場合だけ。none は確認した範囲で指摘が無い意味であり、完了の証拠にはしない。
 ```
 
 ##### Reviewer 6 (オプション: --codex 指定時): Codex レビュー
@@ -430,6 +434,10 @@ issue を報告する前に、以下を確認すること:
 
 issue がない場合は以下を出力:
 {"severity":"none","title":"No issues found"}
+
+issue の有無にかかわらず、最後に coverage レコードを必ず 1 件出力する:
+{"type":"coverage","target":"基準SHAとscope","completion":"complete|incomplete","reviewed":["path: 確認した契約"],"unreviewed":[{"path":"対象pathまたは契約","reason":"未確認の理由"}],"verification":"静的確認・実行した検査等"}
+担当範囲の確認を終え、unreviewed が空の場合のみ complete とする。時間切れ・資料未取得なら incomplete。severity:none だけで完了を表現しない。
 ```
 
 #### なぜこのプロンプトが長いのか
@@ -447,7 +455,8 @@ CodeRabbit のようなレビューボットが高品質な指摘を出せる理
 
 1. 全レビュワーの出力を収集
    - 先に完了 / 未完了と走査範囲を確認する。出力なし・パース不能・timeout は issue 0 件へ変換しない
-2. JSON Lines をパース
+2. JSON Lines をパースし、`type=coverage` を issue から分離する。各担当に coverage が 1 件あること、target が一致すること、completion と unreviewed が矛盾しないことを確認する。欠落・重複・不正形式は未完了とする。coverage を severity 判定や自動修正へ渡さない
+   - CLI 等の別形式は明示された完了状態と走査根拠から同じ構造へ正規化する。取得できない項目を「確認済み」で補わず、未確認として残す
 3. 同一ファイル・同一行の重複 issue をマージ（複数レビュワーが同じ問題を指摘 → 確信度が高い）
 4. **自動修正対象**を severity でフィルタリング（`--severity` で指定）:
    - `--severity=critical` → critical のみ修正
