@@ -13,18 +13,24 @@ description: ローカルの未コミット変更をレビューしたい時、P
 
 ### 1. 変更内容の取得
 
+同じ skill ソースディレクトリの `review-loop.md`「全レビュアー共通の走査・報告契約」を読む。インストール先で skill が別ディレクトリに分かれる場合は、インストール済み `review-loop` skill の本文を参照する。これは共通契約の参照であり、review-loop 全体を起動する指示ではない。
+
 まず変更内容を確認します：
 
 ```bash
 # デフォルト: ステージング済み + 未ステージングの全変更
 git diff HEAD --stat
 git diff HEAD
+# git diff に出ない新規ファイルも対象一覧に加える
+git ls-files --others --exclude-standard
 ```
 
 引数で制御:
 - `--staged`: ステージング済みの変更のみ (`git diff --cached`)
 - `--file=<path>`: 特定ファイルの変更のみ (`git diff HEAD -- <path>`)
 - `--focus=security|performance|all`: 特定の観点に絞る
+
+新規ファイルの内容も読む。`--staged` では untracked を加えず、周辺コードも index の内容で確認する。`--file` の場合も指定パスが untracked か確認する。
 
 $ARGUMENTS
 
@@ -34,7 +40,7 @@ Agent ツールを使用して、独立したコンテキストでレビュー�
 
 - **subagent_type**: `general-purpose`
 - **model**: `opus`（高品質なレビューのため）
-- **prompt**: 変更内容（diff）と以下のレビュー観点を含める
+- **prompt**: 対象 HEAD / scope、全変更一覧（対象となる新規ファイルを含む）、diff、上記の共通契約と以下のレビュー観点を含める。調べた経路と未確認範囲も返させる
 
 ### 3. レビュー観点
 
