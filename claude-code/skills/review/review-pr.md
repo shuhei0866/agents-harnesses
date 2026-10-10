@@ -15,15 +15,16 @@ agent: code-reviewer
 
 エージェントメモリを確認し、過去のレビューで発見したパターンや頻出する問題を思い出す。
 
+同じ skill ソースディレクトリの `review-loop.md`「全レビュアー共通の走査・報告契約」を適用する。インストール先ではインストール済み `review-loop` skill の本文を参照する。これは手順の参照であり、review-loop 全体の起動は不要。memory は検証する仮説とし、repository の指示と現行コードを優先する。
+
 ### 2. PR 情報の取得
 
 ```bash
 # PR 情報を取得（引数から PR 番号または URL を抽出）
-gh pr view $ARGUMENTS --json number,title,body,headRefName,baseRefName,files,additions,deletions
-
-# diff を取得
-gh pr diff $ARGUMENTS
+gh pr view $ARGUMENTS --json number,title,body,headRefName,baseRefName,headRefOid,baseRefOid,files,additions,deletions
 ```
+
+取得した base/head OID を固定する。ローカルに対象 commit が無ければ取得し、隔離した読み取り用 checkout または `git show <head>:<path>` でその内容を読む。`git diff --name-status <base>...<head>` とファイルごとの差分を使い、API の files 一覧が切れても取りこぼさない。取得不能なら未完了として報告する。変化する `gh pr diff` と異なる checkout の内容を混ぜない。
 
 ### 3. レビュー実行
 
@@ -59,6 +60,8 @@ gh pr diff $ARGUMENTS
 **PR:** #番号 タイトル
 **ブランチ:** head → base
 **変更:** N files (+X, -Y)
+**対象 SHA:** base / head
+**確認範囲:** 読んだ経路・検証方法・未確認範囲と理由
 
 ### Critical Issues
 - [ ] **[ファイル名:行番号]** 問題の説明
@@ -76,6 +79,8 @@ gh pr diff $ARGUMENTS
 ### 5. PR にコメント投稿
 
 `--dry-run` オプションが指定されていない場合、レビュー結果を PR にコメントとして投稿する:
+
+投稿直前に PR head を再確認し、変わっていたら旧結果を最新レビューとして投稿しない。本文には対象 SHA を含める。inline 投稿へ切り替える場合も API の commit 指定を固定 head に合わせる。
 
 ```bash
 gh pr comment $ARGUMENTS --body "$(cat <<'EOF'
