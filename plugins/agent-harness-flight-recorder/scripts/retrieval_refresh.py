@@ -12,7 +12,7 @@ import time
 import uuid
 
 import retrieval_lab as lab
-from retrieval_live import export_live, source_id
+from retrieval_live import COLLECTOR_VERSION, export_live, source_id
 from retrieval_snapshot import _files, _read, _registration, MAX_METADATA_BYTES
 
 
@@ -97,16 +97,18 @@ def refresh(root, force=False):
             archive = root / 'snapshots'
             if archive.exists() and sum(p.stat().st_size for p in archive.glob('*.json')) > 1024 ** 3:
                 raise ValueError('snapshot archive budget exhausted')
+            same_collection = (state.get('config_id') == lab.digest(config)
+                               and state.get('collector_version') == COLLECTOR_VERSION)
             delta = export_live([(r['adapter'], Path(r['path'])) for r in config['roots']],
-                                since=state.get('since', 0) if state.get('config_id') == lab.digest(config) else 0, exclude_sessions=config.get('exclude_sessions', []),
+                                since=state.get('since', 0) if same_collection else 0, exclude_sessions=config.get('exclude_sessions', []),
                                 settle_seconds=0, known_source_ids=state.get('source_ids', []))
-            if delta.get('inventory_complete') is False and state.get('config_id') != lab.digest(config):
-                raise ValueError('incomplete inventory after config change')
+            if delta.get('inventory_complete') is False and not same_collection:
+                raise ValueError('incomplete inventory after collection change')
             replaced = set(delta['refreshed_source_ids']) | set(delta['excluded_source_ids'])
             present = set(delta.get('present_source_ids', []))
             documents = ([d for d in current['documents'] if d['source_id'] not in replaced
                           and (not delta.get('inventory_complete', False) or d['source_id'] in present)]
-                         if state.get('bootstrapped') and state.get('config_id') == lab.digest(config) else [])
+                         if state.get('bootstrapped') and same_collection else [])
             summaries = _summaries(root, current, config)
             for doc in delta['documents']:
                 doc['summaries'] = summaries.get((doc['source_id'], doc['start_line'], doc['end_line'], doc['text']), [])
@@ -115,7 +117,7 @@ def refresh(root, force=False):
                                                      import_report=delta['import_report']))
             state.update(result, status='updated' if result['changed'] else 'unchanged',
                          sources=len({d['source_id'] for d in documents}),
-                         source_ids=delta.get('present_source_ids', state.get('source_ids', [])), bootstrapped=True, config_id=lab.digest(config), since=max(0, started - 60), last_success=time.time(),
+                         source_ids=delta.get('present_source_ids', state.get('source_ids', [])), bootstrapped=True, collector_version=COLLECTOR_VERSION, config_id=lab.digest(config), since=max(0, started - 60), last_success=time.time(),
                          elapsed_ms=round((time.time() - started) * 1000), error_type=None)
         except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
             # Never publish partial collections or move the successful watermark.

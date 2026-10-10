@@ -20,13 +20,31 @@ from retrieval_snapshot import _message
 MAX_FILES = 10_000
 MAX_ENTRIES = 100_000
 MAX_SOURCE_BYTES = 256 * 1024 * 1024
-MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
+MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
 MAX_LINE_BYTES = 8 * 1024 * 1024
 MAX_DOCUMENTS = 20_000
 MAX_DOCUMENT_CHARS = 100_000
 MAX_MANIFEST_BYTES = 60 * 1024 * 1024
 WINDOW_LINES = 40
 ADAPTERS = {'claude-code', 'codex'}
+COLLECTOR_VERSION = 'human-conversation-v2'
+
+
+def generated_session_prompt(text: str) -> bool:
+    """Recognize bundled automation frames, not arbitrary user sentiment.
+
+    Only call for the first user message. Quoted examples and later discussion
+    of these prompts must not remove a human conversation.
+    """
+    return (
+        (text.startswith('あなたは作業セッションの引き継ぎカードを書く係。')
+         and '\n<transcript>\n' in text and '\n</transcript>' in text
+         and '## 現在地' in text and '## 次の一手' in text)
+        or (text.startswith('あなたは探索セッションの評価者で、計画者ではない。')
+            and '却下するものが無ければ {"rejections": []} と返す。' in text
+            and '## 方針\n' in text and '## 台帳の事実\n' in text)
+    )
+
 RETRIEVAL_COMMAND = re.compile(
     r'(?<![A-Za-z0-9_-])(?:recall-history|retrieval_lab\.py|retrieval_live\.py|'
     r'retrieval_refresh\.py|flight-recorder-retrieval|retrieval-live|resume_replay\.py|'
@@ -214,6 +232,7 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
     report = dict(discovered_sources=0, imported_sources=0, unchanged_sources=0,
                   deferred_sources=0, excluded_configured_sessions=0,
                   excluded_subagent_sessions=0, excluded_retrieval_sessions=0,
+                  excluded_generated_sessions=0,
                   missing_roots=0, symlinks_skipped=0, malformed_lines=0,
                   partial_sources=0, bytes_read=0, documents=0, manifest_bytes=0,
                   omitted_oversized_lines=0, excluded_malformed_sessions=0,
@@ -248,6 +267,7 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                 report['deferred_sources'] += 1
                 continue
             messages = []
+            seen_user = False
             message_bytes = 0
             line_count = 0
             records = _records(path, report)
@@ -270,6 +290,11 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                         reason = found
                         break
                     message = _message(value, adapter)
+                    if message and message[0] == 'user':
+                        if not seen_user and generated_session_prompt(message[1]):
+                            reason = 'generated'
+                            break
+                        seen_user = True
                     if message:
                         text = f'[line {number}] {message[0]}: {message[1]}'
                         if len(text) > MAX_DOCUMENT_CHARS:

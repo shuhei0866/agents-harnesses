@@ -29,6 +29,28 @@ class RefreshTests(unittest.TestCase):
         return dict(schema_version=1, documents=docs, refreshed_source_ids=[d['source_id'] for d in docs],
                     excluded_source_ids=removed or [], import_report={})
 
+    def test_collector_upgrade_rescans_old_sources_and_keeps_old_citations(self):
+        with patch.object(refresh, 'export_live', return_value=self.delta([doc('a', 'old generated')])):
+            refresh.refresh(self.root, force=True)
+        query = lab.search(self.root, 'generated', sample_rate=0)
+        before = lab._snapshot(self.root)
+        state = refresh.status(self.root)
+        state.pop('collector_version')
+        refresh._write(self.root, 'refresh-state.json', state)
+        with patch.object(refresh, 'export_live', return_value=dict(
+                self.delta([]), inventory_complete=False)):
+            failed = refresh.refresh(self.root, force=True)
+        self.assertEqual(failed['status'], 'error')
+        self.assertNotIn('collector_version', failed)
+        self.assertEqual(lab._snapshot(self.root), before)
+        with patch.object(refresh, 'export_live', return_value=self.delta(
+                [doc('b', 'human correction')], ['a'])) as export:
+            result = refresh.refresh(self.root, force=True)
+        self.assertEqual(export.call_args.kwargs['since'], 0)
+        self.assertEqual(result['collector_version'], refresh.COLLECTOR_VERSION)
+        self.assertEqual([d['source_id'] for d in lab._snapshot(self.root)['documents']], ['b'])
+        self.assertEqual(lab._snapshot(self.root, query['snapshot_id']), before)
+
     def test_initial_replaces_legacy_then_updates_and_removes_excluded(self):
         with patch.object(refresh, 'export_live', return_value=self.delta([doc('a', 'one'), doc('b', 'two')])):
             first = refresh.refresh(self.root, force=True)

@@ -267,7 +267,7 @@ windows are identical across both search arms. Summary coverage must therefore b
 considered when interpreting recorder-versus-baseline differences.
 
 JSONL collection streams one record at a time, rather than loading entire logs.
-Limits are 256 MiB per source, 2 GiB actually read per refresh, and 8 MiB per raw
+Limits are 256 MiB per source, 4 GiB actually read per refresh, and 8 MiB per raw
 record. A raw record above that limit quarantines its whole source: blindly
 skipping it could hide a retrieval/evaluation command. Subagent and evaluation
 sources stop reading as soon as exclusion is established. Late exclusion still
@@ -284,3 +284,31 @@ At 1 GiB of archived snapshots, automatic publication stops and `refresh-status`
 reports an error; archives are never silently deleted because measurements refer
 to them. Questions, content and errors containing raw paths/text are not logged by
 refresh status. All state remains owner-local, outside Git and the Vault.
+
+
+### Human correction retrieval pilot
+
+The first value hypothesis is avoiding repeated user corrections by retrieving
+an earlier correction and its rationale before acting. Measure three separate
+steps: retrieving the original, using it in a decision, and avoiding repeated
+rework. Positive tone, continuation, silence, and automated evaluator feedback
+are not success labels.
+
+Live collection excludes sessions whose first user message matches the bundled
+session-card distiller or exploration evaluator frame (including its structural
+markers). Their copied transcripts otherwise compete with original conversations.
+The `excluded_generated_sessions` counter reports exclusions. This is a narrow
+known-template filter, not general human-authorship detection. Later discussion
+and quoted examples stay searchable. Other generated prompts and in-session hook
+messages may remain; callers must inspect originals before interpreting feedback.
+
+Collector upgrades force a complete recollection even when source mtimes have
+not changed. Incomplete or over-budget scans retain the previous corpus and
+collector version. Old request-bound citations remain readable. The streamed
+aggregate scan budget is 4 GiB; the 256 MiB source, 8 MiB record and 60 MiB manifest
+limits are unchanged. No model calls are needed.
+
+Evaluate on a fixed local corpus with queries fixed before reading the new
+ranking. Count known generated hits separately from genuine correction hits;
+removing duplicates alone does not demonstrate reduced rework. Keep real logs,
+queries and annotations in the private measurement lab, not this repository.
