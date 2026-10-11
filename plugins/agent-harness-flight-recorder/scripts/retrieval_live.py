@@ -27,7 +27,7 @@ MAX_DOCUMENT_CHARS = 100_000
 MAX_MANIFEST_BYTES = 60 * 1024 * 1024
 WINDOW_LINES = 40
 ADAPTERS = {'claude-code', 'codex'}
-COLLECTOR_VERSION = 'human-conversation-v2'
+COLLECTOR_VERSION = 'structured-message-context-v3'
 
 
 def generated_session_prompt(text: str) -> bool:
@@ -47,7 +47,7 @@ def generated_session_prompt(text: str) -> bool:
 
 RETRIEVAL_COMMAND = re.compile(
     r'(?<![A-Za-z0-9_-])(?:recall-history|retrieval_lab\.py|retrieval_live\.py|'
-    r'retrieval_refresh\.py|flight-recorder-retrieval|retrieval-live|resume_replay\.py|'
+    r'retrieval_refresh\.py|retrieval_context\.py|flight-recorder-retrieval|retrieval-live|resume_replay\.py|'
     r'resume_cases\.py|flight-recorder-resume)(?![A-Za-z0-9_-])'
 )
 
@@ -335,6 +335,15 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                 for first, last, texts in chunks:
                     doc = dict(source_id=identity, start_line=first, end_line=last,
                                text='\n'.join(texts), summaries=[])
+                    spans, offset = [], 0
+                    for rendered in texts:
+                        header, body = rendered.split(': ', 1)
+                        match = re.fullmatch(r'\[line (\d+)\] (user|assistant)', header)
+                        spans.append(dict(line=int(match[1]), role=match[2],
+                                          start=offset + len(header) + 2,
+                                          end=offset + len(rendered)))
+                        offset += len(rendered) + 1
+                    doc['message_spans'] = spans
                     serialized_size = len(json.dumps(doc, ensure_ascii=True).encode()) + 2
                     if (len(documents) >= MAX_DOCUMENTS or
                             report['manifest_bytes'] + serialized_size > MAX_MANIFEST_BYTES):

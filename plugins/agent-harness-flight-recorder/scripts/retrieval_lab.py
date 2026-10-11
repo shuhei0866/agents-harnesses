@@ -128,11 +128,19 @@ def _build_snapshot(manifest, *, allow_empty=False):
             not isinstance(s, str) or len(s) > MAX_TEXT for s in summaries
         ):
             raise ValueError("summaries invalid or oversized")
+        spans = item.get('message_spans')
+        if spans is not None:
+            from retrieval_context import validate_spans
+            validate_spans(text, start, end, spans)
         key = (source, start, end)
         if key in unique and unique[key]["text"] != text:
             raise ValueError("conflicting raw text for source span")
         doc = unique.setdefault(key, dict(source_id=source, start_line=start, end_line=end,
                                           text=text, summaries=[], citation_id=""))
+        if spans is not None:
+            if 'message_spans' in doc and doc['message_spans'] != spans:
+                raise ValueError('conflicting message spans')
+            doc['message_spans'] = spans
         doc["summaries"] = sorted(set(doc["summaries"]) | set(summaries))
         doc["citation_id"] = digest([source, start, end, text])
     docs = [unique[key] for key in sorted(unique)]
@@ -288,6 +296,66 @@ def search(root, query, arm="recorder", limit=5, sample_rate=0.1):
         result["metrics"]["foreground_elapsed_ms"] = (time.perf_counter() - started) * 1000
         db.execute("UPDATE queries SET foreground=? WHERE id=?", (canonical(result), request_id))
     return result
+
+
+def search_corrections(root, query, trigger, limit=3):
+    from retrieval_context import retrieve, TRIGGERS, VERSION as context_version
+    if not isinstance(query, str) or not query.strip() or len(query) > MAX_QUERY or not tokens(query):
+        raise ValueError('invalid correction query')
+    if trigger not in TRIGGERS:
+        raise ValueError('invalid correction trigger')
+    bounded_int(limit, 1, 5)
+    result = retrieve(_snapshot(root), query, limit)
+    request_id = uuid.uuid4().hex
+    result.update(request_id=request_id, trigger=trigger, sampled=False,
+                  sampling_skip_reason='context_mode_has_no_paired_shadow')
+    with _connect(root) as db:
+        db.execute('INSERT INTO queries(id,created,query,snapshot_id,version,arm,limit_n,foreground,job_state) VALUES(?,?,?,?,?,?,?,?,?)',
+                   (request_id, time.time(), query, result['snapshot_id'], context_version,
+                    'recorder', limit, canonical(result), 'not_sampled'))
+    return result
+
+
+def _context_table(db):
+    db.execute('CREATE TABLE IF NOT EXISTS context_uses (request_id TEXT PRIMARY KEY, state TEXT NOT NULL, citations TEXT NOT NULL, reason TEXT NOT NULL, recorded REAL NOT NULL)')
+
+
+def context_use(root, request_id, state, citations, reason):
+    from retrieval_context import VERSION as context_version
+    if state not in ('applied', 'not_applicable', 'unresolved'):
+        raise ValueError('invalid context use state')
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > 1000:
+        raise ValueError('context use requires a bounded reason')
+    if not isinstance(citations, list) or len(citations) > 15 or any(not isinstance(c, str) for c in citations):
+        raise ValueError('invalid context citations')
+    with _connect(root) as db:
+        row = _row(db, request_id)
+        if row['version'] != context_version:
+            raise ValueError('not a context search')
+        result = json.loads(row['foreground'])
+        known = {h[key]['citation_id'] for h in result['hits']
+                 for key in ('utterance', 'request', 'prior_response') if h[key]}
+        read = {r[0] for r in db.execute('SELECT citation_id FROM reads WHERE request_id=?', (request_id,))}
+        if not set(citations) <= known & read or (state == 'applied' and not citations):
+            raise ValueError('use requires read, returned citations')
+        _context_table(db)
+        db.execute('INSERT OR REPLACE INTO context_uses VALUES(?,?,?,?,?)',
+                   (request_id, state, canonical(sorted(set(citations))), reason, time.time()))
+    return dict(request_id=request_id, state=state, provenance='agent_self_report',
+                notice='Not user feedback or verified task improvement.')
+
+
+def context_report(root):
+    from retrieval_context import VERSION as context_version
+    with _connect(root) as db:
+        rows = db.execute('SELECT id,foreground FROM queries WHERE version=?', (context_version,)).fetchall()
+        triggers = Counter(json.loads(r['foreground'])['trigger'] for r in rows)
+        read_requests = db.execute('SELECT COUNT(DISTINCT r.request_id) FROM reads r JOIN queries q ON q.id=r.request_id WHERE q.version=?', (context_version,)).fetchone()[0]
+        exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='context_uses'").fetchone()
+        states = dict(db.execute('SELECT state,COUNT(*) FROM context_uses GROUP BY state')) if exists else {}
+    return dict(searches=len(rows), triggers=dict(triggers), requests_with_reads=read_requests,
+                uses=states, unreported=len(rows)-sum(states.values()),
+                notice='Invocation and agent self-report only. Missed opportunities and reduced rework are not measured.')
 
 
 def drain(root, max_jobs=5, max_seconds=10):
@@ -550,6 +618,14 @@ def main():
     query.add_argument("--limit", type=int, default=5)
     query.add_argument("--sample-rate", type=float, default=.1)
     query.add_argument("--no-worker", action="store_true")
+    context = subs.add_parser('corrections')
+    context.add_argument('query')
+    context.add_argument('--trigger', required=True, choices=('resume', 'ambiguous', 'explicit'))
+    context.add_argument('--limit', type=int, default=3)
+    usage = subs.add_parser('context-use')
+    usage.add_argument('request_id')
+    usage.add_argument('--file', type=Path, required=True, help='JSON: state, citations, reason; agent self-report')
+    subs.add_parser('context-report')
     worker = subs.add_parser("worker")
     worker.add_argument("--max-jobs", type=int, default=5)
     worker.add_argument("--max-seconds", type=float, default=10)
@@ -588,6 +664,13 @@ def main():
             result = create_lab(root, manifest)
         elif args.command == "search":
             result = search(root, args.query, args.arm, args.limit, args.sample_rate)
+        elif args.command == 'corrections':
+            result = search_corrections(root, args.query, args.trigger, args.limit)
+        elif args.command == 'context-use':
+            value = json.loads(safe_file(args.file, 16384))
+            result = context_use(root, args.request_id, **value)
+        elif args.command == 'context-report':
+            result = context_report(root)
         elif args.command == "worker":
             result = drain(root, args.max_jobs, args.max_seconds)
         elif args.command == "report":

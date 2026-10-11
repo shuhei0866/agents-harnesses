@@ -312,3 +312,35 @@ Evaluate on a fixed local corpus with queries fixed before reading the new
 ranking. Count known generated hits separately from genuine correction hits;
 removing duplicates alone does not demonstrate reduced rework. Keep real logs,
 queries and annotations in the private measurement lab, not this repository.
+
+
+### Connecting user-turn context recall
+
+`corrections QUERY --trigger resume|ambiguous|explicit --limit 3` searches user
+turns with BM25 and a small preceding-context contribution. The name describes
+the use case; results are candidates, not automatically classified corrections.
+Only collector-produced `message_spans` are used, never role markers parsed from
+quoted text. Legacy documents are counted and skipped until recollected.
+
+Each result includes the user turn, preceding user request and assistant response,
+original citation IDs, the pinned snapshot and a request ID. The snippets are
+bounded; use `read CITATION --request-id REQUEST` for original evidence, including
+context citations when needed. Sources never mix, future responses are excluded,
+and prior context is explicitly provisional rather than a guaranteed task link.
+
+After interpreting the result, record `context-use REQUEST --file FILE` with
+JSON `{ "state": "applied|not_applicable|unresolved", "citations": [], "reason": "..." }`.
+Applied use requires at least one returned citation already read for that request.
+The record is an agent self-report, separate from user feedback and independent
+assessment. `context-report` summarizes invocation triggers, original reads, and
+self-reported use. No search means no observation: missed opportunities and actual
+rework reduction are not measured by this report. Context mode does not schedule
+a misleading baseline/summary shadow pair. Ordinary search is unchanged.
+
+The discoverable skill is `skills/recall-history/SKILL.md`. Install it in the
+runtime's skill directory alongside a `recall-history` wrapper using the same
+release's scripts. Its description offers proactive use for relevant resumption
+or scope ambiguity; it does not force every task to search. No global hook or
+universal preference is created. Selection still depends on the agent; command
+E2E does not prove autonomous skill selection. Skills already loaded into a
+conversation may require a new session to discover the updated description.

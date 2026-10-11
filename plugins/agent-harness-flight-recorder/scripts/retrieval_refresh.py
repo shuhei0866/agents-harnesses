@@ -163,7 +163,7 @@ def main():
             print(lab.canonical(dict(error=type(exc).__name__, message='Invalid refresh configuration or state.')), file=sys.stderr)
             return 1
     code = lab.main()
-    if code == 0 and command == 'search':
+    if code == 0 and command in ('search', 'corrections'):
         try:
             maybe_start(root)
         except (OSError, ValueError, KeyError, TypeError):
