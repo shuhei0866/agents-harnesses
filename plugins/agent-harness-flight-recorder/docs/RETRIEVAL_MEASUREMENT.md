@@ -344,3 +344,7 @@ or scope ambiguity; it does not force every task to search. No global hook or
 universal preference is created. Selection still depends on the agent; command
 E2E does not prove autonomous skill selection. Skills already loaded into a
 conversation may require a new session to discover the updated description.
+
+Use `--purpose verification` for installation checks; the default is `task`.
+`context-report` counts purposes separately so smoke checks are visible rather
+than silently presented as organic use. Aggregate read/use totals include both.

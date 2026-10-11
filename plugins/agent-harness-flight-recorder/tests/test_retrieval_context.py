@@ -99,11 +99,12 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(lab.context_report(self.root)['searches'], 0)
         script = Path(lab.__file__).with_name('retrieval_refresh.py')
         run = subprocess.run([sys.executable, str(script), '--lab', str(self.root),
-                              'corrections', 'spreadsheet edit', '--trigger', 'resume'],
+                              'corrections', 'spreadsheet edit', '--trigger', 'resume', '--purpose', 'verification'],
                              cwd=self.base, capture_output=True, text=True, check=True)
         result = json.loads(run.stdout)
         self.assertEqual(result['hits'][0]['line'], 3)
         self.assertEqual(result['trigger'], 'resume')
+        self.assertEqual(lab.context_report(self.root)['purposes'], {'verification': 1})
 
     def test_context_does_not_cross_sources_or_include_injected_frames(self):
         original = self.manifest['documents'][0]

@@ -298,16 +298,18 @@ def search(root, query, arm="recorder", limit=5, sample_rate=0.1):
     return result
 
 
-def search_corrections(root, query, trigger, limit=3):
+def search_corrections(root, query, trigger, limit=3, purpose='task'):
     from retrieval_context import retrieve, TRIGGERS, VERSION as context_version
     if not isinstance(query, str) or not query.strip() or len(query) > MAX_QUERY or not tokens(query):
         raise ValueError('invalid correction query')
+    if purpose not in ('task', 'verification'):
+        raise ValueError('invalid context purpose')
     if trigger not in TRIGGERS:
         raise ValueError('invalid correction trigger')
     bounded_int(limit, 1, 5)
     result = retrieve(_snapshot(root), query, limit)
     request_id = uuid.uuid4().hex
-    result.update(request_id=request_id, trigger=trigger, sampled=False,
+    result.update(request_id=request_id, trigger=trigger, purpose=purpose, sampled=False,
                   sampling_skip_reason='context_mode_has_no_paired_shadow')
     with _connect(root) as db:
         db.execute('INSERT INTO queries(id,created,query,snapshot_id,version,arm,limit_n,foreground,job_state) VALUES(?,?,?,?,?,?,?,?,?)',
@@ -350,10 +352,11 @@ def context_report(root):
     with _connect(root) as db:
         rows = db.execute('SELECT id,foreground FROM queries WHERE version=?', (context_version,)).fetchall()
         triggers = Counter(json.loads(r['foreground'])['trigger'] for r in rows)
+        purposes = Counter(json.loads(r['foreground']).get('purpose', 'task') for r in rows)
         read_requests = db.execute('SELECT COUNT(DISTINCT r.request_id) FROM reads r JOIN queries q ON q.id=r.request_id WHERE q.version=?', (context_version,)).fetchone()[0]
         exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='context_uses'").fetchone()
         states = dict(db.execute('SELECT state,COUNT(*) FROM context_uses GROUP BY state')) if exists else {}
-    return dict(searches=len(rows), triggers=dict(triggers), requests_with_reads=read_requests,
+    return dict(searches=len(rows), triggers=dict(triggers), purposes=dict(purposes), requests_with_reads=read_requests,
                 uses=states, unreported=len(rows)-sum(states.values()),
                 notice='Invocation and agent self-report only. Missed opportunities and reduced rework are not measured.')
 
@@ -622,6 +625,7 @@ def main():
     context.add_argument('query')
     context.add_argument('--trigger', required=True, choices=('resume', 'ambiguous', 'explicit'))
     context.add_argument('--limit', type=int, default=3)
+    context.add_argument('--purpose', choices=('task', 'verification'), default='task')
     usage = subs.add_parser('context-use')
     usage.add_argument('request_id')
     usage.add_argument('--file', type=Path, required=True, help='JSON: state, citations, reason; agent self-report')
@@ -665,7 +669,7 @@ def main():
         elif args.command == "search":
             result = search(root, args.query, args.arm, args.limit, args.sample_rate)
         elif args.command == 'corrections':
-            result = search_corrections(root, args.query, args.trigger, args.limit)
+            result = search_corrections(root, args.query, args.trigger, args.limit, args.purpose)
         elif args.command == 'context-use':
             value = json.loads(safe_file(args.file, 16384))
             result = context_use(root, args.request_id, **value)
