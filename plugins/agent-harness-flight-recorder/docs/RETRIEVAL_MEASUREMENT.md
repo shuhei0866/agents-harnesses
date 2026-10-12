@@ -253,8 +253,9 @@ secure erasure or retention cleanup.
 Only complete JSONL lines containing user/assistant text enter the corpus.
 Oversized conversational messages are omitted and counted; malformed sessions
 are quarantined as whole sources and counted, without stopping other imports. Tool
-output and reasoning are omitted. Entire conversations invoking known recall or
-low-level measurement commands or explicit verification are excluded, including commands wrapped in tool code;
+output and reasoning are omitted. Entire conversations invoking
+low-level measurement commands or explicit verification are excluded, including
+commands wrapped in tool code; ordinary recall retains user text as described below;
 subagent sessions are also excluded. Explicit `exclude_sessions` is required for
 other evaluation sessions or custom wrappers that the detector does not recognize.
 This is a conservative filter, not proof that every evaluation session is detectable.
