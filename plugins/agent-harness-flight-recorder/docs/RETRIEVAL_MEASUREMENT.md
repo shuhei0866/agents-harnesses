@@ -428,7 +428,7 @@ This keeps generated advice available without presenting agent prompts as human
 corrections. Collector-version recollection adds provenance to unchanged sources;
 old snapshots and citations remain available unchanged.
 
-Context ranker v3 matches a single-character Japanese query term inside longer
+Context ranker v4 matches a single-character Japanese query term inside longer
 unsegmented sentences. Previously a query containing a standalone character
 could miss that same character in a sentence because only character bigrams were
 indexed. Occurrences are counted once, including standalone occurrences. Other

@@ -257,6 +257,10 @@ class ContextTests(unittest.TestCase):
         for hit in r['hits']:
             self.assertIn('家', hit['explanation']['matched_tokens'])
         self.assertEqual(lab.search_corrections(self.root, '山', 'resume')['hits'], [])
+        combined = lab.search_corrections(self.root, '家 山', 'resume')
+        for hit in combined['hits']:
+            self.assertNotIn('山', hit['explanation']['matched_tokens'])
+            self.assertIn('山', hit['explanation']['unmatched_tokens'])
 
     def test_model_review_is_not_a_user_correction_but_stays_readable(self):
         frame = ("<user_action>\n  <context>User initiated a review task. "

@@ -4,7 +4,7 @@ import math
 import re
 import time
 
-VERSION = 'user-context-bm25-v3'
+VERSION = 'user-context-bm25-v4'
 TRIGGERS = ('resume', 'ambiguous', 'explicit')
 INJECTED_PREFIXES = ('# AGENTS.md', 'Stop hook feedback:', '[exploration-budget]',
     'Base directory for this skill:', 'Another Claude session sent a message:',
@@ -100,7 +100,9 @@ def retrieve(snapshot, query, limit):
             # unsegmented sentence. Do not duplicate standalone occurrences.
             for token in q:
                 if len(token) == 1 and re.fullmatch(r'[\u3040-\u30ff\u3400-\u9fff]', token):
-                    c[token] = text.count(token)
+                    occurrences = text.count(token)
+                    if occurrences:
+                        c[token] = occurrences
             counts.append(c)
             frequency.update(c.keys())
         average = sum(sum(c.values()) for c in counts) / max(1, len(items))
