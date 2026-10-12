@@ -452,7 +452,12 @@ def context_report(root, purpose=None):
         matches = {r['request_id']: r['match'] for r in db.execute('SELECT * FROM context_decision_matches')} if 'context_decision_matches' in tables else {}
     from retrieval_needs import summarize
     from retrieval_followup import report as followup_report
-    followups = {k:v for k,v in followup_report(root).items() if k != 'review_cases'} if purpose != 'verification' else None
+    followups = None
+    if purpose != 'verification':
+        try:
+            followups = {k:v for k,v in followup_report(root).items() if k != 'review_cases'}
+        except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
+            followups = dict(status='error', error_type=type(exc).__name__)
     return dict(followups=followups, decision_needs=summarize(rows, uses, matches), searches=len(rows), triggers=dict(Counter(r['trigger'] for r in results)),
                 purposes=dict(Counter(r.get('purpose', 'task') for r in results)), requests_with_reads=len(read_ids),
                 uses=dict(Counter(u['state'] for u in uses.values())), unreported=len(ids - uses.keys()),

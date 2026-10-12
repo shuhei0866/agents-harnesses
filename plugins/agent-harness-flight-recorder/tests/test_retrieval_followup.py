@@ -182,6 +182,15 @@ class FollowupTests(unittest.TestCase):
         self.assertEqual(followup.report(self.root)['needs'],0)
         self.assertTrue(followup.inspect(self.root,case_id)['originals'])
 
+    def test_broken_observation_status_does_not_hide_decision_need_report(self):
+        self.search();self.run_at()
+        (self.root/'refresh-state.json').write_text('{broken')
+        result=lab.context_report(self.root,'task')
+        self.assertEqual(result['decision_needs']['needs'],1)
+        self.assertEqual(result['followups']['status'],'error')
+        self.assertEqual(result['followups']['error_type'],'JSONDecodeError')
+        self.assertIsNone(lab.context_report(self.root,'verification')['followups'])
+
     def test_invalid_config_and_uncollected_future_are_not_results(self):
         self.search(1000)
         self.assertEqual(self.run_at(240)['eligible_needs'],0)
