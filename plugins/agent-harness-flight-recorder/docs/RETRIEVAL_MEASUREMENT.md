@@ -529,3 +529,9 @@ for cue detection and replay ranking; model-authored questions and wrapper IDs
 remain solely in the inspectable raw source. Cue detection uses the same bounded
 request prefix as replay. Detector versions have separate case IDs/cohorts, so
 retired detector candidates are preserved for inspection but not current totals.
+
+Cue-free sessions are also sampled: deterministically select 10% of eligible
+native-session/UTC-day groups, at most one non-cue turn per selected group. These
+control packets carry `control_origin=background_sample`; cue-matched controls
+carry `matched`. Sampling is not a universal denominator or a gold negative.
+This exposes possible silent opportunities without requiring an explicit cue.

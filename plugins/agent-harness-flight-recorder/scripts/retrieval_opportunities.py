@@ -8,9 +8,10 @@ import re
 import time
 from collections import Counter, defaultdict
 
-VERSION = 'recall-opportunities-v2'
+VERSION = 'recall-opportunities-v3'
 HISTORY = re.compile(r'(?:前に|以前|前回|過去の).{0,24}(?:決め|判断|方針|話|相談|確認|言|伝え)|previously decided|as we agreed|last time|earlier decision', re.I)
 CORRECTION = re.compile(r'前にも.{0,15}(?:言|伝え)|そうじゃなく|そうではなく|I (?:already|previously) (?:said|told)', re.I)
+CONTROL_SAMPLE_DENOMINATOR = 10
 MAX_CASES = 10
 MAX_SECONDS = 8
 
@@ -82,6 +83,7 @@ def candidates(items, since, now):
             continue
         groups[item['source_id']].append(item)
     eligible, marked = {}, {}
+    cue_keys = set()
     seen = set()
     for group in groups.values():
         previous = None
@@ -110,6 +112,8 @@ def candidates(items, since, now):
             else:
                 counts['pending_or_no_answer'] += 1
             text = user_text(item['utterance']['text'])[:600]
+            if CORRECTION.search(text) or HISTORY.search(text):
+                cue_keys.add(key)
             if CORRECTION.search(text) and previous and previous['observation']['timestamp'] >= since:
                 # The later correction discovers the case, never supplies query terms.
                 marked[identity(previous)] = dict(kind='later_correction', cue=item)
@@ -124,13 +128,27 @@ def candidates(items, since, now):
         anchor = eligible[key]
         selected.append(dict(key=key, anchor=anchor, **marked[key]))
         # Same source/day controls: descriptive comparison only, not a causal test.
-        pool = [(k, v) for k, v in eligible.items() if k not in marked and k not in controls_used
+        pool = [(k, v) for k, v in eligible.items() if k not in marked and k not in cue_keys and k not in controls_used
                 and v['source_id'] == anchor['source_id']
                 and int(v['observation']['timestamp'] // 86400) == int(anchor['observation']['timestamp'] // 86400)]
         if pool:
             k, control = min(pool)
             controls_used.add(k)
-            selected.append(dict(key=k, anchor=control, kind='control', cue=None))
+            selected.append(dict(key=k, anchor=control, kind='control', cue=None, control_origin='matched'))
+    # Sample cue-free sessions too: cues alone cannot reveal silent opportunities.
+    from retrieval_lab import digest
+    pools = defaultdict(list)
+    for key, item in eligible.items():
+        if key not in marked and key not in cue_keys and key not in controls_used:
+            o = item['observation']
+            group = (o['native_session_id'] or item['source_id'], int(o['timestamp'] // 86400))
+            pools[group].append((key, item))
+    counts['background_sample_groups'] = len(pools)
+    for group, pool in sorted(pools.items()):
+        if int(digest(list(group))[:8], 16) % CONTROL_SAMPLE_DENOMINATOR == 0:
+            key, item = min(pool)
+            selected.append(dict(key=key, anchor=item, kind='control', cue=None, control_origin='background_sample'))
+    counts['background_samples'] = sum(x.get('control_origin') == 'background_sample' for x in selected)
     counts['cue_candidates'] = sum(x['kind'] != 'control' for x in selected)
     counts['control_candidates'] = sum(x['kind'] == 'control' for x in selected)
     return selected, dict(counts)
@@ -162,7 +180,7 @@ def replay(snapshot, items, target):
         return dict(source_id=item['source_id'], line=item['utterance']['line'],
                     citation_id=item['utterance']['citation_id'], text=item['utterance']['text'][:1600],
                     timestamp=item['observation']['timestamp'])
-    return dict(kind=target['kind'], anchor=excerpt(anchor), cue=excerpt(target['cue']) if target['cue'] else None,
+    return dict(kind=target['kind'], control_origin=target.get('control_origin'), anchor=excerpt(anchor), cue=excerpt(target['cue']) if target['cue'] else None,
                 query=query, query_truncated=len(user_text(anchor['utterance']['text'])) > 600,
                 recall_observation='no_known_tool_marker', snapshot_id=snapshot['snapshot_id'],
                 prior_candidates=len(docs), hits=result['hits'],
