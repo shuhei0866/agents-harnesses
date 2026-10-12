@@ -434,3 +434,37 @@ could miss that same character in a sentence because only character bigrams were
 indexed. Occurrences are counted once, including standalone occurrences. Other
 query tokenization and BM25 weights are unchanged. Detailed score contributions
 still disclose the matched terms. The change requires no model or provider call.
+
+
+### Prospective decision-need measurement
+
+`corrections --need 'Which past decision is needed now?'` stores the need with the
+query before results are returned. `--retry-of REQUEST` links one focused retry;
+the original need, purpose and caller session cannot change. Older calls without
+a need remain a separate legacy cohort. No retroactive labels are inferred.
+
+`context-use` optionally accepts `decision_match`: `found`, `partial`, `not_found`,
+or `unknown`. New workflow calls include it in the existing use record. Found and
+partial require returned citations actually read under that request. Finding a
+past decision and applying it are separate: found + not_applicable is valid.
+The reason describes the answer to the need and its present applicability.
+
+`context-report --purpose task` adds `decision_needs`: unique needs, statuses,
+initial/retry discovery counts, unknown/unreported counts, known caller sessions,
+and up to 20 recent review cases (non-found or recovered by retry). A retry does
+not enlarge the need denominator. Every attempt keeps its own snapshot, results,
+reads, use and timestamps for `context-inspect`. Verification calls are excluded
+by the purpose filter. Missing IDs remain unknown; no new-session claim is made
+for them. The ordinary ranking algorithm and collection are unchanged.
+
+This runs through the installed skill during normal work, with no user scoring,
+extra model call, scheduler or external transmission. Invocation and citation
+reads are observations; decision match and effect remain agent self-reports.
+Sessions without searches are outside the denominator. This does not establish
+recall over all needed decisions, user satisfaction, causal benefit or reduced
+rework. Silence and abandonment never become positive feedback.
+
+The combined status is the latest attempt, so a later unresolved retry does not
+keep an optimistic found total. Review cases preserve every `attempt_reports`
+match, citation and reason, including earlier partial evidence; latest not_found
+does not mean all earlier evidence was absent or retracted.

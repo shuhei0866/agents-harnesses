@@ -312,7 +312,7 @@ def search(root, query, arm="recorder", limit=5, sample_rate=0.1):
     return result
 
 
-def search_corrections(root, query, trigger, limit=3, purpose='task', task=None, session_id=None):
+def search_corrections(root, query, trigger, limit=3, purpose='task', task=None, session_id=None, need=None, retry_of=None):
     from retrieval_context import retrieve, TRIGGERS, VERSION as context_version
     if not isinstance(query, str) or not query.strip() or len(query) > MAX_QUERY or not tokens(query):
         raise ValueError('invalid correction query')
@@ -322,14 +322,26 @@ def search_corrections(root, query, trigger, limit=3, purpose='task', task=None,
         raise ValueError('invalid correction trigger')
     bounded_int(limit, 1, 5)
     started = time.perf_counter()
-    for label in (task, session_id):
+    for label in (task, session_id, need):
         if label is not None and (not isinstance(label, str) or not label.strip() or len(label) > 1000):
             raise ValueError('invalid invocation label')
+    parent = None
+    if retry_of is not None:
+        with _connect(root) as db:
+            parent = json.loads(_row(db, retry_of)['foreground'])
+        if (parent.get('mode') != 'corrections' or not parent.get('decision_need')
+                or parent['decision_need'].get('retry_of') or parent.get('purpose') != purpose):
+            raise ValueError('retry requires an initial decision-need search with same purpose')
+        if need is not None and need != parent['decision_need']['text']:
+            raise ValueError('retry cannot change decision need')
+        need = parent['decision_need']['text']
     result = retrieve(_snapshot(root), query, limit)
     environment_id = os.environ.get('CODEX_THREAD_ID')
     result['origin'] = dict(cwd=str(Path.cwd()), task=task,
         session_id=session_id or (environment_id[:1000] if environment_id else None),
         session_id_source='explicit' if session_id else ('CODEX_THREAD_ID' if environment_id else None))
+    if parent and result['origin']['session_id'] != parent.get('origin', {}).get('session_id'):
+        raise ValueError('retry must use the same caller session')
     state_file = Path(root) / 'refresh-state.json'
     try:
         state = json.loads(safe_file(state_file, 1024 * 1024))
@@ -338,9 +350,16 @@ def search_corrections(root, query, trigger, limit=3, purpose='task', task=None,
         result['collection'] = None
     result['metrics']['foreground_elapsed_ms'] = (time.perf_counter() - started) * 1000
     request_id = uuid.uuid4().hex
+    if need:
+        result['decision_need'] = dict(version=1, text=need, root_request_id=retry_of or request_id,
+                                       retry_of=retry_of, recorded_before_results=True)
     result.update(request_id=request_id, trigger=trigger, purpose=purpose, sampled=False,
                   sampling_skip_reason='context_mode_has_no_paired_shadow')
     with _connect(root) as db:
+        db.execute('BEGIN IMMEDIATE')
+        if retry_of and any(json.loads(r[0]).get('decision_need', {}).get('retry_of') == retry_of
+                            for r in db.execute('SELECT foreground FROM queries')):
+            raise ValueError('only one focused retry per decision need')
         db.execute('INSERT INTO queries(id,created,query,snapshot_id,version,arm,limit_n,foreground,job_state) VALUES(?,?,?,?,?,?,?,?,?)',
                    (request_id, time.time(), query, result['snapshot_id'], context_version,
                     'recorder', limit, canonical(result), 'not_sampled'))
@@ -352,7 +371,9 @@ def _context_table(db):
     db.execute('CREATE TABLE IF NOT EXISTS context_use_details (request_id TEXT PRIMARY KEY, reason_code TEXT, effect TEXT)')
 
 
-def context_use(root, request_id, state, citations, reason, reason_code=None, effect=None):
+def context_use(root, request_id, state, citations, reason, reason_code=None, effect=None, decision_match=None):
+    if decision_match not in (None, 'found', 'partial', 'not_found', 'unknown'):
+        raise ValueError('invalid decision match')
     allowed_reasons = {'applied': ('relevant',), 'not_applicable': ('wrong_scope', 'outdated', 'already_known', 'no_relevant_candidate'), 'unresolved': ('insufficient_context', 'collection_problem')}
     if reason_code is not None and reason_code not in allowed_reasons.get(state, ()):
         raise ValueError('reason code must match use state')
@@ -374,7 +395,17 @@ def context_use(root, request_id, state, citations, reason, reason_code=None, ef
         read = {r[0] for r in db.execute('SELECT citation_id FROM reads WHERE request_id=?', (request_id,))}
         if not set(citations) <= known & read or (state == 'applied' and not citations):
             raise ValueError('use requires read, returned citations')
+        if decision_match is not None and not result.get('decision_need'):
+            raise ValueError('decision match requires a prospectively recorded need')
+        if decision_match in ('found', 'partial') and not citations:
+            raise ValueError('decision match requires read citations')
+        if decision_match in ('not_found', 'unknown') and state == 'applied':
+            raise ValueError('applied decision cannot be not_found or unknown')
         _context_table(db)
+        db.execute('CREATE TABLE IF NOT EXISTS context_decision_matches (request_id TEXT PRIMARY KEY, match TEXT NOT NULL)')
+        db.execute('DELETE FROM context_decision_matches WHERE request_id=?', (request_id,))
+        if decision_match is not None:
+            db.execute('INSERT INTO context_decision_matches VALUES(?,?)', (request_id, decision_match))
         db.execute('INSERT OR REPLACE INTO context_uses VALUES(?,?,?,?,?)',
                    (request_id, state, canonical(sorted(set(citations))), reason, time.time()))
         db.execute('INSERT OR REPLACE INTO context_use_details VALUES(?,?,?)', (request_id, reason_code, effect))
@@ -392,7 +423,8 @@ def context_inspect(root, request_id):
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         use = db.execute('SELECT * FROM context_uses WHERE request_id=?', (request_id,)).fetchone() if 'context_uses' in tables else None
         details = db.execute('SELECT reason_code,effect FROM context_use_details WHERE request_id=?', (request_id,)).fetchone() if 'context_use_details' in tables else None
-        return dict(request_id=request_id, created=row['created'], query=row['query'], result=result,
+        match = db.execute('SELECT match FROM context_decision_matches WHERE request_id=?', (request_id,)).fetchone() if 'context_decision_matches' in tables else None
+        return dict(decision_match=match[0] if match else None, request_id=request_id, created=row['created'], query=row['query'], result=result,
                     reads=[dict(r) for r in db.execute('SELECT * FROM reads WHERE request_id=? ORDER BY created', (request_id,))],
                     use=dict(use) if use else None, use_details=dict(details) if details else None,
                     notice='Recorded evidence only; missing historical fields are unknown. Use/effect are agent self-reports.')
@@ -411,7 +443,9 @@ def context_report(root, purpose=None):
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         uses = {r['request_id']: dict(r) for r in db.execute('SELECT * FROM context_uses') if r['request_id'] in ids} if 'context_uses' in tables else {}
         details = [dict(r) for r in db.execute('SELECT * FROM context_use_details') if r['request_id'] in ids] if 'context_use_details' in tables else []
-    return dict(searches=len(rows), triggers=dict(Counter(r['trigger'] for r in results)),
+        matches = {r['request_id']: r['match'] for r in db.execute('SELECT * FROM context_decision_matches')} if 'context_decision_matches' in tables else {}
+    from retrieval_needs import summarize
+    return dict(decision_needs=summarize(rows, uses, matches), searches=len(rows), triggers=dict(Counter(r['trigger'] for r in results)),
                 purposes=dict(Counter(r.get('purpose', 'task') for r in results)), requests_with_reads=len(read_ids),
                 uses=dict(Counter(u['state'] for u in uses.values())), unreported=len(ids - uses.keys()),
                 reason_codes=dict(Counter(d['reason_code'] for d in details if d['reason_code'])),
@@ -689,6 +723,8 @@ def main():
     context.add_argument('--trigger', required=True, choices=('resume', 'ambiguous', 'explicit'))
     context.add_argument('--limit', type=int, default=3)
     context.add_argument('--purpose', choices=('task', 'verification'), default='task')
+    context.add_argument('--need', help='past decision needed, recorded before seeing results')
+    context.add_argument('--retry-of', help='initial request ID for one focused retry of the same need')
     context.add_argument('--task', help='short current task description, stored locally')
     context.add_argument('--session-id', help='caller session ID when runtime does not expose one')
     inspect = subs.add_parser('context-inspect')
@@ -737,7 +773,7 @@ def main():
         elif args.command == "search":
             result = search(root, args.query, args.arm, args.limit, args.sample_rate)
         elif args.command == 'corrections':
-            result = search_corrections(root, args.query, args.trigger, args.limit, args.purpose, args.task, args.session_id)
+            result = search_corrections(root, args.query, args.trigger, args.limit, args.purpose, args.task, args.session_id, args.need, args.retry_of)
         elif args.command == 'context-use':
             value = json.loads(safe_file(args.file, 16384))
             result = context_use(root, args.request_id, **value)

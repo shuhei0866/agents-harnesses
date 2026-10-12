@@ -59,6 +59,88 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(usage['uses'], {'applied': 1})
         self.assertEqual(usage['requests_with_reads'], 1)
 
+    def test_prospective_need_retry_and_unknown_denominators(self):
+        legacy = lab.search_corrections(self.root, 'spreadsheet', 'resume')
+        first = lab.search_corrections(self.root, 'spreadsheet', 'resume', need='Was editing authorized?', session_id='s1')
+        lab.context_use(self.root, first['request_id'], 'not_applicable', [], 'Too broad', decision_match='not_found')
+        retry = lab.search_corrections(self.root, 'spreadsheet edit', 'resume', retry_of=first['request_id'], session_id='s1')
+        self.assertEqual(retry['decision_need']['text'], 'Was editing authorized?')
+        citation = retry['hits'][0]['citation_id']
+        with self.assertRaises(ValueError):
+            lab.context_use(self.root, retry['request_id'], 'applied', [citation], 'No read', decision_match='found')
+        lab.read_citation(self.root, citation, retry['request_id'])
+        lab.context_use(self.root, retry['request_id'], 'applied', [citation], 'Discuss only', decision_match='found', effect='changed_plan')
+        lab.search_corrections(self.root, 'budget', 'explicit', need='Earlier budget ceiling?', session_id='s2')
+        lab.search_corrections(self.root, 'budget', 'explicit', need='Test only', purpose='verification')
+        report = lab.context_report(self.root, 'task')['decision_needs']
+        self.assertEqual(report['needs'], 2)
+        self.assertEqual(report['legacy_searches'], 1)
+        self.assertEqual(report['statuses'], {'found': 1, 'unknown': 1})
+        self.assertEqual(report['found_on'], {'retry': 1})
+        self.assertEqual(report['unreported'], 1)
+        self.assertEqual(report['sessions_known'], 2)
+        self.assertEqual(len(report['review_cases']), 2)
+        self.assertEqual(lab.context_inspect(self.root, retry['request_id'])['decision_match'], 'found')
+        for kwargs in [dict(retry_of=first['request_id'], session_id='s1'),
+                       dict(retry_of=retry['request_id'], session_id='s1'),
+                       dict(retry_of=legacy['request_id']),
+                       dict(retry_of=first['request_id'], session_id='other'),
+                       dict(retry_of=first['request_id'], session_id='s1', need='Changed target'),
+                       dict(retry_of=first['request_id'], session_id='s1', purpose='verification')]:
+            with self.assertRaises(ValueError):
+                lab.search_corrections(self.root, 'spreadsheet', 'resume', **kwargs)
+        self.assertEqual(lab.context_report(self.root, 'task')['searches'], 4)
+
+    def test_retry_retraction_does_not_preserve_old_success(self):
+        first = lab.search_corrections(self.root, 'spreadsheet', 'resume', need='Edit permission')
+        citation = first['hits'][0]['citation_id']
+        lab.read_citation(self.root, citation, first['request_id'])
+        lab.context_use(self.root, first['request_id'], 'not_applicable', [citation], 'Found but old', decision_match='found')
+        retry = lab.search_corrections(self.root, 'budget', 'resume', retry_of=first['request_id'])
+        report = lab.context_report(self.root)['decision_needs']
+        self.assertEqual(report['statuses'], {'unknown': 1})
+        lab.context_use(self.root, retry['request_id'], 'unresolved', [], 'Decision remains unclear', decision_match='unknown')
+        self.assertEqual(lab.context_report(self.root)['decision_needs']['found_on'], {})
+
+    def test_partial_evidence_survives_unsuccessful_retry(self):
+        first = lab.search_corrections(self.root, 'spreadsheet', 'resume', need='Permission and budget')
+        citation = first['hits'][0]['citation_id']
+        lab.read_citation(self.root, citation, first['request_id'])
+        lab.context_use(self.root, first['request_id'], 'unresolved', [citation], 'Permission only', decision_match='partial')
+        retry = lab.search_corrections(self.root, 'budget', 'resume', retry_of=first['request_id'])
+        lab.context_use(self.root, retry['request_id'], 'unresolved', [], 'No additional evidence', decision_match='not_found')
+        case = lab.context_report(self.root)['decision_needs']['review_cases'][0]
+        self.assertEqual(case['status'], 'not_found')
+        self.assertEqual(case['attempt_reports'][0]['match'], 'partial')
+        self.assertEqual(case['attempt_reports'][0]['citations'], [citation])
+        self.assertEqual(case['attempt_reports'][0]['reason'], 'Permission only')
+
+    def test_match_validation_legacy_and_replacement(self):
+        old = lab.search_corrections(self.root, 'spreadsheet', 'resume')
+        with self.assertRaises(ValueError):
+            lab.context_use(self.root, old['request_id'], 'unresolved', [], 'Unknown', decision_match='unknown')
+        r = lab.search_corrections(self.root, 'spreadsheet', 'resume', need='Editing permission')
+        for match in ['found', 'partial', 'invented']:
+            with self.assertRaises(ValueError):
+                lab.context_use(self.root, r['request_id'], 'unresolved', [], 'Unknown', decision_match=match)
+        lab.context_use(self.root, r['request_id'], 'unresolved', [], 'Unknown', decision_match='unknown')
+        lab.context_use(self.root, r['request_id'], 'not_applicable', [], 'Unreported replacement')
+        self.assertIsNone(lab.context_inspect(self.root, r['request_id'])['decision_match'])
+        self.assertEqual(lab.context_report(self.root)['decision_needs']['unreported'], 1)
+
+    def test_prospective_cli(self):
+        script = Path(lab.__file__).with_name('retrieval_lab.py')
+        proc = subprocess.run([sys.executable, str(script), '--lab', str(self.root), 'corrections',
+                               'spreadsheet', '--trigger', 'resume', '--need', 'Editing permission',
+                               '--purpose', 'verification'], capture_output=True, text=True, check=True)
+        result = json.loads(proc.stdout)
+        self.assertEqual(result['decision_need']['root_request_id'], result['request_id'])
+        payload = self.base / 'use.json'
+        payload.write_text(json.dumps(dict(state='unresolved', citations=[], reason='Test', decision_match='unknown')))
+        subprocess.run([sys.executable, str(script), '--lab', str(self.root), 'context-use',
+                        result['request_id'], '--file', str(payload)], capture_output=True, text=True, check=True)
+        self.assertEqual(lab.context_report(self.root, 'verification')['decision_needs']['statuses'], {'unknown': 1})
+
     def test_literal_speaker_markers_cannot_create_user_turns(self):
         logs = self.base / 'quoted'
         logs.mkdir()
