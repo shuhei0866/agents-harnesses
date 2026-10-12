@@ -463,3 +463,8 @@ reads are observations; decision match and effect remain agent self-reports.
 Sessions without searches are outside the denominator. This does not establish
 recall over all needed decisions, user satisfaction, causal benefit or reduced
 rework. Silence and abandonment never become positive feedback.
+
+The combined status is the latest attempt, so a later unresolved retry does not
+keep an optimistic found total. Review cases preserve every `attempt_reports`
+match, citation and reason, including earlier partial evidence; latest not_found
+does not mean all earlier evidence was absent or retracted.

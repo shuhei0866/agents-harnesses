@@ -29,7 +29,10 @@ def summarize(rows, uses, matches):
                           status=status, reported=last['id'] in matches,
                           found_on=('initial' if found[0]['id'] == root else 'retry') if found else None,
                           selected_ranks=ranks, request_ids=[a['id'] for a, _ in attempts],
-                          reason=uses.get(r['id'], {}).get('reason')))
+                          reason=uses.get(r['id'], {}).get('reason'),
+                          attempt_reports=[dict(request_id=a['id'], match=matches.get(a['id'], 'unknown'),
+                                                citations=json.loads(uses.get(a['id'], {}).get('citations', '[]')),
+                                                reason=uses.get(a['id'], {}).get('reason')) for a, _ in attempts]))
     return dict(version=1, needs=len(cases), legacy_searches=legacy,
                 statuses=dict(Counter(c['status'] for c in cases)),
                 found_on=dict(Counter(c['found_on'] for c in cases if c['found_on'])),
@@ -41,4 +44,5 @@ def summarize(rows, uses, matches):
                                     key=lambda c: c['created'], reverse=True)[:20],
                 notice='Search-invoked needs only; matches are agent self-reports, not human validation. '
                        'Silence, missing reports and sessions without searches do not imply success. '
+                       'Need status is the latest attempt; earlier partial/found evidence remains in attempt_reports. '
                        'Ranks are observed; downstream quality and reduced rework are not measured.')

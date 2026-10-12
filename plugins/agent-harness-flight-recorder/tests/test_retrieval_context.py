@@ -102,6 +102,19 @@ class ContextTests(unittest.TestCase):
         lab.context_use(self.root, retry['request_id'], 'unresolved', [], 'Decision remains unclear', decision_match='unknown')
         self.assertEqual(lab.context_report(self.root)['decision_needs']['found_on'], {})
 
+    def test_partial_evidence_survives_unsuccessful_retry(self):
+        first = lab.search_corrections(self.root, 'spreadsheet', 'resume', need='Permission and budget')
+        citation = first['hits'][0]['citation_id']
+        lab.read_citation(self.root, citation, first['request_id'])
+        lab.context_use(self.root, first['request_id'], 'unresolved', [citation], 'Permission only', decision_match='partial')
+        retry = lab.search_corrections(self.root, 'budget', 'resume', retry_of=first['request_id'])
+        lab.context_use(self.root, retry['request_id'], 'unresolved', [], 'No additional evidence', decision_match='not_found')
+        case = lab.context_report(self.root)['decision_needs']['review_cases'][0]
+        self.assertEqual(case['status'], 'not_found')
+        self.assertEqual(case['attempt_reports'][0]['match'], 'partial')
+        self.assertEqual(case['attempt_reports'][0]['citations'], [citation])
+        self.assertEqual(case['attempt_reports'][0]['reason'], 'Permission only')
+
     def test_match_validation_legacy_and_replacement(self):
         old = lab.search_corrections(self.root, 'spreadsheet', 'resume')
         with self.assertRaises(ValueError):
