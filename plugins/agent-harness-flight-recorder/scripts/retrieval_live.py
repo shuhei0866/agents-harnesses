@@ -104,7 +104,7 @@ def _excluded(value: dict, adapter: str, exclusions: set[str]) -> str | None:
         if matches:
             # Ordinary skill use must not erase the conversation. Low-level
             # evaluation tools and explicit verification retain quarantine.
-            if any(name != 'recall-history' for name in matches) or re.search(
+            if any(name not in ('recall-history', 'flight-recorder-retrieval') for name in matches) or re.search(
                     r'--purpose(?:[=\s]+|[\\\"\']+)+verification', argument):
                 return 'retrieval'
             routine_recall = True

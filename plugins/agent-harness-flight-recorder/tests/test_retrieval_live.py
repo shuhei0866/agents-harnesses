@@ -71,7 +71,7 @@ class LiveTests(unittest.TestCase):
     def test_routine_recall_retains_users_and_not_recycled_assistant_text(self):
         for root, adapter, message in [(self.claude, 'claude-code', claude),
                                        (self.codex, 'codex', codex)]:
-            command = 'recall-history corrections topic --purpose task'
+            command = 'recall-history corrections topic --purpose task; cat ~/.local/share/flight-recorder-retrieval/installation.json'
             tool = (dict(type='assistant', message=dict(role='assistant', content=[
                 dict(type='tool_use', name='Bash', input={'command': command})]))
                 if adapter == 'claude-code' else dict(type='response_item', payload=dict(
