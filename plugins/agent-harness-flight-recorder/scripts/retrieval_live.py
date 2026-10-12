@@ -27,7 +27,7 @@ MAX_DOCUMENT_CHARS = 100_000
 MAX_MANIFEST_BYTES = 60 * 1024 * 1024
 WINDOW_LINES = 40
 ADAPTERS = {'claude-code', 'codex'}
-COLLECTOR_VERSION = 'structured-message-context-v4'
+COLLECTOR_VERSION = 'structured-message-context-v5'
 
 
 def generated_session_prompt(text: str) -> bool:

@@ -353,7 +353,7 @@ than silently presented as organic use. Aggregate read/use totals include both.
 
 ### Ordinary recall retention
 
-Collector v4 keeps user-role messages in ordinary `recall-history` sessions,
+Collector v5 keeps user-role messages in ordinary `recall-history` sessions,
 including subsequent corrections. It omits all assistant messages from those
 sources so retrieved quotations cannot be recycled or paired with later user
 turns as stale context. This deliberately sacrifices assistant context in recall
