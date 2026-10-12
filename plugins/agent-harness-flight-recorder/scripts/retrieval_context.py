@@ -6,6 +6,9 @@ import time
 
 VERSION = 'user-context-bm25-v2'
 TRIGGERS = ('resume', 'ambiguous', 'explicit')
+INJECTED_PREFIXES = ('# AGENTS.md', 'Stop hook feedback:', '[exploration-budget]',
+    'Base directory for this skill:', 'Another Claude session sent a message:',
+    '<environment_context>', '<system-reminder>', '<turn_aborted>', '<app-context>')
 
 
 def validate_spans(text, first, last, spans):
@@ -34,8 +37,7 @@ def validate_spans(text, first, last, spans):
 
 def conversational(text):
     # Known injected frames only. User role does not prove human authorship.
-    return bool(text.strip()) and not text.lstrip().startswith((
-        '<', '# AGENTS.md', 'Stop hook feedback:', '[exploration-budget]',
+    return bool(text.strip()) and not text.lstrip().startswith(INJECTED_PREFIXES + (
         'あなたは作業セッションの引き継ぎカード', 'あなたは探索セッションの評価者'))
 
 

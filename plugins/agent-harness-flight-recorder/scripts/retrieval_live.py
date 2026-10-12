@@ -16,6 +16,7 @@ import stat
 import time
 
 from retrieval_snapshot import _message
+from retrieval_context import INJECTED_PREFIXES
 
 MAX_FILES = 10_000
 MAX_ENTRIES = 100_000
@@ -27,7 +28,7 @@ MAX_DOCUMENT_CHARS = 100_000
 MAX_MANIFEST_BYTES = 60 * 1024 * 1024
 WINDOW_LINES = 40
 ADAPTERS = {'claude-code', 'codex'}
-COLLECTOR_VERSION = 'structured-message-context-v6'
+COLLECTOR_VERSION = 'structured-message-context-v7'
 
 
 def generated_session_prompt(text: str) -> bool:
@@ -279,7 +280,6 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
             routine_recall = False
             recall_boundary = None
             last_user_line = 0
-            message_bytes = 0
             line_count = 0
             records = _records(path, report)
             try:
@@ -310,9 +310,7 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                             reason = 'generated'
                             break
                         seen_user = True
-                    if message and message[0] == 'user' and message[1].lstrip().startswith((
-                            'Base directory for this skill:', 'Another Claude session sent a message:',
-                            '# AGENTS.md', '<', 'Stop hook feedback:', '[exploration-budget]')):
+                    if message and message[0] == 'user' and message[1].lstrip().startswith(INJECTED_PREFIXES):
                         report['omitted_injected_messages'] += 1
                         continue
                     if message:
@@ -322,9 +320,6 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                         if len(text) > MAX_DOCUMENT_CHARS:
                             report['omitted_oversized_lines'] += 1
                         else:
-                            message_bytes += len(json.dumps(text, ensure_ascii=True).encode())
-                            if message_bytes > MAX_MANIFEST_BYTES:
-                                raise ValueError('local snapshot size limit exceeded')
                             messages.append((number, text))
             finally:
                 records.close()
@@ -340,6 +335,10 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                 kept = [(n, t) for n, t in messages if n < recall_boundary or t.startswith(f'[line {n}] user: ')]
                 report['omitted_recall_assistant_messages'] += len(messages) - len(kept)
                 messages = kept
+            # Streaming is bounded by MAX_SOURCE_BYTES; apply output limits only
+            # after removing assistant text that will not enter the corpus.
+            if sum(len(json.dumps(t, ensure_ascii=True).encode()) for _, t in messages) > MAX_MANIFEST_BYTES:
+                raise ValueError('local snapshot size limit exceeded')
             refreshed.append(identity)
             report['imported_sources'] += 1
             groups = {}

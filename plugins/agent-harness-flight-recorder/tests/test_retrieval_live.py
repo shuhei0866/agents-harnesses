@@ -121,6 +121,25 @@ class LiveTests(unittest.TestCase):
         self.assertEqual(items[1]['prior_response']['text'], 'earlier answer')
         self.assertIsNone(items[-1]['prior_response'])
 
+    def test_xml_user_text_survives_and_discarded_output_does_not_fill_manifest(self):
+        tool = dict(type='response_item', payload=dict(type='function_call',
+                    name='exec', arguments='recall-history search topic'))
+        self.write(self.codex, 'bounded.jsonl', encode(codex('<request>genuine request</request>'),
+            tool, *[codex('x' * 1000, 'assistant') for _ in range(10)],
+            codex('<correction>genuine correction</correction>'),
+            codex('<environment_context>injected</environment_context>')))
+        with patch.object(live, 'MAX_MANIFEST_BYTES', 4000):
+            result = live.export_live(self.roots, since=0)
+        text = str(result['documents'])
+        self.assertIn('genuine request', text)
+        self.assertIn('genuine correction', text)
+        self.assertNotIn('injected', text)
+        from retrieval_context import units
+        for doc in result['documents']:
+            doc['citation_id'] = 'synthetic'
+        items, _ = units(result)
+        self.assertEqual(len(items), 2)
+
     def test_late_verification_overrides_routine_recall(self):
         for flag in ['--purpose verification', '--purpose=verification', '--purpose "verification"']:
             def tool(command):

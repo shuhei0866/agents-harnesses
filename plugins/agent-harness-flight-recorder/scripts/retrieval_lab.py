@@ -552,8 +552,8 @@ def assess(root, request_id, answer_id, grounded, unsupported, provenance):
 
 def report(root, include_reviewed=False):
     with _connect(root) as db:
-        rows = db.execute("SELECT * FROM queries ORDER BY created,id").fetchall()
-        reads = db.execute("SELECT COUNT(*),COALESCE(SUM(returned_bytes),0) FROM reads").fetchone()
+        rows = db.execute("SELECT * FROM queries WHERE version=? ORDER BY created,id", (VERSION,)).fetchall()
+        reads = db.execute("SELECT COUNT(*),COALESCE(SUM(r.returned_bytes),0) FROM reads r JOIN queries q ON q.id=r.request_id WHERE q.version=?", (VERSION,)).fetchone()
         acknowledgements = {}
         if db.execute("SELECT 1 FROM sqlite_master WHERE name='review_acknowledgements'").fetchone():
             acknowledgements = dict(db.execute("SELECT request_id,fingerprint FROM review_acknowledgements"))
@@ -757,7 +757,8 @@ def main():
             for hit in display['hits']:
                 hit['explanation'].pop('contributions', None)
             display['diagnostics_command'] = 'context-inspect ' + result['request_id']
-        print(canonical(display), flush=True)
+        from retrieval_redaction import redact_payload
+        print(canonical(redact_payload(display)), flush=True)
         if args.command == "search" and result["sampled"] and not args.no_worker:
             # User output has already been flushed. Child is a bounded, local-only worker.
             try:

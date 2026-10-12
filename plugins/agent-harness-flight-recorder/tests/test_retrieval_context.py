@@ -182,6 +182,41 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(r['hits'][0]['line'], 2)
 
 
+    def test_context_queries_do_not_break_or_pollute_ordinary_report(self):
+        r = lab.search_corrections(self.root, 'spreadsheet', 'resume')
+        lab.read_citation(self.root, r['hits'][0]['citation_id'], r['request_id'])
+        ordinary = lab.search(self.root, 'spreadsheet', sample_rate=0)
+        lab.read_citation(self.root, ordinary['hits'][0]['citation_id'], ordinary['request_id'])
+        report = lab.report(self.root)
+        self.assertEqual(report['total_queries'], 1)
+        self.assertEqual(report['citation_reads'], 1)
+        self.assertEqual(lab.context_report(self.root)['searches'], 1)
+
+    def test_cli_masks_supported_credentials_without_changing_citation(self):
+        from retrieval_redaction import redact_payload
+        secret = 'sk-proj-' + 'a' * 24
+        body = 'spreadsheet API_KEY="example-secret-value" ' + secret
+        logs = self.base / 'credentials'
+        logs.mkdir()
+        (logs/'one.jsonl').write_text(json.dumps(record(body))+'\n')
+        lab.publish_snapshot(self.root, live.export_live([('codex', logs)], since=0))
+        script = Path(lab.__file__)
+        run = subprocess.run([sys.executable, str(script), '--lab', str(self.root),
+            'corrections', 'spreadsheet', '--trigger', 'explicit'], capture_output=True, text=True, check=True)
+        shown = json.loads(run.stdout)
+        self.assertTrue(shown['display_redacted'])
+        self.assertNotIn(secret, run.stdout)
+        self.assertNotIn('example-secret-value', run.stdout)
+        citation = shown['hits'][0]['citation_id']
+        read = subprocess.run([sys.executable, str(script), '--lab', str(self.root),
+            'read', citation, '--request-id', shown['request_id']], capture_output=True, text=True, check=True)
+        self.assertNotIn(secret, read.stdout)
+        self.assertEqual(json.loads(read.stdout)['citation_id'], citation)
+        self.assertIn(secret, lab._snapshot(self.root)['documents'][0]['text'])
+        for value in ['Authorization: Bearer example-token',
+                      '-----BEGIN PRIVATE KEY-----\nexample\n-----END PRIVATE KEY-----']:
+            self.assertEqual(redact_payload({'text': value})['text'], '[credential redacted]')
+
 
 if __name__ == '__main__':
     unittest.main()

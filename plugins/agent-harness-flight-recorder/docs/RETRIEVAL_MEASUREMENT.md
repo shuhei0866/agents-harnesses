@@ -304,8 +304,11 @@ and quoted examples stay searchable. Other generated prompts and in-session hook
 messages may remain; callers must inspect originals before interpreting feedback.
 
 Collector upgrades force a complete recollection even when source mtimes have
-not changed. Incomplete or over-budget scans retain the previous corpus and
-collector version. Old request-bound citations remain readable. The streamed
+not changed. Failed or over-budget scans retain the previous corpus and
+collector version. Incomplete inventory during a collector/configuration change
+also retains the previous corpus. With unchanged collection settings, an
+incomplete incremental inventory may publish scanned updates while retaining
+unseen sources. Old request-bound citations remain readable. The streamed
 aggregate scan budget is 4 GiB; the 256 MiB source, 8 MiB record and 60 MiB manifest
 limits are unchanged. No model calls are needed.
 
@@ -353,7 +356,7 @@ than silently presented as organic use. Aggregate read/use totals include both.
 
 ### Ordinary recall retention
 
-Collector v6 keeps user-role messages in ordinary `recall-history` sessions,
+Collector v7 keeps user-role messages in ordinary `recall-history` sessions,
 including subsequent corrections. It preserves assistant context before the invoking user turn, then omits
 assistant messages from that turn onwards so retrieved quotations cannot be
 recycled or paired with later user turns as stale context. This deliberately sacrifices assistant context in recall
@@ -398,3 +401,10 @@ Context ranking v2 treats identifiers such as `APP-587` as complete tokens;
 a bare `587` in an unrelated pull request no longer matches the ticket suffix.
 Token contributions are stored in the invocation log and returned by inspect;
 normal CLI results omit the detailed contributions to limit context overhead.
+
+CLI output masks recognized credential formats (including common key prefixes,
+Bearer headers, private-key blocks, and labeled key/password assignments). A
+changed display carries `display_redacted: true`. This is best-effort masking,
+not a guarantee that arbitrary secrets can be identified. Owner-only originals,
+query evidence and citation hashes remain unchanged; masking is at display time
+and applies equally to search, read, and inspect.
