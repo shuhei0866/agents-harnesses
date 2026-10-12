@@ -16,10 +16,10 @@ def summarize(rows, uses, matches):
     cases = []
     for root, attempts in groups.items():
         initial, first = attempts[0]
-        found = next(((r, v) for r, v in attempts if matches.get(r['id']) == 'found'), None)
         last, latest = attempts[-1]
-        status = 'found' if found else matches.get(last['id'], 'unknown')
-        chosen = found or (last, latest)
+        status = matches.get(last['id'], 'unknown')
+        found = next(((r, v) for r, v in attempts if matches.get(r['id']) == 'found'), None) if status == 'found' else None
+        chosen = (last, latest)
         r, result = chosen
         citations = set(json.loads(uses.get(r['id'], {}).get('citations', '[]')))
         ranks = [h['rank'] for h in result['hits'] if any(h.get(k) and h[k]['citation_id'] in citations
@@ -27,7 +27,7 @@ def summarize(rows, uses, matches):
         cases.append(dict(root_request_id=root, created=initial['created'], need=first['decision_need']['text'],
                           session_id=first.get('origin', {}).get('session_id'), attempts=len(attempts),
                           status=status, reported=last['id'] in matches,
-                          found_on=('initial' if r['id'] == root else 'retry') if found else None,
+                          found_on=('initial' if found[0]['id'] == root else 'retry') if found else None,
                           selected_ranks=ranks, request_ids=[a['id'] for a, _ in attempts],
                           reason=uses.get(r['id'], {}).get('reason')))
     return dict(version=1, needs=len(cases), legacy_searches=legacy,

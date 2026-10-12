@@ -91,6 +91,17 @@ class ContextTests(unittest.TestCase):
                 lab.search_corrections(self.root, 'spreadsheet', 'resume', **kwargs)
         self.assertEqual(lab.context_report(self.root, 'task')['searches'], 4)
 
+    def test_retry_retraction_does_not_preserve_old_success(self):
+        first = lab.search_corrections(self.root, 'spreadsheet', 'resume', need='Edit permission')
+        citation = first['hits'][0]['citation_id']
+        lab.read_citation(self.root, citation, first['request_id'])
+        lab.context_use(self.root, first['request_id'], 'not_applicable', [citation], 'Found but old', decision_match='found')
+        retry = lab.search_corrections(self.root, 'budget', 'resume', retry_of=first['request_id'])
+        report = lab.context_report(self.root)['decision_needs']
+        self.assertEqual(report['statuses'], {'unknown': 1})
+        lab.context_use(self.root, retry['request_id'], 'unresolved', [], 'Decision remains unclear', decision_match='unknown')
+        self.assertEqual(lab.context_report(self.root)['decision_needs']['found_on'], {})
+
     def test_match_validation_legacy_and_replacement(self):
         old = lab.search_corrections(self.root, 'spreadsheet', 'resume')
         with self.assertRaises(ValueError):
