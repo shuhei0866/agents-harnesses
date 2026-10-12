@@ -8,7 +8,9 @@ import re
 import time
 from collections import Counter, defaultdict
 
-VERSION = 'recall-opportunities-v4'
+from retrieval_context import VERSION as RANKER_VERSION
+
+VERSION = 'recall-opportunities-v5/' + RANKER_VERSION
 HISTORY = re.compile(r'(?:前に|以前|前回|過去の).{0,24}(?:決め|判断|方針|話|相談|確認|言|伝え)|previously decided|as we agreed|last time|earlier decision', re.I)
 CORRECTION = re.compile(r'前にも.{0,15}(?:言|伝え)|そうじゃなく|そうではなく|I (?:already|previously) (?:said|told)', re.I)
 CONTROL_SAMPLE_DENOMINATOR = 10
@@ -188,7 +190,7 @@ def replay(snapshot, items, target):
     return dict(kind=target['kind'], control_origin=target.get('control_origin'), anchor=excerpt(anchor), cue=excerpt(target['cue']) if target['cue'] else None,
                 query=query, query_truncated=len(user_text(anchor['utterance']['text'])) > 600,
                 recall_observation='no_known_tool_marker', snapshot_id=snapshot['snapshot_id'],
-                prior_candidates=len(docs), hits=result['hits'],
+                prior_candidates=len(docs), hits=result['hits'], retrieval_version=result['retrieval_version'],
                 availability_at_turn='unknown', usefulness='unassessed', lineage='native_session_and_exact_text_dedup_only')
 
 

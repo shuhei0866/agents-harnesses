@@ -444,6 +444,10 @@ original text are removed. This script-based heuristic can also downweight
 meaningful hiragana words, so it is not semantic intent recognition.
 Diagnostics v2 exposes `query_weights` and each contribution's `query_weight`;
 the scores still sum to the displayed total. Historical results are not rewritten.
+Opportunity replay cache keys include the ranker version, and new packets record
+`retrieval_version`. Reports select the current composite version; old case IDs
+remain inspectable. A ranker update can produce new retrospective packets for the
+same turn without mixing old and new rankings in the current cohort.
 
 For a private regression, freeze the original request, the eligible earlier
 cross-session corpus, and the expected source/citation/line separately. Pass only
