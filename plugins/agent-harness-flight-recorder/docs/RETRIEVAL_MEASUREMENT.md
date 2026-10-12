@@ -353,10 +353,10 @@ than silently presented as organic use. Aggregate read/use totals include both.
 
 ### Ordinary recall retention
 
-Collector v5 keeps user-role messages in ordinary `recall-history` sessions,
-including subsequent corrections. It omits all assistant messages from those
-sources so retrieved quotations cannot be recycled or paired with later user
-turns as stale context. This deliberately sacrifices assistant context in recall
+Collector v6 keeps user-role messages in ordinary `recall-history` sessions,
+including subsequent corrections. It preserves assistant context before the invoking user turn, then omits
+assistant messages from that turn onwards so retrieved quotations cannot be
+recycled or paired with later user turns as stale context. This deliberately sacrifices assistant context in recall
 sessions; it does not prove that every user-role message is human-authored.
 Known injected skill/agent frames are omitted. Tool results are never indexed.
 Explicit exclusions, generated evaluations, subagents, low-level retrieval tools,
@@ -366,3 +366,35 @@ previous request-pinned snapshots remain readable.
 
 Import reports expose retained_recall_sessions, omitted_recall_assistant_messages,
 and omitted_injected_messages separately from excluded_retrieval_sessions.
+
+
+### Inspecting daily invocations
+
+`corrections QUERY --trigger resume --task 'current task and target'` records
+cwd and an allowlisted CODEX_THREAD_ID when available. `--session-id` is an
+explicit fallback; absent values stay null. These are caller-supplied context,
+not verified project identity or authority. No other environment variables are
+collected. Paths and task descriptions remain in the owner-only lab.
+
+`context-report --purpose task` separates everyday use from verification and
+lists recent request IDs. `context-inspect REQUEST` joins the original query,
+origin, snapshot/version, refresh status at invocation, ranked candidates, score
+contributions per token/field, original reads, and use decision. It neither reruns
+retrieval nor records a citation read. Older records keep missing data unknown.
+BM25 scores are ranking values, not calibrated relevance confidence.
+
+`context-use` accepts optional reason_code and effect fields. Reason codes are
+state-specific: applied/relevant; not_applicable/wrong_scope, outdated,
+already_known, no_relevant_candidate; unresolved/insufficient_context,
+collection_problem. Effects apply only to applied: confirmed, changed_plan,
+avoided_question. Reasons and effects remain agent self-report and do not update
+human feedback or independent assessments. Missing details are not inferred.
+
+Retrieval metrics omit model cost when unknown. Foreground time covers snapshot
+loading and ranking, not end-to-end agent deliberation. Caller cwd may be a hub
+or worktree, not the intended target repository; the task label supplies scope.
+
+Context ranking v2 treats identifiers such as `APP-587` as complete tokens;
+a bare `587` in an unrelated pull request no longer matches the ticket suffix.
+Token contributions are stored in the invocation log and returned by inspect;
+normal CLI results omit the detailed contributions to limit context overhead.

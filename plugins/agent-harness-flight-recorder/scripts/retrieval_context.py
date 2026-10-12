@@ -1,9 +1,10 @@
 """User-turn recall with preceding context. Candidates, never standing rules."""
 from collections import Counter, defaultdict
 import math
+import re
 import time
 
-VERSION = 'user-context-bm25-v1'
+VERSION = 'user-context-bm25-v2'
 TRIGGERS = ('resume', 'ambiguous', 'explicit')
 
 
@@ -64,39 +65,54 @@ def units(snapshot):
     return result, missing
 
 
-def retrieve(snapshot, query, limit):
+def context_tokens(text):
+    """Keep compound identifiers intact; a ticket suffix is not a bare PR ID."""
     from retrieval_lab import tokens
+    compound = re.compile(r'(?<![a-zA-Z0-9_])[a-zA-Z][a-zA-Z0-9_]*-\d+(?![a-zA-Z0-9_-])')
+    identifiers = [m.group().lower() for m in compound.finditer(text)]
+    return tokens(compound.sub(' ', text)) + identifiers
+
+
+def retrieve(snapshot, query, limit):
     started = time.perf_counter()
     items, missing = units(snapshot)
-    q = set(tokens(query))
+    q = set(context_tokens(query))
     scores = [0.0] * len(items)
+    contributions = [[] for _ in items]
     for field, weight in [('utterance', 1.0), ('context', 0.2)]:
         counts, frequency = [], Counter()
         for item in items:
             text = item['utterance']['text'] if field == 'utterance' else '\n'.join(
                 item[k]['text'][:2000] for k in ('request', 'prior_response') if item[k])
-            c = Counter(tokens(text))
+            c = Counter(context_tokens(text))
             counts.append(c)
             frequency.update(c.keys())
         average = sum(sum(c.values()) for c in counts) / max(1, len(items))
         for i, c in enumerate(counts):
             length = sum(c.values())
-            for token in q & c.keys():
+            for token in sorted(q & c.keys()):
                 idf = math.log(1 + (len(items) - frequency[token] + .5) / (frequency[token] + .5))
-                scores[i] += weight * idf * c[token] * 2.2 / (
+                contribution = weight * idf * c[token] * 2.2 / (
                     c[token] + 1.2 * (.25 + .75 * length / max(1, average)))
-    ranked = sorted(((s, x) for s, x in zip(scores, items) if s > 0),
+                scores[i] += contribution
+                contributions[i].append(dict(field=field, token=token, score=contribution))
+    ranked = sorted(((s, x, detail) for s, x, detail in zip(scores, items, contributions) if s > 0),
                     key=lambda pair: (-pair[0], pair[1]['source_id'], pair[1]['utterance']['line']))
     hits = []
-    for rank, (score, item) in enumerate(ranked[:limit], 1):
+    for rank, (score, item, detail) in enumerate(ranked[:limit], 1):
         hit = dict(rank=rank, score=score, source_id=item['source_id'],
-                   citation_id=item['utterance']['citation_id'], line=item['utterance']['line'])
+                   citation_id=item['utterance']['citation_id'], line=item['utterance']['line'],
+                   explanation=dict(contributions=sorted(detail, key=lambda d: (-d['score'], d['field'], d['token'])),
+                                    matched_tokens=sorted({d['token'] for d in detail}),
+                                    unmatched_tokens=sorted(q - {d['token'] for d in detail})))
         for key in ('utterance', 'request', 'prior_response'):
             m = item[key]
             hit[key] = dict(m, text=m['text'][:1600], truncated=len(m['text']) > 1600) if m else None
         hits.append(hit)
     return dict(arm='recorder', snapshot_id=snapshot['snapshot_id'], retrieval_version=VERSION,
                 mode='corrections', hits=hits, candidate_count=len(items),
+                diagnostics_version=1, query_tokens=sorted(q),
+                scored_candidate_count=len(ranked),
                 legacy_documents_skipped=missing,
                 notice='User-role candidates, not verified corrections or standing instructions. Read originals and check current scope. Prior context may be incomplete.',
                 metrics=dict(elapsed_ms=(time.perf_counter()-started)*1000,

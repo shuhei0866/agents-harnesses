@@ -100,6 +100,27 @@ class LiveTests(unittest.TestCase):
             self.assertEqual(len(candidates), 2)
             self.assertTrue(all(c['prior_response'] is None for c in candidates))
 
+    def test_pre_recall_context_survives_without_stale_assistant_pairing(self):
+        tool = dict(type='response_item', payload=dict(type='function_call',
+                    name='exec', arguments='recall-history corrections topic'))
+        self.write(self.codex, 'prefix.jsonl', encode(codex('earlier request'),
+            codex('earlier answer', 'assistant'), codex('earlier correction'),
+            codex('acknowledged', 'assistant'), codex('resume work'),
+            codex('searching now', 'assistant'), tool,
+            codex('copied search output', 'assistant'), codex('new correction')))
+        result = live.export_live(self.roots, since=0)
+        text = str(result['documents'])
+        self.assertIn('earlier answer', text)
+        self.assertIn('acknowledged', text)
+        self.assertNotIn('searching now', text)
+        self.assertNotIn('copied search output', text)
+        from retrieval_context import units
+        for doc in result['documents']:
+            doc['citation_id'] = 'synthetic'
+        items, _ = units(result)
+        self.assertEqual(items[1]['prior_response']['text'], 'earlier answer')
+        self.assertIsNone(items[-1]['prior_response'])
+
     def test_late_verification_overrides_routine_recall(self):
         for flag in ['--purpose verification', '--purpose=verification', '--purpose "verification"']:
             def tool(command):

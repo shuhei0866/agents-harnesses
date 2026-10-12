@@ -27,7 +27,7 @@ MAX_DOCUMENT_CHARS = 100_000
 MAX_MANIFEST_BYTES = 60 * 1024 * 1024
 WINDOW_LINES = 40
 ADAPTERS = {'claude-code', 'codex'}
-COLLECTOR_VERSION = 'structured-message-context-v5'
+COLLECTOR_VERSION = 'structured-message-context-v6'
 
 
 def generated_session_prompt(text: str) -> bool:
@@ -277,6 +277,8 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
             messages = []
             seen_user = False
             routine_recall = False
+            recall_boundary = None
+            last_user_line = 0
             message_bytes = 0
             line_count = 0
             records = _records(path, report)
@@ -296,6 +298,8 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                         continue
                     found = _excluded(value, adapter, exclusions)
                     if found == 'recall':
+                        if not routine_recall:
+                            recall_boundary = last_user_line
                         routine_recall = True
                     elif found:
                         reason = found
@@ -312,6 +316,8 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                         report['omitted_injected_messages'] += 1
                         continue
                     if message:
+                        if message[0] == 'user':
+                            last_user_line = number
                         text = f'[line {number}] {message[0]}: {message[1]}'
                         if len(text) > MAX_DOCUMENT_CHARS:
                             report['omitted_oversized_lines'] += 1
@@ -327,11 +333,11 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                 excluded.append(identity)
                 continue
             if routine_recall:
-                # User-role text survives before AND after recall. Omit assistant
-                # text for this source to avoid recycling retrieved quotations or
-                # pairing a later user turn with a stale preceding response.
+                # Keep pre-recall context. Drop assistant output starting with
+                # the invoking user turn, including pre-tool commentary, so a
+                # later correction cannot inherit a stale preceding response.
                 report['retained_recall_sessions'] += 1
-                kept = [(n, t) for n, t in messages if t.startswith(f'[line {n}] user: ')]
+                kept = [(n, t) for n, t in messages if n < recall_boundary or t.startswith(f'[line {n}] user: ')]
                 report['omitted_recall_assistant_messages'] += len(messages) - len(kept)
                 messages = kept
             refreshed.append(identity)

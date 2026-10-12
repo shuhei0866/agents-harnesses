@@ -105,6 +105,13 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(result['hits'][0]['line'], 3)
         self.assertEqual(result['trigger'], 'resume')
         self.assertEqual(lab.context_report(self.root)['purposes'], {'verification': 1})
+        output = json.loads(run.stdout)
+        self.assertNotIn('contributions', output['hits'][0]['explanation'])
+        inspected = subprocess.run([sys.executable, str(script), '--lab', str(self.root),
+            'context-inspect', output['request_id']], cwd=self.base, capture_output=True, text=True, check=True)
+        packet = json.loads(inspected.stdout)
+        self.assertIn('contributions', packet['result']['hits'][0]['explanation'])
+        self.assertEqual(packet['result']['origin']['cwd'], str(self.base))
 
     def test_context_does_not_cross_sources_or_include_injected_frames(self):
         original = self.manifest['documents'][0]
@@ -115,6 +122,65 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(sum(x['request'] is None for x in items), 2)
         for prefix in ['<environment_context>', 'Stop hook feedback:', '[exploration-budget]']:
             self.assertFalse(context.conversational(prefix + ' automated'))
+
+    def test_diagnostics_explain_score_and_record_only_allowlisted_origin(self):
+        with patch.dict(os.environ, {'CODEX_THREAD_ID': 'thread-example', 'SECRET_KEY': 'not-recorded'}):
+            r = lab.search_corrections(self.root, 'spreadsheet edit absent', 'resume', task='resume budgeting')
+        self.assertEqual(r['origin']['session_id'], 'thread-example')
+        self.assertEqual(r['origin']['task'], 'resume budgeting')
+        self.assertNotIn('not-recorded', json.dumps(r))
+        for hit in r['hits']:
+            self.assertAlmostEqual(hit['score'], sum(d['score'] for d in hit['explanation']['contributions']))
+            self.assertIn('absent', hit['explanation']['unmatched_tokens'])
+        packet = lab.context_inspect(self.root, r['request_id'])
+        self.assertEqual(packet['result'], r)
+        self.assertEqual(packet['reads'], [])
+        self.assertIsNone(packet['use'])
+        with patch.dict(os.environ, {}, clear=True):
+            unknown = lab.search_corrections(self.root, 'spreadsheet', 'resume')
+        self.assertIsNone(unknown['origin']['session_id'])
+
+    def test_usage_details_filtering_and_legacy_records(self):
+        task = lab.search_corrections(self.root, 'spreadsheet edit', 'resume')
+        verification = lab.search_corrections(self.root, 'spreadsheet', 'explicit', purpose='verification')
+        citation = task['hits'][0]['citation_id']
+        lab.read_citation(self.root, citation, task['request_id'])
+        lab.context_use(self.root, task['request_id'], 'applied', [citation], 'Changed work',
+                        reason_code='relevant', effect='changed_plan')
+        lab.context_use(self.root, verification['request_id'], 'not_applicable', [], 'Only a test')
+        report = lab.context_report(self.root, 'task')
+        self.assertEqual(report['searches'], 1)
+        self.assertEqual(report['effects'], {'changed_plan': 1})
+        self.assertEqual(report['uses'], {'applied': 1})
+        self.assertEqual(report['unreported'], 0)
+        before = lab.context_inspect(self.root, task['request_id'])
+        self.assertEqual(before['use_details']['effect'], 'changed_plan')
+        self.assertEqual(lab.context_inspect(self.root, task['request_id'])['reads'], before['reads'])
+        with self.assertRaises(ValueError):
+            lab.context_use(self.root, task['request_id'], 'not_applicable', [], 'No', effect='changed_plan')
+        # Existing v1 rows without diagnostic data remain inspectable and counted.
+        with lab._connect(self.root) as db:
+            old = dict(task)
+            old.pop('origin')
+            old.pop('diagnostics_version')
+            db.execute('UPDATE queries SET foreground=?,version=? WHERE id=?', (lab.canonical(old), 'user-context-bm25-v1', task['request_id']))
+            db.execute('DROP TABLE context_use_details')
+        self.assertIsNone(lab.context_inspect(self.root, task['request_id'])['use_details'])
+        self.assertEqual(lab.context_report(self.root, 'task')['origin_missing'], 1)
+        lab.context_use(self.root, task['request_id'], 'applied', [citation], 'Legacy API still works')
+
+    def test_compound_ticket_identifiers_do_not_match_bare_numbers(self):
+        self.assertEqual(context.context_tokens('APP-587'), ['app-587'])
+        self.assertNotIn('587', context.context_tokens('APP-587'))
+        logs = self.base / 'ids'
+        logs.mkdir()
+        (logs / 'tickets.jsonl').write_text(''.join(json.dumps(v)+'\n' for v in [
+            record('PR 587 is merged'), record('APP-587 remains on hold')]))
+        lab.publish_snapshot(self.root, live.export_live([('codex', logs)], since=0))
+        r = lab.search_corrections(self.root, 'APP-587', 'resume')
+        self.assertEqual(len(r['hits']), 1)
+        self.assertEqual(r['hits'][0]['line'], 2)
+
 
 
 if __name__ == '__main__':

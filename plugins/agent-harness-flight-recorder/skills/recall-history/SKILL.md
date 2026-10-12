@@ -14,15 +14,19 @@ description: 過去の会話から判断・理由・訂正を出典付きで探�
 
 継続作業の再開、対象や依頼範囲の解釈が分かれる場面、「前にも言った」「そっちじゃない」という指摘では、過去の判断が役立つと考えたら、ユーザーに検索を頼まれるのを待たずに使う。すべてのタスクで呼ぶ必要はない。
 
-`"$HOME/.local/bin/recall-history" corrections '作業テーマ 対象 論点' --trigger resume --limit 3`
+`"$HOME/.local/bin/recall-history" corrections '作業テーマ 対象 論点' --trigger resume --task '今回の依頼と対象を短く記す' --limit 3`
 
 `--trigger` は再開なら `resume`、対象・依頼範囲の曖昧さなら `ambiguous`、明示された履歴・訂正の確認なら `explicit`。一般的な「違う」「訂正」だけでなく、今回の具体的な対象を検索語にする。
+
+`--task` には検索語の羅列ではなく今回の作業目的を短く渡す。実行ディレクトリと、環境にある会話IDは自動記録される。環境にIDが無く、現在の会話IDが確実に分かる場合だけ `--session-id` を渡す。不明なIDは作らない。
 
 返るのは訂正と断定されたものではなく、userロールの発話候補と先行する依頼・AIの対応。話者の役割だけで本人の発言と決めず、引用・自動生成文でないかも確認する。使う候補の `citation_id`（必要なら `request` / `prior_response` のものも）を `read CITATION --request-id REQUEST` で読む。
 
 当時の対象・時点・依頼と今回の一致を確認し、現在の指示を優先する。過去の一度の対象指定を恒久的な好みや禁止事項へ変換しない。見つからない・古い・適用範囲が違う場合は、今回の依頼を基準に進める。
 
-判断後、lab内の一時JSONに `state`（`applied` / `not_applicable` / `unresolved`）、読んだ `citations`、今回への適用理由 `reason` を保存し、`context-use REQUEST --file FILE` で記録する。空振りなら citations は空でよい。これはエージェント自身の利用記録であり、ユーザーの成功評価ではない。`context-report` で検索理由・原文確認・採否を確認できるが、呼び忘れや手戻り削減までは測らない。
+判断後、lab内の一時JSONに `state`（`applied` / `not_applicable` / `unresolved`）、読んだ `citations`、今回への適用理由 `reason` を保存し、`context-use REQUEST --file FILE` で記録する。空振りなら citations は空でよい。これはエージェント自身の利用記録であり、ユーザーの成功評価ではない。`context-report --purpose task` で導入確認を除いた一覧と検索IDを確認できる。`context-inspect REQUEST` で当時の検索語・作業目的・呼出元・候補・順位の内訳・原文確認・採否をまとめて読む（検索や既読記録は増やさない）。呼び忘れや手戻り削減までは測らない。
+
+利用記録には可能なら `reason_code` も付ける。採用は `relevant`、不採用は `wrong_scope` / `outdated` / `already_known` / `no_relevant_candidate`、未解決は `insufficient_context` / `collection_problem`。候補が無いだけで、資料自体が存在しないとは判定しない。採用時は `effect` を `confirmed`（再確認）/ `changed_plan`（進め方を変更）/ `avoided_question`（聞き直しを省略）から選び、`reason` に何が変わったかを短く書く。これらも自己申告であり、実際の効果の証明にはしない。
 
 `legacy_documents_skipped` は発話境界のない古い資料の数。0件の結果を「訂正が存在しない」と解釈しない。`refresh-status` を確認し、失敗を無理に回避しない。
 
@@ -57,7 +61,7 @@ description: 過去の会話から判断・理由・訂正を出典付きで探�
 このスキルによる検索・評価の会話を次の評価資料へ取り込まない。
 更新状態は `refresh-status`、明示的な再取り込みは `refresh --force`。通常は手動操作不要。
 検索ごとに版を固定し、過去の出典確認には必ずrequest_idを渡す。
-通常の `recall-history` 利用では、その会話のuser発言を検索前後とも残す。検索結果の再取り込みを避けるため、その会話のassistant発言と既知の注入メッセージは収録しない。userロールだけで本人の発言とは断定しない。
+通常の `recall-history` 利用では、その会話のuser発言を検索前後とも残す。検索結果の再取り込みを避けるため、最初の検索を呼んだユーザー依頼以降のassistant発言と既知の注入メッセージは収録しない。それ以前のassistant文脈は保持する。userロールだけで本人の発言とは断定しない。
 `--purpose verification`・低水準の評価ツールを使った会話、サブエージェント、明示除外した会話は収録しない。独自の評価セッションは明示除外が必要。
 極端に長いメッセージや壊れたログの除外数は更新状態で確認する。完全網羅とは断定しない。
 原文追加のみ自動化済み。新規要約の生成・自己改善の自動採用は未導入。
