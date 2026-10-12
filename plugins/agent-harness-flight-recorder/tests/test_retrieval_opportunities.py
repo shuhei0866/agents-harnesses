@@ -112,6 +112,16 @@ class OpportunityTests(unittest.TestCase):
         self.assertGreater(result['opportunities']['processed'],0)
         self.assertEqual(lab.context_report(self.root)['searches'],0)
 
+    def test_archived_prior_turns_do_not_duplicate_replay_evidence(self):
+        self.write('past-archive',[msg('Project budget must stay below twenty',100),msg('Acknowledged',101,'assistant')],sid='past')
+        snapshot=build(live.export_live([('codex',self.logs)],since=0))
+        items=audit.turns(snapshot)
+        selected,_=audit.candidates(items,0,400)
+        target=next(x for x in selected if x['kind']=='later_correction')
+        packet=audit.replay(snapshot,items,target)
+        self.assertEqual(packet['prior_candidates'],1)
+        self.assertEqual(len(packet['hits']),1)
+
     def test_background_sample_does_not_require_a_recall_cue(self):
         self.write('current',[msg('Plan project budget',200),msg('Answer',201,'assistant'),msg('Thanks',202)])
         snapshot=build(live.export_live([('codex',self.logs)],since=0))

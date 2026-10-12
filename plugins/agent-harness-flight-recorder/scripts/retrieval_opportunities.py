@@ -8,7 +8,7 @@ import re
 import time
 from collections import Counter, defaultdict
 
-VERSION = 'recall-opportunities-v3'
+VERSION = 'recall-opportunities-v4'
 HISTORY = re.compile(r'(?:前に|以前|前回|過去の).{0,24}(?:決め|判断|方針|話|相談|確認|言|伝え)|previously decided|as we agreed|last time|earlier decision', re.I)
 CORRECTION = re.compile(r'前にも.{0,15}(?:言|伝え)|そうじゃなく|そうではなく|I (?:already|previously) (?:said|told)', re.I)
 CONTROL_SAMPLE_DENOMINATOR = 10
@@ -160,12 +160,17 @@ def replay(snapshot, items, target):
     when = anchor['observation']['timestamp']
     sid = anchor['observation']['native_session_id']
     docs = []
+    seen_prior = set()
     for item in items:
         o = item['observation']
         if not o or o['timestamp'] is None or o['timestamp'] >= when:
             continue
         if item['source_id'] == anchor['source_id'] or (sid and o['native_session_id'] == sid):
             continue
+        key = identity(item)
+        if key in seen_prior:
+            continue
+        seen_prior.add(key)
         m = item['utterance']
         body = user_text(m['text'])
         if not body or body == user_text(anchor['utterance']['text']):
