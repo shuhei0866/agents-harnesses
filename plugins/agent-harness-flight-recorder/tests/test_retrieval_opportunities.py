@@ -105,6 +105,22 @@ class OpportunityTests(unittest.TestCase):
         self.assertTrue(packet['originals'])
         self.assertEqual(lab.context_report(self.root)['searches'],0)
 
+    def test_ranker_revision_replays_without_overwriting_historical_packets(self):
+        config = dict(since=0, prospective_since=250)
+        with patch.object(audit, 'VERSION', 'recall-opportunities-v4'):
+            audit.run(self.root, self.snapshot, config)
+            historical = audit.report(self.root)['review_cases'][0]
+        original = audit.inspect(self.root, historical['case_id'])
+        self.assertIn(audit.RANKER_VERSION, audit.VERSION)
+        self.assertGreater(audit.run(self.root, self.snapshot, config)['processed'], 0)
+        current = audit.report(self.root)['review_cases']
+        self.assertTrue(current)
+        self.assertTrue(all(p['retrieval_version'] == audit.RANKER_VERSION for p in current))
+        self.assertNotIn(historical['case_id'], [p['case_id'] for p in current])
+        self.assertEqual(audit.inspect(self.root, historical['case_id']), original)
+        self.assertEqual(audit.run(self.root, self.snapshot, config)['processed'], 0)
+        self.assertEqual(lab.context_report(self.root)['searches'], 0)
+
     def test_refresh_runs_audit_without_search(self):
         (self.root/'refresh-config.json').write_text(json.dumps(dict(schema_version=1,roots=[dict(adapter='codex',path=str(self.logs))],opportunities=dict(since=0,prospective_since=250))))
         result=refresh.refresh(self.root,force=True)

@@ -436,6 +436,30 @@ query tokenization and BM25 weights are unchanged. Detailed score contributions
 still disclose the matched terms. The change requires no model or provider call.
 
 
+Context ranker v5 reduces hiragana-only query token contributions to half when
+other token types are also present. Long conversational queries otherwise give
+many small wording matches enough combined weight to outrank the subject.
+Hiragana-only queries retain full weights; no tokens, candidates, negations, or
+original text are removed. This script-based heuristic can also downweight
+meaningful hiragana words, so it is not semantic intent recognition.
+Diagnostics v2 exposes `query_weights` and each contribution's `query_weight`;
+the scores still sum to the displayed total. Historical results are not rewritten.
+Opportunity replay cache keys include the ranker version, and new packets record
+`retrieval_version`. Reports select the current composite version; old case IDs
+remain inspectable. A ranker update can produce new retrospective packets for the
+same turn without mixing old and new rankings in the current cohort.
+
+For a private regression, freeze the original request, the eligible earlier
+cross-session corpus, and the expected source/citation/line separately. Pass only
+the original request and corpus to the ranker, never the expected answer or later
+correction. Keep fixtures and reports outside Git and task-use measurements.
+Record the corpus hash, ranker version, and before/after ranks. A case used to
+develop the weighting is a development regression, not held-out evidence of
+benefit. Replay earlier adopted citations too, and distinguish agent-reported
+adoption from user-confirmed correctness. Corpus presence now does not establish
+availability at the original turn or causal savings in real work.
+
+
 ### Prospective decision-need measurement
 
 `corrections --need 'Which past decision is needed now?'` stores the need with the

@@ -251,6 +251,34 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(lab.context_report(self.root, 'task')['origin_missing'], 1)
         lab.context_use(self.root, task['request_id'], 'applied', [citation], 'Legacy API still works')
 
+    def test_mixed_japanese_query_softens_fragments_without_dropping_them(self):
+        logs = self.base / 'mixed'
+        logs.mkdir()
+        (logs / 'one.jsonl').write_text(''.join(json.dumps(v)+'\n' for v in [
+            record('写真アルバムは日付を選んで整理したい。削除はしない。'),
+            record('別の話だけど、なんかいまいち考えきられてない感じがする。')]))
+        lab.publish_snapshot(self.root, live.export_live([('codex', logs)], since=0))
+        r = lab.search_corrections(self.root, '写真アルバム 整理 しない なんか', 'resume')
+        self.assertEqual(r['hits'][0]['line'], 1)
+        self.assertEqual(r['query_weights']['写真'], 1)
+        self.assertEqual(r['query_weights']['ない'], .5)
+        self.assertIn('ない', r['hits'][0]['explanation']['matched_tokens'])
+        for hit in r['hits']:
+            self.assertAlmostEqual(hit['score'], sum(d['score'] for d in hit['explanation']['contributions']))
+        self.assertEqual(r['diagnostics_version'], 2)
+
+    def test_hiragana_only_and_non_hiragana_queries_keep_full_weights(self):
+        for query in ['ありがとう', '家', 'spreadsheet edit', 'APP-587', 'カタカナ', '']:
+            tokens = set(context.context_tokens(query))
+            self.assertEqual(context.query_weights(tokens), dict.fromkeys(tokens, 1.0))
+        logs = self.base / 'kana'
+        logs.mkdir()
+        (logs / 'one.jsonl').write_text(json.dumps(record('りんごをえらびたい'))+'\n')
+        lab.publish_snapshot(self.root, live.export_live([('codex', logs)], since=0))
+        r = lab.search_corrections(self.root, 'りんご', 'resume')
+        self.assertEqual(r['hits'][0]['line'], 1)
+        self.assertTrue(all(d['query_weight'] == 1 for d in r['hits'][0]['explanation']['contributions']))
+
     def test_compound_ticket_identifiers_do_not_match_bare_numbers(self):
         self.assertEqual(context.context_tokens('APP-587'), ['app-587'])
         self.assertNotIn('587', context.context_tokens('APP-587'))

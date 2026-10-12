@@ -4,7 +4,7 @@ import math
 import re
 import time
 
-VERSION = 'user-context-bm25-v4'
+VERSION = 'user-context-bm25-v5'
 TRIGGERS = ('resume', 'ambiguous', 'explicit')
 INJECTED_PREFIXES = ('# AGENTS.md', 'Stop hook feedback:', '[exploration-budget]',
     'Base directory for this skill:', 'Another Claude session sent a message:',
@@ -84,10 +84,24 @@ def context_tokens(text):
     return tokens(compound.sub(' ', text)) + identifiers
 
 
+def query_weights(tokens):
+    """Retain kana-only queries; soften kana fragments in mixed queries.
+
+    Character bigrams give conversational Japanese many independent votes.
+    Half weight keeps those matches (including negation) while reducing their
+    ability to swamp subject words. This is a lexical heuristic, not a parser
+    or a claim that hiragana words carry no meaning.
+    """
+    kana = {t for t in tokens if re.fullmatch(r'[\u3041-\u3096ー]+', t)}
+    mixed = bool(tokens - kana)
+    return {t: .5 if mixed and t in kana else 1.0 for t in sorted(tokens)}
+
+
 def retrieve(snapshot, query, limit):
     started = time.perf_counter()
     items, missing = units(snapshot)
     q = set(context_tokens(query))
+    weights = query_weights(q)
     scores = [0.0] * len(items)
     contributions = [[] for _ in items]
     for field, weight in [('utterance', 1.0), ('context', 0.2)]:
@@ -110,10 +124,10 @@ def retrieve(snapshot, query, limit):
             length = sum(c.values())
             for token in sorted(q & c.keys()):
                 idf = math.log(1 + (len(items) - frequency[token] + .5) / (frequency[token] + .5))
-                contribution = weight * idf * c[token] * 2.2 / (
+                contribution = weights[token] * weight * idf * c[token] * 2.2 / (
                     c[token] + 1.2 * (.25 + .75 * length / max(1, average)))
                 scores[i] += contribution
-                contributions[i].append(dict(field=field, token=token, score=contribution))
+                contributions[i].append(dict(field=field, token=token, score=contribution, query_weight=weights[token]))
     ranked = sorted(((s, x, detail) for s, x, detail in zip(scores, items, contributions) if s > 0),
                     key=lambda pair: (-pair[0], pair[1]['source_id'], pair[1]['utterance']['line']))
     hits = []
@@ -129,7 +143,7 @@ def retrieve(snapshot, query, limit):
         hits.append(hit)
     return dict(arm='recorder', snapshot_id=snapshot['snapshot_id'], retrieval_version=VERSION,
                 mode='corrections', hits=hits, candidate_count=len(items),
-                diagnostics_version=1, query_tokens=sorted(q),
+                diagnostics_version=2, query_tokens=sorted(q), query_weights=weights,
                 scored_candidate_count=len(ranked),
                 legacy_documents_skipped=missing,
                 consultation_sources_skipped=len({d['source_id'] for d in snapshot['documents']
