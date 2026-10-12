@@ -1,7 +1,7 @@
 """Bounded local conversational-log collection for incremental recall refresh.
 
 Read-only: caller owns publishing and must keep the prior snapshot on failure.
-A selected session is rescanned in full to exclude retrieval/evaluation feedback,
+A selected session is rescanned in full to isolate retrieval/evaluation feedback,
 then only complete LF-terminated JSONL records are indexed. No model calls.
 """
 from __future__ import annotations
@@ -27,7 +27,7 @@ MAX_DOCUMENT_CHARS = 100_000
 MAX_MANIFEST_BYTES = 60 * 1024 * 1024
 WINDOW_LINES = 40
 ADAPTERS = {'claude-code', 'codex'}
-COLLECTOR_VERSION = 'structured-message-context-v3'
+COLLECTOR_VERSION = 'structured-message-context-v4'
 
 
 def generated_session_prompt(text: str) -> bool:
@@ -96,12 +96,19 @@ def _excluded(value: dict, adapter: str, exclusions: set[str]) -> str | None:
             origin = payload.get('source')
             if (isinstance(origin, dict) and 'subagent' in origin) or origin == 'subagent':
                 return 'subagent'
+    routine_recall = False
     for argument in _tool_inputs(value, adapter):
         if not isinstance(argument, str):
             argument = json.dumps(argument, ensure_ascii=True)
-        if RETRIEVAL_COMMAND.search(argument):
-            return 'retrieval'
-    return None
+        matches = RETRIEVAL_COMMAND.findall(argument)
+        if matches:
+            # Ordinary skill use must not erase the conversation. Low-level
+            # evaluation tools and explicit verification retain quarantine.
+            if any(name != 'recall-history' for name in matches) or re.search(
+                    r'--purpose(?:[=\s]+|[\\\"\']+)+verification', argument):
+                return 'retrieval'
+            routine_recall = True
+    return 'recall' if routine_recall else None
 
 
 def _directory_identity(path):
@@ -232,7 +239,8 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
     report = dict(discovered_sources=0, imported_sources=0, unchanged_sources=0,
                   deferred_sources=0, excluded_configured_sessions=0,
                   excluded_subagent_sessions=0, excluded_retrieval_sessions=0,
-                  excluded_generated_sessions=0,
+                  excluded_generated_sessions=0, retained_recall_sessions=0,
+                  omitted_recall_assistant_messages=0, omitted_injected_messages=0,
                   missing_roots=0, symlinks_skipped=0, malformed_lines=0,
                   partial_sources=0, bytes_read=0, documents=0, manifest_bytes=0,
                   omitted_oversized_lines=0, excluded_malformed_sessions=0,
@@ -268,6 +276,7 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                 continue
             messages = []
             seen_user = False
+            routine_recall = False
             message_bytes = 0
             line_count = 0
             records = _records(path, report)
@@ -286,7 +295,9 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                     if not isinstance(value, dict):
                         continue
                     found = _excluded(value, adapter, exclusions)
-                    if found:
+                    if found == 'recall':
+                        routine_recall = True
+                    elif found:
                         reason = found
                         break
                     message = _message(value, adapter)
@@ -295,6 +306,11 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                             reason = 'generated'
                             break
                         seen_user = True
+                    if message and message[0] == 'user' and message[1].lstrip().startswith((
+                            'Base directory for this skill:', 'Another Claude session sent a message:',
+                            '# AGENTS.md', '<', 'Stop hook feedback:', '[exploration-budget]')):
+                        report['omitted_injected_messages'] += 1
+                        continue
                     if message:
                         text = f'[line {number}] {message[0]}: {message[1]}'
                         if len(text) > MAX_DOCUMENT_CHARS:
@@ -310,6 +326,14 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                 report[f'excluded_{reason}_sessions'] += 1
                 excluded.append(identity)
                 continue
+            if routine_recall:
+                # User-role text survives before AND after recall. Omit assistant
+                # text for this source to avoid recycling retrieved quotations or
+                # pairing a later user turn with a stale preceding response.
+                report['retained_recall_sessions'] += 1
+                kept = [(n, t) for n, t in messages if t.startswith(f'[line {n}] user: ')]
+                report['omitted_recall_assistant_messages'] += len(messages) - len(kept)
+                messages = kept
             refreshed.append(identity)
             report['imported_sources'] += 1
             groups = {}

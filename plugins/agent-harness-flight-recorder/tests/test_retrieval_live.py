@@ -68,6 +68,49 @@ class LiveTests(unittest.TestCase):
         self.assertTrue(any('[line 1] user: 違う' in d['text'] for d in result['documents']))
         self.assertFalse(live.generated_session_prompt('あなたは作業セッションの引き継ぎカードを書く係。'))
 
+    def test_routine_recall_retains_users_and_not_recycled_assistant_text(self):
+        for root, adapter, message in [(self.claude, 'claude-code', claude),
+                                       (self.codex, 'codex', codex)]:
+            command = 'recall-history corrections topic --purpose task'
+            tool = (dict(type='assistant', message=dict(role='assistant', content=[
+                dict(type='tool_use', name='Bash', input={'command': command})]))
+                if adapter == 'claude-code' else dict(type='response_item', payload=dict(
+                    type='function_call', name='functions.exec', arguments=json.dumps({'cmd': command}))))
+            path = self.write(root, 'routine.jsonl', encode(message('original decision'),
+                message('old response', 'assistant'), tool,
+                message('retrieved quotation', 'assistant'),
+                message('Base directory for this skill: injected text'),
+                message('Another Claude session sent a message: generated report'),
+                message('new correction after recall')))
+            result = live.export_live([(adapter, root)], since=0)
+            text = str(result['documents'])
+            self.assertIn('original decision', text)
+            self.assertIn('new correction after recall', text)
+            self.assertNotIn('retrieved quotation', text)
+            self.assertNotIn('old response', text)
+            self.assertNotIn('injected text', text)
+            self.assertNotIn('generated report', text)
+            self.assertNotIn(live.source_id(adapter, path), result['excluded_source_ids'])
+            self.assertEqual(result['import_report']['retained_recall_sessions'], 1)
+            self.assertEqual(result['import_report']['omitted_recall_assistant_messages'], 2)
+            from retrieval_context import units
+            for doc in result['documents']:
+                doc['citation_id'] = 'synthetic-citation'
+            candidates, _ = units(result)
+            self.assertEqual(len(candidates), 2)
+            self.assertTrue(all(c['prior_response'] is None for c in candidates))
+
+    def test_late_verification_overrides_routine_recall(self):
+        for flag in ['--purpose verification', '--purpose=verification', '--purpose "verification"']:
+            def tool(command):
+                return dict(type='response_item', payload=dict(type='function_call',
+                    name='functions.exec', arguments=json.dumps({'cmd': command})))
+            self.write(self.codex, 'verify.jsonl', encode(codex('exclude this'),
+                tool('recall-history search topic'), tool('recall-history corrections topic ' + flag)))
+            result = live.export_live(self.roots, since=0)
+            self.assertEqual(result['documents'], [])
+            self.assertEqual(result['import_report']['excluded_retrieval_sessions'], 1)
+
     def test_complete_conversational_lines_keep_citations_and_stable_ids(self):
         p = self.write(self.claude, 'one.jsonl', encode(claude('first'), {'type':'tool', 'text':'hidden'},
                         claude('answer', 'assistant')) + b'{"partial":')
@@ -110,14 +153,14 @@ class LiveTests(unittest.TestCase):
     def test_claude_tool_and_subagent_exclusions(self):
         tool = dict(type='assistant', message=dict(role='assistant', content=[dict(type='tool_use',
                     name='Bash', input={'command':'cat /skills/recall-history/SKILL.md'})]))
-        self.write(self.claude, 'bad.jsonl', encode(claude('bad'), tool))
+        self.write(self.claude, 'bad.jsonl', encode(claude('retained'), tool))
         self.write(self.claude, 'subagents/agent-one.jsonl', encode(claude('subagent')))
         self.write(self.codex, 'agent.jsonl', encode(dict(type='session_meta', payload={
             'id':'child', 'source':{'subagent':{'thread_spawn':{'parent_thread_id':'parent'}}}}), codex('child')))
         value = live.export_live(self.roots, since=0)
-        self.assertEqual(value['documents'], [])
+        self.assertIn('retained', str(value['documents']))
         self.assertEqual(value['import_report']['excluded_subagent_sessions'], 2)
-        self.assertEqual(value['import_report']['excluded_retrieval_sessions'], 1)
+        self.assertEqual(value['import_report']['retained_recall_sessions'], 1)
 
     def test_explicit_session_id_excludes_filename_and_metadata(self):
         self.write(self.claude, 'filename-id.jsonl', encode(claude('one')))
@@ -185,7 +228,7 @@ class LiveTests(unittest.TestCase):
 
     def test_late_evaluation_record_discards_earlier_streamed_messages(self):
         tool = dict(type='response_item', payload=dict(type='function_call', name='exec',
-                    arguments='recall-history search test'))
+                    arguments='recall-history corrections test --purpose verification'))
         self.write(self.codex, 'late.jsonl', encode(*([codex('must disappear')] * 120), tool))
         result = live.export_live(self.roots, since=0)
         self.assertEqual(result['documents'], [])

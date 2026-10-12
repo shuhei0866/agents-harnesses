@@ -254,7 +254,7 @@ Only complete JSONL lines containing user/assistant text enter the corpus.
 Oversized conversational messages are omitted and counted; malformed sessions
 are quarantined as whole sources and counted, without stopping other imports. Tool
 output and reasoning are omitted. Entire conversations invoking known recall or
-measurement commands are excluded, including commands wrapped in tool code;
+low-level measurement commands or explicit verification are excluded, including commands wrapped in tool code;
 subagent sessions are also excluded. Explicit `exclude_sessions` is required for
 other evaluation sessions or custom wrappers that the detector does not recognize.
 This is a conservative filter, not proof that every evaluation session is detectable.
@@ -348,3 +348,20 @@ conversation may require a new session to discover the updated description.
 Use `--purpose verification` for installation checks; the default is `task`.
 `context-report` counts purposes separately so smoke checks are visible rather
 than silently presented as organic use. Aggregate read/use totals include both.
+
+
+### Ordinary recall retention
+
+Collector v4 keeps user-role messages in ordinary `recall-history` sessions,
+including subsequent corrections. It omits all assistant messages from those
+sources so retrieved quotations cannot be recycled or paired with later user
+turns as stale context. This deliberately sacrifices assistant context in recall
+sessions; it does not prove that every user-role message is human-authored.
+Known injected skill/agent frames are omitted. Tool results are never indexed.
+Explicit exclusions, generated evaluations, subagents, low-level retrieval tools,
+and `--purpose verification` still quarantine entire sources. Custom evaluations
+must be explicitly excluded. A collector-version change triggers recollection;
+previous request-pinned snapshots remain readable.
+
+Import reports expose retained_recall_sessions, omitted_recall_assistant_messages,
+and omitted_injected_messages separately from excluded_retrieval_sessions.
