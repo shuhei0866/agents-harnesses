@@ -1,7 +1,7 @@
 """Bounded local conversational-log collection for incremental recall refresh.
 
 Read-only: caller owns publishing and must keep the prior snapshot on failure.
-A selected session is rescanned in full to exclude retrieval/evaluation feedback,
+A selected session is rescanned in full to isolate retrieval/evaluation feedback,
 then only complete LF-terminated JSONL records are indexed. No model calls.
 """
 from __future__ import annotations
@@ -16,20 +16,39 @@ import stat
 import time
 
 from retrieval_snapshot import _message
+from retrieval_context import INJECTED_PREFIXES
 
 MAX_FILES = 10_000
 MAX_ENTRIES = 100_000
 MAX_SOURCE_BYTES = 256 * 1024 * 1024
-MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
+MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
 MAX_LINE_BYTES = 8 * 1024 * 1024
 MAX_DOCUMENTS = 20_000
 MAX_DOCUMENT_CHARS = 100_000
 MAX_MANIFEST_BYTES = 60 * 1024 * 1024
 WINDOW_LINES = 40
 ADAPTERS = {'claude-code', 'codex'}
+COLLECTOR_VERSION = 'structured-message-context-v7'
+
+
+def generated_session_prompt(text: str) -> bool:
+    """Recognize bundled automation frames, not arbitrary user sentiment.
+
+    Only call for the first user message. Quoted examples and later discussion
+    of these prompts must not remove a human conversation.
+    """
+    return (
+        (text.startswith('あなたは作業セッションの引き継ぎカードを書く係。')
+         and '\n<transcript>\n' in text and '\n</transcript>' in text
+         and '## 現在地' in text and '## 次の一手' in text)
+        or (text.startswith('あなたは探索セッションの評価者で、計画者ではない。')
+            and '却下するものが無ければ {"rejections": []} と返す。' in text
+            and '## 方針\n' in text and '## 台帳の事実\n' in text)
+    )
+
 RETRIEVAL_COMMAND = re.compile(
     r'(?<![A-Za-z0-9_-])(?:recall-history|retrieval_lab\.py|retrieval_live\.py|'
-    r'retrieval_refresh\.py|flight-recorder-retrieval|retrieval-live|resume_replay\.py|'
+    r'retrieval_refresh\.py|retrieval_context\.py|flight-recorder-retrieval|retrieval-live|resume_replay\.py|'
     r'resume_cases\.py|flight-recorder-resume)(?![A-Za-z0-9_-])'
 )
 
@@ -78,12 +97,19 @@ def _excluded(value: dict, adapter: str, exclusions: set[str]) -> str | None:
             origin = payload.get('source')
             if (isinstance(origin, dict) and 'subagent' in origin) or origin == 'subagent':
                 return 'subagent'
+    routine_recall = False
     for argument in _tool_inputs(value, adapter):
         if not isinstance(argument, str):
             argument = json.dumps(argument, ensure_ascii=True)
-        if RETRIEVAL_COMMAND.search(argument):
-            return 'retrieval'
-    return None
+        matches = RETRIEVAL_COMMAND.findall(argument)
+        if matches:
+            # Ordinary skill use must not erase the conversation. Low-level
+            # evaluation tools and explicit verification retain quarantine.
+            if any(name not in ('recall-history', 'flight-recorder-retrieval') for name in matches) or re.search(
+                    r'--purpose(?:[=\s]+|[\\\"\']+)+verification', argument):
+                return 'retrieval'
+            routine_recall = True
+    return 'recall' if routine_recall else None
 
 
 def _directory_identity(path):
@@ -214,6 +240,8 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
     report = dict(discovered_sources=0, imported_sources=0, unchanged_sources=0,
                   deferred_sources=0, excluded_configured_sessions=0,
                   excluded_subagent_sessions=0, excluded_retrieval_sessions=0,
+                  excluded_generated_sessions=0, retained_recall_sessions=0,
+                  omitted_recall_assistant_messages=0, omitted_injected_messages=0,
                   missing_roots=0, symlinks_skipped=0, malformed_lines=0,
                   partial_sources=0, bytes_read=0, documents=0, manifest_bytes=0,
                   omitted_oversized_lines=0, excluded_malformed_sessions=0,
@@ -248,7 +276,10 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                 report['deferred_sources'] += 1
                 continue
             messages = []
-            message_bytes = 0
+            seen_user = False
+            routine_recall = False
+            recall_boundary = None
+            last_user_line = 0
             line_count = 0
             records = _records(path, report)
             try:
@@ -266,18 +297,29 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                     if not isinstance(value, dict):
                         continue
                     found = _excluded(value, adapter, exclusions)
-                    if found:
+                    if found == 'recall':
+                        if not routine_recall:
+                            recall_boundary = last_user_line
+                        routine_recall = True
+                    elif found:
                         reason = found
                         break
                     message = _message(value, adapter)
+                    if message and message[0] == 'user':
+                        if not seen_user and generated_session_prompt(message[1]):
+                            reason = 'generated'
+                            break
+                        seen_user = True
+                    if message and message[0] == 'user' and message[1].lstrip().startswith(INJECTED_PREFIXES):
+                        report['omitted_injected_messages'] += 1
+                        continue
                     if message:
+                        if message[0] == 'user':
+                            last_user_line = number
                         text = f'[line {number}] {message[0]}: {message[1]}'
                         if len(text) > MAX_DOCUMENT_CHARS:
                             report['omitted_oversized_lines'] += 1
                         else:
-                            message_bytes += len(json.dumps(text, ensure_ascii=True).encode())
-                            if message_bytes > MAX_MANIFEST_BYTES:
-                                raise ValueError('local snapshot size limit exceeded')
                             messages.append((number, text))
             finally:
                 records.close()
@@ -285,6 +327,18 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                 report[f'excluded_{reason}_sessions'] += 1
                 excluded.append(identity)
                 continue
+            if routine_recall:
+                # Keep pre-recall context. Drop assistant output starting with
+                # the invoking user turn, including pre-tool commentary, so a
+                # later correction cannot inherit a stale preceding response.
+                report['retained_recall_sessions'] += 1
+                kept = [(n, t) for n, t in messages if n < recall_boundary or t.startswith(f'[line {n}] user: ')]
+                report['omitted_recall_assistant_messages'] += len(messages) - len(kept)
+                messages = kept
+            # Streaming is bounded by MAX_SOURCE_BYTES; apply output limits only
+            # after removing assistant text that will not enter the corpus.
+            if sum(len(json.dumps(t, ensure_ascii=True).encode()) for _, t in messages) > MAX_MANIFEST_BYTES:
+                raise ValueError('local snapshot size limit exceeded')
             refreshed.append(identity)
             report['imported_sources'] += 1
             groups = {}
@@ -310,6 +364,15 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                 for first, last, texts in chunks:
                     doc = dict(source_id=identity, start_line=first, end_line=last,
                                text='\n'.join(texts), summaries=[])
+                    spans, offset = [], 0
+                    for rendered in texts:
+                        header, body = rendered.split(': ', 1)
+                        match = re.fullmatch(r'\[line (\d+)\] (user|assistant)', header)
+                        spans.append(dict(line=int(match[1]), role=match[2],
+                                          start=offset + len(header) + 2,
+                                          end=offset + len(rendered)))
+                        offset += len(rendered) + 1
+                    doc['message_spans'] = spans
                     serialized_size = len(json.dumps(doc, ensure_ascii=True).encode()) + 2
                     if (len(documents) >= MAX_DOCUMENTS or
                             report['manifest_bytes'] + serialized_size > MAX_MANIFEST_BYTES):

@@ -128,11 +128,19 @@ def _build_snapshot(manifest, *, allow_empty=False):
             not isinstance(s, str) or len(s) > MAX_TEXT for s in summaries
         ):
             raise ValueError("summaries invalid or oversized")
+        spans = item.get('message_spans')
+        if spans is not None:
+            from retrieval_context import validate_spans
+            validate_spans(text, start, end, spans)
         key = (source, start, end)
         if key in unique and unique[key]["text"] != text:
             raise ValueError("conflicting raw text for source span")
         doc = unique.setdefault(key, dict(source_id=source, start_line=start, end_line=end,
                                           text=text, summaries=[], citation_id=""))
+        if spans is not None:
+            if 'message_spans' in doc and doc['message_spans'] != spans:
+                raise ValueError('conflicting message spans')
+            doc['message_spans'] = spans
         doc["summaries"] = sorted(set(doc["summaries"]) | set(summaries))
         doc["citation_id"] = digest([source, start, end, text])
     docs = [unique[key] for key in sorted(unique)]
@@ -290,6 +298,117 @@ def search(root, query, arm="recorder", limit=5, sample_rate=0.1):
     return result
 
 
+def search_corrections(root, query, trigger, limit=3, purpose='task', task=None, session_id=None):
+    from retrieval_context import retrieve, TRIGGERS, VERSION as context_version
+    if not isinstance(query, str) or not query.strip() or len(query) > MAX_QUERY or not tokens(query):
+        raise ValueError('invalid correction query')
+    if purpose not in ('task', 'verification'):
+        raise ValueError('invalid context purpose')
+    if trigger not in TRIGGERS:
+        raise ValueError('invalid correction trigger')
+    bounded_int(limit, 1, 5)
+    started = time.perf_counter()
+    for label in (task, session_id):
+        if label is not None and (not isinstance(label, str) or not label.strip() or len(label) > 1000):
+            raise ValueError('invalid invocation label')
+    result = retrieve(_snapshot(root), query, limit)
+    environment_id = os.environ.get('CODEX_THREAD_ID')
+    result['origin'] = dict(cwd=str(Path.cwd()), task=task,
+        session_id=session_id or (environment_id[:1000] if environment_id else None),
+        session_id_source='explicit' if session_id else ('CODEX_THREAD_ID' if environment_id else None))
+    state_file = Path(root) / 'refresh-state.json'
+    try:
+        state = json.loads(safe_file(state_file, 1024 * 1024))
+        result['collection'] = {key: state.get(key) for key in ('status', 'last_success', 'last_attempt', 'error_type', 'collector_version')}
+    except (OSError, ValueError):
+        result['collection'] = None
+    result['metrics']['foreground_elapsed_ms'] = (time.perf_counter() - started) * 1000
+    request_id = uuid.uuid4().hex
+    result.update(request_id=request_id, trigger=trigger, purpose=purpose, sampled=False,
+                  sampling_skip_reason='context_mode_has_no_paired_shadow')
+    with _connect(root) as db:
+        db.execute('INSERT INTO queries(id,created,query,snapshot_id,version,arm,limit_n,foreground,job_state) VALUES(?,?,?,?,?,?,?,?,?)',
+                   (request_id, time.time(), query, result['snapshot_id'], context_version,
+                    'recorder', limit, canonical(result), 'not_sampled'))
+    return result
+
+
+def _context_table(db):
+    db.execute('CREATE TABLE IF NOT EXISTS context_uses (request_id TEXT PRIMARY KEY, state TEXT NOT NULL, citations TEXT NOT NULL, reason TEXT NOT NULL, recorded REAL NOT NULL)')
+    db.execute('CREATE TABLE IF NOT EXISTS context_use_details (request_id TEXT PRIMARY KEY, reason_code TEXT, effect TEXT)')
+
+
+def context_use(root, request_id, state, citations, reason, reason_code=None, effect=None):
+    allowed_reasons = {'applied': ('relevant',), 'not_applicable': ('wrong_scope', 'outdated', 'already_known', 'no_relevant_candidate'), 'unresolved': ('insufficient_context', 'collection_problem')}
+    if reason_code is not None and reason_code not in allowed_reasons.get(state, ()):
+        raise ValueError('reason code must match use state')
+    if effect is not None and (state != 'applied' or effect not in ('confirmed', 'changed_plan', 'avoided_question')):
+        raise ValueError('effect requires applied state')
+    if state not in ('applied', 'not_applicable', 'unresolved'):
+        raise ValueError('invalid context use state')
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > 1000:
+        raise ValueError('context use requires a bounded reason')
+    if not isinstance(citations, list) or len(citations) > 15 or any(not isinstance(c, str) for c in citations):
+        raise ValueError('invalid context citations')
+    with _connect(root) as db:
+        row = _row(db, request_id)
+        if json.loads(row['foreground']).get('mode') != 'corrections':
+            raise ValueError('not a context search')
+        result = json.loads(row['foreground'])
+        known = {h[key]['citation_id'] for h in result['hits']
+                 for key in ('utterance', 'request', 'prior_response') if h[key]}
+        read = {r[0] for r in db.execute('SELECT citation_id FROM reads WHERE request_id=?', (request_id,))}
+        if not set(citations) <= known & read or (state == 'applied' and not citations):
+            raise ValueError('use requires read, returned citations')
+        _context_table(db)
+        db.execute('INSERT OR REPLACE INTO context_uses VALUES(?,?,?,?,?)',
+                   (request_id, state, canonical(sorted(set(citations))), reason, time.time()))
+        db.execute('INSERT OR REPLACE INTO context_use_details VALUES(?,?,?)', (request_id, reason_code, effect))
+    return dict(request_id=request_id, state=state, provenance='agent_self_report',
+                notice='Not user feedback or verified task improvement.')
+
+
+def context_inspect(root, request_id):
+    """Reconstruct one recorded invocation without rerunning search or marking read."""
+    with _connect(root) as db:
+        row = _row(db, request_id)
+        result = json.loads(row['foreground'])
+        if result.get('mode') != 'corrections':
+            raise ValueError('not a context search')
+        tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        use = db.execute('SELECT * FROM context_uses WHERE request_id=?', (request_id,)).fetchone() if 'context_uses' in tables else None
+        details = db.execute('SELECT reason_code,effect FROM context_use_details WHERE request_id=?', (request_id,)).fetchone() if 'context_use_details' in tables else None
+        return dict(request_id=request_id, created=row['created'], query=row['query'], result=result,
+                    reads=[dict(r) for r in db.execute('SELECT * FROM reads WHERE request_id=? ORDER BY created', (request_id,))],
+                    use=dict(use) if use else None, use_details=dict(details) if details else None,
+                    notice='Recorded evidence only; missing historical fields are unknown. Use/effect are agent self-reports.')
+
+
+def context_report(root, purpose=None):
+    if purpose not in (None, 'task', 'verification'):
+        raise ValueError('invalid purpose filter')
+    with _connect(root) as db:
+        rows = [r for r in db.execute('SELECT id,created,query,foreground FROM queries ORDER BY created')
+                if json.loads(r['foreground']).get('mode') == 'corrections'
+                and (purpose is None or json.loads(r['foreground']).get('purpose', 'task') == purpose)]
+        ids = {r['id'] for r in rows}
+        results = [json.loads(r['foreground']) for r in rows]
+        read_ids = {r[0] for r in db.execute('SELECT DISTINCT request_id FROM reads')} & ids
+        tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        uses = {r['request_id']: dict(r) for r in db.execute('SELECT * FROM context_uses') if r['request_id'] in ids} if 'context_uses' in tables else {}
+        details = [dict(r) for r in db.execute('SELECT * FROM context_use_details') if r['request_id'] in ids] if 'context_use_details' in tables else []
+    return dict(searches=len(rows), triggers=dict(Counter(r['trigger'] for r in results)),
+                purposes=dict(Counter(r.get('purpose', 'task') for r in results)), requests_with_reads=len(read_ids),
+                uses=dict(Counter(u['state'] for u in uses.values())), unreported=len(ids - uses.keys()),
+                reason_codes=dict(Counter(d['reason_code'] for d in details if d['reason_code'])),
+                effects=dict(Counter(d['effect'] for d in details if d['effect'])),
+                reason_code_missing=len(uses) - sum(bool(d['reason_code']) for d in details),
+                origin_missing=sum(not r.get('origin', {}).get('session_id') for r in results),
+                recent=[dict(request_id=r['id'], created=r['created'], query=r['query'],
+                             state=uses.get(r['id'], {}).get('state')) for r in rows[-20:][::-1]],
+                notice='Invocation and agent self-report only. Missed opportunities and reduced rework are not measured.')
+
+
 def drain(root, max_jobs=5, max_seconds=10):
     bounded_int(max_jobs, 0, 100)
     if type(max_seconds) not in (int, float) or not math.isfinite(max_seconds) or not 0 < max_seconds <= 60:
@@ -433,8 +552,8 @@ def assess(root, request_id, answer_id, grounded, unsupported, provenance):
 
 def report(root, include_reviewed=False):
     with _connect(root) as db:
-        rows = db.execute("SELECT * FROM queries ORDER BY created,id").fetchall()
-        reads = db.execute("SELECT COUNT(*),COALESCE(SUM(returned_bytes),0) FROM reads").fetchone()
+        rows = db.execute("SELECT * FROM queries WHERE version=? ORDER BY created,id", (VERSION,)).fetchall()
+        reads = db.execute("SELECT COUNT(*),COALESCE(SUM(r.returned_bytes),0) FROM reads r JOIN queries q ON q.id=r.request_id WHERE q.version=?", (VERSION,)).fetchone()
         acknowledgements = {}
         if db.execute("SELECT 1 FROM sqlite_master WHERE name='review_acknowledgements'").fetchone():
             acknowledgements = dict(db.execute("SELECT request_id,fingerprint FROM review_acknowledgements"))
@@ -550,6 +669,20 @@ def main():
     query.add_argument("--limit", type=int, default=5)
     query.add_argument("--sample-rate", type=float, default=.1)
     query.add_argument("--no-worker", action="store_true")
+    context = subs.add_parser('corrections')
+    context.add_argument('query')
+    context.add_argument('--trigger', required=True, choices=('resume', 'ambiguous', 'explicit'))
+    context.add_argument('--limit', type=int, default=3)
+    context.add_argument('--purpose', choices=('task', 'verification'), default='task')
+    context.add_argument('--task', help='short current task description, stored locally')
+    context.add_argument('--session-id', help='caller session ID when runtime does not expose one')
+    inspect = subs.add_parser('context-inspect')
+    inspect.add_argument('request_id')
+    usage = subs.add_parser('context-use')
+    usage.add_argument('request_id')
+    usage.add_argument('--file', type=Path, required=True, help='JSON: state, citations, reason; agent self-report')
+    summary = subs.add_parser('context-report')
+    summary.add_argument('--purpose', choices=('task', 'verification'))
     worker = subs.add_parser("worker")
     worker.add_argument("--max-jobs", type=int, default=5)
     worker.add_argument("--max-seconds", type=float, default=10)
@@ -588,6 +721,15 @@ def main():
             result = create_lab(root, manifest)
         elif args.command == "search":
             result = search(root, args.query, args.arm, args.limit, args.sample_rate)
+        elif args.command == 'corrections':
+            result = search_corrections(root, args.query, args.trigger, args.limit, args.purpose, args.task, args.session_id)
+        elif args.command == 'context-use':
+            value = json.loads(safe_file(args.file, 16384))
+            result = context_use(root, args.request_id, **value)
+        elif args.command == 'context-report':
+            result = context_report(root, args.purpose)
+        elif args.command == 'context-inspect':
+            result = context_inspect(root, args.request_id)
         elif args.command == "worker":
             result = drain(root, args.max_jobs, args.max_seconds)
         elif args.command == "report":
@@ -608,7 +750,15 @@ def main():
             result = assess(root, args.request_id, **value)
         else:
             result = benchmark(root, json.loads(safe_file(args.cases, 1024 * 1024)), args.repeats)
-        print(canonical(result), flush=True)
+        display = result
+        if args.command == 'corrections':
+            # Detailed score terms stay in the log; fetch them only for diagnosis.
+            display = json.loads(canonical(result))
+            for hit in display['hits']:
+                hit['explanation'].pop('contributions', None)
+            display['diagnostics_command'] = 'context-inspect ' + result['request_id']
+        from retrieval_redaction import redact_payload
+        print(canonical(redact_payload(display)), flush=True)
         if args.command == "search" and result["sampled"] and not args.no_worker:
             # User output has already been flushed. Child is a bounded, local-only worker.
             try:

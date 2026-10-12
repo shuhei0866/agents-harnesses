@@ -59,7 +59,7 @@ the identical bounded history; missing earlier decisions can affect both.
    inspection. Model judgments remain explicitly provisional; ties remain counted
    even when omitted from the difference list.
 
-Known retrieval/evaluation sessions, subagents, explicit session exclusions and
+Known evaluation sessions, subagents, explicit session exclusions and
 malformed sources are omitted. Tools and thinking are never extracted. Do not
 paste replay results into future evaluation inputs; custom evaluation tools may
 need explicit session exclusion.

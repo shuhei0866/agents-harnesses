@@ -253,8 +253,9 @@ secure erasure or retention cleanup.
 Only complete JSONL lines containing user/assistant text enter the corpus.
 Oversized conversational messages are omitted and counted; malformed sessions
 are quarantined as whole sources and counted, without stopping other imports. Tool
-output and reasoning are omitted. Entire conversations invoking known recall or
-measurement commands are excluded, including commands wrapped in tool code;
+output and reasoning are omitted. Entire conversations invoking
+low-level measurement commands or explicit verification are excluded, including
+commands wrapped in tool code; ordinary recall retains user text as described below;
 subagent sessions are also excluded. Explicit `exclude_sessions` is required for
 other evaluation sessions or custom wrappers that the detector does not recognize.
 This is a conservative filter, not proof that every evaluation session is detectable.
@@ -267,7 +268,7 @@ windows are identical across both search arms. Summary coverage must therefore b
 considered when interpreting recorder-versus-baseline differences.
 
 JSONL collection streams one record at a time, rather than loading entire logs.
-Limits are 256 MiB per source, 2 GiB actually read per refresh, and 8 MiB per raw
+Limits are 256 MiB per source, 4 GiB actually read per refresh, and 8 MiB per raw
 record. A raw record above that limit quarantines its whole source: blindly
 skipping it could hide a retrieval/evaluation command. Subagent and evaluation
 sources stop reading as soon as exclusion is established. Late exclusion still
@@ -284,3 +285,126 @@ At 1 GiB of archived snapshots, automatic publication stops and `refresh-status`
 reports an error; archives are never silently deleted because measurements refer
 to them. Questions, content and errors containing raw paths/text are not logged by
 refresh status. All state remains owner-local, outside Git and the Vault.
+
+
+### Human correction retrieval pilot
+
+The first value hypothesis is avoiding repeated user corrections by retrieving
+an earlier correction and its rationale before acting. Measure three separate
+steps: retrieving the original, using it in a decision, and avoiding repeated
+rework. Positive tone, continuation, silence, and automated evaluator feedback
+are not success labels.
+
+Live collection excludes sessions whose first user message matches the bundled
+session-card distiller or exploration evaluator frame (including its structural
+markers). Their copied transcripts otherwise compete with original conversations.
+The `excluded_generated_sessions` counter reports exclusions. This is a narrow
+known-template filter, not general human-authorship detection. Later discussion
+and quoted examples stay searchable. Other generated prompts and in-session hook
+messages may remain; callers must inspect originals before interpreting feedback.
+
+Collector upgrades force a complete recollection even when source mtimes have
+not changed. Failed or over-budget scans retain the previous corpus and
+collector version. Incomplete inventory during a collector/configuration change
+also retains the previous corpus. With unchanged collection settings, an
+incomplete incremental inventory may publish scanned updates while retaining
+unseen sources. Old request-bound citations remain readable. The streamed
+aggregate scan budget is 4 GiB; the 256 MiB source, 8 MiB record and 60 MiB manifest
+limits are unchanged. No model calls are needed.
+
+Evaluate on a fixed local corpus with queries fixed before reading the new
+ranking. Count known generated hits separately from genuine correction hits;
+removing duplicates alone does not demonstrate reduced rework. Keep real logs,
+queries and annotations in the private measurement lab, not this repository.
+
+
+### Connecting user-turn context recall
+
+`corrections QUERY --trigger resume|ambiguous|explicit --limit 3` searches user
+turns with BM25 and a small preceding-context contribution. The name describes
+the use case; results are candidates, not automatically classified corrections.
+Only collector-produced `message_spans` are used, never role markers parsed from
+quoted text. Legacy documents are counted and skipped until recollected.
+
+Each result includes the user turn, preceding user request and assistant response,
+original citation IDs, the pinned snapshot and a request ID. The snippets are
+bounded; use `read CITATION --request-id REQUEST` for original evidence, including
+context citations when needed. Sources never mix, future responses are excluded,
+and prior context is explicitly provisional rather than a guaranteed task link.
+
+After interpreting the result, record `context-use REQUEST --file FILE` with
+JSON `{ "state": "applied|not_applicable|unresolved", "citations": [], "reason": "..." }`.
+Applied use requires at least one returned citation already read for that request.
+The record is an agent self-report, separate from user feedback and independent
+assessment. `context-report` summarizes invocation triggers, original reads, and
+self-reported use. No search means no observation: missed opportunities and actual
+rework reduction are not measured by this report. Context mode does not schedule
+a misleading baseline/summary shadow pair. Ordinary search is unchanged.
+
+The discoverable skill is `skills/recall-history/SKILL.md`. Install it in the
+runtime's skill directory alongside a `recall-history` wrapper using the same
+release's scripts. Its description offers proactive use for relevant resumption
+or scope ambiguity; it does not force every task to search. No global hook or
+universal preference is created. Selection still depends on the agent; command
+E2E does not prove autonomous skill selection. Skills already loaded into a
+conversation may require a new session to discover the updated description.
+
+Use `--purpose verification` for installation checks; the default is `task`.
+`context-report` counts purposes separately so smoke checks are visible rather
+than silently presented as organic use. Aggregate read/use totals include both.
+
+
+### Ordinary recall retention
+
+Collector v7 keeps user-role messages in ordinary `recall-history` sessions,
+including subsequent corrections. It preserves assistant context before the invoking user turn, then omits
+assistant messages from that turn onwards so retrieved quotations cannot be
+recycled or paired with later user turns as stale context. This deliberately sacrifices assistant context in recall
+sessions; it does not prove that every user-role message is human-authored.
+Known injected skill/agent frames are omitted. Tool results are never indexed.
+Explicit exclusions, generated evaluations, subagents, low-level retrieval tools,
+and `--purpose verification` still quarantine entire sources. Custom evaluations
+must be explicitly excluded. A collector-version change triggers recollection;
+previous request-pinned snapshots remain readable.
+
+Import reports expose retained_recall_sessions, omitted_recall_assistant_messages,
+and omitted_injected_messages separately from excluded_retrieval_sessions.
+
+
+### Inspecting daily invocations
+
+`corrections QUERY --trigger resume --task 'current task and target'` records
+cwd and an allowlisted CODEX_THREAD_ID when available. `--session-id` is an
+explicit fallback; absent values stay null. These are caller-supplied context,
+not verified project identity or authority. No other environment variables are
+collected. Paths and task descriptions remain in the owner-only lab.
+
+`context-report --purpose task` separates everyday use from verification and
+lists recent request IDs. `context-inspect REQUEST` joins the original query,
+origin, snapshot/version, refresh status at invocation, ranked candidates, score
+contributions per token/field, original reads, and use decision. It neither reruns
+retrieval nor records a citation read. Older records keep missing data unknown.
+BM25 scores are ranking values, not calibrated relevance confidence.
+
+`context-use` accepts optional reason_code and effect fields. Reason codes are
+state-specific: applied/relevant; not_applicable/wrong_scope, outdated,
+already_known, no_relevant_candidate; unresolved/insufficient_context,
+collection_problem. Effects apply only to applied: confirmed, changed_plan,
+avoided_question. Reasons and effects remain agent self-report and do not update
+human feedback or independent assessments. Missing details are not inferred.
+
+Retrieval metrics omit model cost when unknown. Foreground time covers snapshot
+loading and ranking, not end-to-end agent deliberation. Caller cwd may be a hub
+or worktree, not the intended target repository; the task label supplies scope.
+
+Context ranking v2 treats identifiers such as `APP-587` as complete tokens;
+a bare `587` in an unrelated pull request no longer matches the ticket suffix.
+Token contributions are stored in the invocation log and returned by inspect;
+normal CLI results omit the detailed contributions to limit context overhead.
+
+CLI output masks recognized credential formats (including common key prefixes,
+Bearer headers, private-key blocks, and labeled key/password assignments). A
+changed display carries `display_redacted: true`. This is best-effort masking,
+not a guarantee that arbitrary secrets can be identified. Owner-only originals,
+query evidence and citation hashes remain unchanged; masking is at display time
+and applies equally to search, read, and inspect.
