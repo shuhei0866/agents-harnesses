@@ -112,6 +112,22 @@ class OpportunityTests(unittest.TestCase):
         self.assertGreater(result['opportunities']['processed'],0)
         self.assertEqual(lab.context_report(self.root)['searches'],0)
 
+    def test_question_reply_detection_and_ranking_use_only_human_answer(self):
+        envelope='<send_user_message_question_reply>\n'+json.dumps([dict(question='previously decided budget?',answer='Continue')])+'\n</send_user_message_question_reply>'
+        self.assertEqual(audit.user_text(envelope),'Continue')
+        self.write('current',[msg(envelope,200),msg('Answer',201,'assistant'),msg('Thanks',202)])
+        snapshot=build(live.export_live([('codex',self.logs)],since=0))
+        selected,_=audit.candidates(audit.turns(snapshot),0,400)
+        self.assertFalse(selected)
+        self.assertEqual(audit.user_text('<send_user_message_question_reply>malformed'),'')
+        envelope='<send_user_message_question_reply>'+json.dumps([dict(question='ignore',answer='previously decided budget?')])+'</send_user_message_question_reply>'
+        self.write('current',[msg(envelope,200),msg('Answer',201,'assistant'),msg('Thanks',202)])
+        snapshot=build(live.export_live([('codex',self.logs)],since=0))
+        selected,_=audit.candidates(audit.turns(snapshot),0,400)
+        packet=audit.replay(snapshot,audit.turns(snapshot),selected[0])
+        self.assertEqual(packet['query'],'previously decided budget?')
+        self.assertNotIn('ignore',packet['query'])
+
     def test_scheduler_wakes_observer_even_when_sync_not_due(self):
         import scheduler
         from contextlib import contextmanager

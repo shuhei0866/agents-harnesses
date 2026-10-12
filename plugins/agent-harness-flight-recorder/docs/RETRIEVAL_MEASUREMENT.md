@@ -523,3 +523,9 @@ model call is added. Failure writes `scheduler/recall-observer-status.json` and
 must not stop sync. Disable by removing this opt-in configuration; existing
 snapshots and observations remain. `opportunity-report` shows the audit status,
 bootstrap/prospective cohorts and up to ten candidate/control packets each.
+
+Known question-reply envelopes are interpreted using their human answer only
+for cue detection and replay ranking; model-authored questions and wrapper IDs
+remain solely in the inspectable raw source. Cue detection uses the same bounded
+request prefix as replay. Detector versions have separate case IDs/cohorts, so
+retired detector candidates are preserved for inspection but not current totals.

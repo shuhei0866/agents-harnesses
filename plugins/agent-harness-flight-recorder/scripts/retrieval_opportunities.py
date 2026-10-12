@@ -8,8 +8,8 @@ import re
 import time
 from collections import Counter, defaultdict
 
-VERSION = 'recall-opportunities-v1'
-HISTORY = re.compile(r'(?:前に|以前|前回|過去の).{0,24}(?:決め|判断|方針|話|相談|確認|言|伝え)|覚えて|previously decided|as we agreed|last time|earlier decision', re.I)
+VERSION = 'recall-opportunities-v2'
+HISTORY = re.compile(r'(?:前に|以前|前回|過去の).{0,24}(?:決め|判断|方針|話|相談|確認|言|伝え)|previously decided|as we agreed|last time|earlier decision', re.I)
 CORRECTION = re.compile(r'前にも.{0,15}(?:言|伝え)|そうじゃなく|そうではなく|I (?:already|previously) (?:said|told)', re.I)
 MAX_CASES = 10
 MAX_SECONDS = 8
@@ -34,6 +34,27 @@ def validate_observations(value, spans):
         if sid is not None and (not isinstance(sid, str) or not sid or len(sid) > 256):
             raise ValueError('invalid native session identity')
     return value
+
+
+def user_text(text):
+    """Known question-reply envelope: only answer is authored by the user.
+
+    Keep the full original for source inspection, but do not rank question IDs,
+    model-authored questions or option wrappers as the user's recall intent.
+    """
+    prefix, suffix = '<send_user_message_question_reply>', '</send_user_message_question_reply>'
+    text = text.strip()
+    if text.startswith(prefix):
+        if not text.endswith(suffix):
+            return ''
+        try:
+            values = json.loads(text[len(prefix):-len(suffix)])
+            if not isinstance(values, list) or any(not isinstance(v, dict) or not isinstance(v.get('answer'), str) for v in values):
+                return ''
+            return '\n'.join(v['answer'] for v in values)
+        except (ValueError, RecursionError):
+            return ''
+    return text
 
 
 def turns(snapshot):
@@ -69,6 +90,10 @@ def candidates(items, since, now):
             if not since <= o['timestamp'] <= now:
                 previous = item
                 continue
+            if not user_text(item['utterance']['text']):
+                counts['uninterpretable_user_turns'] += 1
+                previous = item
+                continue
             key = identity(item)
             if key in seen:
                 counts['duplicate_turns'] += 1
@@ -84,7 +109,7 @@ def candidates(items, since, now):
                     eligible[key] = item
             else:
                 counts['pending_or_no_answer'] += 1
-            text = item['utterance']['text']
+            text = user_text(item['utterance']['text'])[:600]
             if CORRECTION.search(text) and previous and previous['observation']['timestamp'] >= since:
                 # The later correction discovers the case, never supplies query terms.
                 marked[identity(previous)] = dict(kind='later_correction', cue=item)
@@ -124,20 +149,21 @@ def replay(snapshot, items, target):
         if item['source_id'] == anchor['source_id'] or (sid and o['native_session_id'] == sid):
             continue
         m = item['utterance']
-        if m['text'] == anchor['utterance']['text']:
+        body = user_text(m['text'])
+        if not body or body == user_text(anchor['utterance']['text']):
             continue
         prefix = f"[line {m['line']}] user: "
         docs.append(dict(source_id=item['source_id'], citation_id=m['citation_id'],
-                         start_line=m['line'], end_line=m['line'], text=prefix + m['text'],
-                         message_spans=[dict(line=m['line'], role='user', start=len(prefix), end=len(prefix)+len(m['text']))]))
-    query = anchor['utterance']['text'][:600]
+                         start_line=m['line'], end_line=m['line'], text=prefix + body,
+                         message_spans=[dict(line=m['line'], role='user', start=len(prefix), end=len(prefix)+len(body))]))
+    query = user_text(anchor['utterance']['text'])[:600]
     result = retrieve(dict(snapshot_id=snapshot['snapshot_id'], documents=docs), query, 3)
     def excerpt(item):
         return dict(source_id=item['source_id'], line=item['utterance']['line'],
                     citation_id=item['utterance']['citation_id'], text=item['utterance']['text'][:1600],
                     timestamp=item['observation']['timestamp'])
     return dict(kind=target['kind'], anchor=excerpt(anchor), cue=excerpt(target['cue']) if target['cue'] else None,
-                query=query, query_truncated=len(anchor['utterance']['text']) > 600,
+                query=query, query_truncated=len(user_text(anchor['utterance']['text'])) > 600,
                 recall_observation='no_known_tool_marker', snapshot_id=snapshot['snapshot_id'],
                 prior_candidates=len(docs), hits=result['hits'],
                 availability_at_turn='unknown', usefulness='unassessed', lineage='native_session_and_exact_text_dedup_only')
