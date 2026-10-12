@@ -451,7 +451,14 @@ def context_report(root, purpose=None):
         details = [dict(r) for r in db.execute('SELECT * FROM context_use_details') if r['request_id'] in ids] if 'context_use_details' in tables else []
         matches = {r['request_id']: r['match'] for r in db.execute('SELECT * FROM context_decision_matches')} if 'context_decision_matches' in tables else {}
     from retrieval_needs import summarize
-    return dict(decision_needs=summarize(rows, uses, matches), searches=len(rows), triggers=dict(Counter(r['trigger'] for r in results)),
+    from retrieval_followup import report as followup_report
+    followups = None
+    if purpose != 'verification':
+        try:
+            followups = {k:v for k,v in followup_report(root).items() if k != 'review_cases'}
+        except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
+            followups = dict(status='error', error_type=type(exc).__name__)
+    return dict(followups=followups, decision_needs=summarize(rows, uses, matches), searches=len(rows), triggers=dict(Counter(r['trigger'] for r in results)),
                 purposes=dict(Counter(r.get('purpose', 'task') for r in results)), requests_with_reads=len(read_ids),
                 uses=dict(Counter(u['state'] for u in uses.values())), unreported=len(ids - uses.keys()),
                 reason_codes=dict(Counter(d['reason_code'] for d in details if d['reason_code'])),
@@ -460,7 +467,7 @@ def context_report(root, purpose=None):
                 origin_missing=sum(not r.get('origin', {}).get('session_id') for r in results),
                 recent=[dict(request_id=r['id'], created=r['created'], query=r['query'],
                              state=uses.get(r['id'], {}).get('state')) for r in rows[-20:][::-1]],
-                notice='Invocation and agent self-report only. Missed opportunities and reduced rework are not measured.')
+                notice='Invocation and agent self-report only. Follow-up observations are separate; causal reduction in rework is unmeasured.')
 
 
 def drain(root, max_jobs=5, max_seconds=10):
@@ -738,6 +745,13 @@ def main():
     usage = subs.add_parser('context-use')
     usage.add_argument('request_id')
     usage.add_argument('--file', type=Path, required=True, help='JSON: state, citations, reason; agent self-report')
+    subs.add_parser('followup-report')
+    followup = subs.add_parser('followup-inspect')
+    followup.add_argument('case_id')
+    followup.add_argument('--blind', action='store_true')
+    followup_review = subs.add_parser('followup-review')
+    followup_review.add_argument('case_id')
+    followup_review.add_argument('--file', type=Path, required=True)
     subs.add_parser('opportunity-report')
     opportunity = subs.add_parser('opportunity-inspect')
     opportunity.add_argument('case_id')
@@ -786,6 +800,15 @@ def main():
         elif args.command == 'context-use':
             value = json.loads(safe_file(args.file, 16384))
             result = context_use(root, args.request_id, **value)
+        elif args.command == 'followup-report':
+            from retrieval_followup import report as followup_report
+            result = followup_report(root)
+        elif args.command == 'followup-inspect':
+            from retrieval_followup import inspect as followup_inspect
+            result = followup_inspect(root, args.case_id, args.blind)
+        elif args.command == 'followup-review':
+            from retrieval_followup import review as followup_review
+            result = followup_review(root, args.case_id, **json.loads(safe_file(args.file, 16384)))
         elif args.command == 'opportunity-inspect':
             from retrieval_opportunities import inspect as inspect_opportunity
             result = inspect_opportunity(root, args.case_id)

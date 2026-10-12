@@ -129,6 +129,12 @@ def refresh(root, force=False):
                 state['opportunities'] = audit_opportunities(root, lab._snapshot(root), config['opportunities'])
             except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
                 state['opportunities'] = dict(status='error', error_type=type(exc).__name__)
+        if state.get('status') in ('updated', 'unchanged') and config.get('followups'):
+            try:
+                from retrieval_followup import run as observe_followups
+                state['followups'] = observe_followups(root, lab._snapshot(root), config['followups'])
+            except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
+                state['followups'] = dict(status='error', error_type=type(exc).__name__)
         _write(root, 'refresh-state.json', state)
         return state
     finally:

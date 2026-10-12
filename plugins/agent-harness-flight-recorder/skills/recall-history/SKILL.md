@@ -58,6 +58,16 @@ description: 過去の会話から判断・理由・訂正を出典付きで探�
 
 `review_cases` と `control_cases` は確認候補で、本人の判断・必要性・見逃し・効果が確認済みという意味ではない。`opportunity-inspect CASE_ID` で固定snapshotの原文を読む（検索・既読件数は増えない）。`anchor`、`cue`、`hits` の出典行と引用を照合してから解釈する。現在のcorpusによる再現なので、当時収録済みだったとは断定しない。別名コマンド・別ツール・forkの系譜は不明な場合があり、無記述を検索未実行の証明にしない。末尾の未区切りターン、時刻不明、収集除外は別扱い。導入前の再検証と導入後の観測を混ぜず、自然利用・既読・成功の件数へ加えない。
 
+## 検索後の説明し直しを観測する
+
+後続観測を有効にした環境では、既存の定期収集が、導入後の `--need` 付きtask検索と同じ会話の次の最大3ユーザー発言（7日以内）を出典付きで結ぶ。計測のためにユーザーへ質問しない。再検索は最初のneedへまとめ、検証検索・needのない検索は対象外。会話IDや時刻が不明なら別の会話へ推測で結ばない。
+
+`followup-report` は、訂正・再説明らしい表現のある例を先に出す。表現一致は確認候補であり、本人による訂正や検索の失敗と断定しない。「表現なしで観測窓終了」「発言待ち」「期間内に後続発言なし」「結合できない」を区別する。無反応や終了は成功ではない。検索前後の自己申告は、最初の後続発言より前に記録されたものだけを比較側へ使う。後から見つけ直した判断を、訂正前に届いていたことにしない。
+
+確認するときは、まず `followup-inspect CASE_ID --blind` で検索結果・採否を隠した原文を見る。その後、`context-inspect REQUEST_ID` と過去の出典を照合する。必要ならlab内JSONに `label`（`repeated_prior_decision` / `new_requirement` / `other` / `uncertain`）、後続発言の `citations`、`reason` を書き、`followup-review CASE_ID --file FILE` へ渡す。`repeated_prior_decision` は相談より前の判断を示す `prior_decisions: [{"citation_id": "…", "line": 123}]` も必須。これはエージェントの振り返りであり、ユーザーfeedbackや因果的な効果評価へ流用しない。現在の観測版と過去のレビューは別に残る。
+
+集計単位はneed。複数needの窓が重なるので、ユーザー発言の総数には `unique_followup_turns` / `unique_cue_turns` を使う。検索版・trigger・判断発見別の件数は記述的な比較に限り、削減率と呼ばない。検索しなかった相談は既存の `opportunity-report` で別に扱う。別会話での再説明、会話系譜の変更、記録外の行動はこの窓では追跡しない。
+
 ## 訂正と振り返り
 
 - 利用者が明示した場合だけ `feedback REQUEST_ID relevant|wrong_target|unresolved` を記録する。
