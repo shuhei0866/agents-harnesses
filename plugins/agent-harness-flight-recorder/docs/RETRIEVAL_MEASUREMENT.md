@@ -408,3 +408,29 @@ changed display carries `display_redacted: true`. This is best-effort masking,
 not a guarantee that arbitrary secrets can be identified. Owner-only originals,
 query evidence and citation hashes remain unchanged; masking is at display time
 and applies equally to search, read, and inspect.
+
+
+### Agent consultation provenance and Japanese single-character queries
+
+Collector v8 labels a source `agent_consultation` when its first user message
+starts with the exact known consultation-bridge envelope (including the explicit
+caller-provenance sentence). Later unwrapped followups share that provenance.
+A prefix fragment, quoted example, or the envelope later in an ordinary
+conversation does not classify that conversation. `consultation_sources` counts
+these sources in the import report. This is a narrow known-format detector,
+not proof of human authorship for all remaining sources.
+
+Consultation content and advice remain in the corpus for ordinary `search` and
+request-bound `read`, which display the source kind. `corrections` excludes those
+sources and reports `consultation_sources_skipped`. A known model-review envelope
+is also excluded from correction candidates, without deleting it from history.
+This keeps generated advice available without presenting agent prompts as human
+corrections. Collector-version recollection adds provenance to unchanged sources;
+old snapshots and citations remain available unchanged.
+
+Context ranker v3 matches a single-character Japanese query term inside longer
+unsegmented sentences. Previously a query containing a standalone character
+could miss that same character in a sentence because only character bigrams were
+indexed. Occurrences are counted once, including standalone occurrences. Other
+query tokenization and BM25 weights are unchanged. Detailed score contributions
+still disclose the matched terms. The change requires no model or provider call.

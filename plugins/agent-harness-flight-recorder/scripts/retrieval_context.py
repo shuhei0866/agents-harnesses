@@ -4,7 +4,7 @@ import math
 import re
 import time
 
-VERSION = 'user-context-bm25-v2'
+VERSION = 'user-context-bm25-v3'
 TRIGGERS = ('resume', 'ambiguous', 'explicit')
 INJECTED_PREFIXES = ('# AGENTS.md', 'Stop hook feedback:', '[exploration-budget]',
     'Base directory for this skill:', 'Another Claude session sent a message:',
@@ -37,7 +37,14 @@ def validate_spans(text, first, last, spans):
 
 def conversational(text):
     # Known injected frames only. User role does not prove human authorship.
-    return bool(text.strip()) and not text.lstrip().startswith(INJECTED_PREFIXES + (
+    # A review model's report is a tool-injected user-role envelope, not a
+    # human correction. Keep it in ordinary history, but not in this view.
+    stripped = text.lstrip()
+    if (stripped.startswith('<user_action>')
+            and '<context>User initiated a review task.' in stripped[:200]
+            and 'full review output from reviewer model.' in stripped[:250]):
+        return False
+    return bool(text.strip()) and not stripped.startswith(INJECTED_PREFIXES + (
         'あなたは作業セッションの引き継ぎカード', 'あなたは探索セッションの評価者'))
 
 
@@ -45,6 +52,8 @@ def units(snapshot):
     groups = defaultdict(list)
     missing = 0
     for d in snapshot['documents']:
+        if d.get('source_kind') == 'agent_consultation':
+            continue
         spans = d.get('message_spans')
         if spans is None:
             missing += 1
@@ -87,6 +96,11 @@ def retrieve(snapshot, query, limit):
             text = item['utterance']['text'] if field == 'utterance' else '\n'.join(
                 item[k]['text'][:2000] for k in ('request', 'prior_response') if item[k])
             c = Counter(context_tokens(text))
+            # A one-character Japanese query must also match inside an
+            # unsegmented sentence. Do not duplicate standalone occurrences.
+            for token in q:
+                if len(token) == 1 and re.fullmatch(r'[\u3040-\u30ff\u3400-\u9fff]', token):
+                    c[token] = text.count(token)
             counts.append(c)
             frequency.update(c.keys())
         average = sum(sum(c.values()) for c in counts) / max(1, len(items))
@@ -116,6 +130,8 @@ def retrieve(snapshot, query, limit):
                 diagnostics_version=1, query_tokens=sorted(q),
                 scored_candidate_count=len(ranked),
                 legacy_documents_skipped=missing,
+                consultation_sources_skipped=len({d['source_id'] for d in snapshot['documents']
+                                                  if d.get('source_kind') == 'agent_consultation'}),
                 notice='User-role candidates, not verified corrections or standing instructions. Read originals and check current scope. Prior context may be incomplete.',
                 metrics=dict(elapsed_ms=(time.perf_counter()-started)*1000,
                              input_tokens=None, output_tokens=None, cost_microusd=None))

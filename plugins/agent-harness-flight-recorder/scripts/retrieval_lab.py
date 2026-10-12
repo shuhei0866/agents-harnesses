@@ -128,6 +128,9 @@ def _build_snapshot(manifest, *, allow_empty=False):
             not isinstance(s, str) or len(s) > MAX_TEXT for s in summaries
         ):
             raise ValueError("summaries invalid or oversized")
+        source_kind = item.get('source_kind')
+        if source_kind not in (None, 'agent_consultation'):
+            raise ValueError('invalid source kind')
         spans = item.get('message_spans')
         if spans is not None:
             from retrieval_context import validate_spans
@@ -135,14 +138,24 @@ def _build_snapshot(manifest, *, allow_empty=False):
         key = (source, start, end)
         if key in unique and unique[key]["text"] != text:
             raise ValueError("conflicting raw text for source span")
+        if key in unique and unique[key].get('source_kind') != source_kind:
+            raise ValueError('conflicting source provenance')
         doc = unique.setdefault(key, dict(source_id=source, start_line=start, end_line=end,
                                           text=text, summaries=[], citation_id=""))
+        if source_kind:
+            doc['source_kind'] = source_kind
         if spans is not None:
             if 'message_spans' in doc and doc['message_spans'] != spans:
                 raise ValueError('conflicting message spans')
             doc['message_spans'] = spans
         doc["summaries"] = sorted(set(doc["summaries"]) | set(summaries))
         doc["citation_id"] = digest([source, start, end, text])
+    source_kinds = {}
+    for doc in unique.values():
+        kind = doc.get('source_kind')
+        if doc['source_id'] in source_kinds and source_kinds[doc['source_id']] != kind:
+            raise ValueError('inconsistent source provenance')
+        source_kinds[doc['source_id']] = kind
     docs = [unique[key] for key in sorted(unique)]
     value = dict(schema_version=1, snapshot_id=digest(docs), documents=docs,
                  import_report=manifest.get("import_report", {}))
@@ -260,6 +273,7 @@ def _retrieve(snapshot, query, arm, limit, deadline=None):
     hits = []
     for rank, (_, d) in enumerate(scored[:limit], 1):
         hit = {k: d[k] for k in ("citation_id", "source_id", "start_line", "end_line", "text")}
+        hit["source_kind"] = d.get("source_kind", "unspecified")
         hit["rank"] = rank
         hits.append(hit)
     return dict(arm=arm, snapshot_id=snapshot["snapshot_id"], retrieval_version=VERSION, hits=hits,
@@ -474,6 +488,7 @@ def read_citation(root, citation_id, request_id=None):
         if d["citation_id"] != citation_id:
             continue
         result = {k: d[k] for k in ("citation_id", "source_id", "start_line", "end_line", "text")}
+        result["source_kind"] = d.get("source_kind", "unspecified")
         if request_id is not None:
             with _connect(root) as db:
                 row = _row(db, request_id)

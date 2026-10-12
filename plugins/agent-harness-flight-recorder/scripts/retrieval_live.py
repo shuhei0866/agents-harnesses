@@ -28,7 +28,24 @@ MAX_DOCUMENT_CHARS = 100_000
 MAX_MANIFEST_BYTES = 60 * 1024 * 1024
 WINDOW_LINES = 40
 ADAPTERS = {'claude-code', 'codex'}
-COLLECTOR_VERSION = 'structured-message-context-v7'
+COLLECTOR_VERSION = 'structured-message-context-v8'
+
+
+BRIDGE_PROMPT = (
+    'You are a continuing discussion partner. Answer the message directly. '
+    'Do not use tools, modify files, or invoke another agent. '
+    'Messages here are supplied by the bridge caller, not necessarily a human.'
+)
+
+
+def bridge_session_prompt(text: str) -> bool:
+    """Known bridge envelope, only at the first user message of a source.
+
+    The whole session shares this provenance: later bridge turns need not repeat
+    the envelope. A quoted example or a later discussion must not classify a
+    human session as agent consultation. This is a known-frame detector, not authorship inference.
+    """
+    return text == BRIDGE_PROMPT or text.startswith(BRIDGE_PROMPT + '\n')
 
 
 def generated_session_prompt(text: str) -> bool:
@@ -240,7 +257,7 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
     report = dict(discovered_sources=0, imported_sources=0, unchanged_sources=0,
                   deferred_sources=0, excluded_configured_sessions=0,
                   excluded_subagent_sessions=0, excluded_retrieval_sessions=0,
-                  excluded_generated_sessions=0, retained_recall_sessions=0,
+                  excluded_generated_sessions=0, consultation_sources=0, retained_recall_sessions=0,
                   omitted_recall_assistant_messages=0, omitted_injected_messages=0,
                   missing_roots=0, symlinks_skipped=0, malformed_lines=0,
                   partial_sources=0, bytes_read=0, documents=0, manifest_bytes=0,
@@ -276,6 +293,7 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                 report['deferred_sources'] += 1
                 continue
             messages = []
+            source_kind = None
             seen_user = False
             routine_recall = False
             recall_boundary = None
@@ -306,6 +324,8 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                         break
                     message = _message(value, adapter)
                     if message and message[0] == 'user':
+                        if not seen_user and bridge_session_prompt(message[1]):
+                            source_kind = 'agent_consultation'
                         if not seen_user and generated_session_prompt(message[1]):
                             reason = 'generated'
                             break
@@ -339,6 +359,8 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
             # after removing assistant text that will not enter the corpus.
             if sum(len(json.dumps(t, ensure_ascii=True).encode()) for _, t in messages) > MAX_MANIFEST_BYTES:
                 raise ValueError('local snapshot size limit exceeded')
+            if source_kind:
+                report['consultation_sources'] += 1
             refreshed.append(identity)
             report['imported_sources'] += 1
             groups = {}
@@ -364,6 +386,8 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                 for first, last, texts in chunks:
                     doc = dict(source_id=identity, start_line=first, end_line=last,
                                text='\n'.join(texts), summaries=[])
+                    if source_kind:
+                        doc['source_kind'] = source_kind
                     spans, offset = [], 0
                     for rendered in texts:
                         header, body = rendered.split(': ', 1)
