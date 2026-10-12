@@ -19,3 +19,5 @@ jobs:
         run: |
           bash plugins/agent-harness-flight-recorder/tests/test-retrieval-lab.sh
           bash plugins/agent-harness-flight-recorder/tests/test-resume-replay.sh
+          bash plugins/agent-harness-flight-recorder/tests/test-scheduler.sh
+          bash plugins/agent-harness-flight-recorder/tests/test-scheduler-pending-wake.sh

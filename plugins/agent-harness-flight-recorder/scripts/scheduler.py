@@ -1218,6 +1218,8 @@ def run(root: Path) -> None:
     with _run_lock(root, blocking=False) as acquired:
         if not acquired:
             return
+        from retrieval_observer import tick
+        tick(root)
         previous = _load_state(root)
         now = _now()
         if not _scheduler_due(root, previous, now):

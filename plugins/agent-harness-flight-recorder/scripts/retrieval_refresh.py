@@ -123,6 +123,12 @@ def refresh(root, force=False):
             # Never publish partial collections or move the successful watermark.
             state.update(status='error', error_type=type(exc).__name__,
                          elapsed_ms=round((time.time() - started) * 1000))
+        if state.get('status') in ('updated', 'unchanged') and config.get('opportunities'):
+            try:
+                from retrieval_opportunities import run as audit_opportunities
+                state['opportunities'] = audit_opportunities(root, lab._snapshot(root), config['opportunities'])
+            except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
+                state['opportunities'] = dict(status='error', error_type=type(exc).__name__)
         _write(root, 'refresh-state.json', state)
         return state
     finally:
