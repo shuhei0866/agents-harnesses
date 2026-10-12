@@ -148,6 +148,12 @@ def _build_snapshot(manifest, *, allow_empty=False):
             if 'message_spans' in doc and doc['message_spans'] != spans:
                 raise ValueError('conflicting message spans')
             doc['message_spans'] = spans
+        if 'turn_observations' in item:
+            from retrieval_opportunities import validate_observations
+            observations = validate_observations(item['turn_observations'], spans)
+            if 'turn_observations' in doc and doc['turn_observations'] != observations:
+                raise ValueError('conflicting turn observations')
+            doc['turn_observations'] = observations
         doc["summaries"] = sorted(set(doc["summaries"]) | set(summaries))
         doc["citation_id"] = digest([source, start, end, text])
     source_kinds = {}
@@ -732,6 +738,9 @@ def main():
     usage = subs.add_parser('context-use')
     usage.add_argument('request_id')
     usage.add_argument('--file', type=Path, required=True, help='JSON: state, citations, reason; agent self-report')
+    subs.add_parser('opportunity-report')
+    opportunity = subs.add_parser('opportunity-inspect')
+    opportunity.add_argument('case_id')
     summary = subs.add_parser('context-report')
     summary.add_argument('--purpose', choices=('task', 'verification'))
     worker = subs.add_parser("worker")
@@ -777,6 +786,12 @@ def main():
         elif args.command == 'context-use':
             value = json.loads(safe_file(args.file, 16384))
             result = context_use(root, args.request_id, **value)
+        elif args.command == 'opportunity-inspect':
+            from retrieval_opportunities import inspect as inspect_opportunity
+            result = inspect_opportunity(root, args.case_id)
+        elif args.command == 'opportunity-report':
+            from retrieval_opportunities import report as opportunity_report
+            result = opportunity_report(root)
         elif args.command == 'context-report':
             result = context_report(root, args.purpose)
         elif args.command == 'context-inspect':

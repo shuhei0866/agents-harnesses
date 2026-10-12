@@ -468,3 +468,70 @@ The combined status is the latest attempt, so a later unresolved retry does not
 keep an optimistic found total. Review cases preserve every `attempt_reports`
 match, citation and reason, including earlier partial evidence; latest not_found
 does not mean all earlier evidence was absent or retracted.
+
+
+### Passive uninvoked-recall opportunity candidates
+
+Collector v9 adds timestamp, native session identity, known recall-tool marker,
+assistant-observed and next-user-boundary flags to user turns. Old citation IDs
+remain unchanged; snapshots include the new metadata. Unknown or regressing
+source timestamps are excluded from temporal replay. Consultation/evaluation,
+generated, subagent and explicitly excluded sources retain their exclusions.
+A known marker is conservative: a tool command mentioning help may count; aliases
+and other retrieval tools may not. It is not an execution-success detector.
+
+Opt in through the lab refresh config:
+
+```json
+"opportunities": {"since": 0, "prospective_since": 0}
+```
+
+Use actual Unix epoch boundaries when deploying. `since` bounds the bootstrap
+window; `prospective_since` separates later observations. On refresh, up to ten
+unseen candidates run with an eight-second between-case budget. A single bounded
+retrieval may finish after that budget. Cases persist idempotently in the existing
+owner-only measurements DB, separately from query/use/evaluation counts.
+
+Candidates are narrow history-reference cues, or the request preceding a later
+correction. Later correction text only discovers the case and is never query
+input. Same-source, same-UTC-day non-cue turns provide deterministic controls
+where available; unmatched counts are visible. Replays use at most 600 characters
+of the anchor request, and earlier user text from other native sessions. Same
+native-ID archive copies and exact anchor-text copies are excluded. Arbitrary
+fork lineage is not resolved. No tool/assistant or future text enters ranking.
+Reports retain exact source lines, immutable snapshot/citation IDs and excerpts.
+
+The current corpus may contain old text collected after the turn. Therefore
+`availability_at_turn=unknown`: these are current-corpus replays, not historical
+retrievability claims. A lexical hit proves neither a decision nor relevance or
+benefit. Review candidates and controls, not a fabricated recall/success rate.
+Final turns without a subsequent user boundary remain pending, including sessions
+that ended normally. Silence and abandonment are not evaluated as success.
+
+For search-independent execution, the existing recorder scheduler calls an
+optional `scheduler/recall-observer.json` before deciding whether Vault sync is
+due. Configuration is local and ignored by Git:
+
+```json
+{"schema_version":1,"command":"/absolute/path/to/recall-history"}
+```
+
+The owner-controlled non-symlink command is invoked as an argument vector with
+`refresh`, a 30-second timeout and no inherited stdin/output. The lab's existing
+refresh throttle controls scan frequency; no new timer, external transmission or
+model call is added. Failure writes `scheduler/recall-observer-status.json` and
+must not stop sync. Disable by removing this opt-in configuration; existing
+snapshots and observations remain. `opportunity-report` shows the audit status,
+bootstrap/prospective cohorts and up to ten candidate/control packets each.
+
+Known question-reply envelopes are interpreted using their human answer only
+for cue detection and replay ranking; model-authored questions and wrapper IDs
+remain solely in the inspectable raw source. Cue detection uses the same bounded
+request prefix as replay. Detector versions have separate case IDs/cohorts, so
+retired detector candidates are preserved for inspection but not current totals.
+
+Cue-free sessions are also sampled: deterministically select 10% of eligible
+native-session/UTC-day groups, at most one non-cue turn per selected group. These
+control packets carry `control_origin=background_sample`; cue-matched controls
+carry `matched`. Sampling is not a universal denominator or a gold negative.
+This exposes possible silent opportunities without requiring an explicit cue.

@@ -6,6 +6,7 @@ then only complete LF-terminated JSONL records are indexed. No model calls.
 """
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
 import math
@@ -28,7 +29,7 @@ MAX_DOCUMENT_CHARS = 100_000
 MAX_MANIFEST_BYTES = 60 * 1024 * 1024
 WINDOW_LINES = 40
 ADAPTERS = {'claude-code', 'codex'}
-COLLECTOR_VERSION = 'structured-message-context-v8'
+COLLECTOR_VERSION = 'structured-message-context-v9'
 
 
 BRIDGE_PROMPT = (
@@ -223,6 +224,17 @@ def _records(path: Path, report: dict):
                 raise ValueError('input changed')
 
 
+def message_time(value):
+    raw = value.get('timestamp')
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(raw.replace('Z', '+00:00'))
+        return parsed.timestamp() if parsed.tzinfo is not None else None
+    except (ValueError, OverflowError):
+        return None
+
+
 def export_live(roots: list[tuple[str, Path]], *, since: float,
                 exclude_sessions: list[str] | None = None,
                 now: float | None = None, settle_seconds: float = 0,
@@ -293,6 +305,10 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                 report['deferred_sources'] += 1
                 continue
             messages = []
+            observations = []
+            native_id = None
+            chronology_valid = True
+            previous_time = None
             source_kind = None
             seen_user = False
             routine_recall = False
@@ -314,8 +330,21 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                         break
                     if not isinstance(value, dict):
                         continue
+                    stamp = message_time(value)
+                    if stamp is not None:
+                        if previous_time is not None and stamp < previous_time:
+                            chronology_valid = False
+                        previous_time = stamp
+                    sid = value.get('sessionId') if adapter == 'claude-code' else (
+                        value['payload'].get('id') if value.get('type') == 'session_meta' and isinstance(value.get('payload'), dict) else None)
+                    if isinstance(sid, str) and len(sid) <= 256:
+                        if native_id is not None and native_id != sid:
+                            chronology_valid = False
+                        native_id = sid
                     found = _excluded(value, adapter, exclusions)
                     if found == 'recall':
+                        if observations:
+                            observations[-1]['recall_marker'] = True
                         if not routine_recall:
                             recall_boundary = last_user_line
                         routine_recall = True
@@ -335,7 +364,13 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                         continue
                     if message:
                         if message[0] == 'user':
+                            if observations:
+                                observations[-1]['closed'] = True
+                            observations.append(dict(line=number, timestamp=stamp, closed=False,
+                                                     assistant_observed=False, recall_marker=False))
                             last_user_line = number
+                        elif observations:
+                            observations[-1]['assistant_observed'] = True
                         text = f'[line {number}] {message[0]}: {message[1]}'
                         if len(text) > MAX_DOCUMENT_CHARS:
                             report['omitted_oversized_lines'] += 1
@@ -397,6 +432,10 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                                           end=offset + len(rendered)))
                         offset += len(rendered) + 1
                     doc['message_spans'] = spans
+                    user_lines = {m['line'] for m in spans if m['role'] == 'user'}
+                    doc['turn_observations'] = [dict(o, timestamp=o['timestamp'] if chronology_valid else None,
+                                                       native_session_id=native_id)
+                                                for o in observations if o['line'] in user_lines]
                     serialized_size = len(json.dumps(doc, ensure_ascii=True).encode()) + 2
                     if (len(documents) >= MAX_DOCUMENTS or
                             report['manifest_bytes'] + serialized_size > MAX_MANIFEST_BYTES):
