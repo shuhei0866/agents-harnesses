@@ -559,3 +559,60 @@ native-session/UTC-day groups, at most one non-cue turn per selected group. Thes
 control packets carry `control_origin=background_sample`; cue-matched controls
 carry `matched`. Sampling is not a universal denominator or a gold negative.
 This exposes possible silent opportunities without requiring an explicit cue.
+
+
+### Natural follow-up observation
+
+Opt in with `"followups": {"since": <unix timestamp>}` in the existing local
+`refresh-config.json`. Use deployment time to start a prospective cohort. The
+existing refresh/scheduler invokes the observer even without another search;
+there is no new timer or provider call. At most 100 needs are checked per refresh,
+with least-recently checked needs first. Collection failures and observer status
+remain visible; no forced collection or success claim is made by a report.
+
+Only task-purpose searches with prospectively recorded decision needs enter this
+cohort. A retry stays with its root need. Native session identity and timestamps
+link the first search to its preceding user turn; absent IDs, ambiguous or missing
+timestamps, missing sources and anchors without an observed assistant response
+remain unlinked. This is a time-based association, not a verified tool-to-turn ID.
+No cwd or textual similarity is used to guess a caller. Identical archive copies
+are deduplicated and known injected frames do not consume the observation window.
+
+Observe up to three following user turns within seven days. Store their original
+citation/line references and lexical restatement/correction cues. Distinguish
+pending, observing, window_complete, no_followup_observed and unlinked. A full
+window without detected cues is an observed negative for this detector, never
+proof that no correction or dissatisfaction occurred. Silence is not success.
+Short follow-ups can refer to new requirements; a lexical cue is not a verdict.
+
+`followup-report` exposes cue-prioritized cases, unique turn counts, overlapping
+windows, and descriptive counts stratified by ranker version, trigger and the
+agent's decision-match report. Only reads and use/match reports recorded before
+the first follow-up count as prior exposure; late reports remain visible on the
+need but cannot retroactively explain the earlier response. Current use records
+are replaceable, so a missing historical early report is unknown, not recovered
+from a later report. Counts are per need, not independent tasks. Do not sum
+subgroup counts into user correction events; use the deduplicated turn counts.
+`context-report --purpose task` includes the compact observation summary.
+
+`followup-inspect CASE --blind` returns cited original user text without retrieval
+results or self-reports. Review that text first, then consult the search and prior
+evidence. `followup-review CASE --file JSON` records an agent retrospective label:
+`repeated_prior_decision`, `new_requirement`, `other`, or `uncertain`, plus observed
+follow-up `citations` and a bounded `reason`. A repeated-decision label additionally
+requires `prior_decisions` references with exact `citation_id` and `line`, validated
+as user turns earlier than the anchor in the fixed snapshot. This validates timing
+and provenance, not the semantic review. Review records never alter user feedback,
+search use, or success metrics.
+
+Evidence revisions are immutable and deduplicated; a separate current pointer
+allows reports or collection state to change back to an existing revision without
+silently keeping a stale state. Historical case IDs remain inspectable and their
+reviews stay tied to those revisions. All data lives in the existing owner-only
+lab database and snapshot archive, never the public repo or vault sync.
+
+This measures observable follow-up evidence, not causal time saved. The cohort
+excludes searches without needs, uninvoked searches and other-session follow-ups;
+legacy-search counts and linkage gaps are explicit. Found/not-found groups differ
+in task difficulty and are not randomized controls. Keep existing opportunity
+sampling separate; no result from it is silently promoted to an observed failure.

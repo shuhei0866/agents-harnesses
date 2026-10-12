@@ -3,7 +3,7 @@ import json
 from collections import Counter
 
 
-def summarize(rows, uses, matches):
+def summarize(rows, uses, matches, all_cases=False):
     groups = {}
     legacy = 0
     for row in rows:
@@ -33,7 +33,7 @@ def summarize(rows, uses, matches):
                           attempt_reports=[dict(request_id=a['id'], match=matches.get(a['id'], 'unknown'),
                                                 citations=json.loads(uses.get(a['id'], {}).get('citations', '[]')),
                                                 reason=uses.get(a['id'], {}).get('reason')) for a, _ in attempts]))
-    return dict(version=1, needs=len(cases), legacy_searches=legacy,
+    return dict(**(dict(cases=cases) if all_cases else {}), version=1, needs=len(cases), legacy_searches=legacy,
                 statuses=dict(Counter(c['status'] for c in cases)),
                 found_on=dict(Counter(c['found_on'] for c in cases if c['found_on'])),
                 unreported=sum(not c['reported'] for c in cases),
