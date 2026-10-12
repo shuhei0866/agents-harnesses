@@ -217,6 +217,64 @@ class ContextTests(unittest.TestCase):
                       '-----BEGIN PRIVATE KEY-----\nexample\n-----END PRIVATE KEY-----']:
             self.assertEqual(redact_payload({'text': value})['text'], '[credential redacted]')
 
+    def test_consultation_remains_in_history_but_not_human_context_candidates(self):
+        logs = self.base / 'bridge'
+        logs.mkdir()
+        (logs/'one.jsonl').write_text(''.join(json.dumps(v)+'\n' for v in [
+            record(live.BRIDGE_PROMPT + '\nCompare constellation designs'),
+            record('Use a constellation layout for this reason', 'assistant'),
+            record('More constellation details')]))
+        manifest = live.export_live([('codex', logs)], since=0)
+        lab.publish_snapshot(self.root, manifest)
+        ordinary = lab.search(self.root, 'constellation', sample_rate=0)
+        self.assertTrue(ordinary['hits'])
+        self.assertEqual(ordinary['hits'][0]['source_kind'], 'agent_consultation')
+        raw = lab.read_citation(self.root, ordinary['hits'][0]['citation_id'], ordinary['request_id'])
+        self.assertIn('for this reason', raw['text'])
+        recalled = lab.search_corrections(self.root, 'constellation', 'resume')
+        self.assertEqual(recalled['hits'], [])
+        self.assertEqual(recalled['consultation_sources_skipped'], 1)
+        bad = json.loads(json.dumps(manifest))
+        bad['documents'][0]['source_kind'] = 'human-confirmed'
+        with self.assertRaises(ValueError):
+            lab.publish_snapshot(self.root, bad)
+        mixed = json.loads(json.dumps(manifest))
+        duplicate = dict(mixed['documents'][0])
+        duplicate.pop('source_kind')
+        mixed['documents'].append(duplicate)
+        with self.assertRaises(ValueError):
+            lab.publish_snapshot(self.root, mixed)
+
+
+    def test_single_character_japanese_terms_match_within_sentences(self):
+        logs = self.base / 'single'
+        logs.mkdir()
+        (logs/'one.jsonl').write_text(''.join(json.dumps(v)+'\n' for v in [
+            record('自分が本当に住んでいる家という事実です'), record('家')]))
+        lab.publish_snapshot(self.root, live.export_live([('codex', logs)], since=0))
+        r = lab.search_corrections(self.root, '家', 'resume')
+        self.assertEqual({h['line'] for h in r['hits']}, {1, 2})
+        for hit in r['hits']:
+            self.assertIn('家', hit['explanation']['matched_tokens'])
+        self.assertEqual(lab.search_corrections(self.root, '山', 'resume')['hits'], [])
+        combined = lab.search_corrections(self.root, '家 山', 'resume')
+        for hit in combined['hits']:
+            self.assertNotIn('山', hit['explanation']['matched_tokens'])
+            self.assertIn('山', hit['explanation']['unmatched_tokens'])
+
+    def test_model_review_is_not_a_user_correction_but_stays_readable(self):
+        frame = ("<user_action>\n  <context>User initiated a review task. "
+                 "Here's the full review output from reviewer model. User may select comments.</context>\n"
+                 "review model constellation advice</user_action>")
+        self.assertFalse(context.conversational(frame))
+        self.assertTrue(context.conversational('<user_action>My own constellation request</user_action>'))
+        logs = self.base / 'review'
+        logs.mkdir()
+        (logs/'one.jsonl').write_text(''.join(json.dumps(v)+'\n' for v in [record(frame), record('ordinary request')]))
+        lab.publish_snapshot(self.root, live.export_live([('codex', logs)], since=0))
+        self.assertTrue(lab.search(self.root, 'constellation', sample_rate=0)['hits'])
+        self.assertEqual(lab.search_corrections(self.root, 'constellation', 'resume')['hits'], [])
+
 
 if __name__ == '__main__':
     unittest.main()

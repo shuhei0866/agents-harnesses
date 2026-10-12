@@ -45,6 +45,24 @@ class LiveTests(unittest.TestCase):
         path.write_bytes(raw)
         return path
 
+    def test_bridge_session_and_followups_are_classified_but_quotes_are_not(self):
+        for root, message in [(self.codex, codex), (self.claude, claude)]:
+            self.write(root, 'bridge.jsonl', encode(message(live.BRIDGE_PROMPT + '\nDiscuss an architecture'),
+                message('generated advice', 'assistant'), message('unwrapped followup')))
+            self.write(root, 'quoted.jsonl', encode(message('Explain this prompt:\n' + live.BRIDGE_PROMPT)))
+            self.write(root, 'later.jsonl', encode(message('human request'), message(live.BRIDGE_PROMPT)))
+            self.write(root, 'similar.jsonl', encode(message('You are a continuing discussion partner.')))
+        result = live.export_live(self.roots, since=0)
+        self.assertEqual(result['import_report']['consultation_sources'], 2)
+        self.assertEqual(len(result['excluded_source_ids']), 0)
+        self.assertEqual(result['import_report']['imported_sources'], 8)
+        classified = [d for d in result['documents'] if d.get('source_kind') == 'agent_consultation']
+        self.assertEqual(len(classified), 2)
+        self.assertIn('generated advice', str(classified))
+        self.assertIn('unwrapped followup', str(classified))
+        self.assertIn('Explain this prompt', str(result['documents']))
+        self.assertIn('human request', str(result['documents']))
+
     def test_generated_sessions_excluded_but_human_corrections_retained(self):
         handoff = ('あなたは作業セッションの引き継ぎカードを書く係。\n'
                    '## 現在地\n## 次の一手\n<transcript>\n'
