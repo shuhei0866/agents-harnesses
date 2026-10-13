@@ -129,7 +129,7 @@ class RetentionTests(unittest.TestCase):
         result = retention.maintain(self.root, {'budget_bytes': size+10, 'warning_percent': 80})
         self.assertEqual(result['warning'], 'snapshot_capacity_high')
         result = lab.publish_snapshot(self.root, corpus('next'), storage_policy={})
-        actual = sum(p.stat().st_size for p in (self.root / 'snapshots').glob('*.json'))
+        actual = sum(p.stat().st_size for p in (self.root / 'snapshots').glob('*.json*'))
         self.assertEqual(result['storage']['archive_bytes'], actual)
         self.assertEqual(result['storage']['reserved_bytes'], 0)
 
