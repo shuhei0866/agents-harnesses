@@ -7,7 +7,6 @@ import os
 from pathlib import Path
 import re
 import sqlite3
-import stat
 import time
 
 import retrieval_lab as lab
@@ -100,36 +99,29 @@ def _plan(root, config, reserve_bytes=0, extra_protected=()):
     config = policy(config)
     current = lab._snapshot(root)['snapshot_id']
     protected = _references(root) | {current} | set(extra_protected)
-    archive = root / 'snapshots'
-    entries = []
-    if archive.exists() or archive.is_symlink():
-        lab._root(archive)
-        for path in archive.iterdir():
-            # Temporary atomic-publication files are not deletion candidates.
-            if path.name.startswith('.'):
-                continue
-            info = path.lstat()
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
-                    or info.st_mode & 0o077 or not re.fullmatch('[0-9a-f]{64}\\.json', path.name)):
-                raise RetentionError('unsafe_snapshot_archive')
-            entries.append((path, info))
+    from retrieval_archive import entries as archive_entries, identity
+    entries = archive_entries(root)
+    groups = {}
+    for path, info in entries:
+        groups.setdefault(identity(path), []).append((path, info))
     total = sum(info.st_size for _, info in entries)
-    pinned = sum(info.st_size for path, info in entries if path.stem in protected)
-    candidates = sorted([(p, i) for p, i in entries if p.stem not in protected],
-                        key=lambda pair: (pair[1].st_mtime_ns, pair[0].name), reverse=True)
-    retained, remaining = [], pinned + reserve_bytes
-    for index, (path, info) in enumerate(candidates):
-        if index < config['keep_recent'] and remaining + info.st_size <= config['budget_bytes']:
-            retained.append(path)
-            remaining += info.st_size
-    deleting = [(p, i) for p, i in candidates if p not in retained]
+    pinned = sum(info.st_size for path, info in entries if identity(path) in protected)
+    candidates = sorted([(key, files) for key, files in groups.items() if key not in protected],
+                        key=lambda pair: (max(i.st_mtime_ns for _, i in pair[1]), pair[0]), reverse=True)
+    retained, remaining = set(), pinned + reserve_bytes
+    for index, (key, files) in enumerate(candidates):
+        size = sum(i.st_size for _, i in files)
+        if index < config['keep_recent'] and remaining + size <= config['budget_bytes']:
+            retained.add(key)
+            remaining += size
+    deleting = [(p, i) for key, files in candidates if key not in retained for p, i in files]
     blocked = pinned + reserve_bytes > config['budget_bytes']
     warning = ('protected_snapshots_exceed_budget' if blocked else
                'snapshot_capacity_high' if remaining * 100 >= config['budget_bytes'] * config['warning_percent'] else None)
     result = dict(schema_version=1, status='error' if blocked else 'ok', checked_at=time.time(),
                   archive_bytes=total, projected_bytes=remaining, reserved_bytes=reserve_bytes,
-                  protected_bytes=pinned, protected_count=sum(p.stem in protected for p, _ in entries),
-                  archive_count=len(entries), removable_count=len(deleting),
+                  protected_bytes=pinned, protected_count=sum(key in protected for key in groups),
+                  archive_count=len(groups), removable_count=len({identity(p) for p, _ in deleting}),
                   removable_bytes=sum(i.st_size for _, i in deleting), warning=warning,
                   usage_percent=round(remaining / config['budget_bytes'] * 100, 2), **config)
     return result, deleting
@@ -161,7 +153,8 @@ def maintain(root, config=None, *, reserve_bytes=0, extra_protected=()):
             # Validate every deletion before deleting ANY file. Corruption or
             # unknown reference inputs abort cleanup, preserving all evidence.
             for path, info in deleting:
-                lab._snapshot(root, path.stem)
+                from retrieval_archive import read_file, validate, identity
+                validate(read_file(path), identity(path))
                 actual = path.lstat()
                 if (actual.st_dev, actual.st_ino, actual.st_size, actual.st_mtime_ns, actual.st_mode) != (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_mode):
                     raise RetentionError('snapshot_changed_during_retention')
@@ -173,9 +166,9 @@ def maintain(root, config=None, *, reserve_bytes=0, extra_protected=()):
                     os.fsync(fd)
                 finally:
                     os.close(fd)
-            result.update(deleted_count=len(deleting), freed_bytes=result['removable_bytes'],
+            result.update(deleted_count=result['removable_count'], freed_bytes=result['removable_bytes'],
                           archive_bytes=result['archive_bytes'] - result['removable_bytes'],
-                          archive_count=result['archive_count'] - len(deleting))
+                          archive_count=result['archive_count'] - result['removable_count'])
             _save(root, result)
             return result
         except RetentionError as exc:

@@ -306,7 +306,8 @@ Optional `refresh-config.json` settings:
 {"retention":{"budget_bytes":1073741824,"warning_percent":80,"keep_recent":3}}
 ```
 
-The budget covers `snapshots/*.json`, not the current corpus, database, or other
+The budget covers the actual bytes of `snapshots/*.json` and `*.json.gz`,
+not the current corpus, database, or other
 lab files. Local `.json`, `.jsonl`, `.md`, `.txt`, `.py`, `.log`, `.diff`, `.err`
 artifacts and all text/blob fields in local `.sqlite` databases conservatively pin
 matching snapshot hashes, even under unfamiliar field names. The scan is bounded
@@ -325,6 +326,45 @@ hold the exclusive lock. Deploy by draining old runtime processes first, since
 older releases do not participate in the shared-reader protocol. Fixed labs
 without automatic refresh keep their existing retention behavior. Questions, content and errors containing raw paths/text are not logged by
 refresh status. All state remains owner-local, outside Git and the Vault.
+
+
+### Lossless archive compression
+
+Automatic refresh writes each new archived generation as an independent gzip file
+(`SNAPSHOT_ID.json.gz`, level 6). The live `snapshot.json` stays uncompressed, so
+foreground searches do not decompress the archive. Request-bound citations,
+follow-up/opportunity inspection and historical replay accept both formats without
+changing snapshot IDs, citation IDs, queries, feedback, or evidence content.
+
+Legacy archives convert in batches of at most two per refresh, before capacity
+admission, including when storage is already full. `storage-compress` explicitly
+converts up to five generations per call and reports remaining plain generations.
+It then reapplies the same evidence-preserving retention policy. This is a format
+migration; it does not count as successful search use or improved retrieval.
+
+Conversion validates the original generation, writes gzip through an fsynced
+atomic rename, reads it back with a bounded decoder, and compares **all original
+bytes** before unlinking the plain file and syncing the directory. Modification
+times are preserved for spare-generation ordering. If interrupted between the
+rename and unlink, both formats can coexist; a retry verifies equality before
+removing the redundant plain copy. A conflicting or corrupt twin is an error,
+never a reason to delete the original. Both physical files count toward storage
+until reconciliation, but retention counts one generation and evicts twins together
+only when that generation is unreferenced. Expanded data remains bounded at 64 MiB;
+CRC/truncation errors and snapshot document-hash mismatches are rejected.
+
+The temporary compressed file needs additional free disk space during conversion;
+it is not charged as permanent archive growth. Filesystem write failure keeps the
+original. Each gzip is independently recoverable with standard gzip tools, without
+a chain of deltas or another generation. Use the updated storage reader for custom
+evaluation scripts; a frozen ranker can remain unchanged while its storage reader
+is upgraded. Older runtime releases cannot read gzip archives: restore plain
+archives before rolling back to a pre-compression reader, or keep the compatible
+reader. Do not simply switch an old launcher back over a compressed archive.
+
+Generation-level compression intentionally avoids document-level shared objects:
+there is no new reference graph or garbage collector. Protected generations still
+accumulate and remain subject to the same 80% warning and hard storage limit.
 
 
 ### Human correction retrieval pilot

@@ -108,20 +108,20 @@ def _snapshot(root, snapshot_id=None):
     root = _root(root)
     if snapshot_id is not None and (not isinstance(snapshot_id, str) or not re.fullmatch(r"[0-9a-f]{64}", snapshot_id)):
         raise ValueError("invalid snapshot identifier")
-    path = root / "snapshot.json"
-    if snapshot_id is not None:
-        directory = root / "snapshots"
-        if directory.is_symlink():
-            raise ValueError("unsafe snapshot directory")
-        historical = directory / (snapshot_id + ".json")
-        if historical.exists() or historical.is_symlink():
-            path = historical
-    value = json.loads(safe_file(path, MAX_SNAPSHOT_BYTES))
-    # A legacy reader can race the first publication between checking the archive
-    # and opening current. Publication archives the old generation before switching.
-    if snapshot_id is not None and value.get("snapshot_id") != snapshot_id and path.name == "snapshot.json":
-        value = json.loads(safe_file(root / "snapshots" / (snapshot_id + ".json"), MAX_SNAPSHOT_BYTES))
-    if value.get("schema_version") != 1 or value.get("snapshot_id") != digest(value.get("documents")):
+    from retrieval_archive import read as read_archive
+    if snapshot_id is None:
+        raw = safe_file(root / 'snapshot.json', MAX_SNAPSHOT_BYTES)
+    else:
+        try:
+            raw = read_archive(root, snapshot_id)
+        except FileNotFoundError:
+            raw = safe_file(root / 'snapshot.json', MAX_SNAPSHOT_BYTES)
+            current = json.loads(raw)
+            if not isinstance(current, dict) or current.get('snapshot_id') != snapshot_id:
+                # Publication can archive the old current while we open current.
+                raw = read_archive(root, snapshot_id)
+    value = json.loads(raw)
+    if not isinstance(value, dict) or value.get("schema_version") != 1 or value.get("snapshot_id") != digest(value.get("documents")):
         raise ValueError("snapshot identity mismatch")
     if snapshot_id is not None and value["snapshot_id"] != snapshot_id:
         raise ValueError("historical snapshot unavailable")
@@ -237,25 +237,30 @@ def publish_snapshot(root, manifest, *, storage_policy=None):
         directory = root / "snapshots"
         directory.mkdir(mode=0o700, exist_ok=True)
         _root(directory)
+        from retrieval_archive import exists, pack
         storage = None
+        generations = {previous['snapshot_id']: canonical(previous).encode()}
+        generations.setdefault(value['snapshot_id'], raw)
+        missing = {identity: data for identity, data in generations.items() if not exists(root, identity)}
         if storage_policy is not None:
             from retrieval_retention import maintain
-            incoming = sum(len(data) for identity, data in {
-                previous['snapshot_id']: canonical(previous).encode(), value['snapshot_id']: raw
-            }.items() if not (directory / (identity + '.json')).exists())
-            storage = maintain(root, storage_policy, reserve_bytes=incoming,
-                               extra_protected={previous['snapshot_id'], value['snapshot_id']})
-        # Archive old first: a search racing the switch can always resolve its generation.
-        for generation, data in ((previous, canonical(previous).encode()), (value, raw)):
-            path = directory / (generation["snapshot_id"] + ".json")
-            if path.exists() or path.is_symlink():
-                _snapshot(root, generation["snapshot_id"])
+            encoded = {identity: pack(data) for identity, data in missing.items()}
+            storage = maintain(root, storage_policy, reserve_bytes=sum(map(len, encoded.values())),
+                               extra_protected=set(generations))
+        else:
+            encoded = missing
+        # Archive old first. Fixed labs keep the legacy format; auto-refresh
+        # writes compressed generations and leaves the live corpus uncompressed.
+        for identity in generations:
+            if exists(root, identity):
+                _snapshot(root, identity)
             else:
-                _atomic_snapshot_file(path, data)
+                suffix = '.json.gz' if storage_policy is not None else '.json'
+                _atomic_snapshot_file(directory / (identity + suffix), encoded[identity])
         _atomic_snapshot_file(root / "snapshot.json", raw)
         if storage is not None:
             storage.update(archive_bytes=storage['projected_bytes'], reserved_bytes=0,
-                           archive_count=len(list(directory.glob('*.json'))))
+                           archive_count=len({p.name[:64] for p in directory.glob('*.json*')}))
             from retrieval_retention import _save
             _save(root, storage)
     return dict(snapshot_id=value["snapshot_id"], previous_snapshot_id=previous["snapshot_id"],

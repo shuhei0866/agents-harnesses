@@ -95,6 +95,8 @@ def refresh(root, force=False):
             state.update(last_attempt=started, status='running')
             _write(root, 'refresh-state.json', state)
             try:
+                from retrieval_archive import compress
+                state['compression'] = compress(root, limit=2)
                 current = lab._snapshot(root)
                 state['storage'] = retention.maintain(root, config.get('retention', {}))
                 same_collection = (state.get('config_id') == lab.digest(config)
@@ -170,9 +172,17 @@ def main():
     if len(sys.argv) < 4 or sys.argv[1] != '--lab':
         return lab.main()
     root, command = Path(sys.argv[2]), sys.argv[3]
-    if command in ('refresh', 'refresh-status', 'storage-status', 'snapshot-pin'):
+    if command in ('refresh', 'refresh-status', 'storage-status', 'snapshot-pin', 'storage-compress'):
         try:
-            if command == 'snapshot-pin':
+            if command == 'storage-compress':
+                from retrieval_archive import compress
+                if len(sys.argv) != 4:
+                    raise ValueError('storage-compress takes no options')
+                config = _config(lab._root(root))
+                with lab.snapshot_lock(root, exclusive=True):
+                    result = dict(status='ok', compression=compress(root, limit=5))
+                    result['storage'] = retention.maintain(root, config.get('retention', {}))
+            elif command == 'snapshot-pin':
                 if len(sys.argv) != 5:
                     raise ValueError('snapshot-pin requires one snapshot ID')
                 result = retention.pin(root, sys.argv[4])
