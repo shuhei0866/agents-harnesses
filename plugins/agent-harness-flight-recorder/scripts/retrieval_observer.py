@@ -26,9 +26,31 @@ def tick(root):
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid() or metadata.st_mode & 0o022:
             raise ValueError('unsafe observer command')
         proc = subprocess.run([str(command), 'refresh'], stdin=subprocess.DEVNULL,
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                               timeout=30, check=False)
         result['status'] = 'ok' if proc.returncode == 0 else 'error'
+        raw = getattr(proc, 'stdout', None)
+        if isinstance(raw, bytes) and raw and len(raw) <= 1024 * 1024:
+            report = json.loads(raw)
+            if not isinstance(report, dict):
+                raise ValueError('invalid refresh report')
+            if report.get('collection_status') == 'error':
+                result['status'] = 'error'
+            storage = report.get('storage', {})
+            # Only fixed codes and numeric metrics cross the scheduler boundary.
+            if isinstance(storage, dict):
+                result['storage'] = {k: storage[k] for k in
+                    ('archive_bytes', 'budget_bytes', 'protected_bytes', 'usage_percent')
+                    if type(storage.get(k)) in (int, float)}
+                warning = storage.get('warning')
+                if warning in ('snapshot_capacity_high', 'protected_snapshots_exceed_budget',
+                               'reference_scan_budget_exhausted', 'unsafe_reference_path',
+                               'unsafe_snapshot_archive', 'snapshot_changed_during_retention',
+                               'retention_reference_check_failed', 'reference_database_unavailable'):
+                    result['storage']['warning'] = warning
+                    if result['status'] == 'ok':
+                        result['status'] = 'warning'
+
     except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
         result['status'] = 'error'
     try:
