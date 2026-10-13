@@ -134,19 +134,25 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(result['storage']['reserved_bytes'], 0)
 
     def test_search_registers_reference_before_cleanup_can_proceed(self):
-        loaded, resume = threading.Event(), threading.Event()
+        loaded, resume, publishing = threading.Event(), threading.Event(), threading.Event()
         original = lab._retrieve
         def paused(*args, **kwargs):
             loaded.set()
             if not resume.wait(5):
                 raise RuntimeError('test timed out')
             return original(*args, **kwargs)
+        def replace_twice():
+            publishing.set()
+            lab.publish_snapshot(self.root, corpus('next'), storage_policy={'keep_recent': 0})
+            lab.publish_snapshot(self.root, corpus('after next'), storage_policy={'keep_recent': 0})
         with concurrent.futures.ThreadPoolExecutor(2) as pool:
             with patch.object(lab, '_retrieve', side_effect=paused):
                 query = pool.submit(lab.search, self.root, 'decision', sample_rate=0)
                 self.assertTrue(loaded.wait(5))
-                publication = pool.submit(lab.publish_snapshot, self.root, corpus('next'), storage_policy={'keep_recent': 0})
-                self.assertFalse(publication.done())
+                publication = pool.submit(replace_twice)
+                self.assertTrue(publishing.wait(5))
+                with self.assertRaises(concurrent.futures.TimeoutError):
+                    publication.result(timeout=0.1)
                 resume.set()
                 request = query.result(timeout=5)
                 publication.result(timeout=5)
