@@ -6,6 +6,8 @@ import argparse
 from collections import Counter
 from contextlib import contextmanager
 import hashlib
+from functools import wraps
+import threading
 import fcntl
 import json
 import math
@@ -66,6 +68,42 @@ def _root(root):
     return root
 
 
+# Readers hold this through reference registration, not just loading the corpus.
+# Nested calls share the outer lock; a shared-to-exclusive upgrade is forbidden.
+_snapshot_locks = threading.local()
+
+
+@contextmanager
+def snapshot_lock(root, exclusive=False):
+    root = _root(root)
+    held = getattr(_snapshot_locks, 'held', {})
+    key = str(root)
+    if key in held:
+        if exclusive and not held[key]:
+            raise ValueError('snapshot lock upgrade unsupported')
+        yield
+        return
+    fd = os.open(root / '.snapshot.lock', os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        held[key] = exclusive
+        _snapshot_locks.held = held
+        try:
+            yield
+        finally:
+            del held[key]
+    finally:
+        os.close(fd)
+
+
+def snapshot_operation(function):
+    @wraps(function)
+    def guarded(root, *args, **kwargs):
+        with snapshot_lock(root):
+            return function(root, *args, **kwargs)
+    return guarded
+
+
 def _snapshot(root, snapshot_id=None):
     root = _root(root)
     if snapshot_id is not None and (not isinstance(snapshot_id, str) or not re.fullmatch(r"[0-9a-f]{64}", snapshot_id)):
@@ -96,13 +134,14 @@ def _connect(root):
     path = root / "measurements.sqlite"
     if path.is_symlink() or not path.is_file():
         raise ValueError("measurement database unavailable")
-    db = sqlite3.connect(str(path), timeout=5)
-    db.row_factory = sqlite3.Row
-    try:
-        with db:
-            yield db
-    finally:
-        db.close()
+    with snapshot_lock(root):
+        db = sqlite3.connect(str(path), timeout=5)
+        db.row_factory = sqlite3.Row
+        try:
+            with db:
+                yield db
+        finally:
+            db.close()
 
 
 def _build_snapshot(manifest, *, allow_empty=False):
@@ -189,17 +228,23 @@ def _atomic_snapshot_file(path, raw):
         temporary.unlink(missing_ok=True)
 
 
-def publish_snapshot(root, manifest):
-    """Publish a complete validated generation, retaining every previous corpus."""
+def publish_snapshot(root, manifest, *, storage_policy=None):
+    """Publish atomically; optional retention preserves every referenced corpus."""
     value, raw = _build_snapshot(manifest, allow_empty=True)
     root = _root(root)
-    lock_fd = os.open(root / ".snapshot.lock", os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    with os.fdopen(lock_fd, "r+b") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with snapshot_lock(root, exclusive=True):
         previous = _snapshot(root)
         directory = root / "snapshots"
         directory.mkdir(mode=0o700, exist_ok=True)
         _root(directory)
+        storage = None
+        if storage_policy is not None:
+            from retrieval_retention import maintain
+            incoming = sum(len(data) for identity, data in {
+                previous['snapshot_id']: canonical(previous).encode(), value['snapshot_id']: raw
+            }.items() if not (directory / (identity + '.json')).exists())
+            storage = maintain(root, storage_policy, reserve_bytes=incoming,
+                               extra_protected={previous['snapshot_id'], value['snapshot_id']})
         # Archive old first: a search racing the switch can always resolve its generation.
         for generation, data in ((previous, canonical(previous).encode()), (value, raw)):
             path = directory / (generation["snapshot_id"] + ".json")
@@ -208,10 +253,15 @@ def publish_snapshot(root, manifest):
             else:
                 _atomic_snapshot_file(path, data)
         _atomic_snapshot_file(root / "snapshot.json", raw)
+        if storage is not None:
+            storage.update(archive_bytes=storage['projected_bytes'], reserved_bytes=0,
+                           archive_count=len(list(directory.glob('*.json'))))
+            from retrieval_retention import _save
+            _save(root, storage)
     return dict(snapshot_id=value["snapshot_id"], previous_snapshot_id=previous["snapshot_id"],
                 changed=value["snapshot_id"] != previous["snapshot_id"], documents=len(value["documents"]),
                 summary_documents=sum(bool(d["summaries"]) for d in value["documents"]),
-                import_report=value["import_report"])
+                import_report=value["import_report"], **({"storage": storage} if storage is not None else {}))
 
 
 def create_lab(root: Path, manifest: dict) -> dict:
@@ -288,6 +338,7 @@ def _retrieve(snapshot, query, arm, limit, deadline=None):
                              input_tokens=None, output_tokens=None, cost_microusd=None))
 
 
+@snapshot_operation
 def search(root, query, arm="recorder", limit=5, sample_rate=0.1):
     started = time.perf_counter()
     if not isinstance(query, str) or not query.strip() or len(query) > MAX_QUERY or not tokens(query):
@@ -318,6 +369,7 @@ def search(root, query, arm="recorder", limit=5, sample_rate=0.1):
     return result
 
 
+@snapshot_operation
 def search_corrections(root, query, trigger, limit=3, purpose='task', task=None, session_id=None, need=None, retry_of=None):
     from retrieval_context import retrieve, TRIGGERS, VERSION as context_version
     if not isinstance(query, str) or not query.strip() or len(query) > MAX_QUERY or not tokens(query):

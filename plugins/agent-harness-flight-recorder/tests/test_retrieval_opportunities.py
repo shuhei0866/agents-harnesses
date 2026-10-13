@@ -202,5 +202,24 @@ class OpportunityTests(unittest.TestCase):
         command.write_text('#!/bin/sh\nexit 1\n');observer.tick(recorder)
         self.assertEqual(json.loads((recorder/'scheduler/recall-observer-status.json').read_text())['status'],'error')
 
+    def test_scheduler_preserves_warning_and_throttled_failure(self):
+        from types import SimpleNamespace
+        recorder=self.base/'recorder';(recorder/'scheduler').mkdir(parents=True)
+        command=self.base/'recall';command.write_text('#!/bin/sh\nexit 0\n');command.chmod(0o700)
+        config=recorder/'scheduler/recall-observer.json'
+        config.write_text(json.dumps(dict(schema_version=1,command=str(command))));config.chmod(0o600)
+        report=dict(status='throttled', collection_status='updated', storage=dict(
+            warning='snapshot_capacity_high', usage_percent=82, archive_bytes=820, budget_bytes=1000, private_text='omit'))
+        with patch.object(observer.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout=json.dumps(report).encode())):
+            observer.tick(recorder)
+        value=json.loads((recorder/'scheduler/recall-observer-status.json').read_text())
+        self.assertEqual(value['status'],'warning')
+        self.assertEqual(value['storage']['warning'],'snapshot_capacity_high')
+        self.assertNotIn('private_text',value['storage'])
+        report['collection_status']='error'
+        with patch.object(observer.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout=json.dumps(report).encode())):
+            observer.tick(recorder)
+        self.assertEqual(json.loads((recorder/'scheduler/recall-observer-status.json').read_text())['status'],'error')
+
 
 if __name__=='__main__':unittest.main()

@@ -205,7 +205,8 @@ This release provides the search/measurement entry point, automatic sampled
 local shadows, citation reads, explicit feedback, blinded assessment packets,
 and reproducible retrieval regression. It does not yet provide automatic
 answer generation/judging, model-cost accounting, cross-session task joining,
-retention automation, periodic corpus refresh, or automatic search-policy changes.
+automatic search-policy changes. Opt-in refresh and evidence-preserving retention
+are described below.
 Those should be added only with measured benefit and separately bounded budgets.
 
 Run the contracts:
@@ -281,9 +282,48 @@ are checked around streamed reads, including early exclusions.
 Collection and publication are bounded. An unstable read, oversized corpus or
 other import failure preserves the last good corpus and successful watermark;
 the next eligible search retries. A local lock prevents simultaneous refreshes.
-At 1 GiB of archived snapshots, automatic publication stops and `refresh-status`
-reports an error; archives are never silently deleted because measurements refer
-to them. Questions, content and errors containing raw paths/text are not logged by
+Automatic refresh retains all snapshots referenced by measurement database
+rows (including historical opportunity/follow-up revisions), the current corpus,
+and local text artifacts. It removes only unreferenced archive generations,
+keeping up to three recent spare generations when space permits. The default
+archive budget is 1 GiB. Cleanup runs before collection to recover an already-full
+archive, and admission reserves space for the next generation before publication.
+Protected evidence is never evicted to fit the budget: if it cannot fit, publication
+stops without advancing the successful collection watermark.
+
+`storage-status` previews the protected/removable counts and projected bytes
+without deleting anything. `refresh-status.storage` and `storage-state.json` expose
+usage, the latest cleanup counts, and a fixed warning/error code. At 80% of budget,
+`warning=snapshot_capacity_high` appears even if collection succeeds. Foreground
+searches print a brief warning; the existing scheduler observer preserves it in
+its status rather than discarding the refresh result. A throttled retry retains
+both the warning and the previous collection failure. This is local status, not
+an independent notification service.
+
+Optional `refresh-config.json` settings:
+
+```json
+{"retention":{"budget_bytes":1073741824,"warning_percent":80,"keep_recent":3}}
+```
+
+The budget covers `snapshots/*.json`, not the current corpus, database, or other
+lab files. Local `.json`, `.jsonl`, `.md`, `.txt`, `.py`, `.log`, `.diff`, `.err`
+artifacts and all text/blob fields in local `.sqlite` databases conservatively pin
+matching snapshot hashes, even under unfamiliar field names. The scan is bounded
+at 10,000 files and 256 MiB of reference data; unreadable/corrupt databases,
+unsafe paths, exceeded scan bounds, missing required evidence, or corrupt
+candidates abort deletion. No raw content is copied into storage diagnostics.
+
+Before creating an external or otherwise unrecognized fixture, run
+`snapshot-pin SNAPSHOT_ID`; this validates and atomically records the pin in
+`snapshot-pins.json`. Keep that pin for the lifetime of the fixture. Custom
+artifact writers must pin before writing or hold `retrieval_lab.snapshot_lock`
+through reading and saving their reference. Merely holding an in-memory snapshot
+outside the lock is not a persistent reference. Automatic readers hold a shared
+lock through search and reference registration; refresh, publication and cleanup
+hold the exclusive lock. Deploy by draining old runtime processes first, since
+older releases do not participate in the shared-reader protocol. Fixed labs
+without automatic refresh keep their existing retention behavior. Questions, content and errors containing raw paths/text are not logged by
 refresh status. All state remains owner-local, outside Git and the Vault.
 
 
