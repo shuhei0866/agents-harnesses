@@ -81,6 +81,8 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(self.old.read_bytes(),raw)
         value=json.loads(raw);value['import_report']={'different':True}
         target.write_bytes(archive.pack(lab.canonical(value).encode()))
+        with self.assertRaisesRegex(ValueError,'differs from original'):
+            lab._snapshot(self.root,self.query['snapshot_id'])
         with self.assertRaisesRegex(ValueError,'differs from original'):archive.compress(self.root,100)
         self.assertEqual(self.old.read_bytes(),raw)
 
@@ -163,6 +165,19 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(result['status'],'ok')
         self.assertLess(result['archive_bytes'],budget)
         self.assertEqual(result['archive_count'],2)
+
+    def test_conflicting_unused_twins_abort_all_cleanup(self):
+        extra=lab.publish_snapshot(self.root,corpus('unused generation'))['snapshot_id']
+        lab.publish_snapshot(self.root,corpus('live generation'))
+        path=self.root/'snapshots'/(extra+'.json')
+        original=path.read_bytes();value=json.loads(original)
+        value['import_report']={'metadata':'conflicting'}
+        twin=path.with_suffix('.json.gz')
+        twin.write_bytes(archive.pack(lab.canonical(value).encode()));twin.chmod(0o600)
+        before={p.name:p.read_bytes() for p,_ in archive.entries(self.root)}
+        with self.assertRaises(retention.RetentionError):
+            retention.maintain(self.root,{'keep_recent':0})
+        self.assertEqual({p.name:p.read_bytes() for p,_ in archive.entries(self.root)},before)
 
 
 if __name__=='__main__':unittest.main()

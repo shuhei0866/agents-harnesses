@@ -62,7 +62,14 @@ def read(root, snapshot_id):
     compressed = directory / (snapshot_id + '.json.gz')
     plain = directory / (snapshot_id + '.json')
     if compressed.exists() or compressed.is_symlink():
-        return read_file(compressed)
+        raw = read_file(compressed)
+        try:
+            original = read_file(plain)
+        except FileNotFoundError:
+            return raw
+        if original != raw:
+            raise ValueError('compressed snapshot differs from original')
+        return raw
     try:
         return read_file(plain)
     except FileNotFoundError:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from contextlib import closing
 import os
 from pathlib import Path
@@ -152,9 +153,16 @@ def maintain(root, config=None, *, reserve_bytes=0, extra_protected=()):
                 raise RetentionError('protected_snapshots_exceed_budget')
             # Validate every deletion before deleting ANY file. Corruption or
             # unknown reference inputs abort cleanup, preserving all evidence.
+            twins = {}
             for path, info in deleting:
                 from retrieval_archive import read_file, validate, identity
-                validate(read_file(path), identity(path))
+                raw = read_file(path)
+                key = identity(path)
+                validate(raw, key)
+                fingerprint = hashlib.sha256(raw).digest()
+                if key in twins and twins[key] != fingerprint:
+                    raise ValueError('compressed snapshot differs from original')
+                twins[key] = fingerprint
                 actual = path.lstat()
                 if (actual.st_dev, actual.st_ino, actual.st_size, actual.st_mtime_ns, actual.st_mode) != (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_mode):
                     raise RetentionError('snapshot_changed_during_retention')
