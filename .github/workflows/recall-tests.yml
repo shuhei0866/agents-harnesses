@@ -15,6 +15,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+      - name: Install bounded source decoder
+        run: |
+          if ! command -v zstd >/dev/null; then
+            if [ "$RUNNER_OS" = "macOS" ]; then brew install zstd; else sudo apt-get update && sudo apt-get install -y zstd; fi
+          fi
       - name: Test local recall and historical replay (synthetic, no model calls)
         run: |
           bash plugins/agent-harness-flight-recorder/tests/test-retrieval-lab.sh

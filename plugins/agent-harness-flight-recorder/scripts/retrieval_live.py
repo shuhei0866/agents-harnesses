@@ -14,6 +14,8 @@ import os
 from pathlib import Path
 import re
 import stat
+import shutil
+import subprocess
 import time
 
 from retrieval_snapshot import _message
@@ -29,7 +31,7 @@ MAX_DOCUMENT_CHARS = 100_000
 MAX_MANIFEST_BYTES = 60 * 1024 * 1024
 WINDOW_LINES = 40
 ADAPTERS = {'claude-code', 'codex'}
-COLLECTOR_VERSION = 'structured-message-context-v9'
+COLLECTOR_VERSION = 'structured-message-context-v10-zstd'
 
 
 BRIDGE_PROMPT = (
@@ -75,6 +77,9 @@ def source_id(adapter: str, path: Path) -> str:
     """Stable opaque identity for one adapter's absolute local source path."""
     if adapter not in ADAPTERS or not Path(path).is_absolute():
         raise ValueError('invalid local source identity')
+    path = Path(path)
+    if path.name.endswith('.jsonl.zst'):
+        path = path.with_suffix('')
     key = json.dumps([adapter, os.path.normpath(str(path))], ensure_ascii=True, separators=(',', ':'))
     return 'sha256:' + hashlib.sha256(key.encode()).hexdigest()
 
@@ -135,7 +140,7 @@ def _directory_identity(path):
     return (value.st_dev, value.st_ino, value.st_mode, value.st_mtime_ns, value.st_ctime_ns)
 
 
-def _discover(roots, report, *, directory_stamps=None):
+def _discover(roots, report, *, directory_stamps=None, include_compressed=False):
     pending = []
     seen_dirs = set()
     seen_files = set()
@@ -172,7 +177,7 @@ def _discover(roots, report, *, directory_stamps=None):
                     continue
                 if entry.is_dir(follow_symlinks=False):
                     pending.append((adapter, Path(entry.path)))
-                elif entry.name.endswith('.jsonl') and entry.is_file(follow_symlinks=False):
+                elif (entry.name.endswith('.jsonl') or (include_compressed and entry.name.endswith('.jsonl.zst'))) and entry.is_file(follow_symlinks=False):
                     identity = (adapter, entry.path)
                     if identity in seen_files:
                         continue
@@ -181,6 +186,9 @@ def _discover(roots, report, *, directory_stamps=None):
                         raise ValueError('local source count limit exceeded')
                     metadata = entry.stat(follow_symlinks=False)
                     files.append((metadata.st_mtime, adapter, Path(entry.path), metadata.st_size))
+    identities = [source_id(adapter, path) for _, adapter, path, _ in files]
+    if len(set(identities)) != len(identities):
+        raise ValueError('ambiguous compressed source twins')
     report['discovered_sources'] = len(files)
     return sorted(files, key=lambda item: (-item[0], item[1], str(item[2])))
 
@@ -197,10 +205,23 @@ def _records(path: Path, report: dict):
         if before.st_size > MAX_SOURCE_BYTES:
             raise ValueError('local source byte limit exceeded')
         consumed = 0
+        decoder = None
+        decoded = stream
+        if path.name.endswith('.jsonl.zst'):
+            executable = shutil.which('zstd')
+            if executable is None:
+                raise ValueError('zstd decoder unavailable')
+            # Pass the already validated descriptor, never reopen a path in the
+            # child. Limit both decoder memory and decompressed output bytes.
+            decoder = subprocess.Popen([executable, '-q', '-d', '-c', '-M256MB'],
+                                       stdin=stream, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            decoded = decoder.stdout
         try:
             while True:
-                line = stream.readline(MAX_LINE_BYTES + 1)
+                line = decoded.readline(MAX_LINE_BYTES + 1)
                 if not line:
+                    if decoder is not None and decoder.wait() != 0:
+                        raise ValueError('invalid compressed source')
                     break
                 consumed += len(line)
                 report['bytes_read'] += len(line)
@@ -213,10 +234,17 @@ def _records(path: Path, report: dict):
                     yield None
                     return
                 if not line.endswith(b'\n'):
+                    if decoder is not None and decoder.wait() != 0:
+                        raise ValueError('invalid compressed source')
                     report['partial_sources'] += 1
                     break
                 yield line
         finally:
+            if decoder is not None:
+                decoded.close()
+                if decoder.poll() is None:
+                    decoder.kill()
+                decoder.wait()
             after = os.fstat(stream.fileno())
             current = path.stat(follow_symlinks=False)
             identity = lambda st: (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
@@ -284,7 +312,7 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
     excluded = []
     try:
         directory_stamps = {}
-        files = _discover(roots, report, directory_stamps=directory_stamps)
+        files = _discover(roots, report, directory_stamps=directory_stamps, include_compressed=True)
         present = [source_id(adapter, path) for _, adapter, path, _ in files]
         for mtime, adapter, path, _size in files:
             identity = source_id(adapter, path)

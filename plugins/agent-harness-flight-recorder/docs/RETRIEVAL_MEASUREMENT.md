@@ -716,3 +716,11 @@ are not automatically retried. The worker timeout allows bounded retention and
 collection work within the existing five-minute scheduler wakeup. SIGKILL or
 power loss cannot write a final record; the next status check detects the released
 lock and the next refresh records the interruption before retrying when due.
+
+Live collection also discovers `.jsonl.zst` sources. It requires the `zstd` CLI
+on PATH, streams decompression through a validated input descriptor, and bounds
+both decoder memory and expanded bytes. Plain and compressed paths share their
+original source identity and line numbering. Corruption, unavailable decoding,
+or ambiguous plain/compressed twins abort collection and preserve the last good
+corpus. Fixed snapshots and their citations are unchanged. The collector version
+forces one complete recollection so old compressed paths are not silently skipped.

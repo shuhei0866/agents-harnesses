@@ -2,6 +2,8 @@
 import importlib.util
 import json
 import os
+import shutil
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -350,6 +352,37 @@ class LiveTests(unittest.TestCase):
         self.write(self.claude, 'one.jsonl', encode(claude('one')))
         result = live.export_live(self.roots + [('claude-code', self.claude)], since=0)
         self.assertEqual(len(result['documents']), 1)
+
+    @unittest.skipUnless(shutil.which('zstd'), 'zstd CLI required')
+    def test_compressed_source_keeps_identity_lines_and_text(self):
+        raw = encode(codex('past decision'), codex('answer', 'assistant'))
+        plain = self.write(self.codex, 'one.jsonl', raw)
+        first = live.export_live(self.roots, since=0)
+        packed = plain.with_suffix('.jsonl.zst')
+        packed.write_bytes(subprocess.run(['zstd','-q','-c'],input=raw,capture_output=True,check=True).stdout)
+        plain.unlink()
+        second = live.export_live(self.roots, since=0)
+        self.assertEqual(first['documents'],second['documents'])
+        self.assertEqual(first['present_source_ids'],second['present_source_ids'])
+        with patch.object(live.shutil, 'which', return_value=None), self.assertRaisesRegex(ValueError,'zstd decoder unavailable'):
+            live.export_live(self.roots,since=0)
+
+    @unittest.skipUnless(shutil.which('zstd'), 'zstd CLI required')
+    def test_compressed_corruption_and_expansion_fail_closed(self):
+        raw=encode(codex('x'*3000))
+        packed=subprocess.run(['zstd','-q','-c'],input=raw,capture_output=True,check=True).stdout
+        path=self.write(self.codex,'one.jsonl.zst',packed)
+        with patch.object(live,'MAX_SOURCE_BYTES',1000), self.assertRaisesRegex(ValueError,'byte limit'):
+            live.export_live(self.roots,since=0)
+        path.write_bytes(packed[:-2])
+        with self.assertRaisesRegex(ValueError,'invalid compressed source'):
+            live.export_live(self.roots,since=0)
+
+    def test_ambiguous_plain_and_compressed_twins_fail_closed(self):
+        self.write(self.codex,'one.jsonl',encode(codex('plain')))
+        self.write(self.codex,'one.jsonl.zst',b'invalid')
+        with self.assertRaisesRegex(ValueError,'ambiguous compressed source twins'):
+            live.export_live(self.roots,since=0)
 
 
 if __name__ == '__main__':

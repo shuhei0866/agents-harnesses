@@ -84,6 +84,9 @@ def _failure_code(exc):
     message = str(exc).removeprefix('local refresh aborted: ')
     return {
         'input changed': 'source_changed',
+        'zstd decoder unavailable': 'decoder_unavailable',
+        'invalid compressed source': 'source_compression_invalid',
+        'ambiguous compressed source twins': 'source_format_conflict',
         'local session scan unavailable or changed; prior snapshot retained': 'source_unavailable',
         'local source byte limit exceeded': 'source_size_limit',
         'local snapshot size limit exceeded': 'collection_size_limit',
