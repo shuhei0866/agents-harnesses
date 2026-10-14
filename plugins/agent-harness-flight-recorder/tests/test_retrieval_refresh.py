@@ -158,6 +158,78 @@ class RefreshTests(unittest.TestCase):
             self.assertEqual(result[key], prior[key])
         self.assertEqual(lab._snapshot(self.root), snapshot)
 
+    def test_stale_success_is_not_healthy_even_when_throttled(self):
+        with patch.object(refresh, 'export_live', return_value=self.delta([doc('a', 'one')])):
+            refresh.refresh(self.root, force=True)
+        state = refresh._state(self.root)
+        state['last_success'] = 1
+        refresh._write(self.root, 'refresh-state.json', state)
+        result = refresh.refresh(self.root)
+        self.assertEqual(result['status'], 'throttled')
+        self.assertEqual(result['health_code'], 'collection_stale')
+
+    def test_orphaned_run_is_detected_without_pid_guessing(self):
+        import time
+        state = dict(status='running', last_attempt=time.time(), last_success=time.time(), stage='collect')
+        refresh._write(self.root, 'refresh-state.json', state)
+        self.assertEqual(refresh.status(self.root)['health_code'], 'collection_interrupted')
+        result = refresh.refresh(self.root)
+        self.assertEqual(result['health'], 'error')
+        self.assertEqual(result['collection_status'], 'error')
+        self.assertEqual(refresh._state(self.root)['error_code'], 'collection_interrupted')
+
+    def test_busy_refresh_keeps_health_and_does_not_touch_owner(self):
+        import fcntl, time
+        state = dict(status='running', last_attempt=time.time(), last_success=1, stage='collect')
+        refresh._write(self.root, 'refresh-state.json', state)
+        with open(self.root / 'refresh.lock', 'w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = refresh.refresh(self.root)
+            self.assertEqual(result['status'], 'busy')
+            self.assertEqual(result['health_code'], 'collection_stale')
+            self.assertEqual(refresh._state(self.root), state)
+
+    def test_collection_race_retries_once_without_advancing_failed_watermark(self):
+        race = ValueError('local refresh aborted: input changed')
+        with patch.object(refresh, 'export_live', side_effect=[race, self.delta([doc('a', 'one')])]):
+            result = refresh.refresh(self.root, force=True)
+        self.assertEqual(result['collection_attempts'], 2)
+        self.assertEqual(result['health'], 'ok')
+        old = lab._snapshot(self.root)
+        with patch.object(refresh, 'export_live', side_effect=race) as export:
+            failure = refresh.refresh(self.root, force=True)
+        self.assertEqual(export.call_count, 2)
+        self.assertEqual(failure['error_code'], 'source_changed')
+        self.assertEqual(failure['stage'], 'collect')
+        self.assertIn('collect', failure['stage_ms'])
+        self.assertEqual(failure['since'], result['since'])
+        self.assertEqual(lab._snapshot(self.root), old)
+
+    def test_failed_followup_is_not_healthy_after_successful_collection(self):
+        config = refresh._config(self.root)
+        config['followups'] = {'since': 1}
+        refresh._write(self.root, 'refresh-config.json', config)
+        with patch.object(refresh, 'export_live', return_value=self.delta([doc('a', 'one')])), \
+             patch('retrieval_followup.run', side_effect=ValueError('private data')):
+            result = refresh.refresh(self.root, force=True)
+        self.assertEqual(result['status'], 'updated')
+        self.assertEqual(result['health_code'], 'observation_failed')
+        self.assertNotIn('private data', json.dumps(result))
+
+
+    def test_process_exit_leaves_stage_and_next_attempt_recovers(self):
+        import subprocess
+        code = "import sys,os,pathlib; sys.path.insert(0,sys.argv[1]); import retrieval_refresh as r; r.export_live=lambda *a,**k: os._exit(23); r.refresh(pathlib.Path(sys.argv[2]),force=True)"
+        result = subprocess.run([sys.executable, '-c', code, str(Path(refresh.__file__).parent), str(self.root)])
+        self.assertEqual(result.returncode, 23)
+        self.assertEqual(refresh.status(self.root)['health_code'], 'collection_interrupted')
+        self.assertEqual(refresh.status(self.root)['stage'], 'collect')
+        with patch.object(refresh, 'export_live', return_value=self.delta([doc('a', 'recovered')])):
+            recovered = refresh.refresh(self.root, force=True)
+        self.assertEqual(recovered['health'], 'ok')
+        self.assertEqual(recovered['last_failure']['code'], 'collection_interrupted')
+        self.assertEqual(recovered['last_failure']['stage'], 'collect')
+
 
 if __name__ == '__main__':
     unittest.main()

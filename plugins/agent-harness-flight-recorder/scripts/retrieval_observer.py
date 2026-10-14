@@ -1,6 +1,7 @@
 """Opt-in local recall refresh on the existing recorder scheduler wakeup."""
 import json
 import os
+import math
 from pathlib import Path
 import stat
 import subprocess
@@ -27,15 +28,38 @@ def tick(root):
             raise ValueError('unsafe observer command')
         proc = subprocess.run([str(command), 'refresh'], stdin=subprocess.DEVNULL,
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                              timeout=30, check=False)
+                              timeout=120, check=False)
         result['status'] = 'ok' if proc.returncode == 0 else 'error'
+        result['reason'] = 'refresh_process_failed'
         raw = getattr(proc, 'stdout', None)
         if isinstance(raw, bytes) and raw and len(raw) <= 1024 * 1024:
             report = json.loads(raw)
             if not isinstance(report, dict):
                 raise ValueError('invalid refresh report')
-            if report.get('collection_status') == 'error':
-                result['status'] = 'error'
+            last = report.get('last_success')
+            bound = report.get('stale_after_seconds')
+            valid = (type(last) in (int, float) and math.isfinite(last) and 0 < last <= time.time() + 60
+                     and type(bound) in (int, float) and math.isfinite(bound) and 120 <= bound <= 172920)
+            age = max(0, time.time() - last) if valid else None
+            collection = report.get('collection_status', report.get('status'))
+            if age is not None:
+                result.update(last_success=last, success_age_seconds=age)
+            if proc.returncode != 0:
+                result['reason'] = 'refresh_process_failed'
+            elif not valid:
+                result.update(status='error', reason='missing_collection_health')
+            elif age > bound:
+                result.update(status='error', reason='collection_stale')
+            elif collection == 'error' or report.get('health') == 'error':
+                code = report.get('health_code')
+                reason = code if code in ('collection_interrupted', 'observation_failed') else 'collection_failed'
+                result.update(status='error', reason=reason)
+            elif collection == 'running':
+                result.update(status='running', reason='collection_in_progress')
+            elif collection in ('updated', 'unchanged') and report.get('health') == 'ok':
+                result.update(status='ok', reason='collection_fresh')
+            else:
+                result.update(status='error', reason='unknown_collection_state')
             storage = report.get('storage', {})
             # Only fixed codes and numeric metrics cross the scheduler boundary.
             if isinstance(storage, dict):
@@ -51,8 +75,12 @@ def tick(root):
                     if result['status'] == 'ok':
                         result['status'] = 'warning'
 
-    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
-        result['status'] = 'error'
+        else:
+            result.update(status='error', reason='missing_collection_health')
+    except subprocess.TimeoutExpired:
+        result.update(status='error', reason='refresh_timeout')
+    except (OSError, ValueError, KeyError, TypeError):
+        result.update(status='error', reason='observer_failed')
     try:
         atomic_replace(root / 'scheduler/recall-observer-status.json', canonical_json(result))
     except OSError:
