@@ -102,7 +102,7 @@ scripts/flight-recorder-retrieval --lab "$LAB" worker --max-jobs 5 --max-seconds
 ```
 
 Atomic claims avoid duplicate work by concurrent workers. A crashed worker's
-120-second lease can be reclaimed by a later invocation. There are no paid calls
+240-second lease can be reclaimed by a later invocation. There are no paid calls
 to double-charge. Contract mismatches and exhausted time budgets are recorded as
 errors rather than compared. Worker startup failure leaves jobs queued.
 
@@ -621,7 +621,7 @@ due. Configuration is local and ignored by Git:
 ```
 
 The owner-controlled non-symlink command is invoked as an argument vector with
-`refresh`, a 120-second timeout and no inherited stdin/output. The lab's existing
+`refresh`, a 240-second timeout and no inherited stdin/output. The lab's existing
 refresh throttle controls scan frequency; no new timer, external transmission or
 model call is added. Failure writes `scheduler/recall-observer-status.json` and
 must not stop sync. Disable by removing this opt-in configuration; existing
@@ -702,7 +702,7 @@ sampling separate; no result from it is silently promoted to an observed failure
 
 `refresh-status` separates the persisted collection `status` from derived `health`.
 A successful exit or a throttled/busy refresh is not evidence of fresh collection.
-`health` becomes error after two configured intervals plus the 120-second worker
+`health` becomes error after two configured intervals plus the 240-second worker
 allowance without success, when a running record no longer has a refresh lock
 owner, or when follow-up/opportunity observation fails. The scheduler preserves
 freshness and timeout failure reasons; empty/legacy health reports fail closed.
