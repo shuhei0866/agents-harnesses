@@ -621,7 +621,7 @@ due. Configuration is local and ignored by Git:
 ```
 
 The owner-controlled non-symlink command is invoked as an argument vector with
-`refresh`, a 30-second timeout and no inherited stdin/output. The lab's existing
+`refresh`, a 120-second timeout and no inherited stdin/output. The lab's existing
 refresh throttle controls scan frequency; no new timer, external transmission or
 model call is added. Failure writes `scheduler/recall-observer-status.json` and
 must not stop sync. Disable by removing this opt-in configuration; existing
@@ -696,3 +696,31 @@ excludes searches without needs, uninvoked searches and other-session follow-ups
 legacy-search counts and linkage gaps are explicit. Found/not-found groups differ
 in task difficulty and are not randomized controls. Keep existing opportunity
 sampling separate; no result from it is silently promoted to an observed failure.
+
+
+### Refresh health and interrupted workers
+
+`refresh-status` separates the persisted collection `status` from derived `health`.
+A successful exit or a throttled/busy refresh is not evidence of fresh collection.
+`health` becomes error after two configured intervals plus the 120-second worker
+allowance without success, when a running record no longer has a refresh lock
+owner, or when follow-up/opportunity observation fails. The scheduler preserves
+freshness and timeout failure reasons; empty/legacy health reports fail closed.
+An active worker is reported as running, not completed.
+
+Each attempt persists its current `stage`, bounded `stage_ms`, and a sanitized
+`error_code`. Exception text, source paths, and conversation excerpts are omitted.
+A source changing during collection retries the whole export once. A second
+failure preserves the previous snapshot and successful watermark. Other errors
+are not automatically retried. The worker timeout allows bounded retention and
+collection work within the existing five-minute scheduler wakeup. SIGKILL or
+power loss cannot write a final record; the next status check detects the released
+lock and the next refresh records the interruption before retrying when due.
+
+Live collection also discovers `.jsonl.zst` sources. It requires the `zstd` CLI
+on PATH, streams decompression through a validated input descriptor, and bounds
+both decoder memory and expanded bytes. Plain and compressed paths share their
+original source identity and line numbering. Corruption, unavailable decoding,
+or ambiguous plain/compressed twins abort collection and preserve the last good
+corpus. Fixed snapshots and their citations are unchanged. The collector version
+forces one complete recollection so old compressed paths are not silently skipped.

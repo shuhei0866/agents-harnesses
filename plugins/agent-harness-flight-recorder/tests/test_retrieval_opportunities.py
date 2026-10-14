@@ -198,7 +198,7 @@ class OpportunityTests(unittest.TestCase):
         command=self.base/'recall';command.write_text('#!/bin/sh\nexit 0\n');command.chmod(0o700)
         config=recorder/'scheduler/recall-observer.json';config.write_text(json.dumps(dict(schema_version=1,command=str(command))));config.chmod(0o600)
         observer.tick(recorder)
-        self.assertEqual(json.loads((recorder/'scheduler/recall-observer-status.json').read_text())['status'],'ok')
+        self.assertEqual(json.loads((recorder/'scheduler/recall-observer-status.json').read_text())['reason'],'missing_collection_health')
         command.write_text('#!/bin/sh\nexit 1\n');observer.tick(recorder)
         self.assertEqual(json.loads((recorder/'scheduler/recall-observer-status.json').read_text())['status'],'error')
 
@@ -208,7 +208,7 @@ class OpportunityTests(unittest.TestCase):
         command=self.base/'recall';command.write_text('#!/bin/sh\nexit 0\n');command.chmod(0o700)
         config=recorder/'scheduler/recall-observer.json'
         config.write_text(json.dumps(dict(schema_version=1,command=str(command))));config.chmod(0o600)
-        report=dict(status='throttled', collection_status='updated', storage=dict(
+        report=dict(status='throttled', collection_status='updated', health='ok', last_success=__import__('time').time(), stale_after_seconds=1920, storage=dict(
             warning='snapshot_capacity_high', usage_percent=82, archive_bytes=820, budget_bytes=1000, private_text='omit'))
         with patch.object(observer.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout=json.dumps(report).encode())):
             observer.tick(recorder)
@@ -220,6 +220,29 @@ class OpportunityTests(unittest.TestCase):
         with patch.object(observer.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout=json.dumps(report).encode())):
             observer.tick(recorder)
         self.assertEqual(json.loads((recorder/'scheduler/recall-observer-status.json').read_text())['status'],'error')
+
+    def test_observer_distinguishes_timeout_stale_running_and_unknown(self):
+        from types import SimpleNamespace
+        import subprocess, time
+        recorder=self.base/'recorder';(recorder/'scheduler').mkdir(parents=True)
+        command=self.base/'recall';command.write_text('#!/bin/sh\nexit 0\n');command.chmod(0o700)
+        config=recorder/'scheduler/recall-observer.json'
+        config.write_text(json.dumps(dict(schema_version=1,command=str(command))));config.chmod(0o600)
+        reports = [
+            ({'status':'throttled','collection_status':'running','health':'error','last_success':1,'stale_after_seconds':1920}, 'error','collection_stale'),
+            ({'status':'busy','collection_status':'running','health':'running','last_success':time.time(),'stale_after_seconds':1920}, 'running','collection_in_progress'),
+            ({'status':'throttled','collection_status':'error','health':'error','last_success':time.time(),'stale_after_seconds':1920}, 'error','collection_failed'),
+            ({'status':'unchanged','health':'ok','last_success':time.time(),'stale_after_seconds':1920}, 'ok','collection_fresh'),
+            ({'status':'unchanged'}, 'error','missing_collection_health'),
+        ]
+        for report, status, reason in reports:
+            with self.subTest(reason=reason), patch.object(observer.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout=json.dumps(report).encode())):
+                observer.tick(recorder)
+                value=json.loads((recorder/'scheduler/recall-observer-status.json').read_text())
+                self.assertEqual((value['status'],value['reason']),(status,reason))
+        with patch.object(observer.subprocess, 'run', side_effect=subprocess.TimeoutExpired('redacted',120)):
+            observer.tick(recorder)
+        self.assertEqual(json.loads((recorder/'scheduler/recall-observer-status.json').read_text())['reason'],'refresh_timeout')
 
 
 if __name__=='__main__':unittest.main()

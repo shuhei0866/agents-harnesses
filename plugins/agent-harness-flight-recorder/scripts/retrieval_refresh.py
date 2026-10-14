@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -32,10 +33,67 @@ def _write(root, name, value):
         path.unlink(missing_ok=True)
 
 
-def status(root):
+def _state(root):
     root = lab._root(root)
     path = root / 'refresh-state.json'
     return _json(path) if path.exists() else dict(status='not_started', since=0)
+
+
+# Two missed collection intervals plus the bounded worker allowance.
+WORKER_TIMEOUT = 120
+
+
+def status(root):
+    value = _state(root)
+    try:
+        config = _config(Path(root))
+    except FileNotFoundError:
+        return dict(value, health='unknown', health_code='refresh_not_configured')
+    interval = config.get('interval_seconds', 900)
+    last = value.get('last_success')
+    age = max(0, time.time() - last) if type(last) in (int, float) and math.isfinite(last) and 0 < last <= time.time() + 60 else None
+    health = 'ok'
+    code = None
+    if age is None or age > 2 * interval + WORKER_TIMEOUT:
+        health, code = 'error', 'collection_stale'
+    if value.get('status') == 'error':
+        health, code = 'error', value.get('error_code') or 'collection_failed'
+    if value.get('status') == 'running':
+        fd = os.open(Path(root) / 'refresh.lock', os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                if health == 'ok': health = 'running'
+            else:
+                health, code = 'error', 'collection_interrupted'
+        finally:
+            os.close(fd)
+    for name in ('followups', 'opportunities'):
+        if config.get(name) and value.get(name, {}).get('status') != 'ok':
+            health, code = 'error', 'observation_failed'
+    value.update(health=health, health_code=code, success_age_seconds=age,
+                 stale_after_seconds=2 * interval + WORKER_TIMEOUT)
+    return value
+
+
+def _failure_code(exc):
+    if isinstance(exc, retention.RetentionError):
+        return exc.code
+    # Only known literals leave this process; never log exception text or paths.
+    message = str(exc).removeprefix('local refresh aborted: ')
+    return {
+        'input changed': 'source_changed',
+        'zstd decoder unavailable': 'decoder_unavailable',
+        'invalid compressed source': 'source_compression_invalid',
+        'ambiguous compressed source twins': 'source_format_conflict',
+        'local session scan unavailable or changed; prior snapshot retained': 'source_unavailable',
+        'local source byte limit exceeded': 'source_size_limit',
+        'local snapshot size limit exceeded': 'collection_size_limit',
+        'snapshot too large': 'snapshot_size_limit',
+        'corpus document count outside supported range': 'document_count_limit',
+        'incomplete inventory after collection change': 'inventory_incomplete',
+    }.get(message, 'collection_failed')
 
 
 def _config(root):
@@ -78,6 +136,18 @@ def _summaries(root, current, config):
     return result
 
 
+def _collect(state, *args, **kwargs):
+    # An actively appended log can change during a bounded read. Retry the
+    # complete export once; never publish a partial source or skip its evidence.
+    for attempt in range(2):
+        state['collection_attempts'] = attempt + 1
+        try:
+            return export_live(*args, **kwargs)
+        except ValueError as exc:
+            if _failure_code(exc) != 'source_changed' or attempt:
+                raise
+
+
 def refresh(root, force=False):
     root = lab._root(root)
     config = _config(root)
@@ -86,22 +156,37 @@ def refresh(root, force=False):
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return dict(status='busy')
+            return dict(status(root), status='busy', collection_status=_state(root).get('status'))
         with lab.snapshot_lock(root, exclusive=True):
-            state = status(root)
+            state = _state(root)
             started = time.time()
+            interrupted = state.get('status') == 'running'
+            if interrupted:
+                state.update(status='error', error_code='collection_interrupted',
+                             last_failure=dict(at=started, code='collection_interrupted', stage=state.get('stage', 'unknown')))
+                _write(root, 'refresh-state.json', state)
             if not force and started - state.get('last_attempt', 0) < config.get('interval_seconds', 900):
-                return dict(status='throttled', collection_status=state.get('status'), storage=state.get('storage', {}), error_code=state.get('error_code'))
-            state.update(last_attempt=started, status='running')
+                return dict(status(root), status='throttled', collection_status=state.get('status'))
+            state.update(last_attempt=started, status='running', error_code=None, error_type=None,
+                         interrupted_previous_attempt=interrupted, stage='starting', stage_ms={})
             _write(root, 'refresh-state.json', state)
+            def stage(name, fn, *args, **kwargs):
+                state['stage'] = name
+                _write(root, 'refresh-state.json', dict(state, status='running'))
+                began = time.monotonic()
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    state['stage_ms'][name] = round((time.monotonic() - began) * 1000)
+
             try:
                 from retrieval_archive import compress
-                state['compression'] = compress(root, limit=2)
-                current = lab._snapshot(root)
-                state['storage'] = retention.maintain(root, config.get('retention', {}))
+                state['compression'] = stage('compress', compress, root, limit=2)
+                current = stage('load_snapshot', lab._snapshot, root)
+                state['storage'] = stage('retention', retention.maintain, root, config.get('retention', {}))
                 same_collection = (state.get('config_id') == lab.digest(config)
                                    and state.get('collector_version') == COLLECTOR_VERSION)
-                delta = export_live([(r['adapter'], Path(r['path'])) for r in config['roots']],
+                delta = stage('collect', _collect, state, [(r['adapter'], Path(r['path'])) for r in config['roots']],
                                     since=state.get('since', 0) if same_collection else 0, exclude_sessions=config.get('exclude_sessions', []),
                                     settle_seconds=0, known_source_ids=state.get('source_ids', []))
                 if delta.get('inventory_complete') is False and not same_collection:
@@ -111,11 +196,11 @@ def refresh(root, force=False):
                 documents = ([d for d in current['documents'] if d['source_id'] not in replaced
                               and (not delta.get('inventory_complete', False) or d['source_id'] in present)]
                              if state.get('bootstrapped') and same_collection else [])
-                summaries = _summaries(root, current, config)
+                summaries = stage('summaries', _summaries, root, current, config)
                 for doc in delta['documents']:
                     doc['summaries'] = summaries.get((doc['source_id'], doc['start_line'], doc['end_line'], doc['text']), [])
                 documents.extend(delta['documents'])
-                result = lab.publish_snapshot(root, dict(schema_version=1, documents=documents,
+                result = stage('publish', lab.publish_snapshot, root, dict(schema_version=1, documents=documents,
                                                          import_report=delta['import_report']),
                                               storage_policy=config.get('retention', {}))
                 state.update(result, status='updated' if result['changed'] else 'unchanged',
@@ -125,26 +210,30 @@ def refresh(root, force=False):
             except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
                 # Never publish partial collections or move the successful watermark.
                 state.update(status='error', error_type=type(exc).__name__,
-                             error_code=exc.code if isinstance(exc, retention.RetentionError) else "collection_failed",
-                             elapsed_ms=round((time.time() - started) * 1000))
+                             error_code=_failure_code(exc),
+                             elapsed_ms=round((time.time() - started) * 1000),
+                             last_failure=dict(at=time.time(), code=_failure_code(exc),
+                                               stage=state['stage'], error_type=type(exc).__name__))
             if state.get('status') in ('updated', 'unchanged') and config.get('opportunities'):
                 try:
                     from retrieval_opportunities import run as audit_opportunities
-                    state['opportunities'] = audit_opportunities(root, lab._snapshot(root), config['opportunities'])
+                    state['opportunities'] = stage('opportunities', audit_opportunities, root, lab._snapshot(root), config['opportunities'])
                 except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
                     state['opportunities'] = dict(status='error', error_type=type(exc).__name__)
             if state.get('status') in ('updated', 'unchanged') and config.get('followups'):
                 try:
                     from retrieval_followup import run as observe_followups
-                    state['followups'] = observe_followups(root, lab._snapshot(root), config['followups'])
+                    state['followups'] = stage('followups', observe_followups, root, lab._snapshot(root), config['followups'])
                 except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
                     state['followups'] = dict(status='error', error_type=type(exc).__name__)
             try:
                 state['storage'] = retention.read_status(root)
             except (OSError, ValueError):
                 pass
+            if state.get('status') in ('updated', 'unchanged'):
+                state['stage'] = 'complete'
             _write(root, 'refresh-state.json', state)
-            return state
+            return status(root)
     finally:
         os.close(fd)
 
@@ -158,7 +247,7 @@ def maybe_start(root):
     storage = state.get('storage', {})
     if storage.get('warning'):
         print('Snapshot storage warning: ' + storage['warning'] + '; see refresh-status storage.', file=sys.stderr)
-    if state.get('status') == 'error':
+    if state.get('health') == 'error':
         print('Conversation refresh failed; using the last valid corpus. See refresh-status.', file=sys.stderr)
     if time.time() - state.get('last_attempt', 0) >= config.get('interval_seconds', 900):
         subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--lab', str(root), 'refresh'],
