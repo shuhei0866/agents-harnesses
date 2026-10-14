@@ -40,7 +40,7 @@ def _state(root):
 
 
 # Two missed collection intervals plus the bounded worker allowance.
-WORKER_TIMEOUT = 120
+WORKER_TIMEOUT = 240
 
 
 def status(root):

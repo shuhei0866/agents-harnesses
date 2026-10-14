@@ -28,7 +28,7 @@ def tick(root):
             raise ValueError('unsafe observer command')
         proc = subprocess.run([str(command), 'refresh'], stdin=subprocess.DEVNULL,
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                              timeout=120, check=False)
+                              timeout=240, check=False)
         result['status'] = 'ok' if proc.returncode == 0 else 'error'
         result['reason'] = 'refresh_process_failed'
         raw = getattr(proc, 'stdout', None)
@@ -39,7 +39,7 @@ def tick(root):
             last = report.get('last_success')
             bound = report.get('stale_after_seconds')
             valid = (type(last) in (int, float) and math.isfinite(last) and 0 < last <= time.time() + 60
-                     and type(bound) in (int, float) and math.isfinite(bound) and 120 <= bound <= 172920)
+                     and type(bound) in (int, float) and math.isfinite(bound) and 120 <= bound <= 173040)
             age = max(0, time.time() - last) if valid else None
             collection = report.get('collection_status', report.get('status'))
             if age is not None:
