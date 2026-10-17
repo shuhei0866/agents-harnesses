@@ -221,6 +221,9 @@ def _state(left: str | None, right: str | None) -> str:
 def score_pair(
     left: Event, right: Event, policy: dict[str, Any]
 ) -> tuple[int, str, str]:
+    # link_plan() restates this scoring to prune candidate pairs. Change them
+    # together: tests/test-relationship-compaction.sh compares the two over
+    # random policies and events.
     weights = policy["weights"]
     task_state = _state(left.task_id, right.task_id)
     contradiction = (
