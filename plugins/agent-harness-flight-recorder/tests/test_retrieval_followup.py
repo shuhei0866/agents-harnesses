@@ -87,6 +87,13 @@ class FollowupTests(unittest.TestCase):
         self.run_at(205 + followup.WINDOW_SECONDS)
         self.assertEqual(self.case()['status'], 'window_complete')
 
+    def test_heartbeat_before_search_is_not_selected_as_human_anchor(self):
+        self.heartbeat_snapshot()
+        self.search(when=208.5)
+        self.run_at(240)
+        self.assertEqual(self.case()['anchor']['timestamp'], 200)
+        self.assertEqual(self.case()['status'], 'pending')
+
     def test_heartbeat_only_expires_without_human_followup(self):
         self.search()
         self.heartbeat_snapshot()
