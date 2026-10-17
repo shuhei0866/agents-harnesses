@@ -583,6 +583,28 @@ def report(
     )
 
 
+def _episode_edge_floor(
+    connection: sqlite3.Connection, policy_version: str, episode_id: str
+) -> dict[str, list[dict[str, Any]]]:
+    """Stand in for an Episode's link edges when only its confidence matters.
+
+    A card derives ``confidence`` from the weakest score among its link edges
+    and nothing else, so selection reads that one number in SQL instead of
+    expanding every edge together with its evidence document. The card is
+    identical; the memory no longer grows with the Episode's edge count.
+    """
+    (floor,) = connection.execute(
+        "SELECT MIN(edge.score) FROM episode_members AS member "
+        "JOIN relationship_edges AS edge "
+        "ON edge.policy_version = member.policy_version "
+        "AND edge.left_event_id = member.event_id "
+        "WHERE member.policy_version = ? AND member.episode_id = ? "
+        "AND edge.decision = 'link'",
+        (policy_version, episode_id),
+    ).fetchone()
+    return {episode_id: [{"score": floor}]} if floor is not None else {}
+
+
 def select_episode_ids(
     root: Path,
     last: str,
@@ -598,9 +620,10 @@ def select_episode_ids(
     ``report`` materializes every Episode Card together with every relationship
     edge before anything is filtered, so its peak memory grows with the number
     of link edges in the index. Selection visits Episodes in the same order as
-    ``report`` but builds one card at a time from that Episode's own edges and
-    stops once ``limit`` cards were accepted. Memory stays bounded by the
-    largest single Episode, whatever the size of the index.
+    ``report`` but builds one card at a time and stops once ``limit`` cards
+    were accepted. A card needs only the weakest link score of its Episode, so
+    no edge or evidence document is expanded: memory is bounded by the member
+    count of the largest Episode visited, whatever the size of the index.
     """
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
         raise VaultError("episode selection limit is invalid")
@@ -642,7 +665,7 @@ def select_episode_ids(
                 connection,
                 policy,
                 episode_id,
-                _target_episode_edges(connection, policy_version, episode_id),
+                _episode_edge_floor(connection, policy_version, episode_id),
             )
             if accept(card):
                 selected.append(episode_id)

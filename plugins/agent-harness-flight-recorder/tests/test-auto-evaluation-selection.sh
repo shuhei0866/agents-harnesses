@@ -206,6 +206,24 @@ report_peak = tracemalloc.get_traced_memory()[1]
 assert len(view["cards"]) == 36 and len(expected) == 12, (len(view["cards"]), len(expected))
 del view
 
+
+def card_parity(connection, policy):
+    full = reporting._edges_by_episode(connection, "default-v1")
+    count = 0
+    for (episode_id,) in connection.execute(
+        "SELECT episode_id FROM episodes WHERE policy_version = ?", ("default-v1",)
+    ):
+        expected, _ = reporting._episode_card(root, connection, policy, episode_id, full)
+        stand_in = reporting._episode_edge_floor(connection, "default-v1", episode_id)
+        actual, _ = reporting._episode_card(root, connection, policy, episode_id, stand_in)
+        assert actual == expected, episode_id
+        count += 1
+    return count
+
+
+# The weakest-score stand-in yields exactly the card that every edge would.
+assert reporting._authenticated_query(root, "default-v1", card_parity) == 36
+
 real_edges = reporting._edges_by_episode
 reporting._edges_by_episode = lambda *_a, **_k: (_ for _ in ()).throw(
     AssertionError("selection must not materialize every relationship edge")
