@@ -38,6 +38,7 @@ jobs:
             test-relationship-compaction \
             test-relationship-graph \
             test-index-freshness \
+            test-edge-floor-plan \
             test-auto-evaluation-selection \
             test-background-evaluation; do
             echo "::group::$name"

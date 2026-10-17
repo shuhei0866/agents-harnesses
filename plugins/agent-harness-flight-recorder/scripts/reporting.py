@@ -11,8 +11,10 @@ import re
 import secrets
 import sqlite3
 import stat
+import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, Container, TypeVar
 
 from chunk_rotation import canonical_json, parse_time
 from evidence_index import (
@@ -69,6 +71,14 @@ UNITS = {
     "d": 24 * 60 * 60,
     "w": 7 * 24 * 60 * 60,
 }
+# Selection holds the Vault lock while it looks for candidates, so it is bounded
+# by work as well as by the number of candidates wanted: an index with few or no
+# candidates (or a slow query plan) must not keep the lock for long.
+SELECTION_MAX_VISITS = 1_000
+SELECTION_MAX_SECONDS = 20.0
+# How many SQLite VM steps pass between two checks of the selection deadline.
+SELECTION_PROGRESS_STEPS = 10_000
+
 GRAPH_TABLES = (
     "relationship_policies",
     "relationship_edges",
@@ -346,6 +356,7 @@ def _episode_card(
     edges_by_episode: dict[str, list[dict[str, Any]]],
     *,
     include_model_evaluations: bool = True,
+    stored_evaluations: list[tuple[Path, bytes, dict[str, Any]]] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     rows = list(
         connection.execute(
@@ -462,7 +473,7 @@ def _episode_card(
             "minimum_supporting_score": min(edge["score"] for edge in edges),
             "threshold": policy["threshold"],
         }
-    from evaluation import load_evaluations
+    from evaluation import load_evaluations, select_evaluations
 
     card = {
         "schema_version": OUTPUT_VERSION,
@@ -493,11 +504,20 @@ def _episode_card(
         },
         "deterministic_evidence": deterministic_evidence,
         "model_evaluations": (
-            load_evaluations(
-                root,
-                policy["policy_version"],
-                episode_id,
-                {fact["evidence_id"] for fact in deterministic_evidence},
+            (
+                load_evaluations(
+                    root,
+                    policy["policy_version"],
+                    episode_id,
+                    {fact["evidence_id"] for fact in deterministic_evidence},
+                )
+                if stored_evaluations is None
+                else select_evaluations(
+                    stored_evaluations,
+                    policy["policy_version"],
+                    episode_id,
+                    {fact["evidence_id"] for fact in deterministic_evidence},
+                )
             )
             if include_model_evaluations
             else []
@@ -589,20 +609,173 @@ def _episode_edge_floor(
     """Stand in for an Episode's link edges when only its confidence matters.
 
     A card derives ``confidence`` from the weakest score among its link edges
-    and nothing else, so selection reads that one number in SQL instead of
-    expanding every edge together with its evidence document. The card is
-    identical; the memory no longer grows with the Episode's edge count.
+    and nothing else (and only for an Episode of two or more events), so
+    selection reads that one number in SQL instead of expanding every edge
+    together with its evidence document. The card is identical; the memory no
+    longer grows with the Episode's edge count.
+
+    The members are read first and the edges are then looked up by primary-key
+    prefix. A single join lets the planner start from either table, and without
+    ``sqlite_stat1`` it starts from ``relationship_edges`` and walks every link
+    edge in the index for each Episode. Two statements leave it no choice, and
+    the cost follows the Episode, not the index.
     """
-    (floor,) = connection.execute(
-        "SELECT MIN(edge.score) FROM episode_members AS member "
-        "JOIN relationship_edges AS edge "
-        "ON edge.policy_version = member.policy_version "
-        "AND edge.left_event_id = member.event_id "
-        "WHERE member.policy_version = ? AND member.episode_id = ? "
-        "AND edge.decision = 'link'",
-        (policy_version, episode_id),
-    ).fetchone()
+    members = [
+        row[0]
+        for row in connection.execute(
+            "SELECT event_id FROM episode_members "
+            "WHERE policy_version = ? AND episode_id = ?",
+            (policy_version, episode_id),
+        )
+    ]
+    if len(members) < 2:
+        return {}
+    floor = None
+    for offset in range(0, len(members), 500):
+        batch = members[offset:offset + 500]
+        marks = ",".join("?" for _item in batch)
+        (weakest,) = connection.execute(
+            "SELECT MIN(score) FROM relationship_edges "
+            f"WHERE policy_version = ? AND left_event_id IN ({marks}) "
+            "AND decision = 'link'",
+            (policy_version, *batch),
+        ).fetchone()
+        if weakest is not None and (floor is None or weakest < floor):
+            floor = weakest
     return {episode_id: [{"score": floor}]} if floor is not None else {}
+
+
+@dataclass(frozen=True)
+class EpisodeFilter:
+    """A condition that lets selection skip Episodes without building a card.
+
+    ``sql`` is a boolean expression over ``e`` (the event that surfaced the
+    Episode, a ``source_events`` row) and ``ep`` (its ``episodes`` row), with
+    ``?`` placeholders bound to ``params``. It comes from code, never from
+    input. It must never exclude an Episode that ``accept`` would take; it only
+    has to be cheap, so that Episodes that cannot qualify cost no card and
+    count as no visit.
+    """
+
+    sql: str
+    params: tuple[Any, ...] = ()
+
+
+@dataclass
+class SelectionStats:
+    """What a selection did, for callers that report on it.
+
+    ``visited`` counts the Episode cards built (Episodes skipped by an
+    ``EpisodeFilter`` are not counted). ``stopped`` is ``None`` when the
+    walk ended on its own (enough candidates, or the window ran out) and
+    ``"visit_limit"`` or ``"time_limit"`` when a work bound cut it short.
+    """
+
+    visited: int = 0
+    stopped: str | None = None
+
+
+def _select_newest_first(
+    root: Path,
+    connection: sqlite3.Connection,
+    policy: dict[str, Any],
+    *,
+    forgotten: Container[tuple[str, str]],
+    start: dt.datetime,
+    end: dt.datetime,
+    accept: Callable[[dict[str, Any]], bool],
+    limit: int,
+    max_visits: int,
+    max_seconds: float,
+    stats: SelectionStats,
+    stored_evaluations: list[tuple[Path, bytes, dict[str, Any]]] | None = None,
+    episode_filter: EpisodeFilter | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> list[str]:
+    policy_version = policy["policy_version"]
+    started = clock()
+
+    def expired() -> bool:
+        return clock() - started >= max_seconds
+
+    evaluations_by_episode: dict[str, list[Any]] | None = None
+    if stored_evaluations is not None:
+        evaluations_by_episode = {}
+        for item in stored_evaluations:
+            evaluations_by_episode.setdefault(
+                item[2]["episode_id"], []
+            ).append(item)
+    # One statement walks the events newest first together with their Episode.
+    # CROSS JOIN fixes the join order: without sqlite_stat1 the planner may
+    # start from either side of a plain join, and the events index is what
+    # delivers the order without sorting.
+    walk = (
+        "SELECT e.event_id, e.recorded_at, m.episode_id "
+        "FROM source_events AS e INDEXED BY source_events_by_time "
+        "CROSS JOIN episode_members AS m "
+        "ON m.policy_version = ? AND m.event_id = e.event_id "
+        "CROSS JOIN episodes AS ep "
+        "ON ep.policy_version = m.policy_version "
+        "AND ep.episode_id = m.episode_id "
+        + (f"WHERE {episode_filter.sql} " if episode_filter else "")
+        + "ORDER BY e.recorded_at DESC, e.event_id DESC"
+    )
+    parameters = (
+        policy_version,
+        *(episode_filter.params if episode_filter else ()),
+    )
+    seen: set[str] = set()
+    selected: list[str] = []
+    # A filtered walk can run a long way without producing a row, and a card
+    # query can run long on a large Episode. Neither returns to the loop's own
+    # clock check, so SQLite is told to abandon the statement at the deadline.
+    connection.set_progress_handler(expired, SELECTION_PROGRESS_STEPS)
+    rows = None
+    try:
+        rows = connection.execute(walk, parameters)
+        for _event_id, recorded_at, episode_id in rows:
+            if expired():
+                stats.stopped = "time_limit"
+                break
+            moment = parse_time(recorded_at)
+            if moment < start:
+                break
+            if episode_id in seen:
+                continue
+            seen.add(episode_id)
+            if moment > end or (policy_version, episode_id) in forgotten:
+                continue
+            if stats.visited >= max_visits:
+                stats.stopped = "visit_limit"
+                break
+            stats.visited += 1
+            card, _edges = _episode_card(
+                root,
+                connection,
+                policy,
+                episode_id,
+                _episode_edge_floor(connection, policy_version, episode_id),
+                stored_evaluations=(
+                    None
+                    if evaluations_by_episode is None
+                    else evaluations_by_episode.get(episode_id, [])
+                ),
+            )
+            if accept(card):
+                selected.append(episode_id)
+                if len(selected) >= limit:
+                    break
+    except sqlite3.OperationalError as error:
+        # Only our own deadline ends a selection quietly; any other database
+        # error is still an error.
+        if str(error) != "interrupted" or not expired():
+            raise
+        stats.stopped = "time_limit"
+    finally:
+        if rows is not None:
+            rows.close()
+        connection.set_progress_handler(None, 0)
+    return selected
 
 
 def select_episode_ids(
@@ -614,6 +787,11 @@ def select_episode_ids(
     limit: int,
     *,
     now: dt.datetime | None = None,
+    max_visits: int = SELECTION_MAX_VISITS,
+    max_seconds: float = SELECTION_MAX_SECONDS,
+    stats: SelectionStats | None = None,
+    episode_filter: EpisodeFilter | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> list[str]:
     """Return up to ``limit`` Episode IDs, newest first, whose card is accepted.
 
@@ -624,13 +802,32 @@ def select_episode_ids(
     appears, so Episodes come out ordered by their latest event. It builds one
     card at a time, stops as soon as ``limit`` cards were accepted, and never
     looks at older events than it needs. A card needs only the weakest link
-    score of its Episode, so no edge or evidence document is expanded: the work
-    and memory are bounded by what was visited, not by the size of the index.
-    Episodes whose latest events share a timestamp may come out in a different
-    order than ``report`` gives them.
+    score of its Episode, so no edge or evidence document is expanded.
+
+    The walk also stops after ``max_visits`` cards or ``max_seconds`` seconds,
+    whichever comes first, and returns what it found. A selection that is cut
+    short says so in ``stats.stopped``; the Vault lock is therefore held for a
+    bounded time even when no Episode qualifies. The deadline is also enforced
+    inside SQLite, so a statement that produces no row for a long time cannot
+    outlast it.
+
+    Candidates can be sparse among the newest Episodes. ``episode_filter``
+    lets the caller rule Episodes out inside the same statement that walks the
+    events, so that only Episodes that might be accepted cost a card and count
+    as a visit. Episodes whose latest events share a timestamp may come out in
+    a different order than ``report`` gives them.
     """
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
         raise VaultError("episode selection limit is invalid")
+    if (
+        isinstance(max_visits, bool)
+        or not isinstance(max_visits, int)
+        or max_visits < 1
+        or isinstance(max_seconds, bool)
+        or not isinstance(max_seconds, (int, float))
+        or not 0 < max_seconds <= 3600
+    ):
+        raise VaultError("episode selection bounds are invalid")
     policy_version, trusted_policy = _policy_selection(
         policy_version, policy_path
     )
@@ -640,44 +837,31 @@ def select_episode_ids(
         raise VaultError("report clock must include a timezone")
     end = end.astimezone(dt.timezone.utc)
     start = end - window
+    outcome = stats if stats is not None else SelectionStats()
 
     def query(
         connection: sqlite3.Connection, policy: dict[str, Any]
     ) -> list[str]:
-        forgotten = load_forgotten(root)
-        seen: set[str] = set()
-        selected: list[str] = []
-        for event_id, recorded_at in connection.execute(
-            "SELECT event_id, recorded_at FROM source_events "
-            "INDEXED BY source_events_by_time "
-            "ORDER BY recorded_at DESC, event_id DESC"
-        ):
-            moment = parse_time(recorded_at)
-            if moment < start:
-                break
-            row = connection.execute(
-                "SELECT episode_id FROM episode_members "
-                "WHERE policy_version = ? AND event_id = ?",
-                (policy_version, event_id),
-            ).fetchone()
-            if row is None or row[0] in seen:
-                continue
-            episode_id = row[0]
-            seen.add(episode_id)
-            if moment > end or (policy_version, episode_id) in forgotten:
-                continue
-            card, _edges = _episode_card(
-                root,
-                connection,
-                policy,
-                episode_id,
-                _episode_edge_floor(connection, policy_version, episode_id),
-            )
-            if accept(card):
-                selected.append(episode_id)
-                if len(selected) >= limit:
-                    break
-        return selected
+        from evaluation import _stored_evaluations
+
+        return _select_newest_first(
+            root,
+            connection,
+            policy,
+            forgotten=load_forgotten(root),
+            # Every visited card needs the stored evaluations; read them once
+            # rather than once per card.
+            stored_evaluations=_stored_evaluations(root),
+            start=start,
+            end=end,
+            accept=accept,
+            limit=limit,
+            max_visits=max_visits,
+            max_seconds=max_seconds,
+            stats=outcome,
+            episode_filter=episode_filter,
+            clock=clock,
+        )
 
     return _authenticated_query(root, policy_version, query, trusted_policy)
 
