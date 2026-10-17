@@ -470,9 +470,10 @@ applied purge share an outer lock, and purge removes or transactionally restores
 matching reservations. Background health is separate from sync health and
 exposes finite diagnostics only. Custom relationship policies require their
 owner-held file as the authenticity anchor. A run visits Episodes newest first,
-builds one card at a time from that Episode's own link edges, and stops once the
-evaluation budget plus a small slack is covered, so its memory does not depend on
-the size of the index. Attempted and already evaluated Episodes are skipped
+builds one card at a time from the weakest link score of that Episode (no edge or
+evidence document is expanded), and stops once the evaluation budget plus a small
+slack is covered, so its memory does not depend on the size of the index or on
+the number of link edges. Attempted and already evaluated Episodes are skipped
 while selecting. Consecutive evaluator failures back off on the scheduler's
 retry schedule; the status records a finite failure reason, the exit status, and
 the next retry time but never evaluator output. A failure before the evaluator
