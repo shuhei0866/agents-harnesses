@@ -5,7 +5,7 @@ import re
 import time
 from collections import Counter, defaultdict
 
-VERSION = 'recall-followup-v2'
+VERSION = 'recall-followup-v3'
 WINDOW_SECONDS = 7 * 86400
 MAX_TURNS = 3
 MAX_CASES = 100
@@ -52,10 +52,11 @@ def _sessions(snapshot):
 
 def _reference(item):
     from retrieval_opportunities import user_text
+    from retrieval_reuse import answered_questions
     m = item['utterance']; text = user_text(m['text'])
     return dict(source_id=item['source_id'], citation_id=m['citation_id'], line=m['line'],
                 timestamp=item['observation']['timestamp'], text=text[:1600], truncated=len(text)>1600,
-                characters=len(text))
+                characters=len(text), answered_questions=answered_questions(m['text']))
 
 
 def observe(need, session, now):
@@ -140,6 +141,8 @@ def run(root, snapshot, config):
                 reported_before_followup=timely,
                 read_count=sum(t < boundary for a in attempts for t in reads[a['id']]),
                 retrieval_version=versions[latest['id']] if latest else None)
+            from retrieval_reuse import exposure as reuse_exposure
+            packet['answer_reuse'] = reuse_exposure(db, need, boundary, packet['anchor'])
             # Keep immutable evidence revisions, but do not append only because time
             # passed or an unrelated source changed the overall snapshot ID.
             identity = {k:v for k,v in packet.items() if k not in ('observed_at','snapshot_id')}
@@ -190,6 +193,9 @@ def report(root):
                 states=dict(Counter(c['status'] for c in cases)), by_exposure=[dict(retrieval_version=k[0],trigger=k[1],decision_match=k[2],**v) for k,v in groups.items()],
                 reviewed_current_revisions=dict(Counter(c['review']['label'] for c in cases if c['review'])),
                 historical_reviews=len(reviews), review_cases=priority[:20],
+                answer_reuse=dict(coverage=dict(Counter(c['answer_reuse']['status'] for c in cases)),
+                    reviewed=dict(Counter(c['review']['reuse_outcome']['classification'] for c in cases if c['review'] and c['review'].get('reuse_outcome'))),
+                    question_coverage='answered_structured_replies_only', causal_effect='unmeasured'),
                 notice=NOTICE)
 
 
@@ -211,7 +217,7 @@ def inspect(root, case_id, blind=False):
     return dict(case_id=case_id,packet=packet,originals=originals,notice=NOTICE)
 
 
-def review(root, case_id, label, citations, reason, prior_decisions=None):
+def review(root, case_id, label, citations, reason, prior_decisions=None, reuse_outcome=None):
     """Agent retrospective classification, separate from explicit human feedback."""
     import retrieval_lab as lab
     from retrieval_opportunities import turns
@@ -237,6 +243,9 @@ def review(root, case_id, label, citations, reason, prior_decisions=None):
         raise ValueError('restatement review requires earlier cited decision evidence')
     value=dict(label=label,citations=citations,prior_decisions=prior_decisions,reason=reason,
                provenance='agent_retrospective_review',causal_effect='unmeasured')
+    if reuse_outcome is not None:
+        from retrieval_reuse import review as review_reuse
+        value['reuse_outcome'] = review_reuse(root, packet, reuse_outcome)
     with lab._connect(root) as db:
         _create(db)
         db.execute('INSERT OR REPLACE INTO recall_followup_reviews VALUES(?,?,?)',(case_id,time.time(),lab.canonical(value)))

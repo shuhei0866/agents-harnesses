@@ -434,7 +434,7 @@ def _context_table(db):
     db.execute('CREATE TABLE IF NOT EXISTS context_use_details (request_id TEXT PRIMARY KEY, reason_code TEXT, effect TEXT)')
 
 
-def context_use(root, request_id, state, citations, reason, reason_code=None, effect=None, decision_match=None):
+def context_use(root, request_id, state, citations, reason, reason_code=None, effect=None, decision_match=None, reuse=None):
     if decision_match not in (None, 'found', 'partial', 'not_found', 'unknown'):
         raise ValueError('invalid decision match')
     allowed_reasons = {'applied': ('relevant',), 'not_applicable': ('wrong_scope', 'outdated', 'already_known', 'no_relevant_candidate'), 'unresolved': ('insufficient_context', 'collection_problem')}
@@ -464,6 +464,12 @@ def context_use(root, request_id, state, citations, reason, reason_code=None, ef
             raise ValueError('decision match requires read citations')
         if decision_match in ('not_found', 'unknown') and state == 'applied':
             raise ValueError('applied decision cannot be not_found or unknown')
+        reuse_report = None
+        if reuse is not None:
+            if state != 'applied' or not result.get('decision_need'):
+                raise ValueError('reuse requires applied decision need')
+            from retrieval_reuse import validate
+            reuse_report = validate(root, row, citations, reuse)
         _context_table(db)
         db.execute('CREATE TABLE IF NOT EXISTS context_decision_matches (request_id TEXT PRIMARY KEY, match TEXT NOT NULL)')
         db.execute('DELETE FROM context_decision_matches WHERE request_id=?', (request_id,))
@@ -472,6 +478,9 @@ def context_use(root, request_id, state, citations, reason, reason_code=None, ef
         db.execute('INSERT OR REPLACE INTO context_uses VALUES(?,?,?,?,?)',
                    (request_id, state, canonical(sorted(set(citations))), reason, time.time()))
         db.execute('INSERT OR REPLACE INTO context_use_details VALUES(?,?,?)', (request_id, reason_code, effect))
+        if reuse_report is not None:
+            db.execute('CREATE TABLE IF NOT EXISTS context_answer_reuse (seq INTEGER PRIMARY KEY, request_id TEXT NOT NULL, recorded REAL NOT NULL, report TEXT NOT NULL)')
+            db.execute('INSERT INTO context_answer_reuse(request_id,recorded,report) VALUES(?,?,?)', (request_id, time.time(), canonical(reuse_report)))
     return dict(request_id=request_id, state=state, provenance='agent_self_report',
                 notice='Not user feedback or verified task improvement.')
 
@@ -490,6 +499,7 @@ def context_inspect(root, request_id):
         return dict(decision_match=match[0] if match else None, request_id=request_id, created=row['created'], query=row['query'], result=result,
                     reads=[dict(r) for r in db.execute('SELECT * FROM reads WHERE request_id=? ORDER BY created', (request_id,))],
                     use=dict(use) if use else None, use_details=dict(details) if details else None,
+                    reuse_reports=[dict(r, report=json.loads(r['report'])) for r in db.execute('SELECT * FROM context_answer_reuse WHERE request_id=? ORDER BY seq',(request_id,))] if 'context_answer_reuse' in tables else [],
                     notice='Recorded evidence only; missing historical fields are unknown. Use/effect are agent self-reports.')
 
 
@@ -802,6 +812,11 @@ def main():
     usage = subs.add_parser('context-use')
     usage.add_argument('request_id')
     usage.add_argument('--file', type=Path, required=True, help='JSON: state, citations, reason; agent self-report')
+    freeze = subs.add_parser('reuse-freeze')
+    freeze.add_argument('request_id')
+    freeze.add_argument('--case-id', required=True)
+    replay = subs.add_parser('reuse-replay')
+    replay.add_argument('--file', type=Path, required=True)
     subs.add_parser('followup-report')
     followup = subs.add_parser('followup-inspect')
     followup.add_argument('case_id')
@@ -857,6 +872,12 @@ def main():
         elif args.command == 'context-use':
             value = json.loads(safe_file(args.file, 16384))
             result = context_use(root, args.request_id, **value)
+        elif args.command == 'reuse-freeze':
+            from retrieval_reuse import freeze
+            result = freeze(root, args.request_id, args.case_id)
+        elif args.command == 'reuse-replay':
+            from retrieval_reuse import replay
+            result = replay(root, json.loads(safe_file(args.file, 262144)))
         elif args.command == 'followup-report':
             from retrieval_followup import report as followup_report
             result = followup_report(root)

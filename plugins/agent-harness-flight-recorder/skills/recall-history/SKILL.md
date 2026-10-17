@@ -30,6 +30,10 @@ description: 過去の会話から判断・理由・訂正を出典付きで探�
 
 `--need` 付き検索では、既存の利用記録JSONに `decision_match` を必ず加える。`found` は探した判断を原文と適用範囲まで確認、`partial` は一部だけ確認、`not_found` は返却候補に見当たらず、`unknown` は確認不足。`found` / `partial` は読んだ出典を `citations` に含める。関連する話題だっただけでは `found` にしない。`reason` に探した判断への答えと今回への適用理由を一文で残す。古い判断が見つかったが今回は使わない場合、`found` と `not_applicable` は両立する。初回で見つからなければその結果も記録してから再検索する。
 
+過去回答を再利用したときは、同じ `context-use` JSONへ任意の `reuse` を加える。計測のために本人へ質問しない。`request_presence` は今回の相談文に同じ回答が `absent` / `present` / `unknown`、`other_context` は今回すでに読んだ別資料・会話にも回答が `present` / `not_seen` / `unknown`。`not_seen` は他に存在しない証明ではない。`action` は `proceeded` / `self_corrected` / `confirmed` / `skipped_question`。`question` は省いた具体的な質問（省いていなければ空文字）、`prior_answers` は読んで採用した過去のuser発言の `[{"citation_id":"…","line":123}]`。選択肢の文字回答は設問との対応まで原文で確認する。時刻不明・対象不一致・自動メッセージは再利用の根拠にしない。過去の許可を新しい送信・権限追加・別対象へ拡張しない。
+
+この記録は最初の後続発言より前に残すエージェントの自己申告。未記録を失敗にも成功にもせず、後付けで当時の記録を埋めない。同じ検索の最初のreuse記録を観測に使い、追記は履歴として残す。検索以外の台帳でも回答が見つかっていたら `other_context: present` とし、「検索だけで質問を省いた」としない。
+
 `context-report --purpose task` の `decision_needs` は初回と再検索を1件にまとめ、初回発見・再検索発見・部分一致・未発見・不明を分ける。`review_cases` は未発見・未記録・再検索で見つかった例を優先する。既存の記録へ後付け採点せず、検索しなかったセッションや記録漏れも成功扱いしない。発見はエージェントの自己申告であり、無反応・会話終了・放置から成功を推定しない。
 
 利用記録には可能なら `reason_code` も付ける。採用は `relevant`、不採用は `wrong_scope` / `outdated` / `already_known` / `no_relevant_candidate`、未解決は `insufficient_context` / `collection_problem`。候補が無いだけで、資料自体が存在しないとは判定しない。採用時は `effect` を `confirmed`（再確認）/ `changed_plan`（進め方を変更）/ `avoided_question`（聞き直しを省略）から選び、`reason` に何が変わったかを短く書く。これらも自己申告であり、実際の効果の証明にはしない。
@@ -65,6 +69,12 @@ description: 過去の会話から判断・理由・訂正を出典付きで探�
 `followup-report` は、訂正・再説明らしい表現のある例を先に出す。表現一致は確認候補であり、本人による訂正や検索の失敗と断定しない。「表現なしで観測窓終了」「発言待ち」「期間内に後続発言なし」「結合できない」を区別する。無反応や終了は成功ではない。検索前後の自己申告は、最初の後続発言より前に記録されたものだけを比較側へ使う。後から見つけ直した判断を、訂正前に届いていたことにしない。
 
 確認するときは、まず `followup-inspect CASE_ID --blind` で検索結果・採否を隠した原文を見る。その後、`context-inspect REQUEST_ID` と過去の出典を照合する。必要ならlab内JSONに `label`（`repeated_prior_decision` / `new_requirement` / `other` / `uncertain`）、後続発言の `citations`、`reason` を書き、`followup-review CASE_ID --file FILE` へ渡す。`repeated_prior_decision` は相談より前の判断を示す `prior_decisions: [{"citation_id": "…", "line": 123}]` も必須。これはエージェントの振り返りであり、ユーザーfeedbackや因果的な効果評価へ流用しない。現在の観測版と過去のレビューは別に残る。
+
+`followup-report.answer_reuse` は再利用記録の有無・時点とレビュー分類を分ける。`followup-inspect` の `answered_questions` は、回答済みの構造化質問に含まれる設問だけ。自由文の質問・未回答の質問は未観測であり、空配列を「聞き直しなし」としない。本人操作の依頼、新しい権限への承認、新しい要件を重複質問と混同しない。
+
+再利用を振り返った場合は `followup-review` JSONへ任意の `reuse_outcome` を付ける。`classification` は `reuse_without_observed_repetition` / `corroboration` / `repeated_question` / `user_restatement` / `new_requirement` / `uncertain`、`prior_answers` は `[{"request_id":"…","citation_id":"…","line":123}]`、`limitations` は観測範囲と別資料などの交絡。過去回答はその検索の固定snapshotで照合する。肯定的な分類も「観測した範囲で再説明なし」であり因果的な削減ではない。自由文や未回答の質問が確認できず判定に必要なら `uncertain` とする。再利用の自己申告と後続レビューを別々に報告する。
+
+`reuse-freeze REQUEST_ID --case-id CASE_ID` のJSONを端末内labへ保存すると、元の検索語・need・検索snapshot・期待する出典行・後続観測を固定できる。`reuse-replay --file FILE` は元の検索入力だけで出典が上位3件に残るか検証する。後の訂正や後続観測を検索へ混ぜず、通常の検索・既読・成功件数を増やさない。固定例は新しい自然利用の実績から分離し、元の質問設問との対応など補足原文もlocal-onlyで保護する。
 
 集計単位はneed。複数needの窓が重なるので、ユーザー発言の総数には `unique_followup_turns` / `unique_cue_turns` を使う。検索版・trigger・判断発見別の件数は記述的な比較に限り、削減率と呼ばない。検索しなかった相談は既存の `opportunity-report` で別に扱う。別会話での再説明、会話系譜の変更、記録外の行動はこの窓では追跡しない。
 
