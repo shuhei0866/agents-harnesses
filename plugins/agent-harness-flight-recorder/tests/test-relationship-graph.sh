@@ -581,7 +581,7 @@ test_cross_harness_veto_bridge_missing_and_singletons() {
     fail "episode semantics fixtureを構築できる"
     return
   }
-  if python3 - "$db" <<'PY' 2>/dev/null
+  if PYTHONPATH="$PLUGIN_DIR/scripts" python3 - "$db" <<'PY' 2>/dev/null
 import json
 import sqlite3
 import sys
@@ -616,8 +616,10 @@ logical_edges = list(connection.execute(
 assert len(logical_edges) == connection.execute(
     "SELECT COUNT(*) FROM relationship_edges WHERE policy_version='default-v1'"
 ).fetchone()[0]
+# no_link is derivable from the source events and the policy and nothing reads
+# it, so the index no longer persists it (D-20261017-35).
 assert {row[0] for row in logical_edges} == {
-    "link", "no_link", "hard_veto", "component_conflict",
+    "link", "hard_veto", "component_conflict",
 }
 for _decision, encoded in logical_edges:
     assert encoded == json.dumps(
@@ -649,8 +651,13 @@ missing = connection.execute(
     """,
     (e, f),
 ).fetchone()
-assert missing is not None and missing[0] != "link"
-evidence = json.loads(missing[1])
+assert missing is None  # e and f share nothing, so no row is persisted
+from relationship_graph import DEFAULT_POLICY, _events, score_pair
+
+by_id = {event.event_id: event for event in _events(connection)}
+_score, decision, encoded = score_pair(by_id[e], by_id[f], DEFAULT_POLICY)
+assert decision == "no_link"  # the explanation is recomputed on demand
+evidence = json.loads(encoded)
 assert evidence["explicit_task_id"]["state"] == "missing"
 assert evidence["branch_or_worktree_id"]["state"] == "missing"
 assert evidence["changed_file_fingerprints"]["state"] == "missing"
@@ -669,6 +676,7 @@ test_candidate_generation_and_full_persistence_are_bounded_streams() {
   if PYTHONPATH="$PLUGIN_DIR/scripts" python3 - "$db" <<'PY' 2>"$err"
 import builtins
 import inspect
+import json
 import pathlib
 import sqlite3
 import sys
@@ -759,6 +767,8 @@ inner.execute(
         "2026-07-25T00:00:00Z", 2, event_count, "digest",
     ),
 )
+# Every event shares workspace, branch and a changed file at the same instant,
+# so all pairs link and the stream persists C(n, 2) edges.
 source_rows = []
 for number in range(event_count):
     source_rows.append((
@@ -766,7 +776,8 @@ for number in range(event_count):
         "stream-chunk", number, 2, "2026-07-25T00:00:00Z", "codex",
         "Stop", "turn.completed", "sha256:" + "a" * 24, None,
         "sha256:" + "b" * 24, None, None, None, None, None, None,
-        None, None, None, "[]", "missing", "{}",
+        None, None, "sha256:" + "c" * 24,
+        json.dumps(["sha256:" + "d" * 24]), "complete", "{}",
     ))
 inner.executemany(
     "INSERT INTO source_events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -943,9 +954,9 @@ for number in range(event_count):
         None,
         None,
         None,
-        None,
-        "[]",
-        "missing",
+        "sha256:" + "c" * 24,
+        json.dumps(["sha256:" + "d" * 24]),
+        "complete",
         "{}",
     ]
     assert len(values) == 23
@@ -963,12 +974,12 @@ connection.commit()
 after_bytes = connection.execute("PRAGMA page_count").fetchone()[0] * page_size
 expected_edges = event_count * (event_count - 1) // 2
 assert edge_count == expected_edges
-assert episode_count == event_count
+assert episode_count == 1  # every pair links, so the events form one episode
 assert connection.execute(
     "SELECT COUNT(*) FROM relationship_edges"
 ).fetchone()[0] == expected_edges
 assert connection.execute(
-    "SELECT COUNT(*) FROM relationship_edges WHERE decision='no_link'"
+    "SELECT COUNT(*) FROM relationship_edges WHERE decision='link'"
 ).fetchone()[0] == expected_edges
 assert connection.execute(
     "SELECT COUNT(*) FROM relationship_evidence"

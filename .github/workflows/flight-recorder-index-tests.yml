@@ -1,0 +1,47 @@
+name: Flight Recorder Index Tests
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'plugins/agent-harness-flight-recorder/**'
+      - '.github/workflows/flight-recorder-index-tests.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'plugins/agent-harness-flight-recorder/**'
+      - '.github/workflows/flight-recorder-index-tests.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  index-tests:
+    # 関係グラフ・index 更新・自動評価は、GNU 系と BSD 系の両方で回す。
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      # テストは読み取りだけで足りる。認証情報を残さず、action は完全な SHA に固定する。
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.13'
+      - name: Test relationship edges, index refresh and background evaluation (synthetic, no model calls)
+        run: |
+          status=0
+          for name in \
+            test-relationship-compaction \
+            test-relationship-graph \
+            test-index-freshness \
+            test-auto-evaluation-selection \
+            test-background-evaluation; do
+            echo "::group::$name"
+            bash "plugins/agent-harness-flight-recorder/tests/$name.sh" || status=1
+            echo "::endgroup::"
+          done
+          exit "$status"

@@ -192,10 +192,12 @@ Schema v5 separates immutable source projections from recomputable state:
 - `relationship_policies`, `relationship_edges`, `episodes`, and
   `episode_members` contain recomputable versioned relationship views;
 - `relationship_evidence` stores each canonical relationship explanation once
-  per policy. Every edge retains its decision and references the deterministic
-  evidence digest, so `link`, `no_link`, `hard_veto`, and
+  per policy. Every persisted edge retains its decision and references the
+  deterministic evidence digest, so `link`, `hard_veto`, and
   `component_conflict` remain exactly reconstructable without repeating the
-  same JSON for every candidate pair;
+  same JSON for every candidate pair. `no_link` decisions are not persisted:
+  they are a pure function of two source events and the stored policy, and no
+  reader consumes them (D-20261017-35);
 - `session_atlas_facets` contains exactly one recomputable row per Episode and
   relationship policy with four finite structural facets.
 
@@ -253,6 +255,11 @@ before immutable publication. Legacy larger chunks are admitted through the
 schema-v5 full rebuild, so the current producer cannot create a source unit
 that bounded automatic refresh cannot consume.
 
+Candidate generation is pruned by the policy. `link_plan` derives the time
+horizon and the workspace, branch, and changed-file matches that a pair without
+a shared explicit task needs before it can reach the threshold; every other pair
+can only be `no_link` and is neither scored nor stored. Pairs that share an
+explicit task and pairs with contradictory explicit tasks are always generated.
 Candidate pairs and relationship rows stream through bounded batches. The
 writer retains only the compact evidence dictionary and link candidates needed
 to rebuild connected components in memory; it does not materialize the full
@@ -462,7 +469,15 @@ provide the corresponding idempotency boundary. Configure, automatic runs, and
 applied purge share an outer lock, and purge removes or transactionally restores
 matching reservations. Background health is separate from sync health and
 exposes finite diagnostics only. Custom relationship policies require their
-owner-held file as the authenticity anchor.
+owner-held file as the authenticity anchor. A run visits Episodes newest first,
+builds one card at a time from the weakest link score of that Episode (no edge or
+evidence document is expanded), and stops once the evaluation budget plus a small
+slack is covered, so its memory does not depend on the size of the index or on
+the number of link edges. Attempted and already evaluated Episodes are skipped
+while selecting. Consecutive evaluator failures back off on the scheduler's
+retry schedule; the status records a finite failure reason, the exit status, and
+the next retry time but never evaluator output. A failure before the evaluator
+could run releases the reservation.
 
 The deterministic collector is deliberately narrower than a shell parser.
 Event v3 recognizes only finite operation kinds from simple allowlisted tool

@@ -60,6 +60,43 @@ RESPONSE_FIELDS = {
     "criteria",
 }
 RESPONSE_V2_FIELDS = RESPONSE_FIELDS | {"measured_cost_microusd"}
+# Finite reasons an evaluator run can fail. They describe the failure, never
+# the episode or the evaluator's output, so they are safe to keep in local
+# diagnostics. The first three happen before any model call can be made.
+FAILURE_REASONS = (
+    "executable_not_found",
+    "executable_unsafe",
+    "launch_failed",
+    "executable_changed",
+    "timeout",
+    "nonzero_exit",
+    "output_too_large",
+    "invalid_json",
+    "protocol_violation",
+    "cost_budget_violation",
+)
+NO_SPEND_FAILURES = frozenset(FAILURE_REASONS[:3])
+
+
+class EvaluatorFailure(VaultError):
+    """A content-free account of why an evaluator run failed."""
+
+    def __init__(
+        self,
+        message: str,
+        reason: str,
+        *,
+        exit_code: int | None = None,
+        claude_on_path: bool | None = None,
+    ) -> None:
+        super().__init__(message)
+        if reason not in FAILURE_REASONS:
+            raise ValueError("evaluator failure reason is not recognized")
+        self.reason = reason
+        self.exit_code = exit_code
+        self.claude_on_path = claude_on_path
+
+
 RECORD_FIELDS = {
     "schema_version",
     "evaluation_id",
@@ -287,11 +324,15 @@ def _validate_response(
     remaining_cost_microusd: int | None = None,
 ) -> dict[str, Any]:
     if len(raw) > MAX_EVALUATOR_OUTPUT_BYTES:
-        raise VaultError("evaluator response exceeds the size limit")
+        raise EvaluatorFailure(
+            "evaluator response exceeds the size limit", "output_too_large"
+        )
     try:
         response = json.loads(raw)
     except (json.JSONDecodeError, UnicodeError) as error:
-        raise VaultError("evaluator returned invalid JSON") from error
+        raise EvaluatorFailure(
+            "evaluator returned invalid JSON", "invalid_json"
+        ) from error
     criteria = response.get("criteria") if isinstance(response, dict) else None
     evidence_ids = (
         response.get("evidence_ids") if isinstance(response, dict) else None
@@ -325,7 +366,9 @@ def _validate_response(
             for value in criteria.values()
         )
     ):
-        raise VaultError("evaluator response violates the protocol")
+        raise EvaluatorFailure(
+            "evaluator response violates the protocol", "protocol_violation"
+        )
     measured = response.get("measured_cost_microusd", 0)
     if (
         isinstance(measured, bool)
@@ -336,7 +379,10 @@ def _validate_response(
             and measured > remaining_cost_microusd
         )
     ):
-        raise VaultError("evaluator response violates the cost budget")
+        raise EvaluatorFailure(
+            "evaluator response violates the cost budget",
+            "cost_budget_violation",
+        )
     response["measured_cost_microusd"] = measured
     return response
 
@@ -348,7 +394,9 @@ def _executable_identity(executable: str) -> tuple[Path, str]:
     else:
         located = shutil.which(executable)
     if located is None:
-        raise VaultError("evaluator executable was not found")
+        raise EvaluatorFailure(
+            "evaluator executable was not found", "executable_not_found"
+        )
     try:
         resolved = Path(located).resolve(strict=True)
         metadata = resolved.lstat()
@@ -357,10 +405,14 @@ def _executable_identity(executable: str) -> tuple[Path, str]:
             or metadata.st_mode & 0o022
             or metadata.st_size > 16 * 1024 * 1024
         ):
-            raise VaultError("evaluator executable is unsafe")
+            raise EvaluatorFailure(
+                "evaluator executable is unsafe", "executable_unsafe"
+            )
         digest = _sha256(resolved.read_bytes())
     except OSError as error:
-        raise VaultError("evaluator executable is unsafe") from error
+        raise EvaluatorFailure(
+            "evaluator executable is unsafe", "executable_unsafe"
+        ) from error
     return resolved, digest
 
 
@@ -406,18 +458,42 @@ def _invoke(
             )
             output.seek(0)
             raw = output.read(MAX_EVALUATOR_OUTPUT_BYTES + 1)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise VaultError("evaluator execution failed") from error
+    except subprocess.TimeoutExpired as error:
+        raise EvaluatorFailure(
+            "evaluator execution failed", "timeout"
+        ) from error
+    except OSError as error:
+        raise EvaluatorFailure(
+            "evaluator execution failed", "launch_failed"
+        ) from error
     try:
         current_sha256 = _sha256(executable.read_bytes())
     except OSError as error:
-        raise VaultError("evaluator executable changed during evaluation") from error
+        raise EvaluatorFailure(
+            "evaluator executable changed during evaluation",
+            "executable_changed",
+        ) from error
     if current_sha256 != executable_sha256:
-        raise VaultError("evaluator executable changed during evaluation")
+        raise EvaluatorFailure(
+            "evaluator executable changed during evaluation",
+            "executable_changed",
+        )
     if len(raw) > MAX_EVALUATOR_OUTPUT_BYTES:
-        raise VaultError("evaluator response exceeds the size limit")
+        raise EvaluatorFailure(
+            "evaluator response exceeds the size limit", "output_too_large"
+        )
     if completed.returncode != 0:
-        raise VaultError("evaluator execution failed")
+        # The child only sees PATH; a missing `claude` there is the commonest
+        # cause of an adapter exiting at once, and it is a fact about the
+        # environment rather than about the episode, so record it.
+        raise EvaluatorFailure(
+            "evaluator execution failed",
+            "nonzero_exit",
+            exit_code=completed.returncode,
+            claude_on_path=(
+                shutil.which("claude", path=environment["PATH"]) is not None
+            ),
+        )
     return raw
 
 

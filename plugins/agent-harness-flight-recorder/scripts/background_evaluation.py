@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import stat
@@ -11,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from chunk_rotation import canonical_json, safe_subdirectory
+from chunk_rotation import canonical_json, parse_time, safe_subdirectory
 from evaluation import _safe_name, _sha256
 from relationship_graph import load_policy
 from vault import (
@@ -36,6 +37,19 @@ DECISION_BEARING_EVIDENCE_TYPES = {
     "git_commit",
     "pull_request",
 }
+# Episodes are considered newest first. A run visits at most the evaluation
+# budget plus this many extra candidates, so one run's work and memory stay
+# bounded however large the index or the retry ledger has grown.
+SELECTION_WINDOW = "3650d"
+SELECTION_SLACK = 8
+RETRY_SEED = "auto-evaluation"
+FAILURE_STATUS_FIELDS = (
+    "failure_reason",
+    "exit_code",
+    "claude_on_path",
+    "consecutive_failures",
+    "last_failure_at",
+)
 
 
 class _AlreadyEvaluated(Exception):
@@ -342,45 +356,205 @@ def run_lock(root: Path, *, blocking: bool):
         os.close(descriptor)
 
 
+def _now() -> dt.datetime:
+    override = os.environ.get("FLIGHT_RECORDER_NOW")
+    if override:
+        try:
+            return parse_time(override).astimezone(dt.timezone.utc)
+        except ValueError as error:
+            raise VaultError("auto-evaluation clock override is invalid") from error
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+
+
+def _format_time(value: dt.datetime) -> str:
+    return value.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _read_status(root: Path) -> dict[str, Any]:
+    """Return the previous status, or {} when it is absent or untrusted."""
+    path = root / STATUS_PATH
+    try:
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or metadata.st_mode & 0o077
+        ):
+            return {}
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _failure_count(status: dict[str, Any]) -> int:
+    count = status.get("consecutive_failures", 0)
+    return count if _integer(count) and 0 <= count < 1_000_000 else 0
+
+
+def _retry_at(status: dict[str, Any]) -> dt.datetime | None:
+    value = status.get("next_retry_at")
+    if not isinstance(value, str):
+        return None
+    try:
+        return parse_time(value).astimezone(dt.timezone.utc)
+    except ValueError:
+        return None
+
+
+def _is_candidate(config: dict[str, Any], card: dict[str, Any]) -> bool:
+    confidence = card["confidence"]
+    if (
+        confidence is not None
+        and confidence["minimum_supporting_score"]
+        >= config["uncertainty_score_below"]
+    ):
+        return False
+    return card["event_count"] > 1 or any(
+        fact["evidence_type"] in DECISION_BEARING_EVIDENCE_TYPES
+        and fact["state"] in {"success", "failure"}
+        for fact in card["deterministic_evidence"]
+    )
+
+
+def _source_ids(card: dict[str, Any]) -> set[str]:
+    return {fact["evidence_id"] for fact in card["deterministic_evidence"]}
+
+
+def _already_evaluated(config: dict[str, Any], card: dict[str, Any]) -> bool:
+    source_ids = _source_ids(card)
+    return any(
+        item.get("trigger") == "background"
+        and item["model"] == config["model"]
+        and set(item["source_evidence_ids"]) == source_ids
+        for item in card["model_evaluations"]
+    )
+
+
+def _fingerprint(config: dict[str, Any], card: dict[str, Any]) -> str:
+    return _sha256(
+        canonical_json(
+            {
+                "policy_version": config["policy_version"],
+                "episode_id": card["episode_id"],
+                "evaluator": config["evaluator"],
+                "model": config["model"],
+                "source_evidence_ids": sorted(_source_ids(card)),
+            }
+        )
+    )
+
+
+def _summary(
+    state: str,
+    *,
+    candidates: int = 0,
+    evaluated: int = 0,
+    idempotent_skips: int = 0,
+    attempt_skips: int = 0,
+    measured_cost: int = 0,
+    **extra: Any,
+) -> dict[str, Any]:
+    return {
+        "schema_version": OUTPUT_VERSION,
+        "command": "auto-evaluation run",
+        "state": state,
+        "candidate_count": candidates,
+        "evaluated_count": evaluated,
+        "idempotent_skip_count": idempotent_skips,
+        "attempt_skip_count": attempt_skips,
+        "measured_cost_microusd": measured_cost,
+        **extra,
+    }
+
+
+def _failure_status(
+    previous: dict[str, Any],
+    attempts: dict[str, dict[str, str]],
+    error: VaultError,
+    now: dt.datetime,
+    *,
+    recovered: bool = False,
+) -> dict[str, Any]:
+    from evaluation import FAILURE_REASONS
+    from scheduler import retry_delay_seconds
+
+    reason = getattr(error, "reason", None)
+    if reason not in FAILURE_REASONS:
+        reason = "evaluation_error"
+    # An evaluation that succeeded earlier in this run shows the evaluator
+    # works, so a later failure starts a new streak instead of extending the
+    # one recorded before the run.
+    count = (0 if recovered else _failure_count(previous)) + 1
+    status: dict[str, Any] = {
+        "schema_version": 1,
+        "state": "error",
+        "diagnostic_code": "evaluator_failed",
+        "attempt_count": len(attempts),
+        "failure_reason": reason,
+        "consecutive_failures": count,
+        "last_failure_at": _format_time(now),
+        "next_retry_at": _format_time(
+            now + dt.timedelta(seconds=retry_delay_seconds(RETRY_SEED, count))
+        ),
+    }
+    if recovered:
+        status["last_success_at"] = _format_time(now)
+    elif "last_success_at" in previous:
+        status["last_success_at"] = previous["last_success_at"]
+    exit_code = getattr(error, "exit_code", None)
+    if _integer(exit_code):
+        status["exit_code"] = exit_code
+    claude_on_path = getattr(error, "claude_on_path", None)
+    if isinstance(claude_on_path, bool):
+        status["claude_on_path"] = claude_on_path
+    return status
+
+
 def _run_once(root: Path) -> dict[str, Any]:
-    from evaluation import evaluate
-    from reporting import report
+    from evaluation import NO_SPEND_FAILURES, evaluate
+    from reporting import select_episode_ids
 
     config = load_config(root)
-    view = report(
-        root,
-        "3650d",
-        config["policy_version"],
-        (
-            Path(config["policy_path"])
-            if config["policy_path"] is not None
-            else None
-        ),
+    now = _now()
+    previous = _read_status(root)
+    retry_at = _retry_at(previous)
+    if retry_at is not None and now < retry_at:
+        # Consecutive evaluator failures back off instead of rebuilding the
+        # candidate list and invoking the evaluator on every scheduler tick.
+        return _summary("backoff", next_retry_at=_format_time(retry_at))
+    policy_path = (
+        Path(config["policy_path"]) if config["policy_path"] is not None else None
     )
-    candidates = [
-        card
-        for card in view["cards"]
-        if (
-            card["confidence"] is None
-            or card["confidence"]["minimum_supporting_score"]
-            < config["uncertainty_score_below"]
-        )
-        and (
-            card["event_count"] > 1
-            or any(
-                fact["evidence_type"] in DECISION_BEARING_EVIDENCE_TYPES
-                and fact["state"] in {"success", "failure"}
-                for fact in card["deterministic_evidence"]
-            )
-        )
-    ]
-    evaluated = 0
-    idempotent_skips = 0
-    attempt_skips = 0
-    measured_cost = 0
     with vault_lock(root):
         attempts = _load_attempts(root)
-    for card in candidates:
+    idempotent_skips = 0
+    attempt_skips = 0
+
+    def wanted(card: dict[str, Any]) -> bool:
+        nonlocal idempotent_skips, attempt_skips
+        if not _is_candidate(config, card):
+            return False
+        if _already_evaluated(config, card):
+            idempotent_skips += 1
+            return False
+        if _fingerprint(config, card) in attempts:
+            attempt_skips += 1
+            return False
+        return True
+
+    episode_ids = select_episode_ids(
+        root,
+        SELECTION_WINDOW,
+        config["policy_version"],
+        policy_path,
+        wanted,
+        config["max_evaluations_per_run"] + SELECTION_SLACK,
+    )
+    evaluated = 0
+    measured_cost = 0
+    for episode_id in episode_ids:
         if evaluated >= config["max_evaluations_per_run"]:
             break
         remaining = config["max_cost_microusd_per_run"] - measured_cost
@@ -390,41 +564,13 @@ def _run_once(root: Path) -> dict[str, Any]:
 
         def reserve(actual_card: dict[str, Any]) -> None:
             nonlocal attempt_fingerprint
-            confidence = actual_card["confidence"]
-            if (
-                confidence is not None
-                and confidence["minimum_supporting_score"]
-                >= config["uncertainty_score_below"]
-            ):
+            # The card above came from an earlier read; decide again on the
+            # card the evaluation itself will use, before anything is spent.
+            if not _is_candidate(config, actual_card):
                 raise _NoLongerCandidate
-            if actual_card["event_count"] <= 1 and not any(
-                fact["evidence_type"] in DECISION_BEARING_EVIDENCE_TYPES
-                and fact["state"] in {"success", "failure"}
-                for fact in actual_card["deterministic_evidence"]
-            ):
-                raise _NoLongerCandidate
-            source_ids = {
-                fact["evidence_id"]
-                for fact in actual_card["deterministic_evidence"]
-            }
-            if any(
-                item.get("trigger") == "background"
-                and item["model"] == config["model"]
-                and set(item["source_evidence_ids"]) == source_ids
-                for item in actual_card["model_evaluations"]
-            ):
+            if _already_evaluated(config, actual_card):
                 raise _AlreadyEvaluated
-            fingerprint = _sha256(
-                canonical_json(
-                    {
-                        "policy_version": config["policy_version"],
-                        "episode_id": actual_card["episode_id"],
-                        "evaluator": config["evaluator"],
-                        "model": config["model"],
-                        "source_evidence_ids": sorted(source_ids),
-                    }
-                )
-            )
+            fingerprint = _fingerprint(config, actual_card)
             if fingerprint in attempts:
                 raise _AttemptReserved
             attempts[fingerprint] = {
@@ -443,13 +589,9 @@ def _run_once(root: Path) -> dict[str, Any]:
         try:
             result = evaluate(
                 root,
-                card["episode_id"],
+                episode_id,
                 config["policy_version"],
-                (
-                    Path(config["policy_path"])
-                    if config["policy_path"] is not None
-                    else None
-                ),
+                policy_path,
                 None,
                 config["evaluator"],
                 config["model"],
@@ -469,30 +611,32 @@ def _run_once(root: Path) -> dict[str, Any]:
         except _AttemptReserved:
             attempt_skips += 1
             continue
-        except VaultError:
+        except VaultError as error:
             if attempt_fingerprint is not None:
-                attempts[attempt_fingerprint]["state"] = "failed"
-            status = {
-                "schema_version": 1,
-                "state": "error",
-                "diagnostic_code": "evaluator_failed",
-                "attempt_count": len(attempts),
-            }
+                if getattr(error, "reason", None) in NO_SPEND_FAILURES:
+                    # The evaluator never ran, so nothing says this episode
+                    # is hard to evaluate; release it for a later attempt.
+                    attempts.pop(attempt_fingerprint)
+                else:
+                    attempts[attempt_fingerprint]["state"] = "failed"
+            status = _failure_status(
+                previous, attempts, error, now, recovered=evaluated > 0
+            )
             with vault_lock(root):
                 if attempt_fingerprint is not None:
                     _store_attempts(root, attempts)
                 _store_status(root, status)
-            return {
-                "schema_version": OUTPUT_VERSION,
-                "command": "auto-evaluation run",
-                "state": "error",
-                "diagnostic_code": "evaluator_failed",
-                "candidate_count": len(candidates),
-                "evaluated_count": evaluated,
-                "idempotent_skip_count": idempotent_skips,
-                "attempt_skip_count": attempt_skips,
-                "measured_cost_microusd": measured_cost,
-            }
+            return _summary(
+                "error",
+                candidates=len(episode_ids),
+                evaluated=evaluated,
+                idempotent_skips=idempotent_skips,
+                attempt_skips=attempt_skips,
+                measured_cost=measured_cost,
+                diagnostic_code="evaluator_failed",
+                failure_reason=status["failure_reason"],
+                next_retry_at=status["next_retry_at"],
+            )
         measured_cost += result["evaluation"]["measured_cost_microusd"]
         evaluated += 1
         assert attempt_fingerprint is not None
@@ -513,31 +657,28 @@ def _run_once(root: Path) -> dict[str, Any]:
         "diagnostic_code": diagnostic_code,
         "attempt_count": len(attempts),
     }
+    if evaluated:
+        # An evaluation completed, so earlier failures no longer describe the
+        # evaluator. Older failed reservations stay in the ledger.
+        status["last_success_at"] = _format_time(now)
+    else:
+        for key in (*FAILURE_STATUS_FIELDS, "last_success_at"):
+            if key in previous:
+                status[key] = previous[key]
     with vault_lock(root):
         _store_status(root, status)
-    return {
-        "schema_version": OUTPUT_VERSION,
-        "command": "auto-evaluation run",
-        "state": "completed",
-        "candidate_count": len(candidates),
-        "evaluated_count": evaluated,
-        "idempotent_skip_count": idempotent_skips,
-        "attempt_skip_count": attempt_skips,
-        "measured_cost_microusd": measured_cost,
-    }
+    return _summary(
+        "completed",
+        candidates=len(episode_ids),
+        evaluated=evaluated,
+        idempotent_skips=idempotent_skips,
+        attempt_skips=attempt_skips,
+        measured_cost=measured_cost,
+    )
 
 
 def run(root: Path) -> dict[str, Any]:
     with run_lock(root, blocking=False) as acquired:
         if not acquired:
-            return {
-                "schema_version": OUTPUT_VERSION,
-                "command": "auto-evaluation run",
-                "state": "busy",
-                "candidate_count": 0,
-                "evaluated_count": 0,
-                "idempotent_skip_count": 0,
-                "attempt_skip_count": 0,
-                "measured_cost_microusd": 0,
-            }
+            return _summary("busy")
         return _run_once(root)

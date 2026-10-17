@@ -583,6 +583,105 @@ def report(
     )
 
 
+def _episode_edge_floor(
+    connection: sqlite3.Connection, policy_version: str, episode_id: str
+) -> dict[str, list[dict[str, Any]]]:
+    """Stand in for an Episode's link edges when only its confidence matters.
+
+    A card derives ``confidence`` from the weakest score among its link edges
+    and nothing else, so selection reads that one number in SQL instead of
+    expanding every edge together with its evidence document. The card is
+    identical; the memory no longer grows with the Episode's edge count.
+    """
+    (floor,) = connection.execute(
+        "SELECT MIN(edge.score) FROM episode_members AS member "
+        "JOIN relationship_edges AS edge "
+        "ON edge.policy_version = member.policy_version "
+        "AND edge.left_event_id = member.event_id "
+        "WHERE member.policy_version = ? AND member.episode_id = ? "
+        "AND edge.decision = 'link'",
+        (policy_version, episode_id),
+    ).fetchone()
+    return {episode_id: [{"score": floor}]} if floor is not None else {}
+
+
+def select_episode_ids(
+    root: Path,
+    last: str,
+    policy_version: str | None,
+    policy_path: Path | None,
+    accept: Callable[[dict[str, Any]], bool],
+    limit: int,
+    *,
+    now: dt.datetime | None = None,
+) -> list[str]:
+    """Return up to ``limit`` Episode IDs, newest first, whose card is accepted.
+
+    ``report`` materializes every Episode Card together with every relationship
+    edge before anything is filtered, so its peak memory grows with the number
+    of link edges in the index. Selection instead walks the events from the
+    newest backwards and takes each Episode the first time one of its events
+    appears, so Episodes come out ordered by their latest event. It builds one
+    card at a time, stops as soon as ``limit`` cards were accepted, and never
+    looks at older events than it needs. A card needs only the weakest link
+    score of its Episode, so no edge or evidence document is expanded: the work
+    and memory are bounded by what was visited, not by the size of the index.
+    Episodes whose latest events share a timestamp may come out in a different
+    order than ``report`` gives them.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise VaultError("episode selection limit is invalid")
+    policy_version, trusted_policy = _policy_selection(
+        policy_version, policy_path
+    )
+    window = parse_duration(last)
+    end = now or dt.datetime.now(dt.timezone.utc)
+    if end.tzinfo is None:
+        raise VaultError("report clock must include a timezone")
+    end = end.astimezone(dt.timezone.utc)
+    start = end - window
+
+    def query(
+        connection: sqlite3.Connection, policy: dict[str, Any]
+    ) -> list[str]:
+        forgotten = load_forgotten(root)
+        seen: set[str] = set()
+        selected: list[str] = []
+        for event_id, recorded_at in connection.execute(
+            "SELECT event_id, recorded_at FROM source_events "
+            "INDEXED BY source_events_by_time "
+            "ORDER BY recorded_at DESC, event_id DESC"
+        ):
+            moment = parse_time(recorded_at)
+            if moment < start:
+                break
+            row = connection.execute(
+                "SELECT episode_id FROM episode_members "
+                "WHERE policy_version = ? AND event_id = ?",
+                (policy_version, event_id),
+            ).fetchone()
+            if row is None or row[0] in seen:
+                continue
+            episode_id = row[0]
+            seen.add(episode_id)
+            if moment > end or (policy_version, episode_id) in forgotten:
+                continue
+            card, _edges = _episode_card(
+                root,
+                connection,
+                policy,
+                episode_id,
+                _episode_edge_floor(connection, policy_version, episode_id),
+            )
+            if accept(card):
+                selected.append(episode_id)
+                if len(selected) >= limit:
+                    break
+        return selected
+
+    return _authenticated_query(root, policy_version, query, trusted_policy)
+
+
 def inspect_episode(
     root: Path,
     episode_id: str,

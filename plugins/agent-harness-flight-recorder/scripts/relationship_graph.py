@@ -221,6 +221,9 @@ def _state(left: str | None, right: str | None) -> str:
 def score_pair(
     left: Event, right: Event, policy: dict[str, Any]
 ) -> tuple[int, str, str]:
+    # link_plan() restates this scoring to prune candidate pairs. Change them
+    # together: tests/test-relationship-compaction.sh compares the two over
+    # random policies and events.
     weights = policy["weights"]
     task_state = _state(left.task_id, right.task_id)
     contradiction = (
@@ -305,16 +308,76 @@ def _evidence_id(encoded: str) -> str:
     return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def _candidate_ids(
-    events: list[Event],
-    policy: dict[str, Any],
-    new_event_ids: set[str] | None = None,
-) -> Iterator[tuple[str, str]]:
-    chronological = sorted(
-        (parse_time(event.recorded_at), event.event_id) for event in events
-    )
-    event_by_id = {event.event_id: event for event in events}
+@dataclass(frozen=True)
+class LinkPlan:
+    """What a pair without a shared task needs before it can reach the threshold.
+
+    Every pair outside this plan scores below the threshold and is therefore
+    ``no_link``. That outcome is a pure function of the two source events and
+    the stored policy, and no reader consumes it, so the index does not persist
+    it (D-20261017-35). ``horizon`` is the largest whole-second distance at
+    which such a pair can still link (``None`` if it never can). The flags name
+    the features that every qualifying combination contains.
+    """
+
+    horizon: int | None
+    block_workspace: bool
+    block_branch: bool
+    require_files: bool
+
+
+_PLAN_FEATURES = (
+    ("workspace", "workspace_match"),
+    ("branch", "branch_or_worktree_match"),
+    ("files", "changed_file_overlap"),
+)
+
+
+def link_plan(policy: dict[str, Any]) -> LinkPlan:
+    """Derive necessary conditions for a link from a validated policy.
+
+    Mirrors ``score_pair``: without an explicit-task match the score is the sum
+    of the matched workspace, branch and file weights plus the time bucket the
+    whole-second distance falls into (zero beyond the window).
+    """
+    weights = policy["weights"]
     window = policy["time_window_seconds"]
+    threshold = policy["threshold"]
+    feature_weights = {name: weights[key] for name, key in _PLAN_FEATURES}
+    regions: list[tuple[int, int]] = []  # (largest whole second, contribution)
+    covered = -1
+    for bucket in policy["time_buckets"]:
+        upper = min(bucket["max_seconds"], window)
+        if upper > covered:
+            regions.append((upper, bucket["contribution"]))
+            covered = upper
+    if covered < window:
+        regions.append((window, 0))
+    feasible: list[tuple[int, frozenset[str]]] = []
+    names = tuple(feature_weights)
+    for upper, contribution in regions:
+        for size in range(len(names) + 1):
+            for subset in itertools.combinations(names, size):
+                total = contribution + sum(feature_weights[n] for n in subset)
+                if total >= threshold:
+                    feasible.append((upper, frozenset(subset)))
+    if not feasible:
+        return LinkPlan(None, False, False, False)
+    required = frozenset.intersection(*(subset for _upper, subset in feasible))
+    return LinkPlan(
+        max(upper for upper, _subset in feasible),
+        "workspace" in required,
+        "branch" in required,
+        "files" in required,
+    )
+
+
+def _pairs_within(
+    chronological: list[tuple[Any, str]],
+    window: int,
+    new_event_ids: set[str] | None,
+) -> Iterator[tuple[str, str]]:
+    """Yield id pairs that are at most ``window`` seconds apart."""
     if new_event_ids is None:
         for index, (left_time, left_id) in enumerate(chronological):
             for right_index in range(index + 1, len(chronological)):
@@ -322,28 +385,95 @@ def _candidate_ids(
                 if (right_time - left_time).total_seconds() > window:
                     break
                 yield tuple(sorted((left_id, right_id)))
-    else:
-        for index, (selected_time, selected_id) in enumerate(chronological):
-            if selected_id not in new_event_ids:
+        return
+    for index, (selected_time, selected_id) in enumerate(chronological):
+        if selected_id not in new_event_ids:
+            continue
+        for step in (-1, 1):
+            candidate_index = index + step
+            while 0 <= candidate_index < len(chronological):
+                candidate_time, candidate_id = chronological[candidate_index]
+                if abs(
+                    (candidate_time - selected_time).total_seconds()
+                ) > window:
+                    break
+                # A new-old pair has one new endpoint and is visited once.
+                # A new-new pair is visited from both endpoints, so the
+                # stable ID order emits it from only one without retaining
+                # an unbounded de-duplication set.
+                if (
+                    candidate_id not in new_event_ids
+                    or selected_id < candidate_id
+                ):
+                    yield tuple(sorted((selected_id, candidate_id)))
+                candidate_index += step
+
+
+def _candidate_ids(
+    events: list[Event],
+    policy: dict[str, Any],
+    new_event_ids: set[str] | None = None,
+) -> Iterator[tuple[str, str]]:
+    """Yield every pair that can receive a persisted decision.
+
+    The contract is a superset: any pair not yielded here would be scored
+    ``no_link`` by ``score_pair``. Callers discard ``no_link`` results.
+    Three disjoint groups are generated:
+
+    * pairs close enough in time, inside one workspace/branch block and with
+      comparable file evidence, as far as ``link_plan`` requires;
+    * pairs that share an explicit task, at any distance;
+    * pairs with contradictory explicit tasks inside the window, which carry
+      the ``hard_veto`` decision.
+    """
+    plan = link_plan(policy)
+    window = policy["time_window_seconds"]
+    event_by_id = {event.event_id: event for event in events}
+    times = {event.event_id: parse_time(event.recorded_at) for event in events}
+
+    def block_key(event: Event) -> tuple[str, ...] | None:
+        key: list[str] = []
+        if plan.block_workspace:
+            if event.workspace_id is None:
+                return None
+            key.append(event.workspace_id)
+        if plan.block_branch:
+            if event.branch_id is None:
+                return None
+            key.append(event.branch_id)
+        return tuple(key)
+
+    def comparable(event: Event) -> bool:
+        return not plan.require_files or (
+            event.files_state == "complete" and bool(event.files)
+        )
+
+    def in_time_block(left_id: str, right_id: str) -> bool:
+        """Whether the first group already yields this pair."""
+        if plan.horizon is None:
+            return False
+        left, right = event_by_id[left_id], event_by_id[right_id]
+        if not (comparable(left) and comparable(right)):
+            return False
+        key = block_key(left)
+        if key is None or key != block_key(right):
+            return False
+        return abs(
+            (times[left_id] - times[right_id]).total_seconds()
+        ) <= plan.horizon
+
+    if plan.horizon is not None:
+        blocks: dict[tuple[str, ...], list[tuple[Any, str]]] = {}
+        for event in events:
+            key = block_key(event)
+            if key is None or not comparable(event):
                 continue
-            for step in (-1, 1):
-                candidate_index = index + step
-                while 0 <= candidate_index < len(chronological):
-                    candidate_time, candidate_id = chronological[candidate_index]
-                    if abs(
-                        (candidate_time - selected_time).total_seconds()
-                    ) > window:
-                        break
-                    # A new-old pair has one new endpoint and is visited once.
-                    # A new-new pair is visited from both endpoints, so the
-                    # stable ID order emits it from only one without retaining
-                    # an unbounded de-duplication set.
-                    if (
-                        candidate_id not in new_event_ids
-                        or selected_id < candidate_id
-                    ):
-                        yield tuple(sorted((selected_id, candidate_id)))
-                    candidate_index += step
+            blocks.setdefault(key, []).append(
+                (times[event.event_id], event.event_id)
+            )
+        for chronological in blocks.values():
+            chronological.sort()
+            yield from _pairs_within(chronological, plan.horizon, new_event_ids)
     task_groups: dict[str, list[str]] = {}
     for event in events:
         if event.task_id is not None:
@@ -353,14 +483,24 @@ def _candidate_ids(
             continue
         for pair in itertools.combinations(group, 2):
             ordered = tuple(sorted(pair))
-            left, right = (event_by_id[item] for item in ordered)
-            seconds = abs(
-                (parse_time(left.recorded_at) - parse_time(right.recorded_at))
-                .total_seconds()
-            )
-            if seconds <= window:
+            if new_event_ids is not None and not new_event_ids.intersection(
+                ordered
+            ):
                 continue
-            if new_event_ids is None or new_event_ids.intersection(ordered):
+            if not in_time_block(*ordered):
+                yield ordered
+    if policy["hard_veto"]["contradictory_task_ids"]:
+        tasked = sorted(
+            (times[event.event_id], event.event_id)
+            for event in events
+            if event.task_id is not None
+        )
+        for ordered in _pairs_within(tasked, window, new_event_ids):
+            if (
+                event_by_id[ordered[0]].task_id
+                != event_by_id[ordered[1]].task_id
+                and not in_time_block(*ordered)
+            ):
                 yield ordered
 
 
@@ -468,11 +608,15 @@ def rebuild_relationships(
     evidence_cache: dict[str, str] = {}
     edge_batch = []
     link_candidates = []
-    pair_count = 0
+    edge_count = 0
     for left_id, right_id in _candidate_ids(events, policy):
         score, decision, evidence = score_pair(
             by_id[left_id], by_id[right_id], policy
         )
+        if decision == "no_link":
+            # Derivable from the two source events and the stored policy, and
+            # read by nothing: neither reports nor component replay look at it.
+            continue
         evidence_id = _evidence_id(evidence)
         prior = evidence_cache.get(evidence_id)
         if prior is not None and prior != evidence:
@@ -488,7 +632,7 @@ def rebuild_relationships(
         )
         if decision == "link":
             link_candidates.append((score, left_id, right_id))
-        pair_count += 1
+        edge_count += 1
         if len(edge_batch) >= 1_000:
             connection.executemany(
                 "INSERT INTO relationship_edges VALUES (?, ?, ?, ?, ?, ?)",
@@ -511,7 +655,7 @@ def rebuild_relationships(
                 (version, left_id, right_id),
             )
     episode_count = _replace_episodes(connection, version, events, components)
-    return pair_count, episode_count
+    return edge_count, episode_count
 
 
 def refresh_relationships_incremental(
@@ -548,11 +692,13 @@ def refresh_relationships_incremental(
     )
     evidence_cache = dict(evidence_rows) if evidence_cache_complete else {}
     edge_batch = []
-    pair_count = 0
+    edge_count = 0
     for left_id, right_id in _candidate_ids(events, policy, new_event_ids):
         score, decision, evidence = score_pair(
             by_id[left_id], by_id[right_id], policy
         )
+        if decision == "no_link":
+            continue
         evidence_id = _evidence_id(evidence)
         prior = evidence_cache.get(evidence_id)
         if prior is not None and prior != evidence:
@@ -581,7 +727,7 @@ def refresh_relationships_incremental(
         edge_batch.append(
             (version, left_id, right_id, score, decision, evidence_id)
         )
-        pair_count += 1
+        edge_count += 1
         if len(edge_batch) >= 1_000:
             connection.executemany(
                 "INSERT OR REPLACE INTO relationship_edges "
@@ -661,4 +807,4 @@ def refresh_relationships_incremental(
         )
     connection.execute("DROP TABLE relationship_decision_updates")
     episode_count = _replace_episodes(connection, version, events, components)
-    return pair_count, episode_count
+    return edge_count, episode_count

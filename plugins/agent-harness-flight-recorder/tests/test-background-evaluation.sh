@@ -211,6 +211,14 @@ status = json.loads(
 assert status["diagnostic_code"] == "evaluator_failed"
 assert status["attempt_count"] == 1
 assert "error" not in status
+# The reason is finite and content-free: what failed, not what was evaluated.
+assert status["failure_reason"] == "nonzero_exit"
+assert status["exit_code"] == 7
+assert isinstance(status["claude_on_path"], bool)
+assert status["consecutive_failures"] == 1
+assert status["next_retry_at"] > status["last_failure_at"]
+assert value["failure_reason"] == "nonzero_exit"
+assert value["next_retry_at"] == status["next_retry_at"]
 PY
   then
     pass "background evaluator失敗をsafe stateへ閉じCLIをfail-openにする"
@@ -234,14 +242,68 @@ value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 status = json.loads(
     (pathlib.Path(sys.argv[2]) / "auto-evaluation/status.json").read_text()
 )
+# Consecutive failures back off: no candidate list, no evaluator call.
+assert value["state"] == "backoff"
+assert value["evaluated_count"] == 0
+assert value["next_retry_at"] == status["next_retry_at"]
+assert status["state"] == "error"
+assert status["diagnostic_code"] == "evaluator_failed"
+assert status["consecutive_failures"] == 1
+PY
+  then
+    pass "連続失敗はnext_retry_atまでbackoffし、候補選定も評価器呼び出しもしない"
+  else
+    cat "$TEST_ROOT/failure-repeat.err" >&2
+    fail "連続失敗はnext_retry_atまでbackoffし、候補選定も評価器呼び出しもしない"
+    return
+  fi
+
+  local later
+  later="$(python3 - "$STATE" <<'PY'
+import datetime as dt
+import json
+import pathlib
+import sys
+
+status = json.loads(
+    (pathlib.Path(sys.argv[1]) / "auto-evaluation/status.json").read_text()
+)
+moment = dt.datetime.fromisoformat(status["next_retry_at"].replace("Z", "+00:00"))
+print((moment + dt.timedelta(seconds=1)).isoformat().replace("+00:00", "Z"))
+PY
+)"
+  if FLIGHT_RECORDER_NOW="$later" \
+    FLIGHT_RECORDER_TEST_EVALUATOR_COUNT="$counter" \
+    FLIGHT_RECORDER_TEST_EVALUATOR_FAIL=1 \
+    run_cli auto-evaluation run --json \
+      >"$output" 2>"$TEST_ROOT/failure-retry.err" \
+    && [[ "$(cat "$counter")" == "1" ]] \
+    && python3 - "$output" "$STATE" <<'PY'
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+status = json.loads(
+    (pathlib.Path(sys.argv[2]) / "auto-evaluation/status.json").read_text()
+)
+# After the retry time the failed fingerprint is still not retried: it is
+# skipped while selecting, so the evaluator is not invoked again.
+assert value["state"] == "completed"
 assert value["attempt_skip_count"] == 1
 assert value["evaluated_count"] == 0
 assert status["state"] == "error"
 assert status["diagnostic_code"] == "evaluator_failed"
+# The failure history survives until an evaluation succeeds; the elapsed
+# retry time does not.
+assert status["failure_reason"] == "nonzero_exit"
+assert status["consecutive_failures"] == 1
+assert "next_retry_at" not in status
 PY
   then
     pass "失敗した同一fingerprintをscheduler周期ごとに無制限再試行しない"
   else
+    cat "$TEST_ROOT/failure-retry.err" >&2
     fail "失敗した同一fingerprintをscheduler周期ごとに無制限再試行しない"
   fi
 }
