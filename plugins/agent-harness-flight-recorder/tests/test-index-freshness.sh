@@ -708,7 +708,10 @@ events = [
 connection.executemany(
     "INSERT INTO source_events VALUES (?, ?, ?, ?, ?, ?, ?)",
     [
-        (event_id, recorded_at, "workspace", None, None, "[]", "complete")
+        # A shared branch and changed file make every pair a link candidate
+        # under the default policy; candidates the policy rules out are never
+        # generated, so a fixture without them would have nothing to score.
+        (event_id, recorded_at, "workspace", None, "branch", '["file"]', "complete")
         for event_id, recorded_at in events
     ],
 )
