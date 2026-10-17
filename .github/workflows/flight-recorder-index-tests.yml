@@ -12,6 +12,9 @@ on:
       - 'plugins/agent-harness-flight-recorder/**'
       - '.github/workflows/flight-recorder-index-tests.yml'
 
+permissions:
+  contents: read
+
 jobs:
   index-tests:
     # 関係グラフ・index 更新・自動評価は、GNU 系と BSD 系の両方で回す。
@@ -21,8 +24,11 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # テストは読み取りだけで足りる。認証情報を残さず、action は完全な SHA に固定する。
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.13'
       - name: Test relationship edges, index refresh and background evaluation (synthetic, no model calls)

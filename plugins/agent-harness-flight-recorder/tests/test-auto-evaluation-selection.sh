@@ -24,7 +24,9 @@ PASS=0
 FAIL=0
 
 cleanup() {
-  rm -rf "$TEST_ROOT"
+  [[ -n "$TEST_ROOT" && "$TEST_ROOT" != "/" && -d "$TEST_ROOT" ]] || return
+  [[ "${TEST_ROOT##*/}" == tmp.* ]] || return
+  rm -rf -- "$TEST_ROOT"
 }
 trap cleanup EXIT
 

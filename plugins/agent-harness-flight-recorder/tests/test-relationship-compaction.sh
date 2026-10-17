@@ -11,12 +11,14 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLUGIN_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-TEST_ROOT="$(mktemp -d)"
+TEST_ROOT="$(mktemp -d)" || exit 1
 PASS=0
 FAIL=0
 
 cleanup() {
-  rm -rf "$TEST_ROOT"
+  [[ -n "$TEST_ROOT" && "$TEST_ROOT" != "/" && -d "$TEST_ROOT" ]] || return
+  [[ "${TEST_ROOT##*/}" == tmp.* ]] || return
+  rm -rf -- "$TEST_ROOT"
 }
 trap cleanup EXIT
 
