@@ -5,7 +5,7 @@ import re
 import time
 from collections import Counter, defaultdict
 
-VERSION = 'recall-followup-v1'
+VERSION = 'recall-followup-v2'
 WINDOW_SECONDS = 7 * 86400
 MAX_TURNS = 3
 MAX_CASES = 100
@@ -34,7 +34,12 @@ def _sessions(snapshot):
     groups = defaultdict(dict)
     for item in turns(snapshot):
         o = item['observation']
-        text = user_text(item['utterance']['text'])
+        # Classify the outer envelope before unwrapping human answers. A
+        # quoted heartbeat or an answer discussing it is still a human turn.
+        raw = item['utterance']['text']
+        if re.match(r'^\s*<heartbeat(?:\s[^>]*|)>', raw):
+            continue
+        text = user_text(raw)
         if not o or not o['native_session_id'] or not text or text.lstrip().startswith(('<external_codex_apps_', '<subagent_notification>', '<local-command-stdout>', '<local-command-caveat>', '<command-name>')):
             continue
         # Live/archive copies of an identical native turn are one observation.

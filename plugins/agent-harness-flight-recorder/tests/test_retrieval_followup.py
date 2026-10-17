@@ -61,6 +61,67 @@ class FollowupTests(unittest.TestCase):
         self.assertEqual(len(self.case()['followups']),3)
         self.assertEqual(lab.context_report(self.root)['searches'],1)
 
+    def heartbeat_snapshot(self, tail=()):
+        self.write('current', 'session-a', self.current[:2] + [
+            msg('  <heartbeat>scheduled work</heartbeat>', 206),
+            msg('<heartbeat automation="example">scheduled work</heartbeat>', 208),
+            msg('<heartbeat>scheduled work</heartbeat>', 209), *tail])
+        self.snapshot = lab._build_snapshot(live.export_live([('codex', self.logs)], since=0))[0]
+        lab.publish_snapshot(self.root, dict(schema_version=1, documents=self.snapshot['documents']))
+
+    def test_heartbeat_does_not_consume_window_or_exposure_boundary(self):
+        r = self.search()
+        self.use(r, 207)
+        self.heartbeat_snapshot()
+        self.run_at(240)
+        self.assertEqual(self.case()['status'], 'pending')
+        self.assertEqual(self.case()['anchor']['timestamp'], 200)
+        self.assertEqual(self.case()['followups'], [])
+        self.assertEqual(self.case()['exposure']['decision_match'], 'found')
+        self.heartbeat_snapshot([msg('I already said twenty', 250),
+                                 msg('OK', 251, 'assistant')])
+        self.run_at(260)
+        self.assertEqual(self.case()['status'], 'observing')
+        self.assertEqual([f['timestamp'] for f in self.case()['followups']], [250])
+        self.assertEqual(self.case()['exposure']['read_count'], 1)
+        self.run_at(205 + followup.WINDOW_SECONDS)
+        self.assertEqual(self.case()['status'], 'window_complete')
+
+    def test_heartbeat_only_expires_without_human_followup(self):
+        self.search()
+        self.heartbeat_snapshot()
+        self.run_at(205 + followup.WINDOW_SECONDS)
+        self.assertEqual(self.case()['status'], 'no_followup_observed')
+
+    def test_human_heartbeat_mentions_and_structured_answers_are_preserved(self):
+        self.search()
+        reply = '<send_user_message_question_reply>' + json.dumps([
+            {'question': 'Which format?', 'answer': '<heartbeat>example</heartbeat>'}
+        ]) + '</send_user_message_question_reply>'
+        self.heartbeat_snapshot([msg('Explain <heartbeat> messages', 250),
+                                 msg('`<heartbeat>example</heartbeat>`', 260),
+                                 msg(reply, 270)])
+        self.run_at(280)
+        self.assertEqual(self.case()['status'], 'window_complete')
+        self.assertEqual([f['timestamp'] for f in self.case()['followups']], [250, 260, 270])
+
+    def test_old_completed_window_is_revised_without_losing_evidence_or_review(self):
+        self.search()
+        self.heartbeat_snapshot()
+        with patch.object(followup, 'VERSION', 'recall-followup-v1'), patch(
+                'retrieval_followup.re.match', return_value=None):
+            self.run_at(240)
+            old = self.case()
+            self.assertEqual(old['status'], 'window_complete')
+            followup.review(self.root, old['case_id'], 'other',
+                            [old['followups'][0]['citation_id']], 'Automated messages')
+        before = followup.inspect(self.root, old['case_id'])
+        self.run_at(240)
+        self.assertEqual(self.case()['status'], 'pending')
+        self.assertEqual(followup.inspect(self.root, old['case_id']), before)
+        self.assertEqual(followup.report(self.root)['historical_reviews'], 1)
+        self.assertEqual(self.run_at(241)['revisions_added'], 0)
+
     def test_silence_never_becomes_success(self):
         self.search();self.run_at(209)
         self.assertEqual(self.case()['status'],'pending')
