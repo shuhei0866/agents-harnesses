@@ -496,7 +496,8 @@ Accepted decisions remain recorded when later superseded.
 
 ## D-20260826-31: Normalize relationship evidence without weakening auditability
 
-- Status: accepted
+- Status: accepted; the retention of `no_link` rows is superseded by
+  D-20261017-35
 - Decision: advance the Evidence Index to schema v5. Store canonical
   relationship explanations once per policy in `relationship_evidence`, using
   their SHA-256 digest as the deterministic identifier, and let every
@@ -602,3 +603,41 @@ Accepted decisions remain recorded when later superseded.
   validated and its exact parent. Fault-injected foreign-key writes roll back
   before seal issuance, unsafe transaction settings fail closed, and legacy or
   unproved writers cannot enter the delta lineage without a full scan.
+
+## D-20261017-35: Persist only the relationship decisions readers consume
+
+- Status: accepted; supersedes the `no_link` retention in D-20260826-31
+- Decision: stop persisting `no_link` rows and stop generating candidate pairs
+  that cannot receive a persisted decision. `link`, `component_conflict`, and
+  `hard_veto` rows are unchanged. `link_plan(policy)` derives the pruning from
+  the validated policy: the largest whole-second distance at which a pair
+  without a shared explicit task can still reach the threshold, and the
+  workspace, branch, and changed-file matches that every such combination
+  needs. Candidate generation yields pairs inside that horizon and block, pairs
+  that share an explicit task at any distance, and pairs with contradictory
+  explicit tasks inside the window. Evidence documents are stored only for
+  persisted edges. The DDL, the policy contract, evidence identifiers, and
+  Episode identity do not change.
+- Reason: D-20260826-31 kept `no_link` because dropping it "would weaken the
+  accepted versioned relationship-evidence contract". Normalization removed the
+  repeated JSON but not the growth of the row count. Every pair inside the
+  one-hour window was a candidate, so the table grows with the square of the
+  event density. One real local index held 92.1 million edges in 17.7 GiB, 95%
+  of them `no_link`. Under the default policy 87% of all rows were farther
+  apart than any pair that can link: without an explicit task a link needs a
+  workspace, branch, and changed-file match plus the five-minute time bucket,
+  exactly 500 points. Nothing reads a `no_link` or `hard_veto` row. Episode
+  formation and incremental replay read `link` and `component_conflict` through
+  the partial index, and reports and `inspect` read only `link`. A `no_link`
+  decision is a pure function of two source events and the stored policy, so
+  it is not lost: `score_pair` recomputes it exactly on demand. `hard_veto`
+  rows stay because they are rare explicit contradictions.
+- Consequence: a newly built index holds roughly the link rows instead of every
+  pair, and it grows with related work rather than with concurrent work. An
+  existing index keeps working without a rebuild and keeps its old `no_link`
+  rows: authenticated delta validation compares the DDL, so changing it would
+  force `full_rebuild_required`, and nothing in the read or write paths needs
+  the old rows to be absent. The file shrinks only when it is rebuilt. Integer
+  keys, dropping the now redundant partial index, and dictionary-encoding the
+  remaining strings need a schema version and a full rebuild, so they are a
+  separate decision.

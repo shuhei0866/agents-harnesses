@@ -505,6 +505,18 @@ stays in an error state while either remains unresolved. A custom relationship
 policy must be selected with its owner-held file via `--policy`, rather than by
 an unauthenticated version string alone.
 
+A run visits episodes newest first and builds only the cards it needs, so its
+memory does not grow with the size of the index. Consecutive evaluator failures
+back off on the scheduler's retry schedule (five minutes, doubling to 24 hours).
+While waiting, a run returns `state: backoff` without opening the index. The
+status file records a finite `failure_reason` (for example `nonzero_exit`,
+`launch_failed`, `timeout`, or `invalid_json`), the evaluator's `exit_code`,
+whether `claude` was on the evaluator's `PATH` (`claude_on_path`),
+`consecutive_failures`, and `next_retry_at`; it never contains evaluator output
+or episode content. A failure before the evaluator could run (missing, unsafe, or
+unlaunchable executable) releases the reservation instead of marking the
+episode failed. A completed evaluation clears the failure fields.
+
 Evidence-free singleton episodes are not automatic-evaluation candidates.
 They contain too little context for a useful model judgment, even when their
 relationship confidence is unknown. A singleton needs a successful or failed
