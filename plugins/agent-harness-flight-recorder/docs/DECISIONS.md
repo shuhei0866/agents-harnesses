@@ -641,3 +641,50 @@ Accepted decisions remain recorded when later superseded.
   keys, dropping the now redundant partial index, and dictionary-encoding the
   remaining strings need a schema version and a full rebuild, so they are a
   separate decision.
+
+## D-20261018-36: Make the cost of choosing an Episode follow the Episode
+
+- Status: accepted; amends the selection in D-20261017-35
+- Decision: read an Episode's weakest link score with two statements instead
+  of one join: the Episode's member rows by primary key, then the link edges of
+  those members by primary-key prefix in batches of 500. A single-event Episode
+  needs no edge statement. Walk the events newest first in one statement that
+  joins each event to its Episode in a fixed order, and let the caller pass a
+  condition on that statement so that Episodes that cannot be candidates cost no
+  card. The auto-evaluation condition is the structural part of the candidate
+  rule: two or more events, or a successful or failed decision-bearing fact on
+  the event that surfaced a single-event Episode. Stop a selection after 1,000
+  cards or 20 seconds, whichever comes first, enforce the deadline inside
+  SQLite as well, and record `selection_stopped` (`visit_limit` or
+  `time_limit`) and `selection_visited` in the status when a run was cut short.
+  Read the stored evaluations once per selection instead of once per card,
+  under the same deadline; a read that the deadline interrupts is discarded, so
+  no card is built from part of the evaluations.
+- Reason: the single join was planned from `relationship_edges`. Without
+  `sqlite_stat1`, SQLite assumes only a handful of rows behind an equality on
+  the leading primary-key column, so it walked every link edge in the index for
+  each Episode and probed the member table for each edge. On an index with 4.6
+  million link edges that took 1.3 to 1.6 seconds per Episode with the pages
+  cached and 9 seconds when they were not, whatever the Episode: the same plan
+  ran for a single event. Selection builds cards until it has enough
+  candidates, and candidates are rare. Collecting the first ten took 5,450
+  Episodes, or 17,281 once the 107 newest candidates had been attempted, so one
+  run held the Vault lock for hours and refresh and sync waited behind it. The unit fixture held about 1,100 edges, where walking all of them takes
+  microseconds, and the benchmark that accompanied D-20261017-35 selected ten
+  Episodes in 0.4 to 1.1 seconds, which looked small, so neither showed a cost
+  per Episode that grew with the index. Bounding the walk was not enough by
+  itself: the 1,000 newest Episodes held no candidate, so a bounded run would
+  have been safe and found nothing. That is why the structural condition moves
+  into the walk.
+- Consequence: the cost of a card follows its Episode's members and link edges
+  (53 ms for the largest Episode, 3,356 events; microseconds for a single
+  event), and a run's lock time is bounded by the deadline whatever the index
+  holds. A selection that finds nothing visits every Episode that might
+  qualify: 889 cards in 2.2 seconds on that index with a warm cache. The schema,
+  the policy, the card, and the candidate rule are unchanged: the condition
+  skips only Episodes that the rule rejects, and a test pins that for every
+  confidence threshold. Already evaluated and attempted Episodes are still
+  decided from their cards, so once more than 1,000 Episodes might qualify the
+  oldest are not reached. Consulting a record of evaluated and attempted
+  Episodes before building their cards would remove that cost and is a
+  separate decision.

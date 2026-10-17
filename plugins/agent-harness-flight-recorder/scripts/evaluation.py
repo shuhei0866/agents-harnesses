@@ -613,8 +613,13 @@ def _validate_record(
     return value
 
 
+class ScanDeadlineExceeded(Exception):
+    """The caller's deadline passed while stored evaluations were being read."""
+
+
 def _stored_evaluations(
     root: Path,
+    expired: Callable[[], bool] | None = None,
 ) -> list[tuple[Path, bytes, dict[str, Any]]]:
     directory = root / "evaluations"
     if not directory.exists() and not directory.is_symlink():
@@ -630,6 +635,8 @@ def _stored_evaluations(
         raise VaultError("evaluation storage is unsafe")
     result = []
     for path in paths:
+        if expired is not None and expired():
+            raise ScanDeadlineExceeded
         try:
             item = path.lstat()
             if (
@@ -662,14 +669,15 @@ def evaluation_record_snapshots(
     ]
 
 
-def load_evaluations(
-    root: Path,
+def select_evaluations(
+    stored: list[tuple[Path, bytes, dict[str, Any]]],
     policy_version: str,
     episode_id: str,
     evidence_ids: set[str],
 ) -> list[dict[str, Any]]:
+    """Pick one Episode's evaluations from records that were already loaded."""
     result = []
-    for _path, _raw, value in _stored_evaluations(root):
+    for _path, _raw, value in stored:
         if (
             value["policy_version"] == policy_version
             and value["episode_id"] == episode_id
@@ -679,6 +687,17 @@ def load_evaluations(
             result.append(value)
     result.sort(key=lambda item: (item["evaluated_at"], item["evaluation_id"]))
     return result
+
+
+def load_evaluations(
+    root: Path,
+    policy_version: str,
+    episode_id: str,
+    evidence_ids: set[str],
+) -> list[dict[str, Any]]:
+    return select_evaluations(
+        _stored_evaluations(root), policy_version, episode_id, evidence_ids
+    )
 
 
 def _evaluated_at() -> str:
