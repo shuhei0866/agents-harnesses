@@ -1166,7 +1166,7 @@ def main() -> int:
             else:
                 value = run_automatic(root)
                 human = (
-                    "Automatic evaluation completed: "
+                    f"Automatic evaluation {value['state']}: "
                     f"{value['evaluated_count']} evaluated.\n"
                 )
             emit(

@@ -583,6 +583,76 @@ def report(
     )
 
 
+def select_episode_ids(
+    root: Path,
+    last: str,
+    policy_version: str | None,
+    policy_path: Path | None,
+    accept: Callable[[dict[str, Any]], bool],
+    limit: int,
+    *,
+    now: dt.datetime | None = None,
+) -> list[str]:
+    """Return up to ``limit`` Episode IDs, newest first, whose card is accepted.
+
+    ``report`` materializes every Episode Card together with every relationship
+    edge before anything is filtered, so its peak memory grows with the number
+    of link edges in the index. Selection visits Episodes in the same order as
+    ``report`` but builds one card at a time from that Episode's own edges and
+    stops once ``limit`` cards were accepted. Memory stays bounded by the
+    largest single Episode, whatever the size of the index.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise VaultError("episode selection limit is invalid")
+    policy_version, trusted_policy = _policy_selection(
+        policy_version, policy_path
+    )
+    window = parse_duration(last)
+    end = now or dt.datetime.now(dt.timezone.utc)
+    if end.tzinfo is None:
+        raise VaultError("report clock must include a timezone")
+    end = end.astimezone(dt.timezone.utc)
+    start = end - window
+
+    def query(
+        connection: sqlite3.Connection, policy: dict[str, Any]
+    ) -> list[str]:
+        forgotten = load_forgotten(root)
+        latest: dict[str, dt.datetime] = {}
+        for episode_id, recorded_at in connection.execute(
+            "SELECT m.episode_id, e.recorded_at FROM episode_members AS m "
+            "JOIN source_events AS e ON e.event_id = m.event_id "
+            "WHERE m.policy_version = ?",
+            (policy_version,),
+        ):
+            moment = parse_time(recorded_at)
+            if episode_id not in latest or moment > latest[episode_id]:
+                latest[episode_id] = moment
+        ordered = sorted(
+            latest, key=lambda item: (latest[item], item), reverse=True
+        )
+        selected: list[str] = []
+        for episode_id in ordered:
+            if (policy_version, episode_id) in forgotten:
+                continue
+            if not start <= latest[episode_id] <= end:
+                continue
+            card, _edges = _episode_card(
+                root,
+                connection,
+                policy,
+                episode_id,
+                _target_episode_edges(connection, policy_version, episode_id),
+            )
+            if accept(card):
+                selected.append(episode_id)
+                if len(selected) >= limit:
+                    break
+        return selected
+
+    return _authenticated_query(root, policy_version, query, trusted_policy)
+
+
 def inspect_episode(
     root: Path,
     episode_id: str,
