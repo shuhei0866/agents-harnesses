@@ -691,9 +691,11 @@ def _select_newest_first(
     stored_evaluations: list[tuple[Path, bytes, dict[str, Any]]] | None = None,
     episode_filter: EpisodeFilter | None = None,
     clock: Callable[[], float] = time.monotonic,
+    started: float | None = None,
 ) -> list[str]:
     policy_version = policy["policy_version"]
-    started = clock()
+    if started is None:
+        started = clock()
 
     def expired() -> bool:
         return clock() - started >= max_seconds
@@ -807,9 +809,10 @@ def select_episode_ids(
     The walk also stops after ``max_visits`` cards or ``max_seconds`` seconds,
     whichever comes first, and returns what it found. A selection that is cut
     short says so in ``stats.stopped``; the Vault lock is therefore held for a
-    bounded time even when no Episode qualifies. The deadline is also enforced
-    inside SQLite, so a statement that produces no row for a long time cannot
-    outlast it.
+    bounded time even when no Episode qualifies. The deadline starts before the
+    stored evaluations are read and is also enforced inside SQLite, so neither
+    that read nor a statement that produces no row for a long time can outlast
+    it.
 
     Candidates can be sparse among the newest Episodes. ``episode_filter``
     lets the caller rule Episodes out inside the same statement that walks the
@@ -842,16 +845,27 @@ def select_episode_ids(
     def query(
         connection: sqlite3.Connection, policy: dict[str, Any]
     ) -> list[str]:
-        from evaluation import _stored_evaluations
+        from evaluation import ScanDeadlineExceeded, _stored_evaluations
 
+        started = clock()
+        try:
+            # Every visited card needs the stored evaluations; read them once
+            # rather than once per card, under the same deadline. A partial
+            # read is never used: a card that missed an existing evaluation
+            # would be evaluated, and paid for, again.
+            stored = _stored_evaluations(
+                root, lambda: clock() - started >= max_seconds
+            )
+        except ScanDeadlineExceeded:
+            outcome.stopped = "time_limit"
+            return []
         return _select_newest_first(
             root,
             connection,
             policy,
             forgotten=load_forgotten(root),
-            # Every visited card needs the stored evaluations; read them once
-            # rather than once per card.
-            stored_evaluations=_stored_evaluations(root),
+            stored_evaluations=stored,
+            started=started,
             start=start,
             end=end,
             accept=accept,

@@ -510,8 +510,8 @@ memory does not grow with the size of the index. It stops after 1,000 cards or
 20 seconds, whichever comes first, and then works with the candidates it found;
 the status file records `selection_stopped` (`visit_limit` or `time_limit`) and
 `selection_visited` only for a run that was cut short. A single event with no
-passing test, build, lint, commit, or pull request is never a candidate and is
-skipped without building its card. Consecutive evaluator failures
+successful or failed test, build, lint, commit, or pull-request fact is never a
+candidate and is skipped without building its card. Consecutive evaluator failures
 back off on the scheduler's retry schedule (five minutes, doubling to 24 hours).
 While waiting, a run returns `state: backoff` without opening the index. The
 status file records a finite `failure_reason` (for example `nonzero_exit`,

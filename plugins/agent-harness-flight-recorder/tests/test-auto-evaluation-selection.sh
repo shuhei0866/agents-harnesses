@@ -543,6 +543,25 @@ ticks = itertools.count()
 found, stats = select(nothing, 10, max_seconds=3, clock=lambda: next(ticks))
 assert stats.stopped == "time_limit" and stats.visited < 36, stats
 
+# The deadline starts before the stored evaluations are read, and a read it
+# interrupts is dropped whole: the first record already finds the second over,
+# and no walk starts on part of the records.
+assert list((root / "evaluations").glob("*.json")), "the fixture holds evaluations"
+real_walk = reporting._select_newest_first
+
+
+def no_walk(*_args, **_kwargs):
+    raise AssertionError("no walk may start after an interrupted read")
+
+
+reporting._select_newest_first = no_walk
+try:
+    ticks = itertools.count()
+    found, stats = select(nothing, 10, max_seconds=1, clock=lambda: next(ticks))
+finally:
+    reporting._select_newest_first = real_walk
+assert (found, stats.visited, stats.stopped) == ([], 0, "time_limit"), stats
+
 # The same deadline inside SQLite: every step reads the clock, so it passes within
 # the first statements. The sealed read must still close cleanly around it.
 original = reporting.SELECTION_PROGRESS_STEPS
@@ -612,7 +631,7 @@ for threshold in (1, 700, 10**9):
         assert kept == taken, (threshold, window)
         assert filtered.visited <= plain.visited
 # It also leaves out what cannot be taken: 24 of the 36 Episodes are one event
-# without a passing test, so only 12 cards are built.
+# without a successful or failed test, so only 12 cards are built.
 _, plain = select(lambda card: False, "3650d")
 _, filtered = select(lambda card: False, "3650d", episode_filter=everyone)
 assert (plain.visited, filtered.visited) == (36, 12), (plain, filtered)

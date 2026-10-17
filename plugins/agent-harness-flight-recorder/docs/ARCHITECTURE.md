@@ -477,11 +477,13 @@ the number of link edges. The weakest score is read from the Episode's own
 member rows and then from the link edges of those members by primary-key prefix,
 so the cost of a card follows the Episode and not the index. The walk is one
 statement over the events' time index; Episodes that cannot be candidates (one
-event with no passing test) are left out inside that statement, and cost no
-card. A run also stops after 1,000 cards or 20 seconds, whichever comes first,
-and the deadline is enforced inside SQLite as well, so the Vault lock is held
-for a bounded time even when nothing qualifies; the status records
-`selection_stopped` (`visit_limit` or `time_limit`) when that happened.
+event with no successful or failed test, build, lint, commit, or pull-request
+fact) are left out inside that statement, and cost no card. A run also stops
+after 1,000 cards or 20 seconds, whichever comes first. The deadline starts
+before the stored evaluations are read and is enforced inside SQLite as well, so
+the Vault lock is held for a bounded time even when nothing qualifies; the
+status records `selection_stopped` (`visit_limit` or `time_limit`) when that
+happened.
 Attempted and already evaluated Episodes are skipped while selecting. Consecutive evaluator failures back off on the scheduler's
 retry schedule; the status records a finite failure reason, the exit status, and
 the next retry time but never evaluator output. A failure before the evaluator

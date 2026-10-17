@@ -652,12 +652,14 @@ Accepted decisions remain recorded when later superseded.
   joins each event to its Episode in a fixed order, and let the caller pass a
   condition on that statement so that Episodes that cannot be candidates cost no
   card. The auto-evaluation condition is the structural part of the candidate
-  rule: two or more events, or a passing or failing decision-bearing fact on
+  rule: two or more events, or a successful or failed decision-bearing fact on
   the event that surfaced a single-event Episode. Stop a selection after 1,000
   cards or 20 seconds, whichever comes first, enforce the deadline inside
   SQLite as well, and record `selection_stopped` (`visit_limit` or
   `time_limit`) and `selection_visited` in the status when a run was cut short.
-  Read the stored evaluations once per selection instead of once per card.
+  Read the stored evaluations once per selection instead of once per card,
+  under the same deadline; a read that the deadline interrupts is discarded, so
+  no card is built from part of the evaluations.
 - Reason: the single join was planned from `relationship_edges`. Without
   `sqlite_stat1`, SQLite assumes only a handful of rows behind an equality on
   the leading primary-key column, so it walked every link edge in the index for
