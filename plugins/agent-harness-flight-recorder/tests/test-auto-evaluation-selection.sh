@@ -236,6 +236,17 @@ newest_peak = tracemalloc.get_traced_memory()[1]
 reporting._edges_by_episode = real_edges
 tracemalloc.stop()
 
+# The window is applied to an Episode's latest event, as report does.
+for window in ("30d", "5h", "3h"):
+    windowed = [
+        card["episode_id"] for card in report(root, window, "default-v1")["cards"]
+        if candidate(card)
+    ]
+    assert select_episode_ids(
+        root, window, "default-v1", None, candidate, 1000
+    ) == windowed, window
+    # Groups start 2h apart and the singles are 13h old or more.
+    assert len(windowed) == {"30d": 12, "5h": 2, "3h": 1}[window], (window, len(windowed))
 assert everything == expected, "selection order differs from report order"
 assert select_episode_ids(root, "3650d", "default-v1", None, candidate, 3) == expected[:3]
 assert newest == expected[:1]
@@ -385,6 +396,74 @@ PY
   fi
 }
 
+test_a_success_earlier_in_the_run_restarts_the_failure_streak() {
+  echo "test_a_success_earlier_in_the_run_restarts_the_failure_streak:"
+  reset_auto_state
+  configure_auto flight-recorder-background-evaluator || {
+    fail "自動評価を構成できる"
+    return
+  }
+  local err="$TEST_ROOT/streak.err"
+  if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts:$TEST_ROOT" \
+    python3 - "$STATE" <<'PY' 2>"$err"
+import datetime as dt
+import json
+import os
+import pathlib
+import sys
+
+import background_evaluation
+import evaluation
+import reporting
+from common import stamp, status_of
+
+root = pathlib.Path(sys.argv[1])
+now = dt.datetime(2026, 10, 17, 12, 0, 0, tzinfo=dt.timezone.utc)
+# A long failure streak recorded by an earlier run, whose retry time has passed.
+earlier = {
+    "schema_version": 1, "state": "error", "diagnostic_code": "evaluator_failed",
+    "attempt_count": 0, "failure_reason": "nonzero_exit", "exit_code": 1,
+    "consecutive_failures": 8, "last_failure_at": stamp(now - dt.timedelta(days=2)),
+    "next_retry_at": stamp(now - dt.timedelta(hours=1)),
+}
+path = root / "auto-evaluation/status.json"
+path.write_text(json.dumps(earlier, sort_keys=True), encoding="utf-8")
+path.chmod(0o600)
+
+calls = []
+
+
+def succeeds_then_fails(root, episode_id, policy_version, policy_path, *_rest,
+                        trigger, remaining_cost_microusd, before_invoke):
+    card = reporting.inspect_episode(root, episode_id, policy_version, policy_path)["card"]
+    before_invoke(card)
+    calls.append(episode_id)
+    if len(calls) == 1:
+        return {"evaluation": {"measured_cost_microusd": 4}}
+    raise evaluation.EvaluatorFailure("evaluator execution failed", "timeout")
+
+
+evaluation.evaluate = succeeds_then_fails
+os.environ["FLIGHT_RECORDER_NOW"] = stamp(now)
+result = background_evaluation.run(root)
+status = status_of(root)
+assert result["state"] == "error" and result["evaluated_count"] == 1, result
+# The success shows the evaluator works: the new failure is the first of a new
+# streak, so the retry is minutes away rather than a day.
+assert status["consecutive_failures"] == 1, status
+assert status["failure_reason"] == "timeout" and "exit_code" not in status, status
+assert status["last_success_at"] == stamp(now), status
+delay = (dt.datetime.fromisoformat(status["next_retry_at"].replace("Z", "+00:00")) - now).total_seconds()
+assert 150 <= delay <= 300, delay
+PY
+  then
+    pass "同じ実行内で評価が成功した後の失敗は、連続失敗数を1から数え直す"
+  else
+    cat "$err" >&2
+    fail "同じ実行内で評価が成功した後の失敗は、連続失敗数を1から数え直す"
+  fi
+}
+
 test_failure_before_the_model_can_run_releases_the_reservation() {
   echo "test_failure_before_the_model_can_run_releases_the_reservation:"
   reset_auto_state
@@ -431,6 +510,7 @@ fi
 test_selection_matches_report_and_stays_bounded
 test_run_never_builds_the_full_report
 test_backoff_grows_then_recovers
+test_a_success_earlier_in_the_run_restarts_the_failure_streak
 test_failure_before_the_model_can_run_releases_the_reservation
 
 echo

@@ -619,11 +619,15 @@ def select_episode_ids(
 
     ``report`` materializes every Episode Card together with every relationship
     edge before anything is filtered, so its peak memory grows with the number
-    of link edges in the index. Selection visits Episodes in the same order as
-    ``report`` but builds one card at a time and stops once ``limit`` cards
-    were accepted. A card needs only the weakest link score of its Episode, so
-    no edge or evidence document is expanded: memory is bounded by the member
-    count of the largest Episode visited, whatever the size of the index.
+    of link edges in the index. Selection instead walks the events from the
+    newest backwards and takes each Episode the first time one of its events
+    appears, so Episodes come out ordered by their latest event. It builds one
+    card at a time, stops as soon as ``limit`` cards were accepted, and never
+    looks at older events than it needs. A card needs only the weakest link
+    score of its Episode, so no edge or evidence document is expanded: the work
+    and memory are bounded by what was visited, not by the size of the index.
+    Episodes whose latest events share a timestamp may come out in a different
+    order than ``report`` gives them.
     """
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
         raise VaultError("episode selection limit is invalid")
@@ -641,24 +645,26 @@ def select_episode_ids(
         connection: sqlite3.Connection, policy: dict[str, Any]
     ) -> list[str]:
         forgotten = load_forgotten(root)
-        latest: dict[str, dt.datetime] = {}
-        for episode_id, recorded_at in connection.execute(
-            "SELECT m.episode_id, e.recorded_at FROM episode_members AS m "
-            "JOIN source_events AS e ON e.event_id = m.event_id "
-            "WHERE m.policy_version = ?",
-            (policy_version,),
+        seen: set[str] = set()
+        selected: list[str] = []
+        for event_id, recorded_at in connection.execute(
+            "SELECT event_id, recorded_at FROM source_events "
+            "INDEXED BY source_events_by_time "
+            "ORDER BY recorded_at DESC, event_id DESC"
         ):
             moment = parse_time(recorded_at)
-            if episode_id not in latest or moment > latest[episode_id]:
-                latest[episode_id] = moment
-        ordered = sorted(
-            latest, key=lambda item: (latest[item], item), reverse=True
-        )
-        selected: list[str] = []
-        for episode_id in ordered:
-            if (policy_version, episode_id) in forgotten:
+            if moment < start:
+                break
+            row = connection.execute(
+                "SELECT episode_id FROM episode_members "
+                "WHERE policy_version = ? AND event_id = ?",
+                (policy_version, event_id),
+            ).fetchone()
+            if row is None or row[0] in seen:
                 continue
-            if not start <= latest[episode_id] <= end:
+            episode_id = row[0]
+            seen.add(episode_id)
+            if moment > end or (policy_version, episode_id) in forgotten:
                 continue
             card, _edges = _episode_card(
                 root,

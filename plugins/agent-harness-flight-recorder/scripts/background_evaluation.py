@@ -474,6 +474,8 @@ def _failure_status(
     attempts: dict[str, dict[str, str]],
     error: VaultError,
     now: dt.datetime,
+    *,
+    recovered: bool = False,
 ) -> dict[str, Any]:
     from evaluation import FAILURE_REASONS
     from scheduler import retry_delay_seconds
@@ -481,7 +483,10 @@ def _failure_status(
     reason = getattr(error, "reason", None)
     if reason not in FAILURE_REASONS:
         reason = "evaluation_error"
-    count = _failure_count(previous) + 1
+    # An evaluation that succeeded earlier in this run shows the evaluator
+    # works, so a later failure starts a new streak instead of extending the
+    # one recorded before the run.
+    count = (0 if recovered else _failure_count(previous)) + 1
     status: dict[str, Any] = {
         "schema_version": 1,
         "state": "error",
@@ -494,7 +499,9 @@ def _failure_status(
             now + dt.timedelta(seconds=retry_delay_seconds(RETRY_SEED, count))
         ),
     }
-    if "last_success_at" in previous:
+    if recovered:
+        status["last_success_at"] = _format_time(now)
+    elif "last_success_at" in previous:
         status["last_success_at"] = previous["last_success_at"]
     exit_code = getattr(error, "exit_code", None)
     if _integer(exit_code):
@@ -612,7 +619,9 @@ def _run_once(root: Path) -> dict[str, Any]:
                     attempts.pop(attempt_fingerprint)
                 else:
                     attempts[attempt_fingerprint]["state"] = "failed"
-            status = _failure_status(previous, attempts, error, now)
+            status = _failure_status(
+                previous, attempts, error, now, recovered=evaluated > 0
+            )
             with vault_lock(root):
                 if attempt_fingerprint is not None:
                     _store_attempts(root, attempts)
