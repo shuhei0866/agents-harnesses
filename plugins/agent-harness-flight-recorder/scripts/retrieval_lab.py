@@ -408,7 +408,7 @@ def search_corrections(root, query, trigger, limit=3, purpose='task', task=None,
     state_file = Path(root) / 'refresh-state.json'
     try:
         state = json.loads(safe_file(state_file, 1024 * 1024))
-        result['collection'] = {key: state.get(key) for key in ('status', 'last_success', 'last_attempt', 'error_type', 'collector_version')}
+        result['collection'] = {key: state.get(key) for key in ('status', 'last_success', 'last_attempt', 'error_type', 'collector_version', 'collection_complete', 'deferred_source_ids', 'last_published')}
     except (OSError, ValueError):
         result['collection'] = None
     result['metrics']['foreground_elapsed_ms'] = (time.perf_counter() - started) * 1000

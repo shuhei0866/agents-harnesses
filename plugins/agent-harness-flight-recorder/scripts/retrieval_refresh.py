@@ -211,6 +211,7 @@ def refresh(root, force=False):
                              sources=len({d['source_id'] for d in documents}),
                              source_ids=delta.get('present_source_ids', state.get('source_ids', [])), bootstrapped=True, collector_version=COLLECTOR_VERSION, config_id=lab.digest(config), since=max(0, started - 60), last_published=time.time(),
                              deferred_source_ids=delta.get('deferred_source_ids', []),
+                             collection_complete=not delta.get('deferred_source_ids', []),
                              elapsed_ms=round((time.time() - started) * 1000), error_type=None, error_code=None)
                 if not state['deferred_source_ids']:
                     state['last_success'] = time.time()
@@ -254,6 +255,8 @@ def maybe_start(root):
     storage = state.get('storage', {})
     if storage.get('warning'):
         print('Snapshot storage warning: ' + storage['warning'] + '; see refresh-status storage.', file=sys.stderr)
+    if state.get('health') == 'degraded':
+        print('Conversation collection incomplete; some sources retain older windows. See refresh-status.', file=sys.stderr)
     if state.get('health') == 'error':
         print('Conversation refresh failed; using the last valid corpus. See refresh-status.', file=sys.stderr)
     if time.time() - state.get('last_attempt', 0) >= config.get('interval_seconds', 900):
