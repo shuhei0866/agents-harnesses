@@ -26,11 +26,13 @@ description: 過去の会話から判断・理由・訂正を出典付きで探�
 
 当時の対象・時点・依頼と今回の一致を確認し、現在の指示を優先する。過去の一度の対象指定を恒久的な好みや禁止事項へ変換しない。見つからない・古い・適用範囲が違う場合は、今回の依頼を基準に進める。
 
-判断後、lab内の一時JSONに `state`（`applied` / `not_applicable` / `unresolved`）、読んだ `citations`、今回への適用理由 `reason` を保存し、`context-use REQUEST --file FILE` で記録する。空振りなら citations は空でよい。これはエージェント自身の利用記録であり、ユーザーの成功評価ではない。`context-report --purpose task` で導入確認を除いた一覧と検索IDを確認できる。`context-inspect REQUEST` で当時の検索語・作業目的・呼出元・候補・順位の内訳・原文確認・採否をまとめて読む（検索や既読記録は増やさない）。検索未実行の候補は下記の `opportunity-report` で別に確認する。手戻り削減は未測定。
+判断後、lab内の一時JSONに `state`（`applied` / `not_applicable` / `unresolved`）、読んだ `citations`、今回への適用理由 `reason` を保存し、`context-use REQUEST --file FILE` で記録する。空振りなら citations は空でよい。応答の `reuse_recording: not_recorded` は追加項目が残っていないことを示す。成功・失敗と解釈せず、後付けで埋めない。これはエージェント自身の利用記録であり、ユーザーの成功評価ではない。`context-report --purpose task` で導入確認を除いた一覧と検索IDを確認できる。`context-inspect REQUEST` で当時の検索語・作業目的・呼出元・候補・順位の内訳・原文確認・採否をまとめて読む（検索や既読記録は増やさない）。検索未実行の候補は下記の `opportunity-report` で別に確認する。手戻り削減は未測定。
 
 `--need` 付き検索では、既存の利用記録JSONに `decision_match` を必ず加える。`found` は探した判断を原文と適用範囲まで確認、`partial` は一部だけ確認、`not_found` は返却候補に見当たらず、`unknown` は確認不足。`found` / `partial` は読んだ出典を `citations` に含める。関連する話題だっただけでは `found` にしない。`reason` に探した判断への答えと今回への適用理由を一文で残す。古い判断が見つかったが今回は使わない場合、`found` と `not_applicable` は両立する。初回で見つからなければその結果も記録してから再検索する。
 
-過去回答を再利用したときは、同じ `context-use` JSONへ任意の `reuse` を加える。計測のために本人へ質問しない。`request_presence` は今回の相談文に同じ回答が `absent` / `present` / `unknown`、`other_context` は今回すでに読んだ別資料・会話にも回答が `present` / `not_seen` / `unknown`。`not_seen` は他に存在しない証明ではない。`action` は `proceeded` / `self_corrected` / `confirmed` / `skipped_question`。`question` は省いた具体的な質問（省いていなければ空文字）、`prior_answers` は読んで採用した過去のuser発言の `[{"citation_id":"…","line":123}]`。選択肢の文字回答は設問との対応まで原文で確認する。時刻不明・対象不一致・自動メッセージは再利用の根拠にしない。過去の許可を新しい送信・権限追加・別対象へ拡張しない。
+採用するときは、記録前に `context-use-template REQUEST_ID` で下書きを取得する。この操作は検索・既読・採用件数を増やさない。`draft` をlab内の一時JSONへ保存し、`candidates` のうち実際に採用した出典だけを `citations` と `reuse.prior_answers` へ選ぶ。候補一覧は採用済みという意味ではない。`reason` と `decision_match` を判断に合わせて記入し、`reuse.used_answer` に「過去の何を今回どう使ったか」を短く書く。今回の相談に無い内容を取り込んだ場合はその内容を具体的にする。下書きの空欄は埋めるまで送信できない。過去回答の再利用でない採用や根拠の時刻が不明な場合は `reuse` を外し、理由にその旨を記す。以前の採用記録を埋め直すためには使わない。
+
+過去回答を再利用したときは、採用と同じ `context-use` 呼び出しで `reuse` を残す。計測のために本人へ質問しない。`request_presence` は今回の相談文に同じ回答が `absent` / `present` / `unknown`、`other_context` は今回すでに読んだ別資料・会話にも回答が `present` / `not_seen` / `unknown`。`not_seen` は他に存在しない証明ではない。`action` は `proceeded` / `self_corrected` / `confirmed` / `skipped_question`。`question` は省いた具体的な質問（省いていなければ空文字）、`prior_answers` は読んで採用した過去のuser発言の `[{"citation_id":"…","line":123}]`。選択肢の文字回答は設問との対応まで原文で確認する。時刻不明・対象不一致・自動メッセージは再利用の根拠にしない。過去の許可を新しい送信・権限追加・別対象へ拡張しない。
 
 この記録は最初の後続発言より前に残すエージェントの自己申告。未記録を失敗にも成功にもせず、後付けで当時の記録を埋めない。同じ検索の最初のreuse記録を観測に使い、追記は履歴として残す。検索以外の台帳でも回答が見つかっていたら `other_context: present` とし、「検索だけで質問を省いた」としない。
 
