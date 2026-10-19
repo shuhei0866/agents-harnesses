@@ -365,6 +365,7 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                     report['deferred_sources'] += 1
                     continue
                 messages = []
+                candidate_bytes = 0
                 observations = []
                 native_id = None
                 chronology_valid = True
@@ -409,6 +410,10 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                                 observations[-1]['recall_marker'] = True
                             if not routine_recall:
                                 recall_boundary = last_user_line
+                                kept = [(n, t) for n, t in messages if n < recall_boundary or t.startswith(f'[line {n}] user: ')]
+                                report['omitted_recall_assistant_messages'] += len(messages) - len(kept)
+                                messages = kept
+                                candidate_bytes = sum(len(json.dumps(t, ensure_ascii=True).encode()) for _, t in messages)
                             routine_recall = True
                         elif found:
                             reason = found
@@ -433,10 +438,16 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                                 last_user_line = number
                             elif observations:
                                 observations[-1]['assistant_observed'] = True
+                            if routine_recall and message[0] == 'assistant':
+                                report['omitted_recall_assistant_messages'] += 1
+                                continue
                             text = f'[line {number}] {message[0]}: {message[1]}'
                             if len(text) > MAX_DOCUMENT_CHARS:
                                 report['omitted_oversized_lines'] += 1
                             else:
+                                candidate_bytes += len(json.dumps(text, ensure_ascii=True).encode())
+                                if candidate_bytes > MAX_MANIFEST_BYTES:
+                                    raise SourceBudgetExceeded('output_budget')
                                 messages.append((number, text))
                 finally:
                     records.close()

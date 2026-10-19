@@ -430,3 +430,11 @@ class LargeSourceTests(unittest.TestCase):
                 self.assertEqual(value['refreshed_source_ids'],[])
                 self.assertEqual(value['import_report']['manifest_bytes'],0)
                 self.assertEqual(len(value['deferred_source_ids']),1)
+
+    def test_candidate_memory_is_bounded_before_eof(self):
+        self.write(self.codex,'many.jsonl',encode(*[codex('payload'*100) for _ in range(1000)]))
+        with patch.object(live,'MAX_MANIFEST_BYTES',2000):
+            value=live.export_live(self.roots,since=0)
+        self.assertEqual(value['documents'],[])
+        self.assertLess(value['import_report']['bytes_read'],10000)
+        self.assertEqual(value['import_report']['deferred_source_details'][0]['reason'],'output_budget')
