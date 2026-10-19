@@ -31,7 +31,7 @@ def prior_answers(root, query, citations, refs):
 
 
 def validate(root, query, citations, value):
-    if not isinstance(value, dict) or set(value) != {'request_presence', 'other_context', 'action', 'question', 'prior_answers'}:
+    if not isinstance(value, dict) or set(value) - {'used_answer'} != {'request_presence', 'other_context', 'action', 'question', 'prior_answers'}:
         raise ValueError('invalid reuse report fields')
     if value['request_presence'] not in ('absent', 'present', 'unknown') or value['other_context'] not in ('present', 'not_seen', 'unknown'):
         raise ValueError('invalid reuse context')
@@ -40,6 +40,8 @@ def validate(root, query, citations, value):
     question = value['question']
     if not isinstance(question, str) or len(question) > 500 or (value['action'] == 'skipped_question' and not question.strip()):
         raise ValueError('skipped question requires the specific question')
+    if 'used_answer' in value and (not isinstance(value['used_answer'], str) or not value['used_answer'].strip() or len(value['used_answer']) > 1000):
+        raise ValueError('used_answer requires a bounded description of what was reused')
     refs = prior_answers(root, query, citations, value['prior_answers'])
     return dict(value, prior_answers=refs, version=VERSION, provenance='agent_self_report', causal_effect='unmeasured')
 
@@ -139,3 +141,37 @@ def replay(root, value):
                 targets=[dict(t, rank=ranks.get((t['citation_id'], t['line']))) for t in value['targets']],
                 all_targets_found=all((t['citation_id'],t['line']) in ranks for t in value['targets']),
                 retrieval_version=result['retrieval_version'], causal_effect='unmeasured')
+
+
+def use_template(root, request_id):
+    """Read-only draft; candidates are not claims of adoption or avoided questions."""
+    import retrieval_lab as lab
+    c = lab.context_inspect(root, request_id)
+    if c['result'].get('mode') != 'corrections' or not c['result'].get('decision_need'):
+        raise ValueError('template requires a decision need')
+    read = {r['citation_id'] for r in c['reads']}
+    candidates = []
+    with lab._connect(root) as db:
+        query = lab._row(db, request_id)
+        seen = set()
+        for hit in c['result']['hits']:
+            for key in ('utterance', 'request'):
+                item = hit.get(key)
+                if not item or item.get('role') != 'user':
+                    continue
+                ref = dict(citation_id=item['citation_id'], line=item['line'])
+                identity = (ref['citation_id'], ref['line'])
+                if ref['citation_id'] not in read or identity in seen:
+                    continue
+                try:
+                    prior_answers(root, query, read, [ref])
+                except ValueError:
+                    continue
+                seen.add(identity)
+                candidates.append(ref)
+    return dict(request_id=request_id, candidates=candidates,
+                notice='Draft only. Select actually used sources; fill reason, used_answer and action. Do not invent an avoided question or backfill a past use.',
+                already_recorded=bool(c['use']),
+                draft=dict(state='applied', citations=[], reason='', decision_match='',
+                           reuse=dict(request_presence='unknown', other_context='unknown',
+                                      action='', question='', used_answer='', prior_answers=[])))

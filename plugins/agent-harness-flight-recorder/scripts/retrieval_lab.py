@@ -482,7 +482,10 @@ def context_use(root, request_id, state, citations, reason, reason_code=None, ef
             db.execute('CREATE TABLE IF NOT EXISTS context_answer_reuse (seq INTEGER PRIMARY KEY, request_id TEXT NOT NULL, recorded REAL NOT NULL, report TEXT NOT NULL)')
             db.execute('INSERT INTO context_answer_reuse(request_id,recorded,report) VALUES(?,?,?)', (request_id, time.time(), canonical(reuse_report)))
     return dict(request_id=request_id, state=state, provenance='agent_self_report',
-                notice='Not user feedback or verified task improvement.')
+                notice='Not user feedback or verified task improvement.',
+                reuse_recording=('recorded' if reuse_report else 'not_recorded'),
+                next_step=('Only if you actually reused a past answer in this current adoption, use context-use-template to record it before the next user reply. Otherwise leave reuse omitted. Do not invent an avoided question or backfill old uses.'
+                           if state == 'applied' and result.get('decision_need') and reuse_report is None else None))
 
 
 def context_inspect(root, request_id):
@@ -809,6 +812,8 @@ def main():
     context.add_argument('--session-id', help='caller session ID when runtime does not expose one')
     inspect = subs.add_parser('context-inspect')
     inspect.add_argument('request_id')
+    template = subs.add_parser('context-use-template')
+    template.add_argument('request_id')
     usage = subs.add_parser('context-use')
     usage.add_argument('request_id')
     usage.add_argument('--file', type=Path, required=True, help='JSON: state, citations, reason; agent self-report')
@@ -869,6 +874,9 @@ def main():
             result = search(root, args.query, args.arm, args.limit, args.sample_rate)
         elif args.command == 'corrections':
             result = search_corrections(root, args.query, args.trigger, args.limit, args.purpose, args.task, args.session_id, args.need, args.retry_of)
+        elif args.command == 'context-use-template':
+            from retrieval_reuse import use_template
+            result = use_template(root, args.request_id)
         elif args.command == 'context-use':
             value = json.loads(safe_file(args.file, 16384))
             result = context_use(root, args.request_id, **value)

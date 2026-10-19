@@ -32,6 +32,47 @@ class ReuseTests(unittest.TestCase):
             lab.context_use(self.root, r['request_id'], 'applied', [ref['citation_id']], 'Reuse earlier answer',
                             decision_match='found', effect='avoided_question', reuse=value)
 
+    def test_template_does_not_claim_use_and_roundtrips_with_followup(self):
+        import subprocess, sys
+        from pathlib import Path
+        r, ref, value = self.prepare()
+        before = lab.context_report(self.root)
+        command = [sys.executable, str(Path(lab.__file__).with_name('retrieval_refresh.py')), '--lab', str(self.root)]
+        template = json.loads(subprocess.check_output(command + ['context-use-template', r['request_id']]))
+        self.assertIn(ref, template['candidates'])
+        self.assertEqual(template['draft']['citations'], [])
+        self.assertEqual(template['draft']['reuse']['prior_answers'], [])
+        self.assertEqual(template['draft']['reuse']['question'], '')
+        self.assertFalse(template['already_recorded'])
+        self.assertEqual(lab.context_report(self.root), before)
+        with self.assertRaises(ValueError):
+            self.record(r, ref, dict(value, used_answer=''))
+        self.record(r, ref, dict(value, used_answer='Use the earlier budget to choose the implementation.'))
+        self.run_at()
+        report = self.case()['answer_reuse']
+        self.assertEqual(report['status'], 'recorded_before_followup')
+        self.assertIn('earlier budget', report['reports'][0]['report']['used_answer'])
+        self.assertTrue(reuse.use_template(self.root, r['request_id'])['already_recorded'])
+
+    def test_template_includes_read_preceding_user_request_once(self):
+        r, ref, value = self.prepare()
+        real = lab.context_inspect(self.root, r['request_id'])
+        earlier = dict(ref, role='user', text='Earlier answer')
+        hit = dict(real['result']['hits'][0], request=earlier,
+                   utterance=dict(role='assistant', citation_id='not-a-user', line=999))
+        real['result']['hits'] = [hit, hit]
+        with patch.object(lab, 'context_inspect', return_value=real):
+            self.assertEqual(reuse.use_template(self.root, r['request_id'])['candidates'], [ref])
+
+    def test_missing_reuse_keeps_use_but_surfaces_missing_record(self):
+        r, ref, _ = self.prepare()
+        result = lab.context_use(self.root, r['request_id'], 'applied', [ref['citation_id']],
+                                 'Confirm existing scope', decision_match='found')
+        self.assertEqual(result['reuse_recording'], 'not_recorded')
+        self.assertIn('context-use-template', result['next_step'])
+        self.assertEqual(lab.context_inspect(self.root, r['request_id'])['reuse_reports'], [])
+        self.assertEqual(lab.context_inspect(self.root, r['request_id'])['use']['state'], 'applied')
+
     def test_prospective_evidence_and_first_statement_survive_revisions(self):
         r, ref, value = self.prepare(); self.record(r, ref, value)
         self.record(r, ref, dict(value, other_context='present'), 208)
