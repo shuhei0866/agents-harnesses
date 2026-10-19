@@ -185,6 +185,8 @@ def report(root):
     from retrieval_refresh import status
     collection = status(root)
     return dict(collection_status=collection.get('status','not_started'),
+                collection_complete=collection.get('collection_complete'),
+                deferred_source_ids=collection.get('deferred_source_ids', []),
                 observation_status=collection.get('followups',{'status':'not_started'}),
                 version=VERSION, unit='decision_need_not_independent_task', needs=len(cases),
                 unique_linked_turns=len(anchors), unique_followup_turns=len(observations),

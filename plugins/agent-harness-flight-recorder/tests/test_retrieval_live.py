@@ -233,7 +233,7 @@ class LiveTests(unittest.TestCase):
     def test_all_overflows_fail_closed_and_errors_do_not_expose_path(self):
         self.write(self.claude, 'one.jsonl', encode(claude('a')))
         self.write(self.codex, 'two.jsonl', encode(codex('b')))
-        for bound in ('MAX_FILES','MAX_TOTAL_BYTES','MAX_SOURCE_BYTES','MAX_DOCUMENTS','MAX_MANIFEST_BYTES'):
+        for bound in ('MAX_FILES',):
             with self.subTest(bound=bound), patch.object(live, bound, 1):
                 with self.assertRaises(ValueError) as raised:
                     live.export_live(self.roots, since=0)
@@ -372,8 +372,10 @@ class LiveTests(unittest.TestCase):
         raw=encode(codex('x'*3000))
         packed=subprocess.run(['zstd','-q','-c'],input=raw,capture_output=True,check=True).stdout
         path=self.write(self.codex,'one.jsonl.zst',packed)
-        with patch.object(live,'MAX_SOURCE_BYTES',1000), self.assertRaisesRegex(ValueError,'byte limit'):
-            live.export_live(self.roots,since=0)
+        with patch.object(live,'MAX_SOURCE_BYTES',1000):
+            result = live.export_live(self.roots,since=0)
+        self.assertEqual(result['documents'], [])
+        self.assertEqual(result['import_report']['deferred_source_details'][0]['reason'], 'source_byte_budget')
         path.write_bytes(packed[:-2])
         with self.assertRaisesRegex(ValueError,'invalid compressed source'):
             live.export_live(self.roots,since=0)
@@ -387,3 +389,52 @@ class LiveTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class LargeSourceTests(unittest.TestCase):
+    setUp = LiveTests.setUp
+    write = LiveTests.write
+    def test_block_boundaries_preserve_lines_and_late_quarantine(self):
+        path = self.write(self.codex, 'blocks.jsonl', encode(codex('日本語'), codex('reply', 'assistant'), codex('decision')))
+        baseline = live.export_live(self.roots, since=0)
+        with patch.object(live, 'READ_BLOCK_BYTES', 7):
+            blocked = live.export_live(self.roots, since=0)
+        self.assertEqual(baseline['documents'], blocked['documents'])
+        self.assertGreater(blocked['import_report']['read_blocks'], 3)
+        with path.open('ab') as out:
+            out.write(encode(dict(type='response_item', payload=dict(type='function_call',name='exec',arguments='retrieval_lab.py search evaluation'))))
+        with patch.object(live, 'READ_BLOCK_BYTES', 7):
+            quarantined = live.export_live(self.roots, since=0)
+        self.assertEqual(quarantined['documents'], [])
+        self.assertEqual(quarantined['import_report']['excluded_retrieval_sessions'],1)
+
+    def test_one_large_source_does_not_block_small_source(self):
+        large = self.write(self.codex, 'large.jsonl', encode(codex('x'*2000)))
+        small = self.write(self.codex, 'small.jsonl', encode(codex('keep me')))
+        with patch.object(live, 'MAX_SOURCE_BYTES', 1000):
+            value = live.export_live(self.roots, since=0)
+        self.assertEqual(value['refreshed_source_ids'], [live.source_id('codex',small)])
+        self.assertEqual(value['deferred_source_ids'], [live.source_id('codex',large)])
+        self.assertFalse(value['import_report']['collection_complete'])
+        self.assertIn('keep me',str(value['documents']))
+        retried = live.export_live(self.roots, since=10**12, known_source_ids=value['refreshed_source_ids'])
+        self.assertEqual(retried['refreshed_source_ids'], [live.source_id('codex',large)])
+        self.assertEqual(retried['deferred_source_ids'], [])
+
+    def test_output_and_total_budgets_discard_partial_source(self):
+        self.write(self.codex, 'windows.jsonl', encode(*[codex('message') for _ in range(90)]))
+        for bound in ('MAX_DOCUMENTS','MAX_MANIFEST_BYTES','MAX_TOTAL_BYTES'):
+            with self.subTest(bound=bound), patch.object(live,bound,1):
+                value=live.export_live(self.roots,since=0)
+                self.assertEqual(value['documents'],[])
+                self.assertEqual(value['refreshed_source_ids'],[])
+                self.assertEqual(value['import_report']['manifest_bytes'],0)
+                self.assertEqual(len(value['deferred_source_ids']),1)
+
+    def test_candidate_memory_is_bounded_before_eof(self):
+        self.write(self.codex,'many.jsonl',encode(*[codex('payload'*100) for _ in range(1000)]))
+        with patch.object(live,'MAX_MANIFEST_BYTES',2000):
+            value=live.export_live(self.roots,since=0)
+        self.assertEqual(value['documents'],[])
+        self.assertLess(value['import_report']['bytes_read'],10000)
+        self.assertEqual(value['import_report']['deferred_source_details'][0]['reason'],'output_budget')

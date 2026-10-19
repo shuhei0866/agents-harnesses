@@ -23,7 +23,8 @@ from retrieval_context import INJECTED_PREFIXES
 
 MAX_FILES = 10_000
 MAX_ENTRIES = 100_000
-MAX_SOURCE_BYTES = 256 * 1024 * 1024
+READ_BLOCK_BYTES = 1024 * 1024
+MAX_SOURCE_BYTES = 1024 * 1024 * 1024
 MAX_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
 MAX_LINE_BYTES = 8 * 1024 * 1024
 MAX_DOCUMENTS = 20_000
@@ -31,7 +32,7 @@ MAX_DOCUMENT_CHARS = 100_000
 MAX_MANIFEST_BYTES = 60 * 1024 * 1024
 WINDOW_LINES = 40
 ADAPTERS = {'claude-code', 'codex'}
-COLLECTOR_VERSION = 'structured-message-context-v10-zstd'
+COLLECTOR_VERSION = 'structured-message-context-v11-blocks'
 
 
 BRIDGE_PROMPT = (
@@ -193,6 +194,33 @@ def _discover(roots, report, *, directory_stamps=None, include_compressed=False)
     return sorted(files, key=lambda item: (-item[0], item[1], str(item[2])))
 
 
+class SourceBudgetExceeded(ValueError):
+    """Discard this source's partial output, retain its previous published windows."""
+
+
+def _block_lines(stream, report):
+    """Bound input buffers independently of session size; preserve original LF lines."""
+    pending = bytearray()
+    while True:
+        block = stream.read(min(READ_BLOCK_BYTES, MAX_LINE_BYTES + 1))
+        if not block:
+            if pending:
+                yield bytes(pending)
+            return
+        report['read_blocks'] = report.get('read_blocks', 0) + 1
+        parts = block.split(b'\n')
+        for index, part in enumerate(parts):
+            pending.extend(part)
+            if index < len(parts) - 1:
+                pending.append(10)
+            if len(pending) > MAX_LINE_BYTES:
+                yield bytes(pending[:MAX_LINE_BYTES + 1])
+                return
+            if index < len(parts) - 1:
+                yield bytes(pending)
+                pending.clear()
+
+
 def _records(path: Path, report: dict):
     """Stream bounded records; closing early is allowed only for excluded sources."""
     if any(p.is_symlink() for p in (path, *path.parents)):
@@ -203,7 +231,7 @@ def _records(path: Path, report: dict):
         if not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid():
             raise ValueError('unsafe input')
         if before.st_size > MAX_SOURCE_BYTES:
-            raise ValueError('local source byte limit exceeded')
+            raise SourceBudgetExceeded('source_byte_budget')
         consumed = 0
         decoder = None
         decoded = stream
@@ -217,16 +245,13 @@ def _records(path: Path, report: dict):
                                        stdin=stream, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             decoded = decoder.stdout
         try:
-            while True:
-                line = decoded.readline(MAX_LINE_BYTES + 1)
-                if not line:
-                    if decoder is not None and decoder.wait() != 0:
-                        raise ValueError('invalid compressed source')
-                    break
+            for line in _block_lines(decoded, report):
                 consumed += len(line)
                 report['bytes_read'] += len(line)
-                if consumed > MAX_SOURCE_BYTES or report['bytes_read'] > MAX_TOTAL_BYTES:
-                    raise ValueError('local source byte limit exceeded')
+                if consumed > MAX_SOURCE_BYTES:
+                    raise SourceBudgetExceeded('source_byte_budget')
+                if report['bytes_read'] > MAX_TOTAL_BYTES:
+                    raise SourceBudgetExceeded('total_byte_budget')
                 if len(line) > MAX_LINE_BYTES:
                     # Do not omit an unparsed record that might contain an
                     # evaluation command; quarantine this entire source.
@@ -239,6 +264,8 @@ def _records(path: Path, report: dict):
                     report['partial_sources'] += 1
                     break
                 yield line
+            if decoder is not None and decoder.wait() != 0:
+                raise ValueError('invalid compressed source')
         finally:
             if decoder is not None:
                 decoded.close()
@@ -275,7 +302,8 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
     the caller to retire moved/deleted paths from the current snapshot only.
     Known source IDs let new archive paths bypass the mtime filter.
     With optional settling, deferred sources stay untouched in the caller.
-    File/corpus limits and read races abort the whole update. Individual text
+    Budget-exhausted sources keep their prior windows and are explicitly deferred.
+    Read races and invalid input still abort the update. Individual text
     lines over the consumer's character limit are omitted and explicitly counted;
     malformed complete records quarantine their entire source.
     """
@@ -310,6 +338,7 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
     documents = []
     refreshed = []
     excluded = []
+    deferred = []
     try:
         directory_stamps = {}
         files = _discover(roots, report, directory_stamps=directory_stamps, include_compressed=True)
@@ -319,157 +348,181 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
             if mtime < since and (known is None or identity in known):
                 report['unchanged_sources'] += 1
                 continue
-            reason = None
-            if any(re.search(r'(?<![A-Za-z0-9])' + re.escape(item) + r'(?![A-Za-z0-9])', path.stem)
-                   for item in exclusions):
-                reason = 'configured'
-            elif adapter == 'claude-code' and 'subagents' in path.parts:
-                reason = 'subagent'
-            if reason:
-                report[f'excluded_{reason}_sessions'] += 1
-                excluded.append(identity)
-                continue
-            if settle_seconds and now - mtime < settle_seconds:
-                report['deferred_sources'] += 1
-                continue
-            messages = []
-            observations = []
-            native_id = None
-            chronology_valid = True
-            previous_time = None
-            source_kind = None
-            seen_user = False
-            routine_recall = False
-            recall_boundary = None
-            last_user_line = 0
-            line_count = 0
-            records = _records(path, report)
+            document_start = len(documents)
+            manifest_before = report['manifest_bytes']
             try:
-                for number, line in enumerate(records, 1):
-                    if line is None:
-                        reason = 'oversized'
-                        break
-                    line_count = number
-                    try:
-                        value = json.loads(line)
-                    except (ValueError, RecursionError):
-                        report['malformed_lines'] += 1
-                        reason = 'malformed'
-                        break
-                    if not isinstance(value, dict):
-                        continue
-                    stamp = message_time(value)
-                    if stamp is not None:
-                        if previous_time is not None and stamp < previous_time:
-                            chronology_valid = False
-                        previous_time = stamp
-                    sid = value.get('sessionId') if adapter == 'claude-code' else (
-                        value['payload'].get('id') if value.get('type') == 'session_meta' and isinstance(value.get('payload'), dict) else None)
-                    if isinstance(sid, str) and len(sid) <= 256:
-                        if native_id is not None and native_id != sid:
-                            chronology_valid = False
-                        native_id = sid
-                    found = _excluded(value, adapter, exclusions)
-                    if found == 'recall':
-                        if observations:
-                            observations[-1]['recall_marker'] = True
-                        if not routine_recall:
-                            recall_boundary = last_user_line
-                        routine_recall = True
-                    elif found:
-                        reason = found
-                        break
-                    message = _message(value, adapter)
-                    if message and message[0] == 'user':
-                        if not seen_user and bridge_session_prompt(message[1]):
-                            source_kind = 'agent_consultation'
-                        if not seen_user and generated_session_prompt(message[1]):
-                            reason = 'generated'
+                reason = None
+                if any(re.search(r'(?<![A-Za-z0-9])' + re.escape(item) + r'(?![A-Za-z0-9])', path.stem)
+                       for item in exclusions):
+                    reason = 'configured'
+                elif adapter == 'claude-code' and 'subagents' in path.parts:
+                    reason = 'subagent'
+                if reason:
+                    report[f'excluded_{reason}_sessions'] += 1
+                    excluded.append(identity)
+                    continue
+                if settle_seconds and now - mtime < settle_seconds:
+                    report['deferred_sources'] += 1
+                    continue
+                messages = []
+                candidate_bytes = 0
+                observations = []
+                native_id = None
+                chronology_valid = True
+                previous_time = None
+                source_kind = None
+                seen_user = False
+                routine_recall = False
+                recall_boundary = None
+                last_user_line = 0
+                line_count = 0
+                if report['bytes_read'] >= MAX_TOTAL_BYTES:
+                    raise SourceBudgetExceeded('total_byte_budget')
+                records = _records(path, report)
+                try:
+                    for number, line in enumerate(records, 1):
+                        if line is None:
+                            reason = 'oversized'
                             break
-                        seen_user = True
-                    if message and message[0] == 'user' and message[1].lstrip().startswith(INJECTED_PREFIXES):
-                        report['omitted_injected_messages'] += 1
-                        continue
-                    if message:
-                        if message[0] == 'user':
+                        line_count = number
+                        try:
+                            value = json.loads(line)
+                        except (ValueError, RecursionError):
+                            report['malformed_lines'] += 1
+                            reason = 'malformed'
+                            break
+                        if not isinstance(value, dict):
+                            continue
+                        stamp = message_time(value)
+                        if stamp is not None:
+                            if previous_time is not None and stamp < previous_time:
+                                chronology_valid = False
+                            previous_time = stamp
+                        sid = value.get('sessionId') if adapter == 'claude-code' else (
+                            value['payload'].get('id') if value.get('type') == 'session_meta' and isinstance(value.get('payload'), dict) else None)
+                        if isinstance(sid, str) and len(sid) <= 256:
+                            if native_id is not None and native_id != sid:
+                                chronology_valid = False
+                            native_id = sid
+                        found = _excluded(value, adapter, exclusions)
+                        if found == 'recall':
                             if observations:
-                                observations[-1]['closed'] = True
-                            observations.append(dict(line=number, timestamp=stamp, closed=False,
-                                                     assistant_observed=False, recall_marker=False))
-                            last_user_line = number
-                        elif observations:
-                            observations[-1]['assistant_observed'] = True
-                        text = f'[line {number}] {message[0]}: {message[1]}'
-                        if len(text) > MAX_DOCUMENT_CHARS:
-                            report['omitted_oversized_lines'] += 1
-                        else:
-                            messages.append((number, text))
-            finally:
-                records.close()
-            if reason:
-                report[f'excluded_{reason}_sessions'] += 1
-                excluded.append(identity)
-                continue
-            if routine_recall:
-                # Keep pre-recall context. Drop assistant output starting with
-                # the invoking user turn, including pre-tool commentary, so a
-                # later correction cannot inherit a stale preceding response.
-                report['retained_recall_sessions'] += 1
-                kept = [(n, t) for n, t in messages if n < recall_boundary or t.startswith(f'[line {n}] user: ')]
-                report['omitted_recall_assistant_messages'] += len(messages) - len(kept)
-                messages = kept
-            # Streaming is bounded by MAX_SOURCE_BYTES; apply output limits only
-            # after removing assistant text that will not enter the corpus.
-            if sum(len(json.dumps(t, ensure_ascii=True).encode()) for _, t in messages) > MAX_MANIFEST_BYTES:
-                raise ValueError('local snapshot size limit exceeded')
-            if source_kind:
-                report['consultation_sources'] += 1
-            refreshed.append(identity)
-            report['imported_sources'] += 1
-            groups = {}
-            for number, text in messages:
-                groups.setdefault((number - 1) // WINDOW_LINES, []).append((number, text))
-            for window, items in groups.items():
-                start = window * WINDOW_LINES + 1
-                end = min(start + WINDOW_LINES - 1, line_count)
-                # Preserve ordinary 40-line boundaries. Split unusually large
-                # windows between JSONL records, never truncate source text.
-                chunks = []
-                current = []
-                chars = 0
-                chunk_start = start
-                for number, text in items:
-                    if current and chars + 1 + len(text) > MAX_DOCUMENT_CHARS:
-                        chunks.append((chunk_start, number - 1, current))
-                        chunk_start, current, chars = number, [], 0
-                    chars += len(text) + bool(current)
-                    current.append(text)
-                if current:
-                    chunks.append((chunk_start, end, current))
-                for first, last, texts in chunks:
-                    doc = dict(source_id=identity, start_line=first, end_line=last,
-                               text='\n'.join(texts), summaries=[])
-                    if source_kind:
-                        doc['source_kind'] = source_kind
-                    spans, offset = [], 0
-                    for rendered in texts:
-                        header, body = rendered.split(': ', 1)
-                        match = re.fullmatch(r'\[line (\d+)\] (user|assistant)', header)
-                        spans.append(dict(line=int(match[1]), role=match[2],
-                                          start=offset + len(header) + 2,
-                                          end=offset + len(rendered)))
-                        offset += len(rendered) + 1
-                    doc['message_spans'] = spans
-                    user_lines = {m['line'] for m in spans if m['role'] == 'user'}
-                    doc['turn_observations'] = [dict(o, timestamp=o['timestamp'] if chronology_valid else None,
-                                                       native_session_id=native_id)
-                                                for o in observations if o['line'] in user_lines]
-                    serialized_size = len(json.dumps(doc, ensure_ascii=True).encode()) + 2
-                    if (len(documents) >= MAX_DOCUMENTS or
-                            report['manifest_bytes'] + serialized_size > MAX_MANIFEST_BYTES):
-                        raise ValueError('local snapshot size limit exceeded')
-                    report['manifest_bytes'] += serialized_size
-                    documents.append(doc)
+                                observations[-1]['recall_marker'] = True
+                            if not routine_recall:
+                                recall_boundary = last_user_line
+                                kept = [(n, t) for n, t in messages if n < recall_boundary or t.startswith(f'[line {n}] user: ')]
+                                report['omitted_recall_assistant_messages'] += len(messages) - len(kept)
+                                messages = kept
+                                candidate_bytes = sum(len(json.dumps(t, ensure_ascii=True).encode()) for _, t in messages)
+                            routine_recall = True
+                        elif found:
+                            reason = found
+                            break
+                        message = _message(value, adapter)
+                        if message and message[0] == 'user':
+                            if not seen_user and bridge_session_prompt(message[1]):
+                                source_kind = 'agent_consultation'
+                            if not seen_user and generated_session_prompt(message[1]):
+                                reason = 'generated'
+                                break
+                            seen_user = True
+                        if message and message[0] == 'user' and message[1].lstrip().startswith(INJECTED_PREFIXES):
+                            report['omitted_injected_messages'] += 1
+                            continue
+                        if message:
+                            if message[0] == 'user':
+                                if observations:
+                                    observations[-1]['closed'] = True
+                                observations.append(dict(line=number, timestamp=stamp, closed=False,
+                                                         assistant_observed=False, recall_marker=False))
+                                last_user_line = number
+                            elif observations:
+                                observations[-1]['assistant_observed'] = True
+                            if routine_recall and message[0] == 'assistant':
+                                report['omitted_recall_assistant_messages'] += 1
+                                continue
+                            text = f'[line {number}] {message[0]}: {message[1]}'
+                            if len(text) > MAX_DOCUMENT_CHARS:
+                                report['omitted_oversized_lines'] += 1
+                            else:
+                                candidate_bytes += len(json.dumps(text, ensure_ascii=True).encode())
+                                if candidate_bytes > MAX_MANIFEST_BYTES:
+                                    raise SourceBudgetExceeded('output_budget')
+                                messages.append((number, text))
+                finally:
+                    records.close()
+                if reason:
+                    report[f'excluded_{reason}_sessions'] += 1
+                    excluded.append(identity)
+                    continue
+                if routine_recall:
+                    # Keep pre-recall context. Drop assistant output starting with
+                    # the invoking user turn, including pre-tool commentary, so a
+                    # later correction cannot inherit a stale preceding response.
+                    report['retained_recall_sessions'] += 1
+                    kept = [(n, t) for n, t in messages if n < recall_boundary or t.startswith(f'[line {n}] user: ')]
+                    report['omitted_recall_assistant_messages'] += len(messages) - len(kept)
+                    messages = kept
+                # Streaming is bounded by MAX_SOURCE_BYTES; apply output limits only
+                # after removing assistant text that will not enter the corpus.
+                if sum(len(json.dumps(t, ensure_ascii=True).encode()) for _, t in messages) > MAX_MANIFEST_BYTES:
+                    raise SourceBudgetExceeded('output_budget')
+                if source_kind:
+                    report['consultation_sources'] += 1
+                refreshed.append(identity)
+                report['imported_sources'] += 1
+                groups = {}
+                for number, text in messages:
+                    groups.setdefault((number - 1) // WINDOW_LINES, []).append((number, text))
+                for window, items in groups.items():
+                    start = window * WINDOW_LINES + 1
+                    end = min(start + WINDOW_LINES - 1, line_count)
+                    # Preserve ordinary 40-line boundaries. Split unusually large
+                    # windows between JSONL records, never truncate source text.
+                    chunks = []
+                    current = []
+                    chars = 0
+                    chunk_start = start
+                    for number, text in items:
+                        if current and chars + 1 + len(text) > MAX_DOCUMENT_CHARS:
+                            chunks.append((chunk_start, number - 1, current))
+                            chunk_start, current, chars = number, [], 0
+                        chars += len(text) + bool(current)
+                        current.append(text)
+                    if current:
+                        chunks.append((chunk_start, end, current))
+                    for first, last, texts in chunks:
+                        doc = dict(source_id=identity, start_line=first, end_line=last,
+                                   text='\n'.join(texts), summaries=[])
+                        if source_kind:
+                            doc['source_kind'] = source_kind
+                        spans, offset = [], 0
+                        for rendered in texts:
+                            header, body = rendered.split(': ', 1)
+                            match = re.fullmatch(r'\[line (\d+)\] (user|assistant)', header)
+                            spans.append(dict(line=int(match[1]), role=match[2],
+                                              start=offset + len(header) + 2,
+                                              end=offset + len(rendered)))
+                            offset += len(rendered) + 1
+                        doc['message_spans'] = spans
+                        user_lines = {m['line'] for m in spans if m['role'] == 'user'}
+                        doc['turn_observations'] = [dict(o, timestamp=o['timestamp'] if chronology_valid else None,
+                                                           native_session_id=native_id)
+                                                    for o in observations if o['line'] in user_lines]
+                        serialized_size = len(json.dumps(doc, ensure_ascii=True).encode()) + 2
+                        if (len(documents) >= MAX_DOCUMENTS or
+                                report['manifest_bytes'] + serialized_size > MAX_MANIFEST_BYTES):
+                            raise SourceBudgetExceeded('output_budget')
+                        report['manifest_bytes'] += serialized_size
+                        documents.append(doc)
+            except SourceBudgetExceeded as exc:
+                del documents[document_start:]
+                report['manifest_bytes'] = manifest_before
+                if identity in refreshed:
+                    refreshed.remove(identity)
+                    report['imported_sources'] -= 1
+                deferred.append(dict(source_id=identity, reason=str(exc)))
+                report['deferred_sources'] += 1
     except OSError:
         raise ValueError('local session scan unavailable or changed; prior snapshot retained') from None
     except ValueError as error:
@@ -484,7 +537,10 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
             changed_directories += 1
     report['changed_directories'] = changed_directories
     report['documents'] = len(documents)
+    report['deferred_source_details'] = deferred
+    report['collection_complete'] = not deferred
     report['elapsed_ms'] = round((time.monotonic() - started) * 1000, 3)
     return dict(schema_version=1, documents=documents, import_report=report,
                 refreshed_source_ids=refreshed, excluded_source_ids=excluded,
+                deferred_source_ids=[item['source_id'] for item in deferred],
                 present_source_ids=present, inventory_complete=not report['missing_roots'] and not changed_directories)
