@@ -484,7 +484,7 @@ def context_use(root, request_id, state, citations, reason, reason_code=None, ef
     return dict(request_id=request_id, state=state, provenance='agent_self_report',
                 notice='Not user feedback or verified task improvement.',
                 reuse_recording=('recorded' if reuse_report else 'not_recorded'),
-                next_step=('For a current adoption, use context-use-template and record what was used before replying; do not backfill old uses.'
+                next_step=('Only if you actually reused a past answer in this current adoption, use context-use-template to record it before the next user reply. Otherwise leave reuse omitted. Do not invent an avoided question or backfill old uses.'
                            if state == 'applied' and result.get('decision_need') and reuse_report is None else None))
 
 

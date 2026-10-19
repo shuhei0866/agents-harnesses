@@ -54,6 +54,16 @@ class ReuseTests(unittest.TestCase):
         self.assertIn('earlier budget', report['reports'][0]['report']['used_answer'])
         self.assertTrue(reuse.use_template(self.root, r['request_id'])['already_recorded'])
 
+    def test_template_includes_read_preceding_user_request_once(self):
+        r, ref, value = self.prepare()
+        real = lab.context_inspect(self.root, r['request_id'])
+        earlier = dict(ref, role='user', text='Earlier answer')
+        hit = dict(real['result']['hits'][0], request=earlier,
+                   utterance=dict(role='assistant', citation_id='not-a-user', line=999))
+        real['result']['hits'] = [hit, hit]
+        with patch.object(lab, 'context_inspect', return_value=real):
+            self.assertEqual(reuse.use_template(self.root, r['request_id'])['candidates'], [ref])
+
     def test_missing_reuse_keeps_use_but_surfaces_missing_record(self):
         r, ref, _ = self.prepare()
         result = lab.context_use(self.root, r['request_id'], 'applied', [ref['citation_id']],

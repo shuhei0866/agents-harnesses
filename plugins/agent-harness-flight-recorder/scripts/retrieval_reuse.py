@@ -153,15 +153,22 @@ def use_template(root, request_id):
     candidates = []
     with lab._connect(root) as db:
         query = lab._row(db, request_id)
+        seen = set()
         for hit in c['result']['hits']:
-            ref = dict(citation_id=hit['citation_id'], line=hit['line'])
-            if ref['citation_id'] not in read:
-                continue
-            try:
-                prior_answers(root, query, read, [ref])
-            except ValueError:
-                continue
-            candidates.append(ref)
+            for key in ('utterance', 'request'):
+                item = hit.get(key)
+                if not item or item.get('role') != 'user':
+                    continue
+                ref = dict(citation_id=item['citation_id'], line=item['line'])
+                identity = (ref['citation_id'], ref['line'])
+                if ref['citation_id'] not in read or identity in seen:
+                    continue
+                try:
+                    prior_answers(root, query, read, [ref])
+                except ValueError:
+                    continue
+                seen.add(identity)
+                candidates.append(ref)
     return dict(request_id=request_id, candidates=candidates,
                 notice='Draft only. Select actually used sources; fill reason, used_answer and action. Do not invent an avoided question or backfill a past use.',
                 already_recorded=bool(c['use']),
