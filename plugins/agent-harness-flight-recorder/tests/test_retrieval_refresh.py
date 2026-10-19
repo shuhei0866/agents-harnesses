@@ -29,6 +29,24 @@ class RefreshTests(unittest.TestCase):
         return dict(schema_version=1, documents=docs, refreshed_source_ids=[d['source_id'] for d in docs],
                     excluded_source_ids=removed or [], import_report={})
 
+    def test_deferred_source_retains_windows_and_retries_after_watermark(self):
+        with patch.object(refresh,'export_live',return_value=self.delta([doc('a','original'),doc('b','old')])):
+            first=refresh.refresh(self.root,force=True)
+        frozen=lab.search(self.root,'original',sample_rate=0)['snapshot_id']
+        partial=dict(self.delta([doc('b','new')]),deferred_source_ids=['a'],present_source_ids=['a','b'],inventory_complete=True)
+        with patch.object(refresh,'export_live',return_value=partial):
+            result=refresh.refresh(self.root,force=True)
+        self.assertEqual(result['health'],'degraded')
+        self.assertEqual(result['health_code'],'collection_incomplete')
+        self.assertEqual(result['last_success'],first['last_success'])
+        self.assertEqual({d['text'] for d in lab._snapshot(self.root)['documents']},{'original','new'})
+        with patch.object(refresh,'export_live',return_value=dict(self.delta([doc('a','finished')]),present_source_ids=['a','b'],inventory_complete=True)) as export:
+            recovered=refresh.refresh(self.root,force=True)
+        self.assertNotIn('a',export.call_args.kwargs['known_source_ids'])
+        self.assertEqual(recovered['health'],'ok')
+        self.assertEqual(recovered['deferred_source_ids'],[])
+        self.assertIn('original',str(lab._snapshot(self.root,frozen)))
+
     def test_collector_upgrade_rescans_old_sources_and_keeps_old_citations(self):
         with patch.object(refresh, 'export_live', return_value=self.delta([doc('a', 'old generated')])):
             refresh.refresh(self.root, force=True)

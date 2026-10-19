@@ -56,6 +56,8 @@ def status(root):
     code = None
     if age is None or age > 2 * interval + WORKER_TIMEOUT:
         health, code = 'error', 'collection_stale'
+    if value.get('deferred_source_ids'):
+        health, code = 'degraded', 'collection_incomplete'
     if value.get('status') == 'error':
         health, code = 'error', value.get('error_code') or 'collection_failed'
     if value.get('status') == 'running':
@@ -188,14 +190,16 @@ def refresh(root, force=False):
                                    and state.get('collector_version') == COLLECTOR_VERSION)
                 delta = stage('collect', _collect, state, [(r['adapter'], Path(r['path'])) for r in config['roots']],
                                     since=state.get('since', 0) if same_collection else 0, exclude_sessions=config.get('exclude_sessions', []),
-                                    settle_seconds=0, known_source_ids=state.get('source_ids', []))
+                                    settle_seconds=0, known_source_ids=[sid for sid in state.get('source_ids', [])
+                                                      if sid not in state.get('deferred_source_ids', [])])
                 if delta.get('inventory_complete') is False and not same_collection:
                     raise ValueError('incomplete inventory after collection change')
                 replaced = set(delta['refreshed_source_ids']) | set(delta['excluded_source_ids'])
                 present = set(delta.get('present_source_ids', []))
                 documents = ([d for d in current['documents'] if d['source_id'] not in replaced
-                              and (not delta.get('inventory_complete', False) or d['source_id'] in present)]
-                             if state.get('bootstrapped') and same_collection else [])
+                              and (not delta.get('inventory_complete', False) or d['source_id'] in present)
+                              and (same_collection or d['source_id'] in delta.get('deferred_source_ids', []))]
+                             if state.get('bootstrapped') else [])
                 summaries = stage('summaries', _summaries, root, current, config)
                 for doc in delta['documents']:
                     doc['summaries'] = summaries.get((doc['source_id'], doc['start_line'], doc['end_line'], doc['text']), [])
@@ -205,8 +209,11 @@ def refresh(root, force=False):
                                               storage_policy=config.get('retention', {}))
                 state.update(result, status='updated' if result['changed'] else 'unchanged',
                              sources=len({d['source_id'] for d in documents}),
-                             source_ids=delta.get('present_source_ids', state.get('source_ids', [])), bootstrapped=True, collector_version=COLLECTOR_VERSION, config_id=lab.digest(config), since=max(0, started - 60), last_success=time.time(),
+                             source_ids=delta.get('present_source_ids', state.get('source_ids', [])), bootstrapped=True, collector_version=COLLECTOR_VERSION, config_id=lab.digest(config), since=max(0, started - 60), last_published=time.time(),
+                             deferred_source_ids=delta.get('deferred_source_ids', []),
                              elapsed_ms=round((time.time() - started) * 1000), error_type=None, error_code=None)
+                if not state['deferred_source_ids']:
+                    state['last_success'] = time.time()
             except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
                 # Never publish partial collections or move the successful watermark.
                 state.update(status='error', error_type=type(exc).__name__,
