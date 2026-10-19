@@ -375,6 +375,8 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                 recall_boundary = None
                 last_user_line = 0
                 line_count = 0
+                if report['bytes_read'] >= MAX_TOTAL_BYTES:
+                    raise SourceBudgetExceeded('total_byte_budget')
                 records = _records(path, report)
                 try:
                     for number, line in enumerate(records, 1):
