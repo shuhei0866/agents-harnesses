@@ -504,6 +504,198 @@ PY
   fi
 }
 
+test_selection_stops_on_work_bounds_and_says_so() {
+  echo "test_selection_stops_on_work_bounds_and_says_so:"
+  local err="$TEST_ROOT/bounds.err"
+  if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts:$TEST_ROOT" \
+    python3 - "$STATE" <<'PY' 2>"$err"
+import itertools
+import pathlib
+import sys
+
+import reporting
+from common import candidate
+from reporting import SelectionStats, report, select_episode_ids
+
+root = pathlib.Path(sys.argv[1])
+nothing = lambda card: False
+
+
+def select(accept, limit, **kwargs):
+    stats = SelectionStats()
+    found = select_episode_ids(
+        root, "3650d", "default-v1", None, accept, limit, stats=stats, **kwargs
+    )
+    return found, stats
+
+
+# The visit bound: three cards are built and the fourth Episode is left alone.
+found, stats = select(nothing, 10, max_visits=3)
+assert (found, stats.visited, stats.stopped) == ([], 3, "visit_limit"), stats
+# A walk that ends by itself, or has all it asked for, is not reported as cut short.
+found, stats = select(nothing, 10)
+assert (found, stats.visited, stats.stopped) == ([], 36, None), stats
+found, stats = select(candidate, 3)
+assert len(found) == 3 and stats.stopped is None, stats
+
+# The time bound, read between Episodes; the clock advances a second per reading.
+ticks = itertools.count()
+found, stats = select(nothing, 10, max_seconds=3, clock=lambda: next(ticks))
+assert stats.stopped == "time_limit" and stats.visited < 36, stats
+
+# The deadline starts before the stored evaluations are read, and a read it
+# interrupts is dropped whole: the first record already finds the second over,
+# and no walk starts on part of the records.
+assert list((root / "evaluations").glob("*.json")), "the fixture holds evaluations"
+real_walk = reporting._select_newest_first
+
+
+def no_walk(*_args, **_kwargs):
+    raise AssertionError("no walk may start after an interrupted read")
+
+
+reporting._select_newest_first = no_walk
+try:
+    ticks = itertools.count()
+    found, stats = select(nothing, 10, max_seconds=1, clock=lambda: next(ticks))
+finally:
+    reporting._select_newest_first = real_walk
+assert (found, stats.visited, stats.stopped) == ([], 0, "time_limit"), stats
+
+# The same deadline inside SQLite: every step reads the clock, so it passes within
+# the first statements. The sealed read must still close cleanly around it.
+original = reporting.SELECTION_PROGRESS_STEPS
+reporting.SELECTION_PROGRESS_STEPS = 1
+try:
+    ticks = itertools.count()
+    found, stats = select(nothing, 10, max_seconds=50, clock=lambda: next(ticks))
+    assert found == [] and stats.stopped == "time_limit" and stats.visited < 36, stats
+finally:
+    reporting.SELECTION_PROGRESS_STEPS = original
+assert len(report(root, "3650d", "default-v1")["cards"]) == 36
+
+for bad in (0, -1, True, 1.5):
+    try:
+        select(nothing, 1, max_visits=bad)
+    except Exception as error:
+        assert "bounds are invalid" in str(error), error
+    else:
+        raise AssertionError("an invalid visit bound must be refused: %r" % (bad,))
+for bad in (0, -1, 3601, True, "5"):
+    try:
+        select(nothing, 1, max_seconds=bad)
+    except Exception as error:
+        assert "bounds are invalid" in str(error), error
+    else:
+        raise AssertionError("an invalid time bound must be refused: %r" % (bad,))
+PY
+  then
+    pass "選別は訪問数・時間(SQLite内も)の上限で打ち切り、打ち切った理由を返す。自然に終わった選別は打ち切り扱いにしない"
+  else
+    cat "$err" >&2
+    fail "選別は訪問数・時間(SQLite内も)の上限で打ち切り、打ち切った理由を返す。自然に終わった選別は打ち切り扱いにしない"
+  fi
+}
+
+test_candidate_filter_never_drops_an_accepted_episode() {
+  echo "test_candidate_filter_never_drops_an_accepted_episode:"
+  local err="$TEST_ROOT/filter.err"
+  if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts:$TEST_ROOT" \
+    python3 - "$STATE" <<'PY' 2>"$err"
+import pathlib
+import sys
+
+import background_evaluation
+from reporting import SelectionStats, report, select_episode_ids
+
+root = pathlib.Path(sys.argv[1])
+everyone = background_evaluation._candidate_filter()
+
+
+def select(accept, window, **kwargs):
+    stats = SelectionStats()
+    found = select_episode_ids(
+        root, window, "default-v1", None, accept, 1000, stats=stats, **kwargs
+    )
+    return found, stats
+
+
+# Whatever the confidence threshold lets through, the structural filter keeps
+# every Episode that the real candidate rule takes, in the same order.
+for threshold in (1, 700, 10**9):
+    config = {"uncertainty_score_below": threshold}
+    accept = lambda card: background_evaluation._is_candidate(config, card)
+    for window in ("30d", "5h", "3h"):
+        taken, plain = select(accept, window)
+        kept, filtered = select(accept, window, episode_filter=everyone)
+        assert kept == taken, (threshold, window)
+        assert filtered.visited <= plain.visited
+# It also leaves out what cannot be taken: 24 of the 36 Episodes are one event
+# without a successful or failed test, so only 12 cards are built.
+_, plain = select(lambda card: False, "3650d")
+_, filtered = select(lambda card: False, "3650d", episode_filter=everyone)
+assert (plain.visited, filtered.visited) == (36, 12), (plain, filtered)
+# A single event that is a candidate through its own evidence is one of the 12:
+# the filter reads the event that surfaced the Episode, which for an Episode of
+# one event is the whole Episode.
+cards = {card["episode_id"]: card for card in report(root, "3650d", "default-v1")["cards"]}
+taken, _ = select(lambda card: card["event_count"] == 1, "3650d", episode_filter=everyone)
+assert len(taken) == 6 and all(cards[item]["deterministic_evidence"] for item in taken)
+PY
+  then
+    pass "候補になりえないEpisodeを走査で除くフィルタは、本物の候補判定が受理するEpisodeを閾値・窓によらず落とさない"
+  else
+    cat "$err" >&2
+    fail "候補になりえないEpisodeを走査で除くフィルタは、本物の候補判定が受理するEpisodeを閾値・窓によらず落とさない"
+  fi
+}
+
+test_run_records_why_the_selection_stopped() {
+  echo "test_run_records_why_the_selection_stopped:"
+  reset_auto_state
+  configure_auto flight-recorder-background-evaluator || {
+    fail "自動評価を構成できる"
+    return
+  }
+  local err="$TEST_ROOT/record.err"
+  if PATH="$FAKE_BIN:$PATH" PYTHONPATH="$PLUGIN_DIR/scripts:$TEST_ROOT" \
+    FLIGHT_RECORDER_TEST_EVALUATOR_COST=12000 \
+    python3 - "$STATE" <<'PY' 2>"$err"
+import pathlib
+import sys
+
+import background_evaluation
+import reporting
+from common import status_of
+
+root = pathlib.Path(sys.argv[1])
+original = reporting.SELECTION_MAX_VISITS
+reporting.SELECTION_MAX_VISITS = 3
+try:
+    cut = background_evaluation.run(root)
+finally:
+    reporting.SELECTION_MAX_VISITS = original
+# Three cards were built although twelve Episodes could be candidates: the run
+# says it was cut short, and why, in both its output and its status.
+assert cut["state"] == "completed", cut
+assert (cut["selection_stopped"], cut["selection_visited"]) == ("visit_limit", 3), cut
+status = status_of(root)
+assert (status["selection_stopped"], status["selection_visited"]) == ("visit_limit", 3), status
+assert status["state"] == "healthy", status
+
+whole = background_evaluation.run(root)
+assert whole["state"] == "completed" and whole["selection_stopped"] is None, whole
+assert "selection_stopped" not in status_of(root), status_of(root)
+assert "selection_visited" not in status_of(root)
+PY
+  then
+    pass "実行は選別が上限で打ち切られたとき理由と訪問数を出力とstatusに残し、次に打ち切られなければstatusから消える"
+  else
+    cat "$err" >&2
+    fail "実行は選別が上限で打ち切られたとき理由と訪問数を出力とstatusに残し、次に打ち切られなければstatusから消える"
+  fi
+}
+
 echo "=== Flight Recorder Auto-Evaluation Selection Tests ==="
 if ! init_dense_fixture; then
   echo "fixture setup failed" >&2
@@ -514,6 +706,9 @@ test_run_never_builds_the_full_report
 test_backoff_grows_then_recovers
 test_a_success_earlier_in_the_run_restarts_the_failure_streak
 test_failure_before_the_model_can_run_releases_the_reservation
+test_selection_stops_on_work_bounds_and_says_so
+test_candidate_filter_never_drops_an_accepted_episode
+test_run_records_why_the_selection_stopped
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
