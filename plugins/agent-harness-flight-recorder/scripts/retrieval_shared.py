@@ -179,6 +179,35 @@ def usage(paths, objects):
     return sum(p.stat().st_size for p in paths) + sum(objects[k] for k in refs)
 
 
+def validate_retained(paths):
+    """Verify retained manifests before cleanup, with a bounded block cache."""
+    from collections import OrderedDict
+    cache = OrderedDict()
+    cached_bytes = 0
+    for path in paths:
+        if path.suffix != '.ref':
+            continue
+        value = manifest(path)
+        digest = hashlib.sha256()
+        for ref in value['blocks']:
+            key = ref['hash']
+            if key in cache:
+                block = cache.pop(key)
+                cache[key] = block
+                if len(block) != ref['bytes']:
+                    raise ValueError('shared block length mismatch')
+            else:
+                block = read_block(path.parent.parent, ref)
+                while cache and cached_bytes + len(block) > lab.MAX_SNAPSHOT_BYTES:
+                    _, previous = cache.popitem(last=False)
+                    cached_bytes -= len(previous)
+                cache[key] = block
+                cached_bytes += len(block)
+            digest.update(block)
+        if digest.hexdigest() != value['sha256']:
+            raise ValueError('shared snapshot mismatch')
+
+
 def collect_unused(root, protected_objects=()):
     """Caller holds exclusive snapshot lock; preserve every remaining manifest."""
     from retrieval_archive import entries

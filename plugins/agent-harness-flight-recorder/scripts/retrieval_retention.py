@@ -175,6 +175,11 @@ def maintain(root, config=None, *, reserve_bytes=0, extra_protected=(), protecte
                 actual = path.lstat()
                 if (actual.st_dev, actual.st_ino, actual.st_size, actual.st_mtime_ns, actual.st_mode) != (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_mode):
                     raise RetentionError('snapshot_changed_during_retention')
+            if result['removable_bytes']:
+                from retrieval_archive import entries
+                from retrieval_shared import validate_retained
+                removed = {p for p, _ in deleting}
+                validate_retained([p for p, _ in entries(root) if p not in removed])
             for path, _ in deleting:
                 path.unlink()
             if deleting:

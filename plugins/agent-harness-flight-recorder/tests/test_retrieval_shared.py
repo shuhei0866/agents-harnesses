@@ -124,6 +124,29 @@ class SharedTests(unittest.TestCase):
             self.assertEqual(before, {p.name for p, _ in archive.entries(self.root)})
             block.write_bytes(original); block.chmod(0o600)
 
+    def test_corrupt_recent_retained_generation_aborts_all_cleanup(self):
+        shared.migrate(self.root, 100)
+        value, _ = lab._build_snapshot(corpus(3))
+        path = self.root/'snapshots'/(value['snapshot_id']+'.json.ref')
+        # Ensure this unpinned generation is selected by keep_recent.
+        import os
+        os.utime(path, (2000000000, 2000000000))
+        before = {p.name for p, _ in archive.entries(self.root)}
+        meta = shared.manifest(path)
+        original = path.read_bytes()
+        meta['sha256'] = '0'*64
+        path.write_text(json.dumps(meta))
+        with self.assertRaises(retention.RetentionError):
+            retention.maintain(self.root, {'keep_recent': 1})
+        self.assertEqual(before, {p.name for p, _ in archive.entries(self.root)})
+        path.write_bytes(original)
+        # The source changed only in this generation: corrupt its unique block.
+        block = shared.object_path(self.root, meta['blocks'][6]['hash'])
+        block.write_bytes(b'broken')
+        with self.assertRaises(retention.RetentionError):
+            retention.maintain(self.root, {'keep_recent': 1})
+        self.assertEqual(before, {p.name for p, _ in archive.entries(self.root)})
+
     def test_unused_blocks_collected_but_new_publication_objects_reserved(self):
         shared.migrate(self.root, 100)
         orphan = b'orphan block'
