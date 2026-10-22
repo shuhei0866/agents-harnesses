@@ -271,9 +271,17 @@ def main():
     if len(sys.argv) < 4 or sys.argv[1] != '--lab':
         return lab.main()
     root, command = Path(sys.argv[2]), sys.argv[3]
-    if command in ('refresh', 'refresh-status', 'storage-status', 'snapshot-pin', 'storage-compress'):
+    if command in ('refresh', 'refresh-status', 'storage-status', 'snapshot-pin', 'storage-compress', 'storage-deduplicate'):
         try:
-            if command == 'storage-compress':
+            if command == 'storage-deduplicate':
+                from retrieval_shared import migrate
+                if len(sys.argv) != 4:
+                    raise ValueError('storage-deduplicate takes no options')
+                config = _config(lab._root(root))
+                with lab.snapshot_lock(root, exclusive=True):
+                    result = dict(status='ok', deduplication=migrate(root, limit=5))
+                    result['storage'] = retention.maintain(root, config.get('retention', {}))
+            elif command == 'storage-compress':
                 from retrieval_archive import compress
                 if len(sys.argv) != 4:
                     raise ValueError('storage-compress takes no options')

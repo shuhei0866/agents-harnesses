@@ -59,7 +59,7 @@ def _references(root):
             path = base / name
             if path.is_symlink():
                 raise RetentionError('unsafe_reference_path')
-            if path == root / 'snapshots' or name == '__pycache__':
+            if path in (root / 'snapshots', root / 'snapshot-objects') or name == '__pycache__':
                 directories.remove(name)
         for name in files:
             path = base / name
@@ -96,7 +96,7 @@ def _references(root):
     return found
 
 
-def _plan(root, config, reserve_bytes=0, extra_protected=()):
+def _plan(root, config, reserve_bytes=0, extra_protected=(), protected_objects=()):
     config = policy(config)
     current = lab._snapshot(root)['snapshot_id']
     protected = _references(root) | {current} | set(extra_protected)
@@ -105,16 +105,25 @@ def _plan(root, config, reserve_bytes=0, extra_protected=()):
     groups = {}
     for path, info in entries:
         groups.setdefault(identity(path), []).append((path, info))
-    total = sum(info.st_size for _, info in entries)
-    pinned = sum(info.st_size for path, info in entries if identity(path) in protected)
+    from retrieval_shared import inventory, references
+    objects = inventory(root)
+    refs = {key: references([p for p, _ in files]) for key, files in groups.items()}
+    if any(not keys <= objects.keys() for keys in refs.values()):
+        raise ValueError('missing shared block')
+    def usage(keys):
+        shared = set(protected_objects) & objects.keys()
+        for key in keys:
+            shared.update(refs[key])
+        return sum(i.st_size for key in keys for _, i in groups[key]) + sum(objects[k] for k in shared)
+    total = sum(info.st_size for _, info in entries) + sum(objects.values())
+    retained = set(groups) & protected
+    pinned = usage(retained)
     candidates = sorted([(key, files) for key, files in groups.items() if key not in protected],
                         key=lambda pair: (max(i.st_mtime_ns for _, i in pair[1]), pair[0]), reverse=True)
-    retained, remaining = set(), pinned + reserve_bytes
     for index, (key, files) in enumerate(candidates):
-        size = sum(i.st_size for _, i in files)
-        if index < config['keep_recent'] and remaining + size <= config['budget_bytes']:
+        if index < config['keep_recent'] and usage(retained | {key}) + reserve_bytes <= config['budget_bytes']:
             retained.add(key)
-            remaining += size
+    remaining = usage(retained) + reserve_bytes
     deleting = [(p, i) for key, files in candidates if key not in retained for p, i in files]
     blocked = pinned + reserve_bytes > config['budget_bytes']
     warning = ('protected_snapshots_exceed_budget' if blocked else
@@ -123,7 +132,7 @@ def _plan(root, config, reserve_bytes=0, extra_protected=()):
                   archive_bytes=total, projected_bytes=remaining, reserved_bytes=reserve_bytes,
                   protected_bytes=pinned, protected_count=sum(key in protected for key in groups),
                   archive_count=len(groups), removable_count=len({identity(p) for p, _ in deleting}),
-                  removable_bytes=sum(i.st_size for _, i in deleting), warning=warning,
+                  removable_bytes=total - (remaining - reserve_bytes), warning=warning,
                   usage_percent=round(remaining / config['budget_bytes'] * 100, 2), **config)
     return result, deleting
 
@@ -143,11 +152,11 @@ def inspect(root, config=None):
         return result
 
 
-def maintain(root, config=None, *, reserve_bytes=0, extra_protected=()):
+def maintain(root, config=None, *, reserve_bytes=0, extra_protected=(), protected_objects=()):
     root = lab._root(root)
     with lab.snapshot_lock(root, exclusive=True):
         try:
-            result, deleting = _plan(root, config or {}, reserve_bytes, extra_protected)
+            result, deleting = _plan(root, config or {}, reserve_bytes, extra_protected, protected_objects)
             if result['status'] == 'error':
                 _save(root, result)
                 raise RetentionError('protected_snapshots_exceed_budget')
@@ -174,6 +183,8 @@ def maintain(root, config=None, *, reserve_bytes=0, extra_protected=()):
                     os.fsync(fd)
                 finally:
                     os.close(fd)
+            from retrieval_shared import collect_unused
+            collect_unused(root, protected_objects)
             result.update(deleted_count=result['removable_count'], freed_bytes=result['removable_bytes'],
                           archive_bytes=result['archive_bytes'] - result['removable_bytes'],
                           archive_count=result['archive_count'] - result['removable_count'])
@@ -190,7 +201,7 @@ def maintain(root, config=None, *, reserve_bytes=0, extra_protected=()):
 
 def _save(root, value):
     # No paths, excerpts, or IDs: this diagnostic must not pin its own garbage.
-    if value.get('deleted_count'):
+    if value.get('deleted_count') or value.get('freed_bytes', 0) > 0:
         value['last_cleanup'] = dict(at=value['checked_at'], deleted_count=value['deleted_count'], freed_bytes=value['freed_bytes'])
     else:
         try:
