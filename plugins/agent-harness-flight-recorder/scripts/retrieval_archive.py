@@ -10,7 +10,7 @@ import zlib
 
 
 def identity(path):
-    match = re.fullmatch(r'([0-9a-f]{64})\.json(?:\.gz)?', path.name)
+    match = re.fullmatch(r'([0-9a-f]{64})\.json(?:\.(?:gz|ref))?', path.name)
     if not match:
         raise ValueError('invalid archive name')
     return match[1]
@@ -48,6 +48,9 @@ def unpack(raw):
 
 def read_file(path):
     import retrieval_lab as lab
+    if path.suffix == '.ref':
+        from retrieval_shared import read
+        return read(path)
     if path.suffix == '.gz':
         return unpack(lab.safe_file(path, lab.MAX_SNAPSHOT_BYTES + 1024 * 1024))
     return lab.safe_file(path, lab.MAX_SNAPSHOT_BYTES)
@@ -59,27 +62,30 @@ def read(root, snapshot_id):
     directory = Path(root) / 'snapshots'
     if directory.is_symlink():
         raise ValueError('unsafe snapshot directory')
-    compressed = directory / (snapshot_id + '.json.gz')
-    plain = directory / (snapshot_id + '.json')
-    if compressed.exists() or compressed.is_symlink():
-        raw = read_file(compressed)
-        try:
-            original = read_file(plain)
-        except FileNotFoundError:
-            return raw
-        if original != raw:
-            raise ValueError('compressed snapshot differs from original')
-        return raw
-    try:
-        return read_file(plain)
-    except FileNotFoundError:
-        return read_file(compressed)
+    paths = [directory / (snapshot_id + suffix) for suffix in ('.json.ref', '.json.gz', '.json')]
+    result = None
+    # A converter may replace a legacy file between the lookup and open.
+    for attempt in range(2):
+        for path in paths:
+            try:
+                raw = read_file(path)
+            except FileNotFoundError:
+                # A missing shared dependency is corruption, not an absent generation.
+                if path.exists() or path.is_symlink():
+                    raise
+                continue
+            if result is not None and result != raw:
+                raise ValueError('compressed snapshot differs from original')
+            result = raw
+        if result is not None:
+            return result
+    raise FileNotFoundError('snapshot unavailable')
 
 
 def exists(root, snapshot_id):
     directory = Path(root) / 'snapshots'
     return any(p.exists() or p.is_symlink() for p in
-               (directory / (snapshot_id + '.json'), directory / (snapshot_id + '.json.gz')))
+               (directory / (snapshot_id + suffix) for suffix in ('.json', '.json.gz', '.json.ref')))
 
 
 def pack(raw):

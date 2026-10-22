@@ -362,6 +362,42 @@ is upgraded. Older runtime releases cannot read gzip archives: restore plain
 archives before rolling back to a pre-compression reader, or keep the compatible
 reader. Do not simply switch an old launcher back over a compressed archive.
 
+#### Lossless shared generations (opt-in)
+
+`storage-deduplicate` converts at most five historical generations per call and
+then applies the existing retention policy. Repeat until `deduplication.pending`
+is zero. Install a reader supporting this format before converting any archive.
+The command also enables shared storage for subsequent publications in this lab.
+
+Each `snapshots/SNAPSHOT_ID.json.ref` manifest lists ordered SHA-256 blocks in
+`snapshot-objects/`, plus the original byte length and whole-file SHA-256. Adjacent
+documents from one source are grouped into roughly 256 KiB blocks (one document
+may exceed this target). Blocks are independently gzip-compressed. A generation
+has no dependency on another generation or a chain of patches. Snapshot IDs,
+original JSON bytes, line references and measurement records are unchanged.
+
+Migration holds the exclusive snapshot lock, persists blocks before the manifest,
+reconstructs and compares every byte, and only then retires that generation's
+legacy copy. Interrupted conversion can be retried; mixed plain/gzip/shared twins
+must agree. Missing blocks, unsafe paths, hash mismatches or conflicting copies
+fail closed. Temporary free disk space is required for one generation's new
+blocks and manifest; write failures preserve its legacy copy.
+
+Capacity accounting includes manifests and the union of shared compressed blocks,
+counted once. Admission reserves only missing blocks and new manifests while
+protecting existing blocks needed by the incoming generation. Cleanup removes
+unprotected manifests first, then objects unreachable from every remaining
+manifest. Orphan objects from interrupted writes are reclaimable. The capacity
+budget measures file bytes, not filesystem allocation overhead or raw session
+logs. The live corpus remains uncompressed. No evidence is summarized or truncated.
+
+Before operational migration, record per-generation byte hashes and preserve a
+local backup. Verify the same hashes and historical citation reads afterwards.
+An older reader cannot read shared manifests: rolling back requires reconstructing
+all legacy snapshots with the new reader before switching executables. Keep the
+new reader or backup until this has been verified; never simply switch launchers.
+
+
 Generation-level compression intentionally avoids document-level shared objects:
 there is no new reference graph or garbage collector. Protected generations still
 accumulate and remain subject to the same 80% warning and hard storage limit.

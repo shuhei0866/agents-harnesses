@@ -242,11 +242,21 @@ def publish_snapshot(root, manifest, *, storage_policy=None):
         generations = {previous['snapshot_id']: canonical(previous).encode()}
         generations.setdefault(value['snapshot_id'], raw)
         missing = {identity: data for identity, data in generations.items() if not exists(root, identity)}
+        import retrieval_shared as shared
+        shared_mode = shared.enabled(root)
+        prepared = {key: shared.prepare(data, key) for key, data in missing.items()} if shared_mode else {}
         if storage_policy is not None:
             from retrieval_retention import maintain
-            encoded = {identity: pack(data) for identity, data in missing.items()}
-            storage = maintain(root, storage_policy, reserve_bytes=sum(map(len, encoded.values())),
-                               extra_protected=set(generations))
+            if shared_mode:
+                objects = {key: data for _, chunks in prepared.values() for key, data in chunks.items()}
+                existing = shared.inventory(root)
+                reserve = sum(len(meta) for meta, _ in prepared.values()) + sum(len(data) for key, data in objects.items() if key not in existing)
+                storage = maintain(root, storage_policy, reserve_bytes=reserve,
+                                   extra_protected=set(generations), protected_objects=set(objects))
+            else:
+                encoded = {identity: pack(data) for identity, data in missing.items()}
+                storage = maintain(root, storage_policy, reserve_bytes=sum(map(len, encoded.values())),
+                                   extra_protected=set(generations))
         else:
             encoded = missing
         # Archive old first. Fixed labs keep the legacy format; auto-refresh
@@ -254,6 +264,10 @@ def publish_snapshot(root, manifest, *, storage_policy=None):
         for identity in generations:
             if exists(root, identity):
                 _snapshot(root, identity)
+            elif shared_mode:
+                path = shared.write(root, identity, prepared[identity])
+                if shared.read(path) != missing[identity]:
+                    raise ValueError('shared publication mismatch')
             else:
                 suffix = '.json.gz' if storage_policy is not None else '.json'
                 _atomic_snapshot_file(directory / (identity + suffix), encoded[identity])
