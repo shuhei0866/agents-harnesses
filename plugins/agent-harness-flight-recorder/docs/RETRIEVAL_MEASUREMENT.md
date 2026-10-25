@@ -788,3 +788,30 @@ original source identity and line numbering. Corruption, unavailable decoding,
 or ambiguous plain/compressed twins abort collection and preserve the last good
 corpus. Fixed snapshots and their citations are unchanged. The collector version
 forces one complete recollection so old compressed paths are not silently skipped.
+
+
+### Conditional query supplement
+
+`context-supplement REQUEST_ID` opens at most one query-only candidate after an
+initial three-result correction search has a recorded `decision_match=not_found`.
+It preserves the original query, need, snapshot and primary result. It requires
+the same ranker version and must precede a focused retry. No new prompt or later
+correction is accepted. Query-only top-three candidates are checked against the
+primary source/line and exact three-message text; no deeper search fills an empty
+supplement. Near duplicates are not reliably detected.
+
+The saved child request belongs to the same need. Repeated opens return that
+child rather than new candidates. Preview text is capped at 240 characters for
+the utterance and 240 for one preceding message, with original offsets and
+truncation flags. Read and record adoption against the child ID. A focused retry
+may still use the initial ID once; the supplement is not a new decision need.
+Supplement reuse fixtures preserve the original primary candidates for replay.
+
+`context-report.supplements` and follow-up packets record query/scope ranks,
+preview characters, primary source reads before opening, child read calls and
+returned UTF-8 bytes. Follow-up packets additionally separate exposure and
+self-report before the first actual human reply from late activity. These are
+returned volumes, not reading time, model tokens or attention. The not-found gate
+can influence self-reporting, so rates before and after rollout are not causal
+comparisons. Empty candidates, unreported use, absent replies and silence are not
+success. Human follow-up and source-grounded review remain necessary.

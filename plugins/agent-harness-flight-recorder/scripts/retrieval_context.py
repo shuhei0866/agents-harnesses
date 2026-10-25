@@ -116,7 +116,7 @@ def query_weights(tokens):
     return {t: .5 if mixed and t in kana else 1.0 for t in sorted(tokens)}
 
 
-def retrieve(snapshot, query, limit, *, scope=None):
+def retrieve(snapshot, query, limit, *, scope=None, rank_refs=()):
     started = time.perf_counter()
     items, missing = units(snapshot)
     q = set(context_tokens(query))
@@ -165,6 +165,10 @@ def retrieve(snapshot, query, limit, *, scope=None):
                      for x, base, support, bonus in zip(items, lexical_scores, scope_scores, bonuses)}
     ranked = sorted(((s, x, detail) for s, x, detail in zip(scores, items, contributions) if s > 0),
                     key=lambda pair: (-pair[0], pair[1]['source_id'], pair[1]['utterance']['line']))
+    reference_keys = {(r['citation_id'], r['line']) for r in rank_refs}
+    reference_ranks = [dict(citation_id=x['utterance']['citation_id'], line=x['utterance']['line'], rank=rank)
+                       for rank, (_, x, _) in enumerate(ranked, 1)
+                       if (x['utterance']['citation_id'], x['utterance']['line']) in reference_keys]
     hits = []
     for rank, (score, item, detail) in enumerate(ranked[:limit], 1):
         hit = dict(rank=rank, score=score, source_id=item['source_id'],
@@ -179,6 +183,7 @@ def retrieve(snapshot, query, limit, *, scope=None):
         hits.append(hit)
     return dict(arm='recorder', snapshot_id=snapshot['snapshot_id'], retrieval_version=VERSION,
                 mode='corrections', hits=hits, candidate_count=len(items),
+                **(dict(reference_ranks=reference_ranks) if rank_refs else {}),
                 diagnostics_version=3, query_tokens=sorted(q), query_weights=weights,
                 scope_tokens=sorted(scope_q), scope=scope,
                 scored_candidate_count=len(ranked),
