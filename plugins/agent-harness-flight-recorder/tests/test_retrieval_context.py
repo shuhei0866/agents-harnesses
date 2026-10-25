@@ -45,6 +45,14 @@ class ContextTests(unittest.TestCase):
         self.assertIn('textbook', recorded['hits'][0]['utterance']['text'])
         self.assertEqual(recorded['scope'], 'textbook vocabulary\nlesson reading')
 
+    def test_single_japanese_character_scope_matches_inside_sentence(self):
+        logs = self.base / 'single-scope'
+        logs.mkdir()
+        (logs / 'one.jsonl').write_text(json.dumps(record('配置は住んでいる家という対象で考える')) + '\n')
+        lab.publish_snapshot(self.root, live.export_live([('codex', logs)], since=0))
+        result = context.retrieve(lab._snapshot(self.root), '配置', 3, scope='家')
+        self.assertGreater(result['hits'][0]['explanation']['scope_bonus'], 0)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

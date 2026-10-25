@@ -117,7 +117,7 @@ def retrieve(snapshot, query, limit, *, scope=None):
             c = Counter(context_tokens(text))
             # A one-character Japanese query must also match inside an
             # unsegmented sentence. Do not duplicate standalone occurrences.
-            for token in q:
+            for token in q | scope_q:
                 if len(token) == 1 and re.fullmatch(r'[\u3040-\u30ff\u3400-\u9fff]', token):
                     occurrences = text.count(token)
                     if occurrences:
