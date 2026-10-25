@@ -574,6 +574,20 @@ Evaluate both meanings of ambiguous terms and preserve source hashes. Lowering a
 irrelevant candidate is not proof that the requested prior decision was found,
 and a development fixture is not a held-out estimate of natural-use benefit.
 
+Context ranker v7 excludes known generated user-role envelopes, including
+heartbeat messages, from the candidate view. Their assistant replies cannot leak
+into the next human turn's preceding context. Original history and snapshots
+remain unchanged. Legacy consultation sources without source-kind metadata are
+also excluded when their opening prompt matches the existing generated-session
+detector. This recognizes known envelopes, not every possible automated message.
+
+The v6 bounded scope scoring policy is unchanged. Removing generated candidates
+can change corpus statistics and therefore ranks. Query-priority overrides are
+not enabled: reserving even one rank can displace another relevant scope match
+from a bounded result set. Validate both generated-frame exclusion and retained
+human judgments against frozen original inputs; do not infer human benefit from
+rank movement alone.
+
 Opportunity replay cache keys include the ranker version, and new packets record
 `retrieval_version`. Reports select the current composite version; old case IDs
 remain inspectable. A ranker update can produce new retrospective packets for the

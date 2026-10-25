@@ -4,7 +4,7 @@ import math
 import re
 import time
 
-VERSION = 'user-context-bm25-v6'
+VERSION = 'user-context-bm25-v7'
 TRIGGERS = ('resume', 'ambiguous', 'explicit')
 INJECTED_PREFIXES = ('# AGENTS.md', 'Stop hook feedback:', '[exploration-budget]',
     'Base directory for this skill:', 'Another Claude session sent a message:',
@@ -40,6 +40,13 @@ def conversational(text):
     # A review model's report is a tool-injected user-role envelope, not a
     # human correction. Keep it in ordinary history, but not in this view.
     stripped = text.lstrip()
+    if re.match(r'^<heartbeat(?:\s[^>]*|)>', stripped):
+        return False
+    if stripped.startswith(('<external_codex_apps_', '<subagent_notification>',
+                            '<task-notification>', '<skill>',
+                            'This session is being continued from a previous conversation that ran out of context.',
+                            '<local-command-stdout>', '<local-command-caveat>', '<command-name>')):
+        return False
     if (stripped.startswith('<user_action>')
             and '<context>User initiated a review task.' in stripped[:200]
             and 'full review output from reviewer model.' in stripped[:250]):
@@ -49,6 +56,7 @@ def conversational(text):
 
 
 def units(snapshot):
+    from retrieval_live import bridge_session_prompt, generated_session_prompt
     groups = defaultdict(list)
     missing = 0
     for d in snapshot['documents']:
@@ -64,13 +72,24 @@ def units(snapshot):
                 text=d['text'][m['start']:m['end']], citation_id=d['citation_id']))
     result = []
     for source, messages in groups.items():
+        ordered = sorted(messages, key=lambda x: (x['line'], x['citation_id']))
+        first_user = next((m for m in ordered if m['role'] == 'user'), None)
+        if first_user and (bridge_session_prompt(first_user['text']) or
+                           generated_session_prompt(first_user['text'])):
+            continue
         request = response = None
-        for m in sorted(messages, key=lambda x: (x['line'], x['citation_id'])):
+        automated_turn = False
+        for m in ordered:
             if not conversational(m['text']):
+                if m['role'] == 'user':
+                    request = response = None
+                    automated_turn = True
                 continue
             if m['role'] == 'assistant':
-                response = m
+                if not automated_turn:
+                    response = m
                 continue
+            automated_turn = False
             result.append(dict(source_id=source, utterance=m, request=request, prior_response=response))
             request, response = m, None
     return result, missing
