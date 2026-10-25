@@ -112,5 +112,6 @@ def observations(db, rows, boundary=None, has_followup=False):
             source_bytes_before_followup=sum(r['returned_bytes'] for r in reads if r['created']<boundary) if has_followup else None))
     return dict(version=VERSION,requests=len(records),records=records,
                 actual_followup_observed=has_followup,
-                candidate_exposures=sum(len(json.loads(r['foreground']).get('hits', [])) for r in rows),
+                candidate_exposures=sum(r['candidate_count'] for r in records),
+                all_attempt_candidate_exposures=sum(len(json.loads(r['foreground']).get('hits', [])) for r in rows),
                 notice='Agent self-report and returned volume only; missing data, no reply and silence are not success. Reading time and causal savings are unmeasured.')

@@ -33,6 +33,9 @@ class SupplementTests(unittest.TestCase):
         with patch('time.time',return_value=when):return supplement.open_supplement(self.root,self.pid)
     def test_gate_and_idempotence_and_primary_unchanged(self):
         with self.assertRaises(ValueError):self.open()
+        before=lab.context_report(self.root)['supplements']
+        self.assertEqual(before['candidate_exposures'],0)
+        self.assertEqual(before['all_attempt_candidate_exposures'],3)
         self.miss();c=self.open();self.assertEqual(len(c['hits']),1)
         self.assertEqual(c['hits'][0]['utterance']['text'],'anchor')
         self.assertGreater(c['supplement']['scope_rank'],3)
@@ -40,7 +43,10 @@ class SupplementTests(unittest.TestCase):
         self.assertEqual(c['supplement']['primary_source_read_count'],0)
         self.assertEqual(self.open()['request_id'],c['request_id'])
         self.assertEqual(lab.context_inspect(self.root,self.pid)['result'],self.parent)
-        self.assertEqual(lab.context_report(self.root)['searches'],2)
+        report=lab.context_report(self.root)
+        self.assertEqual(report['searches'],2)
+        self.assertEqual(report['supplements']['candidate_exposures'],1)
+        self.assertEqual(report['supplements']['all_attempt_candidate_exposures'],4)
         self.assertLessEqual(c['supplement']['preview_characters'],480)
         with self.assertRaises(ValueError):supplement.open_supplement(self.root,c['request_id'])
     def test_snapshot_is_parent_and_reject_version_drift(self):
