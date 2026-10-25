@@ -109,6 +109,25 @@ class SupplementTests(unittest.TestCase):
         self.assertTrue(second['replayed'])
         self.assertEqual(lab.context_report(self.root)['supplements']['requests'],1)
 
+    def test_long_shared_prefix_uses_full_text_and_tail_excerpt(self):
+        logs=self.base/'long-logs';logs.mkdir()
+        prefix='shared '*260
+        for name,tail in [('a','ordinary ending'),('b','needle decision')]:
+            records=[dict(type='session_meta',payload=dict(id=name)),msg(prefix+tail,100)]
+            (logs/(name+'.jsonl')).write_text(''.join(json.dumps(x)+'\n' for x in records))
+        root=self.base/'long-lab'
+        lab.create_lab(root,live.export_live([('codex',logs)],since=0))
+        snapshot=lab._snapshot(root)
+        ranked=context.retrieve(snapshot,'shared needle',3)['hits']
+        primary=[h for h in ranked if 'needle' not in next(u['utterance']['text'] for u in context.units(snapshot)[0] if u['source_id']==h['source_id'])]
+        self.assertEqual(len(primary),1)
+        selected=supplement.select(snapshot,'shared needle',primary)
+        self.assertEqual(len(selected),1)
+        excerpt=selected[0]['utterance']
+        self.assertIn('needle',excerpt['text'])
+        self.assertGreater(excerpt['excerpt_end'],1600)
+        self.assertEqual(excerpt['text'],(prefix+'needle decision')[excerpt['excerpt_start']:excerpt['excerpt_end']])
+
     def test_excerpt_offsets_and_no_overlap(self):
         message=dict(text='x'*400+'needle'+'z'*400,citation_id='ref',line=1)
         e=supplement.excerpt(message,{'needle':1});self.assertIn('needle',e['text']);self.assertEqual(e['text'],message['text'][e['excerpt_start']:e['excerpt_end']]);self.assertLessEqual(len(e['text']),240)

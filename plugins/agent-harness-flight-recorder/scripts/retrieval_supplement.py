@@ -19,11 +19,17 @@ def excerpt(message, weights):
 
 
 def select(snapshot, query, primary):
-    from retrieval_context import retrieve
+    from retrieval_context import retrieve, units
+    originals = {(u["source_id"], u["utterance"]["line"]): u for u in units(snapshot)[0]}
+    def full(hit):
+        unit = originals[(hit["source_id"], hit["line"])]
+        return dict(hit, **{k: unit[k] for k in ("utterance", "request", "prior_response")})
+    primary = [full(h) for h in primary]
     ranked = retrieve(snapshot, query, 3)
     keys = {(h['source_id'], h['line']) for h in primary}
     bodies = {tuple((h.get(k) or {}).get('text', '') for k in ('utterance', 'request', 'prior_response')) for h in primary}
     for hit in ranked['hits']:
+        hit = full(hit)
         if (hit['source_id'], hit['line']) in keys or tuple((hit.get(k) or {}).get('text', '') for k in ('utterance', 'request', 'prior_response')) in bodies:
             continue
         h = copy.deepcopy(hit); weights = {}
