@@ -407,7 +407,7 @@ def search_corrections(root, query, trigger, limit=3, purpose='task', task=None,
         with _connect(root) as db:
             parent = json.loads(_row(db, retry_of)['foreground'])
         if (parent.get('mode') != 'corrections' or not parent.get('decision_need')
-                or parent['decision_need'].get('retry_of') or parent.get('purpose') != purpose):
+                or parent.get('supplement') or parent['decision_need'].get('retry_of') or parent.get('purpose') != purpose):
             raise ValueError('retry requires an initial decision-need search with same purpose')
         if need is not None and need != parent['decision_need']['text']:
             raise ValueError('retry cannot change decision need')
@@ -499,6 +499,9 @@ def context_use(root, request_id, state, citations, reason, reason_code=None, ef
     return dict(request_id=request_id, state=state, provenance='agent_self_report',
                 notice='Not user feedback or verified task improvement.',
                 reuse_recording=('recorded' if reuse_report else 'not_recorded'),
+                supplement_command=('context-supplement ' + request_id
+                    if decision_match == 'not_found' and row['limit_n'] == 3
+                    and not result.get('supplement') and not result.get('decision_need', {}).get('retry_of') else None),
                 next_step=('Only if you actually reused a past answer in this current adoption, use context-use-template to record it before the next user reply. Otherwise leave reuse omitted. Do not invent an avoided question or backfill old uses.'
                            if state == 'applied' and result.get('decision_need') and reuse_report is None else None))
 
@@ -535,6 +538,8 @@ def context_report(root, purpose=None):
         uses = {r['request_id']: dict(r) for r in db.execute('SELECT * FROM context_uses') if r['request_id'] in ids} if 'context_uses' in tables else {}
         details = [dict(r) for r in db.execute('SELECT * FROM context_use_details') if r['request_id'] in ids] if 'context_use_details' in tables else []
         matches = {r['request_id']: r['match'] for r in db.execute('SELECT * FROM context_decision_matches')} if 'context_decision_matches' in tables else {}
+        from retrieval_supplement import observations
+        supplements = observations(db, rows)
     from retrieval_needs import summarize
     from retrieval_followup import report as followup_report
     followups = None
@@ -543,7 +548,7 @@ def context_report(root, purpose=None):
             followups = {k:v for k,v in followup_report(root).items() if k != 'review_cases'}
         except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
             followups = dict(status='error', error_type=type(exc).__name__)
-    return dict(followups=followups, decision_needs=summarize(rows, uses, matches), searches=len(rows), triggers=dict(Counter(r['trigger'] for r in results)),
+    return dict(supplements=supplements, followups=followups, decision_needs=summarize(rows, uses, matches), searches=len(rows), triggers=dict(Counter(r['trigger'] for r in results)),
                 purposes=dict(Counter(r.get('purpose', 'task') for r in results)), requests_with_reads=len(read_ids),
                 uses=dict(Counter(u['state'] for u in uses.values())), unreported=len(ids - uses.keys()),
                 reason_codes=dict(Counter(d['reason_code'] for d in details if d['reason_code'])),
@@ -825,6 +830,8 @@ def main():
     context.add_argument('--retry-of', help='initial request ID for one focused retry of the same need')
     context.add_argument('--task', help='short current task description, stored locally')
     context.add_argument('--session-id', help='caller session ID when runtime does not expose one')
+    supplement = subs.add_parser('context-supplement')
+    supplement.add_argument('request_id')
     inspect = subs.add_parser('context-inspect')
     inspect.add_argument('request_id')
     template = subs.add_parser('context-use-template')
@@ -889,6 +896,9 @@ def main():
             result = search(root, args.query, args.arm, args.limit, args.sample_rate)
         elif args.command == 'corrections':
             result = search_corrections(root, args.query, args.trigger, args.limit, args.purpose, args.task, args.session_id, args.need, args.retry_of)
+        elif args.command == 'context-supplement':
+            from retrieval_supplement import open_supplement
+            result = open_supplement(root, args.request_id)
         elif args.command == 'context-use-template':
             from retrieval_reuse import use_template
             result = use_template(root, args.request_id)

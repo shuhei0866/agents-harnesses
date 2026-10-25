@@ -124,6 +124,9 @@ def freeze(root, request_id, case_id):
                  snapshot_id=c['result']['snapshot_id'], followup_snapshot_id=packet['snapshot_id'],
                  query=c['query'], need=c['result']['decision_need']['text'], targets=targets,
                  baseline=c, observation=packet, causal_effect='unmeasured')
+    if c['result'].get('supplement'):
+        parent = lab.context_inspect(root, c['result']['supplement']['parent_request_id'])
+        value['supplement_primary'] = parent['result']['hits']
     return dict(value, fingerprint=lab.digest(value))
 
 
@@ -138,6 +141,9 @@ def replay(root, value):
     original = value.get('baseline', {}).get('result', {})
     scope = '\n'.join(x for x in (original.get('origin', {}).get('task'), value.get('need')) if x)
     result = retrieve(lab._snapshot(root, value['snapshot_id']), value['query'], 3, scope=scope or None)
+    if original.get('supplement'):
+        from retrieval_supplement import select
+        result['hits'] = select(lab._snapshot(root, value['snapshot_id']), value['query'], value['supplement_primary'])
     ranks = {(h['citation_id'],h['line']):h['rank'] for h in result['hits']}
     return dict(purpose='verification', fixture_fingerprint=value['fingerprint'],
                 targets=[dict(t, rank=ranks.get((t['citation_id'], t['line']))) for t in value['targets']],

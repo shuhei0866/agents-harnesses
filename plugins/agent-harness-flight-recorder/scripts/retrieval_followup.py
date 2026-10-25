@@ -5,7 +5,7 @@ import re
 import time
 from collections import Counter, defaultdict
 
-VERSION = 'recall-followup-v3'
+VERSION = 'recall-followup-v4'
 WINDOW_SECONDS = 7 * 86400
 MAX_TURNS = 3
 MAX_CASES = 100
@@ -141,6 +141,8 @@ def run(root, snapshot, config):
                 reported_before_followup=timely,
                 read_count=sum(t < boundary for a in attempts for t in reads[a['id']]),
                 retrieval_version=versions[latest['id']] if latest else None)
+            from retrieval_supplement import observations
+            packet['supplements'] = observations(db, [row_by_id[r] for r in need['request_ids']], boundary, bool(packet['followups']))
             from retrieval_reuse import exposure as reuse_exposure
             packet['answer_reuse'] = reuse_exposure(db, need, boundary, packet['anchor'])
             # Keep immutable evidence revisions, but do not append only because time
@@ -195,6 +197,10 @@ def report(root):
                 states=dict(Counter(c['status'] for c in cases)), by_exposure=[dict(retrieval_version=k[0],trigger=k[1],decision_match=k[2],**v) for k,v in groups.items()],
                 reviewed_current_revisions=dict(Counter(c['review']['label'] for c in cases if c['review'])),
                 historical_reviews=len(reviews), review_cases=priority[:20],
+                supplements=dict(needs=sum(bool(c.get('supplements', {}).get('requests')) for c in cases),
+                    requests=sum(c.get('supplements', {}).get('requests', 0) for c in cases),
+                    reported_before_followup=sum(bool(r['reported_before_followup']) for c in cases for r in c.get('supplements', {}).get('records', [])),
+                    notice='Inspect cases for preview characters, source bytes, timing and actual replies; no causal savings inferred.'),
                 answer_reuse=dict(coverage=dict(Counter(c['answer_reuse']['status'] for c in cases)),
                     reviewed=dict(Counter(c['review']['reuse_outcome']['classification'] for c in cases if c['review'] and c['review'].get('reuse_outcome'))),
                     question_coverage='answered_structured_replies_only', causal_effect='unmeasured'),

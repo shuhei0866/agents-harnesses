@@ -27,7 +27,7 @@ def summarize(rows, uses, matches, all_cases=False):
         cases.append(dict(root_request_id=root, created=initial['created'], need=first['decision_need']['text'],
                           session_id=first.get('origin', {}).get('session_id'), attempts=len(attempts),
                           status=status, reported=last['id'] in matches,
-                          found_on=('initial' if found[0]['id'] == root else 'retry') if found else None,
+                          found_on=('initial' if found[0]['id'] == root else 'supplement' if found[1].get('supplement') else 'retry') if found else None,
                           selected_ranks=ranks, request_ids=[a['id'] for a, _ in attempts],
                           reason=uses.get(r['id'], {}).get('reason'),
                           attempt_reports=[dict(request_id=a['id'], match=matches.get(a['id'], 'unknown'),
@@ -40,7 +40,7 @@ def summarize(rows, uses, matches, all_cases=False):
                 attempts_unreported=sum(r['id'] not in matches for group in groups.values() for r, _ in group),
                 sessions_known=len({c['session_id'] for c in cases if c['session_id']}),
                 session_unknown=sum(not c['session_id'] for c in cases),
-                review_cases=sorted((c for c in cases if c['status'] != 'found' or c['found_on'] == 'retry'),
+                review_cases=sorted((c for c in cases if c['status'] != 'found' or c['found_on'] in ('retry','supplement')),
                                     key=lambda c: c['created'], reverse=True)[:20],
                 notice='Search-invoked needs only; matches are agent self-reports, not human validation. '
                        'Silence, missing reports and sessions without searches do not imply success. '
