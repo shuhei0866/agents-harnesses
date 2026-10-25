@@ -19,6 +19,32 @@ def record(text, role='user'):
 
 
 class ContextTests(unittest.TestCase):
+    def test_prospective_scope_disambiguates_both_directions(self):
+        logs = self.base / 'scope'
+        logs.mkdir()
+        for name, text in [('git', 'target main branch merge'),
+                           ('book', 'target textbook vocabulary lesson reading'),
+                           ('other', 'vocabulary lesson reading without the query word')]:
+            (logs / (name + '.jsonl')).write_text(json.dumps(record(text)) + '\n')
+        lab.publish_snapshot(self.root, live.export_live([('codex', logs)], since=0))
+        snapshot = lab._snapshot(self.root)
+        plain = context.retrieve(snapshot, 'target', 5)
+        for scope, expected in [('textbook vocabulary lesson reading', 'textbook'), ('main branch merge', 'branch')]:
+            result = context.retrieve(snapshot, 'target', 5, scope=scope)
+            self.assertIn(expected, result['hits'][0]['utterance']['text'])
+            for h in result['hits']:
+                e = h['explanation']
+                self.assertLessEqual(e['scope_bonus'], e['lexical_score'])
+                self.assertAlmostEqual(h['score'], e['lexical_score'] + e['scope_bonus'])
+        self.assertEqual(context.retrieve(snapshot, 'missing', 5, scope='textbook')['hits'], [])
+        repeated_query = context.retrieve(snapshot, 'target', 5, scope='target target')
+        self.assertEqual([(h['line'], h['score']) for h in plain['hits']],
+                         [(h['line'], h['score']) for h in repeated_query['hits']])
+        recorded = lab.search_corrections(self.root, 'target', 'resume',
+                    task='textbook vocabulary', need='lesson reading')
+        self.assertIn('textbook', recorded['hits'][0]['utterance']['text'])
+        self.assertEqual(recorded['scope'], 'textbook vocabulary\nlesson reading')
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -212,7 +238,7 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(r['origin']['task'], 'resume budgeting')
         self.assertNotIn('not-recorded', json.dumps(r))
         for hit in r['hits']:
-            self.assertAlmostEqual(hit['score'], sum(d['score'] for d in hit['explanation']['contributions']))
+            self.assertAlmostEqual(hit['score'], sum(d['score'] for d in hit['explanation']['contributions']) + hit['explanation']['scope_bonus'])
             self.assertIn('absent', hit['explanation']['unmatched_tokens'])
         packet = lab.context_inspect(self.root, r['request_id'])
         self.assertEqual(packet['result'], r)
@@ -264,8 +290,8 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(r['query_weights']['ない'], .5)
         self.assertIn('ない', r['hits'][0]['explanation']['matched_tokens'])
         for hit in r['hits']:
-            self.assertAlmostEqual(hit['score'], sum(d['score'] for d in hit['explanation']['contributions']))
-        self.assertEqual(r['diagnostics_version'], 2)
+            self.assertAlmostEqual(hit['score'], sum(d['score'] for d in hit['explanation']['contributions']) + hit['explanation']['scope_bonus'])
+        self.assertEqual(r['diagnostics_version'], 3)
 
     def test_hiragana_only_and_non_hiragana_queries_keep_full_weights(self):
         for query in ['ありがとう', '家', 'spreadsheet edit', 'APP-587', 'カタカナ', '']:

@@ -122,6 +122,12 @@ class ReuseTests(unittest.TestCase):
         before=lab.context_report(self.root)
         result=reuse.replay(self.root,frozen)
         self.assertTrue(result['all_targets_found'])
+        from unittest.mock import patch
+        from retrieval_context import retrieve
+        with patch('retrieval_context.retrieve', wraps=retrieve) as ranker:
+            reuse.replay(self.root, frozen)
+            expected = '\n'.join(x for x in (frozen['baseline']['result']['origin']['task'], frozen['need']) if x)
+            self.assertEqual(ranker.call_args.kwargs['scope'], expected or None)
         after=lab.context_report(self.root)
         for key in ['searches','requests_with_reads','uses']: self.assertEqual(before[key],after[key])
         tampered=dict(frozen,query='later correction leaked')

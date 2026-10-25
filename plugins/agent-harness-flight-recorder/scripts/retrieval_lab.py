@@ -412,7 +412,8 @@ def search_corrections(root, query, trigger, limit=3, purpose='task', task=None,
         if need is not None and need != parent['decision_need']['text']:
             raise ValueError('retry cannot change decision need')
         need = parent['decision_need']['text']
-    result = retrieve(_snapshot(root), query, limit)
+    scope = '\n'.join(value for value in (task, need) if value)
+    result = retrieve(_snapshot(root), query, limit, scope=scope or None)
     environment_id = os.environ.get('CODEX_THREAD_ID')
     result['origin'] = dict(cwd=str(Path.cwd()), task=task,
         session_id=session_id or (environment_id[:1000] if environment_id else None),
