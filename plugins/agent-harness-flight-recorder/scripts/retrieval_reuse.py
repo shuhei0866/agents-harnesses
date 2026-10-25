@@ -135,7 +135,9 @@ def replay(root, value):
         raise ValueError('invalid frozen reuse fixture')
     # Query and corpus are the original pre-outcome inputs. No live search/read
     # commands, outcome text, or newer corpus are used by the retriever.
-    result = retrieve(lab._snapshot(root, value['snapshot_id']), value['query'], 3)
+    original = value.get('baseline', {}).get('result', {})
+    scope = '\n'.join(x for x in (original.get('origin', {}).get('task'), value.get('need')) if x)
+    result = retrieve(lab._snapshot(root, value['snapshot_id']), value['query'], 3, scope=scope or None)
     ranks = {(h['citation_id'],h['line']):h['rank'] for h in result['hits']}
     return dict(purpose='verification', fixture_fingerprint=value['fingerprint'],
                 targets=[dict(t, rank=ranks.get((t['citation_id'], t['line']))) for t in value['targets']],

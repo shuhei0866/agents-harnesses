@@ -560,6 +560,20 @@ original text are removed. This script-based heuristic can also downweight
 meaningful hiragana words, so it is not semantic intent recognition.
 Diagnostics v2 exposes `query_weights` and each contribution's `query_weight`;
 the scores still sum to the displayed total. Historical results are not rewritten.
+
+Context ranker v6 uses the pre-search `task` and `need` as bounded scope evidence.
+It scores their non-query tokens against the same utterance and preceding context,
+then adds at most the original query score. Scope alone cannot introduce a candidate
+without a query match. No domain names, entity dictionary, or provider calls are
+used. Missing scope preserves lexical ranking. This is lexical disambiguation,
+not a semantic classifier; vague or incorrect task descriptions can still misrank.
+Diagnostics v3 separates `lexical_score`, `scope_score`, and the capped
+`scope_bonus`; query contributions plus the bonus equal the displayed total.
+Reuse replay reads task/need from the frozen pre-outcome inputs, never later replies.
+Evaluate both meanings of ambiguous terms and preserve source hashes. Lowering an
+irrelevant candidate is not proof that the requested prior decision was found,
+and a development fixture is not a held-out estimate of natural-use benefit.
+
 Opportunity replay cache keys include the ranker version, and new packets record
 `retrieval_version`. Reports select the current composite version; old case IDs
 remain inspectable. A ranker update can produce new retrospective packets for the

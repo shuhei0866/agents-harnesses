@@ -4,7 +4,7 @@ import math
 import re
 import time
 
-VERSION = 'user-context-bm25-v5'
+VERSION = 'user-context-bm25-v6'
 TRIGGERS = ('resume', 'ambiguous', 'explicit')
 INJECTED_PREFIXES = ('# AGENTS.md', 'Stop hook feedback:', '[exploration-budget]',
     'Base directory for this skill:', 'Another Claude session sent a message:',
@@ -97,11 +97,16 @@ def query_weights(tokens):
     return {t: .5 if mixed and t in kana else 1.0 for t in sorted(tokens)}
 
 
-def retrieve(snapshot, query, limit):
+def retrieve(snapshot, query, limit, *, scope=None):
     started = time.perf_counter()
     items, missing = units(snapshot)
     q = set(context_tokens(query))
     weights = query_weights(q)
+    # Prospective task/need only; never outcomes or inferred standing preferences.
+    # Exclude query tokens so an ambiguous shared word cannot vote twice.
+    scope_q = set(context_tokens((scope or '')[:2000])) - q
+    scope_weights = query_weights(scope_q)
+    scope_scores = [0.0] * len(items)
     scores = [0.0] * len(items)
     contributions = [[] for _ in items]
     for field, weight in [('utterance', 1.0), ('context', 0.2)]:
@@ -112,7 +117,7 @@ def retrieve(snapshot, query, limit):
             c = Counter(context_tokens(text))
             # A one-character Japanese query must also match inside an
             # unsegmented sentence. Do not duplicate standalone occurrences.
-            for token in q:
+            for token in q | scope_q:
                 if len(token) == 1 and re.fullmatch(r'[\u3040-\u30ff\u3400-\u9fff]', token):
                     occurrences = text.count(token)
                     if occurrences:
@@ -122,12 +127,23 @@ def retrieve(snapshot, query, limit):
         average = sum(sum(c.values()) for c in counts) / max(1, len(items))
         for i, c in enumerate(counts):
             length = sum(c.values())
-            for token in sorted(q & c.keys()):
+            for token in sorted((q | scope_q) & c.keys()):
                 idf = math.log(1 + (len(items) - frequency[token] + .5) / (frequency[token] + .5))
-                contribution = weights[token] * weight * idf * c[token] * 2.2 / (
+                contribution = (weights.get(token, scope_weights.get(token, 1.0))) * weight * idf * c[token] * 2.2 / (
                     c[token] + 1.2 * (.25 + .75 * length / max(1, average)))
+                if token in scope_q:
+                    scope_scores[i] += contribution
+                    continue
                 scores[i] += contribution
                 contributions[i].append(dict(field=field, token=token, score=contribution, query_weight=weights[token]))
+    lexical_scores = list(scores)
+    # At most double a lexical match. Scope cannot introduce query-unmatched
+    # candidates or hard-exclude other domains. Missing scope keeps lexical order.
+    bonuses = [min(base, support) for base, support in zip(scores, scope_scores)]
+    scores = [base + bonus for base, bonus in zip(scores, bonuses)]
+    scope_details = {(x['source_id'], x['utterance']['line']):
+                     dict(lexical_score=base, scope_score=support, scope_bonus=bonus)
+                     for x, base, support, bonus in zip(items, lexical_scores, scope_scores, bonuses)}
     ranked = sorted(((s, x, detail) for s, x, detail in zip(scores, items, contributions) if s > 0),
                     key=lambda pair: (-pair[0], pair[1]['source_id'], pair[1]['utterance']['line']))
     hits = []
@@ -140,10 +156,12 @@ def retrieve(snapshot, query, limit):
         for key in ('utterance', 'request', 'prior_response'):
             m = item[key]
             hit[key] = dict(m, text=m['text'][:1600], truncated=len(m['text']) > 1600) if m else None
+        hit['explanation'].update(scope_details[(item['source_id'], item['utterance']['line'])])
         hits.append(hit)
     return dict(arm='recorder', snapshot_id=snapshot['snapshot_id'], retrieval_version=VERSION,
                 mode='corrections', hits=hits, candidate_count=len(items),
-                diagnostics_version=2, query_tokens=sorted(q), query_weights=weights,
+                diagnostics_version=3, query_tokens=sorted(q), query_weights=weights,
+                scope_tokens=sorted(scope_q), scope=scope,
                 scored_candidate_count=len(ranked),
                 legacy_documents_skipped=missing,
                 consultation_sources_skipped=len({d['source_id'] for d in snapshot['documents']
