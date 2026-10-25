@@ -19,6 +19,29 @@ def record(text, role='user'):
 
 
 class ContextTests(unittest.TestCase):
+    def test_generated_turns_do_not_leak_through_preceding_context(self):
+        logs = self.base / 'automated'
+        logs.mkdir()
+        (logs / 'one.jsonl').write_text(''.join(json.dumps(v)+'\n' for v in [
+            record('human topic'), record('<heartbeat>automated keyword</heartbeat>'),
+            record('automated keyword response', 'assistant'), record('next human topic')]))
+        lab.publish_snapshot(self.root, live.export_live([('codex', logs)], since=0))
+        snapshot = lab._snapshot(self.root)
+        self.assertIn('automated keyword', json.dumps(snapshot))
+        items, _ = context.units(snapshot)
+        self.assertEqual(len(items), 2)
+        self.assertIsNone(items[-1]['request'])
+        self.assertIsNone(items[-1]['prior_response'])
+        self.assertEqual(context.retrieve(snapshot, 'automated keyword', 3)['hits'], [])
+        for text in ['<heartbeat automation="scheduled">body</heartbeat>',
+                     '<task-notification>completed</task-notification>',
+                     '<skill>injected instructions</skill>',
+                     'This session is being continued from a previous conversation that ran out of context. Summary: generated']:
+            self.assertFalse(context.conversational(text))
+        for text in ['heartbeatの設定を変えて', '例: <heartbeat>quoted</heartbeat>',
+                     '<send_user_message_question_reply>answer</send_user_message_question_reply>']:
+            self.assertTrue(context.conversational(text))
+
     def test_prospective_scope_disambiguates_both_directions(self):
         logs = self.base / 'scope'
         logs.mkdir()
@@ -378,6 +401,11 @@ class ContextTests(unittest.TestCase):
         recalled = lab.search_corrections(self.root, 'constellation', 'resume')
         self.assertEqual(recalled['hits'], [])
         self.assertEqual(recalled['consultation_sources_skipped'], 1)
+        legacy = json.loads(json.dumps(lab._snapshot(self.root)))
+        for document in legacy['documents']:
+            document.pop('source_kind', None)
+        self.assertEqual(context.retrieve(legacy, 'constellation', 3)['hits'], [])
+        self.assertIn('constellation', json.dumps(legacy))
         bad = json.loads(json.dumps(manifest))
         bad['documents'][0]['source_kind'] = 'human-confirmed'
         with self.assertRaises(ValueError):
