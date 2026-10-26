@@ -36,8 +36,14 @@ class RefreshTests(unittest.TestCase):
             refresh.refresh(self.root, force=True)
         query = lab.search(self.root, 'original', sample_rate=0)
         original = lab._snapshot(self.root, query['snapshot_id'])
+        fixture_id = lab.publish_snapshot(self.root, dict(schema_version=1, documents=[doc('f', 'fixture only')]))['snapshot_id']
+        fixture = lab._snapshot(self.root, fixture_id)
+        lab.publish_snapshot(self.root, dict(schema_version=1, documents=[doc('a', 'intermediate')]))
+        config = json.loads((self.root / 'refresh-config.json').read_text())
+        config['retention'] = {'keep_recent': 0}
+        (self.root / 'refresh-config.json').write_text(json.dumps(config))
         shared.migrate(self.root, limit=100)
-        (self.root / 'fixture.json').write_text(json.dumps({'snapshot_id': query['snapshot_id']}))
+        (self.root / 'fixture.json').write_text(json.dumps({'snapshot_id': fixture_id}))
         with patch.object(refresh, 'export_live', return_value=self.delta([doc('a', 'new')])), \
                 patch.object(retention, 'maintain', wraps=retention.maintain) as maintain:
             result = refresh.refresh(self.root, force=True)
@@ -45,6 +51,7 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual(maintain.call_count, 1)
         self.assertGreater(maintain.call_args.kwargs['reserve_bytes'], 0)
         self.assertEqual(lab._snapshot(self.root, query['snapshot_id']), original)
+        self.assertEqual(lab._snapshot(self.root, fixture_id), fixture)
         before = lab._snapshot(self.root)
         watermark = result['last_success']
         # A required shared block becoming corrupt must still abort publication.
