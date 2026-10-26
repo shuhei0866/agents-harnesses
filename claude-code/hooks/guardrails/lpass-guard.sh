@@ -3,8 +3,9 @@
 #
 # lpass のエージェントがロック解除されているあいだは、同じユーザーで動くプロセスなら
 # 保管庫のどの項目でも読める。エージェントがパスワードの項目を表示すると、値が会話ログに
-# 平文で残る。読める範囲を専用の窓口 claude-code/scripts/claude-profile（保管庫の Claude/
-# フォルダだけを読み書きする）に絞るため、lpass の直接実行を止める。
+# 平文で残る。フォーム入力用の個人情報は専用の窓口 claude-code/scripts/claude-profile
+# （1Password の専用保管庫だけを読み書きする。op-guard.sh を参照）で扱い、LastPass を
+# 残しているあいだは lpass の直接実行を止める。
 #
 # 判定（誤って許可するより、誤って拒否する側に倒す）:
 #   1) 高速経路: 引用符とバックスラッシュを外した文字列に lpass が語として無ければ素通しする
@@ -18,14 +19,14 @@
 #      ときだけ許す（保管庫の中身に触れない）
 #
 # 許可されるもの:
-#   - claude-profile 経由の読み書き（このフックからは内部の lpass 呼び出しが見えない）
+#   - claude-profile の実行（LastPass は使わない）
 #   - 引用符で囲んだ文章の中の言及（git commit -m "add lpass guard" など）と、cat 等に流す
 #     heredoc 本文の言及
 #   - ~/.lpass や test-lpass-guard.sh のように、パスや名前の一部として出てくるもの
 #
 # 限界: 変数展開（x=l; ${x}pass）や実行時に組み立てる名前は、文字列の照合では検出できない。
 #   事故と素朴な指示の注入を止めるためのもので、敵対的な回避への完全な防御ではない。
-#   command -v lpass のような参照も拒否されるので、状態確認は claude-profile status を使う。
+#   command -v lpass のような参照も拒否される（lpass status だけは許す）。
 
 set -uo pipefail
 
@@ -44,7 +45,7 @@ if [ -z "${COMMAND:-}" ]; then
   exit 0
 fi
 
-MSG="lpass の直接実行はブロックされています。保管庫の Claude/ フォルダの読み書きは ~/agents-harnesses/claude-code/scripts/claude-profile を使ってください（例: claude-profile get 電話番号）。パスワードやカード番号の項目は、ユーザーがブラウザの自動入力やログイン操作で扱います。"
+MSG="lpass の直接実行はブロックされています。フォーム入力用の個人情報は ~/agents-harnesses/claude-code/scripts/claude-profile（1Password の専用保管庫）で読み書きしてください（例: claude-profile get 電話番号）。パスワードやカード番号の項目は、ユーザーがブラウザの自動入力やログイン操作で扱います。"
 
 # lpass を 1 語として含むか（~/.lpass、lastpass-cli、test-lpass-guard.sh の一部としては数えない）
 WORD='(^|[^[:alnum:]_.-])lpass([^[:alnum:]_-]|$)'
