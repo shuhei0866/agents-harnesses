@@ -21,18 +21,25 @@
 #   2) 別の実行経路: $( )・バッククォート・シェル（bash/sh/zsh/ksh/dash/fish）・eval/source/exec・
 #      インタプリタ（python*/pypy*/node/deno/bun/ruby/perl/php/osascript/awk）があり、
 #      「op <サブコマンド>」か security の秘密を出す操作が現れるなら拒否する
-#   3) 直接実行: heredoc 本文を除き、コマンドの区切りごとに先頭の語を見る。変数の代入と
-#      env・sudo・xargs などの前置きは飛ばす。op は語の位置がコマンドのときだけ数えるので、
-#      grep op のような引数としての op は止めない
+#   3) 直接実行: heredoc 本文を除き、コマンドの区切りごとにシェルの語に分けて見る
+#      （引用符で囲んだ文字列は 1 語）。
+#      a) どの位置でも、op の後ろに同じ区切りの中でサブコマンドが続くものと、security の
+#         秘密を出す操作は止める。if・!・{ } や find -exec の後ろに置いても実行されるため
+#      b) 先頭の語が op なら、サブコマンドが無くても止める。変数の代入、if・while・! などの
+#         予約語、env・sudo・xargs などの前置きは飛ばす。command -v / -V は場所を表示する
+#         だけなので数えない
+#      grep op のように、サブコマンドの続かない引数としての op は止めない
 #
 # 許可されるもの:
 #   - claude-profile 経由の読み書き（このフックからは内部の op / security の呼び出しが見えない）
 #   - 引用符で囲んだ文章（git commit -m "use op ..." など）と heredoc 本文の中の言及
 #   - security find-generic-password の属性だけの確認（-w / -g なし）や list-keychains
+#   - command -v op（入っているかの確認）
 #
 # 限界: 変数展開、実行時に組み立てる名前、ファイルに書いたスクリプトの中身は、文字列の
-#   照合では検出できない。事故と素朴な指示の注入を止めるためのもので、敵対的な回避への
-#   完全な防御ではない。
+#   照合では検出できない。env -S・watch・ssh・tmux や cmux の send のように、引用符で囲んだ
+#   文字列を別の場所で実行させる前置きも数えない。事故と素朴な指示の注入を止めるための
+#   もので、敵対的な回避への完全な防御ではない。
 
 set -uo pipefail
 
@@ -78,15 +85,24 @@ security_secret_anywhere() {
   printf '%s' "$NORM" | grep -qE "$SECURITY_WORD" || return 1
   printf '%s' "$NORM" | grep -qE '(^|[^[:alnum:]_-])dump-keychain([^[:alnum:]_-]|$)' && return 0
   printf '%s' "$NORM" | grep -qE '(^|[^[:alnum:]_.-])security[[:space:],]+-[ip]([^[:alnum:]_-]|$)' && return 0
-  printf '%s' "$NORM" | grep -qE '(^|[^[:alnum:]_-])find-(generic|internet)-password([^[:alnum:]_-]|$)' || return 1
-  printf '%s' "$NORM" | grep -qE '(^|[^[:alnum:]_-])-[[:alpha:]]*[wg][[:alpha:]]*([^[:alnum:]_-]|$)' || return 1
-  # トークンを名指しするか、service / label を指定せずに秘密を出すものだけを止める
-  printf '%s' "$NORM" | grep -qF -- "$TOKEN_SERVICE" && return 0
-  ! printf '%s' "$NORM" | grep -qE '(^|[^[:alnum:]_-])-[[:alpha:]]*[sl]([^[:alnum:]_-]|$)'
+  # find-*-password は、コマンドの区切りごとに、その中だけで秘密の出力と指定の有無を見る
+  # （ls -l の -l のような、別のコマンドの引数を service / label の指定と数えない）
+  local piece
+  while IFS= read -r piece; do
+    printf '%s' "$piece" | grep -qE "$SECURITY_WORD" || continue
+    printf '%s' "$piece" | grep -qE '(^|[^[:alnum:]_-])find-(generic|internet)-password([^[:alnum:]_-]|$)' || continue
+    printf '%s' "$piece" | grep -qE '(^|[^[:alnum:]_-])-[[:alpha:]]*[wg][[:alpha:]]*([^[:alnum:]_-]|$)' || continue
+    # トークンを名指しするか、service / label を指定せずに秘密を出すものだけを止める
+    printf '%s' "$piece" | grep -qF -- "$TOKEN_SERVICE" && return 0
+    printf '%s' "$piece" | grep -qE '(^|[^[:alnum:]_-])-[[:alpha:]]*[sl]([^[:alnum:]_-]|$)' || return 0
+  done < <(printf '%s\n' "$NORM" | tr ';&|()`' '\n')
+  return 1
 }
 
-# 2) 別の実行経路: 引用符の中の文字列も実行されうる
-OP_SUB_RE='(^|[^[:alnum:]_.-])op[[:space:],]+(item|vault|read|run|inject|signin|signout|account|service-account|document|user|group|environment|whoami|connect|events-api|plugin|update|completion|daemon)([^[:alnum:]_-]|$)'
+# 2) 別の実行経路: 引用符の中の文字列も実行されうる。op の後ろに --account x や --format=json の
+#    ようなオプションを挟んでも、サブコマンドが続けば実行とみなす
+OP_SUBCOMMANDS='item vault read run inject signin signout account service-account document user group environment whoami connect events-api plugin update completion daemon'
+OP_SUB_RE="(^|[^[:alnum:]_.-])op([[:space:],]+-[^[:space:],]*([[:space:],]+[^-[:space:],][^[:space:],]*)?)*[[:space:],]+(${OP_SUBCOMMANDS// /|})([^[:alnum:]_-]|$)"
 EXEC_RE='(^|[;&|[:space:](/])((ba|z|k|da|a)?sh|fish|eval|source|exec|python[0-9.]*|pypy[0-9.]*|node|deno|bun|ruby|perl|php|osascript|g?awk)([[:space:];&|<>)]|$)'
 if printf '%s' "$COMMAND" | grep -qF -e '$(' -e '`' || printf '%s' "$NORM" | grep -qE "$EXEC_RE"; then
   if printf '%s' "$NORM" | grep -qE "$OP_SUB_RE" || security_secret_anywhere; then
@@ -94,7 +110,44 @@ if printf '%s' "$COMMAND" | grep -qF -e '$(' -e '`' || printf '%s' "$NORM" | gre
   fi
 fi
 
-# 3) 直接実行: コマンドの区切りごとに、前置きを飛ばした先頭の語を見る
+is_op_subcommand() {
+  case "$1" in ''|*[[:space:]]*) return 1 ;; esac
+  case " $OP_SUBCOMMANDS " in *" $1 "*) return 0 ;; esac
+  return 1
+}
+
+# words[$1] が security のとき、同じ区切りの中の後ろの語が秘密を出す操作か
+security_reveals_secret() {
+  local j=$(($1 + 1)) sub="" w secret=0 selector=0 names_token=0
+  while [ "$j" -lt "$n" ]; do
+    case "${words[$j]}" in
+      -i|-p) return 0 ;;
+      -*) j=$((j + 1)) ;;
+      *) sub="${words[$j]}"; break ;;
+    esac
+  done
+  case "$sub" in
+    dump-keychain) return 0 ;;
+    find-generic-password|find-internet-password) ;;
+    *) return 1 ;;
+  esac
+  # 秘密を出す -w / -g があり、トークンを名指しするか service / label の指定が無ければ止める
+  j=$((j + 1))
+  while [ "$j" -lt "$n" ]; do
+    w="${words[$j]}"
+    case "$w" in
+      --*) ;;
+      -*)
+        case "$w" in -*[wg]*) secret=1 ;; esac
+        case "$w" in -*[sl]) selector=1 ;; esac ;;
+    esac
+    [ "$w" = "$TOKEN_SERVICE" ] && names_token=1
+    j=$((j + 1))
+  done
+  [ "$secret" -eq 1 ] && { [ "$names_token" -eq 1 ] || [ "$selector" -eq 0 ]; }
+}
+
+# 3) 直接実行: コマンドの区切りごとに、シェルの語に分けて見る
 STRIPPED=$(guard_strip_heredoc_bodies "$COMMAND")
 while IFS= read -r seg; do
   [ -n "$seg" ] || continue
@@ -103,13 +156,37 @@ while IFS= read -r seg; do
     words+=("$w")
   done < <(guard_shell_tokens "$seg")
   n=${#words[@]}
+
+  # a) どの位置でも、op の後ろにサブコマンドが続くものと、security の秘密を出す操作を止める
+  t=0
+  while [ "$t" -lt "$n" ]; do
+    case "${words[$t]##*/}" in
+      op)
+        k=$((t + 1))
+        while [ "$k" -lt "$n" ]; do
+          is_op_subcommand "${words[$k]}" && deny
+          k=$((k + 1))
+        done ;;
+      security)
+        security_reveals_secret "$t" && deny ;;
+    esac
+    t=$((t + 1))
+  done
+
+  # b) 先頭の語が op なら、サブコマンドが無くても止める
   i=0
   while [ "$i" -lt "$n" ]; do
     case "${words[$i]}" in
       [A-Za-z_]*=*) i=$((i + 1)); continue ;;
+      # if・while・! などの後ろの語もコマンドとして実行される
+      if|then|elif|else|while|until|do|'!'|'{') i=$((i + 1)); continue ;;
     esac
     case "${words[$i]##*/}" in
       env|sudo|command|exec|nohup|time|xargs|nice|caffeinate|stdbuf|timeout|doas)
+        # command -v / -V は場所を表示するだけで実行しない
+        if [ "${words[$i]##*/}" = command ]; then
+          case "${words[$((i + 1))]:-}" in -v|-V) i=$n; break ;; esac
+        fi
         i=$((i + 1))
         while [ "$i" -lt "$n" ]; do
           case "${words[$i]}" in
@@ -118,13 +195,14 @@ while IFS= read -r seg; do
           esac
         done
         # env -u NAME や sudo -u user のように値を取るオプションの値を、実行するコマンドと
-        # 取り違えないよう、前置きの後ろに op / security があればそれを実行対象とみなす
+        # 取り違えないよう、前置きの後ろに op があればそれを実行対象とみなす
         # （xargs grep -n op のような誤拒否は、誤って許可するよりよいとして受け入れる）
         k=$i
         while [ "$k" -lt "$n" ]; do
-          case "${words[$k]##*/}" in
-            op|security) i=$k; break ;;
-          esac
+          if [ "${words[$k]##*/}" = op ]; then
+            i=$k
+            break
+          fi
           k=$((k + 1))
         done
         continue ;;
@@ -132,46 +210,12 @@ while IFS= read -r seg; do
     break
   done
   [ "$i" -lt "$n" ] || continue
-  case "${words[$i]##*/}" in
-    op)
-      case "${words[$((i + 1))]:-}" in
-        --version|--help|-h) ;;
-        *) deny ;;
-      esac ;;
-    security)
-      j=$((i + 1))
-      sub=""
-      while [ "$j" -lt "$n" ]; do
-        case "${words[$j]}" in
-          -i|-p) deny ;;
-          -*) j=$((j + 1)) ;;
-          *) sub="${words[$j]}"; break ;;
-        esac
-      done
-      case "$sub" in
-        dump-keychain) deny ;;
-        find-generic-password|find-internet-password)
-          # 秘密を出す -w / -g があり、トークンを名指しするか service / label の指定が無ければ止める
-          secret=0
-          selector=0
-          names_token=0
-          j=$((j + 1))
-          while [ "$j" -lt "$n" ]; do
-            w="${words[$j]}"
-            case "$w" in
-              --*) ;;
-              -*)
-                case "$w" in -*[wg]*) secret=1 ;; esac
-                case "$w" in -*[sl]) selector=1 ;; esac ;;
-            esac
-            [ "$w" = "$TOKEN_SERVICE" ] && names_token=1
-            j=$((j + 1))
-          done
-          if [ "$secret" -eq 1 ] && { [ "$names_token" -eq 1 ] || [ "$selector" -eq 0 ]; }; then
-            deny
-          fi ;;
-      esac ;;
-  esac
+  if [ "${words[$i]##*/}" = op ]; then
+    case "${words[$((i + 1))]:-}" in
+      --version|--help|-h) ;;
+      *) deny ;;
+    esac
+  fi
 done <<< "$(guard_split_segments "$STRIPPED")"
 
 exit 0

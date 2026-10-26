@@ -2,7 +2,7 @@
 # Tests for scripts/claude-profile
 # （1Password の SDK の代わりに偽物を差し込み、専用の保管庫の外を読まないこと、トークンを
 #   出力に出さないこと、上書きでメモ以外の欄を壊さないこと、差し替えは両方そろえたときだけ
-#   効くことを固定する）
+#   効くこと、本体には決まった環境変数だけを渡すことを固定する）
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,17 +18,17 @@ TOKEN_VALUE="ops_testtoken"
 # --- 偽の SDK: 呼び出しを記録し、保管庫を JSON のファイルで真似る ---
 cat > "$T/fake-sdk.mjs" <<'STUB'
 import fs from "node:fs";
-const dir = process.env.STUB_DIR;
+const dir = process.env.CLAUDE_PROFILE_TEST_DIR;
 const statePath = `${dir}/state.json`;
 const log = (entry) => fs.appendFileSync(`${dir}/calls`, `${JSON.stringify(entry)}\n`);
 const load = () => JSON.parse(fs.readFileSync(statePath, "utf8"));
 const save = (s) => fs.writeFileSync(statePath, JSON.stringify(s));
 export const ItemCategory = { SecureNote: "SecureNote", Login: "Login" };
 export async function createClient({ auth }) {
-  log({ op: "createClient", authOk: auth === "ops_testtoken" });
-  if (process.env.STUB_FAIL === "1") throw new Error(`boom ${auth} ops_SECRETTOKEN123 住所: 東京都`);
-  if (process.env.STUB_FAIL === "net") throw new TypeError("fetch failed");
-  if (process.env.STUB_FAIL === "auth") throw new Error(`Unauthorized: invalid service account token ${auth}`);
+  log({ op: "createClient", authOk: auth === "ops_testtoken", envKeys: Object.keys(process.env).sort() });
+  if (process.env.CLAUDE_PROFILE_TEST_FAIL === "1") throw new Error(`boom ${auth} ops_SECRETTOKEN123 住所: 東京都`);
+  if (process.env.CLAUDE_PROFILE_TEST_FAIL === "net") throw new TypeError("fetch failed");
+  if (process.env.CLAUDE_PROFILE_TEST_FAIL === "auth") throw new Error(`Unauthorized: invalid service account token ${auth}`);
   return {
     vaults: {
       list: async () => [{ id: "v1", title: "Claude" }, { id: "v2", title: "Private" }],
@@ -48,7 +48,7 @@ export async function createClient({ auth }) {
         log({ op: "items.put", vaultId: item.vaultId, id: item.id });
         const s = load();
         const next = structuredClone(item);
-        if (process.env.STUB_PUT_DROPS_FIELD === "1") next.fields = next.fields.filter((f) => f.id !== "username");
+        if (process.env.CLAUDE_PROFILE_TEST_PUT_DROPS_FIELD === "1") next.fields = next.fields.filter((f) => f.id !== "username");
         next.version = (next.version ?? 0) + 1;
         s.items = s.items.map((i) => (i.id === item.id ? next : i));
         save(s);
@@ -84,7 +84,7 @@ cat > "$T/state.json" <<'JSON'
 ]}
 JSON
 
-export STUB_DIR="$T" CLAUDE_PROFILE_TEST_SDK="$T/fake-sdk.mjs" CLAUDE_PROFILE_TEST_TOKEN="$TOKEN_VALUE"
+export CLAUDE_PROFILE_TEST_DIR="$T" CLAUDE_PROFILE_TEST_SDK="$T/fake-sdk.mjs" CLAUDE_PROFILE_TEST_TOKEN="$TOKEN_VALUE"
 
 check() {
   local desc="$1" expected_status="$2" expected_out="$3"
@@ -153,7 +153,7 @@ ok "上書きでメモ以外の欄とタグと URL を残す" json_ok '
     and ([.fields[] | select(.id == "username") | .value] == ["keep-me"]) and (.notes == "090-1111-2222")' "$T/state.json"
 ok "別の保管庫の同じ名前の項目には触れない" json_ok '.items[] | select(.id == "p1") | .notes == "999-should-not-read"' "$T/state.json"
 printf '090-3333-4444' > "$T/in"
-STUB_PUT_DROPS_FIELD=1 run set 電話番号; check "上書きでメモ以外の欄が消えたら止めて知らせる" 1 "メモ以外の欄が変わりました"
+CLAUDE_PROFILE_TEST_PUT_DROPS_FIELD=1 run set 電話番号; check "上書きでメモ以外の欄が消えたら止めて知らせる" 1 "メモ以外の欄が変わりました"
 printf '東京都' > "$T/in"
 run set 身元;                      check "ログインとメモ以外の種類は書き換えない" 1 "この種類の項目（Identity）は claude-profile では書き換えません"
 ok "書き換えない種類には put を送らない" bash -c '! grep -q "items.put" "$1"' _ "$T/calls"
@@ -163,14 +163,23 @@ unset STDIN_FILE
 
 echo ""
 echo "=== トークンと差し替え ==="
-STUB_FAIL=1 run list;              check "SDK のエラーは分類だけを出す" 1 "1Password の操作に失敗しました（Error）"
+CLAUDE_PROFILE_TEST_FAIL=1 run list;              check "SDK のエラーは分類だけを出す" 1 "1Password の操作に失敗しました（Error）"
 ok "SDK のエラーの文面（トークンやメモ）をそのまま出さない" bash -c '! printf "%s" "$1" | grep -qE "ops_testtoken|ops_SECRETTOKEN123|東京都|boom"' _ "$OUT"
-STUB_FAIL=net run list;            check "通信の失敗はそう分類する" 1 "通信に失敗しました"
-STUB_FAIL=auth run list;           check "認証の失敗はそう分類する" 1 "認証に失敗しました"
+CLAUDE_PROFILE_TEST_FAIL=net run list;            check "通信の失敗はそう分類する" 1 "通信に失敗しました"
+CLAUDE_PROFILE_TEST_FAIL=auth run list;           check "認証の失敗はそう分類する" 1 "認証に失敗しました"
 ok "認証のエラーにトークンを出さない" no_token_in_output
-printf '%s\n' 'import fs from "node:fs";' 'fs.writeFileSync(`${process.env.STUB_DIR}/injected`, "x");' > "$T/inject.mjs"
+printf '%s\n' 'import fs from "node:fs";' "fs.writeFileSync(\"$T/injected\", \"x\");" > "$T/inject.mjs"
 NODE_OPTIONS="--import=$T/inject.mjs" run get 氏名 フリガナ; check "NODE_OPTIONS を付けても普通に読める" 0 "ヤマダ タロウ"
 ok "NODE_OPTIONS で差し込んだコードは動かない" bash -c '[ ! -e "$1" ]' _ "$T/injected"
+# OPENSSL_CONF は Node の起動時に読まれ、provider の共有ライブラリを読み込ませられる
+# （無い provider を指す設定を読むと、Node は起動の途中で落ちる）
+printf '%s\n' 'nodejs_conf = nodejs_init' '[nodejs_init]' 'providers = provider_sect' '[provider_sect]' \
+  'evil = evil_sect' '[evil_sect]' "module = $T/no-such-provider.dylib" 'activate = 1' > "$T/evil.cnf"
+OPENSSL_CONF="$T/evil.cnf" run get 氏名 フリガナ; check "OPENSSL_CONF を付けても普通に読める" 0 "ヤマダ タロウ"
+NODE_DEBUG=fetch UNRELATED_VAR=x run status;      check "決まった変数のほかを付けても動く" 0 "接続できます"
+# （__CF_USER_TEXT_ENCODING は macOS が node の起動時に足す文字コードの指定）
+ok "本体には決まった環境変数だけが届く" jq -se '[.[] | select(.op == "createClient") | .envKeys[]]
+  | length > 0 and all(test("^(HOME|USER|PATH|TMPDIR|NODE_USE_ENV_PROXY|NODE_NO_WARNINGS|https?_proxy|HTTPS?_PROXY|no_proxy|NO_PROXY|CLAUDE_PROFILE_[A-Z_]+|__CF_USER_TEXT_ENCODING)$"))' "$T/calls"
 : > "$T/calls"
 OUT=$(env -u CLAUDE_PROFILE_TEST_TOKEN "$PROFILE" get 電話番号 2>&1 < /dev/null); STATUS=$?
 check "偽の SDK だけを指定したら止める" 1 "そろえて指定してください"

@@ -46,12 +46,18 @@ for candidate in /opt/homebrew/bin/node /usr/local/bin/node; do
 done
 [ -n "$NODE" ] || { echo "claude-profile: node が見つかりません（/opt/homebrew/bin/node か /usr/local/bin/node）" >&2; exit 1; }
 
-# 本体より先にコードを読み込ませたり（NODE_OPTIONS の --require / --import、DYLD_*）、証明書の
-# 確認をゆるめたりできる変数を外してから起動する（DYLD_* は SIP が保護されたバイナリの起動時にも
-# 消すが、SIP を切った環境に備えて明示する）。サンドボックスでは Node の fetch がプロキシを
-# 通るようにし、実験機能の警告は出さない
-exec /usr/bin/env -u NODE_OPTIONS -u NODE_PATH -u NODE_EXTRA_CA_CERTS -u NODE_TLS_REJECT_UNAUTHORIZED \
-  -u SSL_CERT_FILE -u SSL_CERT_DIR -u NODE_REPL_EXTERNAL_MODULE \
-  -u DYLD_INSERT_LIBRARIES -u DYLD_LIBRARY_PATH -u DYLD_FALLBACK_LIBRARY_PATH \
-  -u DYLD_FRAMEWORK_PATH -u DYLD_FALLBACK_FRAMEWORK_PATH \
-  NODE_USE_ENV_PROXY=1 NODE_NO_WARNINGS=1 "$NODE" "$DIR/claude-profile-sdk/main.mjs" "$@"
+# 本体には決まった環境変数だけを渡す。NODE_OPTIONS・OPENSSL_CONF・DYLD_* のように、本体より
+# 先にコードや設定を読み込ませたり、証明書の確認をゆるめたりできる変数を持ち込まないため
+# （外す変数を並べる方式では、見落としや新しい変数を防げない）。
+#   HOME・USER: キーチェーンの検索と、トークンの項目のアカウント名
+#   TMPDIR: 一時ファイルの置き場所
+#   *_proxy: サンドボックスでは Node の fetch がこのプロキシを通る（NODE_USE_ENV_PROXY=1）
+#   CLAUDE_PROFILE_*: 保管庫とトークンの指定、テスト用の差し替え（差し替えの指定は op-guard が止める）
+# 実験機能の警告は出さない
+env_args=(PATH=/usr/bin:/bin NODE_USE_ENV_PROXY=1 NODE_NO_WARNINGS=1)
+for name in HOME USER TMPDIR http_proxy HTTP_PROXY https_proxy HTTPS_PROXY no_proxy NO_PROXY ${!CLAUDE_PROFILE_@}; do
+  if [ -n "${!name:-}" ]; then
+    env_args+=("$name=${!name}")
+  fi
+done
+exec /usr/bin/env -i "${env_args[@]}" "$NODE" "$DIR/claude-profile-sdk/main.mjs" "$@"

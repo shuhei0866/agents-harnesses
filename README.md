@@ -309,12 +309,12 @@ claude-profile は、専用の保管庫だけに権限を持つ 1Password のサ
    ```
 
    1Password はトークンの控えを 1Password に保存するよう勧めている。期限（`--expires-in`）は 90 日未満までしか付けられない。
-3. 本体の依存（版を固定した `@1password/sdk`）を入れる。Node 22.21 以降（23 系は不可、24 以降は可）が `/opt/homebrew/bin/node` か `/usr/local/bin/node` に要る（`NODE_USE_ENV_PROXY` がこの版で入ったため）（入口は PATH の node を使わず、起動前に `NODE_OPTIONS` などコードや証明書を差し込める変数を外す）。
+3. 本体の依存（版を固定した `@1password/sdk`）を入れる。Node 22.21 以降（23 系は不可、24 以降は可）が `/opt/homebrew/bin/node` か `/usr/local/bin/node` に要る（`NODE_USE_ENV_PROXY` がこの版で入ったため）。入口は PATH の node を使わず、本体には決まった環境変数（`HOME`・`USER`・`TMPDIR`・プロキシ・`CLAUDE_PROFILE_*`）だけを渡す。`NODE_OPTIONS` や `OPENSSL_CONF` のように、本体より先にコードや設定を読み込ませられる変数を持ち込まないため。
 
    ```sh
    npm ci --ignore-scripts --prefix ~/agents-harnesses/claude-code/scripts/claude-profile-sdk
    ```
-4. `guardrails/op-guard.sh` を PreToolUse（Bash）に登録する。claude-profile を経由しない `op` の実行と、キーチェーンからトークンを読み出しうる操作を止める。ほかのサービスの API キーを、値を出さずに変数へ読む使い方（`key="$(security find-generic-password -w -s <service>)"`）は通す。
+4. `guardrails/op-guard.sh` を PreToolUse（Bash）に登録する。claude-profile を経由しない `op` の実行と、キーチェーンからトークンを読み出しうる操作を止める。`if` や `!` の後ろ、`find -exec` の後ろに置いたものも止める。ほかのサービスの API キーを、値を出さずに変数へ読む使い方（`key="$(security find-generic-password -w -s <service>)"`）と、`command -v op` は通す。
 5. エージェントの Bash をサンドボックスで動かしている場合、入口の `claude-profile` が `NODE_USE_ENV_PROXY=1` を付けて Node の通信をプロキシに通す。それでも届かないときは、ネットワークの許可に 1Password のホスト（サインインアドレスのドメイン）を加える。
 
 トークンを交換するときは、同じ手順で新しいサービスアカウントを作ってキーチェーンを上書きし（`-U`）、古いものを 1Password.com で失効させる。漏れた疑いがあるときは、先に失効させる。
