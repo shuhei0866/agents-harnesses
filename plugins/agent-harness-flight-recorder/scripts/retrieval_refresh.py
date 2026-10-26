@@ -185,7 +185,10 @@ def refresh(root, force=False):
                 from retrieval_archive import compress
                 state['compression'] = stage('compress', compress, root, limit=2)
                 current = stage('load_snapshot', lab._snapshot, root)
-                state['storage'] = stage('retention', retention.maintain, root, config.get('retention', {}))
+                # Publication performs retention once, with the exact new-byte
+                # reservation and both generations protected, under this lock.
+                # A pre-collection pass repeats every historical corpus check
+                # without adding protection to the later publication.
                 same_collection = (state.get('config_id') == lab.digest(config)
                                    and state.get('collector_version') == COLLECTOR_VERSION)
                 delta = stage('collect', _collect, state, [(r['adapter'], Path(r['path'])) for r in config['roots']],

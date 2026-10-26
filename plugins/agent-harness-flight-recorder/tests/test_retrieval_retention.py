@@ -164,7 +164,9 @@ class RetentionTests(unittest.TestCase):
             roots=[dict(adapter='codex', path=str(self.root.parent))], retention={'budget_bytes': 1})))
         self.publish('current')
         refresh._write(self.root, 'refresh-state.json', {'since': 123, 'last_success': 456})
-        result = refresh.refresh(self.root, force=True)
+        delta = dict(documents=[], refreshed_source_ids=[], excluded_source_ids=[], import_report={})
+        with patch.object(refresh, 'export_live', return_value=delta):
+            result = refresh.refresh(self.root, force=True)
         self.assertEqual(result['status'], 'error')
         self.assertEqual(result['last_success'], 456)
         self.assertEqual(result['since'], 123)

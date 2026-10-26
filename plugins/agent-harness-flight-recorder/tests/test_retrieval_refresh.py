@@ -29,6 +29,43 @@ class RefreshTests(unittest.TestCase):
         return dict(schema_version=1, documents=docs, refreshed_source_ids=[d['source_id'] for d in docs],
                     excluded_source_ids=removed or [], import_report={})
 
+    def test_single_retention_pass_preserves_evidence_and_fails_closed(self):
+        import retrieval_retention as retention
+        import retrieval_shared as shared
+        with patch.object(refresh, 'export_live', return_value=self.delta([doc('a', 'original')])):
+            refresh.refresh(self.root, force=True)
+        query = lab.search(self.root, 'original', sample_rate=0)
+        original = lab._snapshot(self.root, query['snapshot_id'])
+        fixture_id = lab.publish_snapshot(self.root, dict(schema_version=1, documents=[doc('f', 'fixture only')]))['snapshot_id']
+        fixture = lab._snapshot(self.root, fixture_id)
+        lab.publish_snapshot(self.root, dict(schema_version=1, documents=[doc('a', 'intermediate')]))
+        config = json.loads((self.root / 'refresh-config.json').read_text())
+        config['retention'] = {'keep_recent': 0}
+        (self.root / 'refresh-config.json').write_text(json.dumps(config))
+        shared.migrate(self.root, limit=100)
+        (self.root / 'fixture.json').write_text(json.dumps({'snapshot_id': fixture_id}))
+        with patch.object(refresh, 'export_live', return_value=self.delta([doc('a', 'new')])), \
+                patch.object(retention, 'maintain', wraps=retention.maintain) as maintain:
+            result = refresh.refresh(self.root, force=True)
+        self.assertEqual(result['health'], 'ok')
+        self.assertEqual(maintain.call_count, 1)
+        self.assertGreater(maintain.call_args.kwargs['reserve_bytes'], 0)
+        self.assertEqual(lab._snapshot(self.root, query['snapshot_id']), original)
+        self.assertEqual(lab._snapshot(self.root, fixture_id), fixture)
+        before = lab._snapshot(self.root)
+        watermark = result['last_success']
+        # A required shared block becoming corrupt must still abort publication.
+        path = self.root / 'snapshots' / (query['snapshot_id'] + '.json.ref')
+        ref = shared.manifest(path)['blocks'][0]
+        shared.object_path(self.root, ref['hash']).write_bytes(b'corrupt')
+        archives = {p.name for p in (self.root / 'snapshots').iterdir()}
+        with patch.object(refresh, 'export_live', return_value=self.delta([doc('a', 'third')])):
+            failed = refresh.refresh(self.root, force=True)
+        self.assertEqual(failed['health'], 'error')
+        self.assertEqual(failed['last_success'], watermark)
+        self.assertEqual(lab._snapshot(self.root), before)
+        self.assertEqual({p.name for p in (self.root / 'snapshots').iterdir()}, archives)
+
     def test_deferred_source_retains_windows_and_retries_after_watermark(self):
         with patch.object(refresh,'export_live',return_value=self.delta([doc('a','original'),doc('b','old')])):
             first=refresh.refresh(self.root,force=True)
