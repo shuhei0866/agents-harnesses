@@ -4,7 +4,7 @@ import math
 import re
 import time
 
-VERSION = 'user-context-bm25-v7'
+VERSION = 'user-context-bm25-v9'
 TRIGGERS = ('resume', 'ambiguous', 'explicit')
 INJECTED_PREFIXES = ('# AGENTS.md', 'Stop hook feedback:', '[exploration-budget]',
     'Base directory for this skill:', 'Another Claude session sent a message:',
@@ -35,10 +35,26 @@ def validate_spans(text, first, last, spans):
     return spans
 
 
+def handoff_frame(text):
+    """Recognize an explicit parent-session handoff envelope, not a topic.
+
+    Exclude only this turn and its assistant context. Later human turns in
+    the same source remain eligible; ordinary search keeps the original.
+    """
+    lines = text.lstrip().splitlines()
+    if not lines or not re.match(r'^引き継ぎ[:：]', lines[0]):
+        return False
+    return ('親セッション' in lines[0]
+            and any(re.fullmatch(r'##\s+依頼\s*', line) for line in lines)
+            and any(re.fullmatch(r'##\s+読む場所(?:（[^\n]*）)?\s*', line) for line in lines))
+
+
 def conversational(text):
     # Known injected frames only. User role does not prove human authorship.
     # A review model's report is a tool-injected user-role envelope, not a
     # human correction. Keep it in ordinary history, but not in this view.
+    if handoff_frame(text):
+        return False
     stripped = text.lstrip()
     if re.match(r'^<heartbeat(?:\s[^>]*|)>', stripped):
         return False
@@ -116,11 +132,26 @@ def query_weights(tokens):
     return {t: .5 if mixed and t in kana else 1.0 for t in sorted(tokens)}
 
 
+def compound_fragments(query):
+    """Group long katakana query words without a domain-specific dictionary.
+
+    Keep fragments that also occur outside those words at their normal weight.
+    This is soft lexical evidence, not semantic domain classification.
+    """
+    pattern = re.compile(r'[ァ-ヺー]{4,}')
+    words = set(pattern.findall(query))
+    independent = set(context_tokens(pattern.sub(' ', query)))
+    return {token: sorted(word for word in words if token in context_tokens(word))
+            for word in words for token in context_tokens(word)
+            if token not in independent}
+
+
 def retrieve(snapshot, query, limit, *, scope=None, rank_refs=()):
     started = time.perf_counter()
     items, missing = units(snapshot)
     q = set(context_tokens(query))
     weights = query_weights(q)
+    fragments = compound_fragments(query)
     # Prospective task/need only; never outcomes or inferred standing preferences.
     # Exclude query tokens so an ambiguous shared word cannot vote twice.
     scope_q = set(context_tokens((scope or '')[:2000])) - q
@@ -129,7 +160,7 @@ def retrieve(snapshot, query, limit, *, scope=None, rank_refs=()):
     scores = [0.0] * len(items)
     contributions = [[] for _ in items]
     for field, weight in [('utterance', 1.0), ('context', 0.2)]:
-        counts, frequency = [], Counter()
+        counts, texts, frequency = [], [], Counter()
         for item in items:
             text = item['utterance']['text'] if field == 'utterance' else '\n'.join(
                 item[k]['text'][:2000] for k in ('request', 'prior_response') if item[k])
@@ -142,6 +173,7 @@ def retrieve(snapshot, query, limit, *, scope=None, rank_refs=()):
                     if occurrences:
                         c[token] = occurrences
             counts.append(c)
+            texts.append(text)
             frequency.update(c.keys())
         average = sum(sum(c.values()) for c in counts) / max(1, len(items))
         for i, c in enumerate(counts):
@@ -153,8 +185,11 @@ def retrieve(snapshot, query, limit, *, scope=None, rank_refs=()):
                 if token in scope_q:
                     scope_scores[i] += contribution
                     continue
+                owners = fragments.get(token, ())
+                compound_weight = .25 if owners and not any(word in texts[i] for word in owners) else 1.0
+                contribution *= compound_weight
                 scores[i] += contribution
-                contributions[i].append(dict(field=field, token=token, score=contribution, query_weight=weights[token]))
+                contributions[i].append(dict(field=field, token=token, score=contribution, query_weight=weights[token], compound_weight=compound_weight))
     lexical_scores = list(scores)
     # At most double a lexical match. Scope cannot introduce query-unmatched
     # candidates or hard-exclude other domains. Missing scope keeps lexical order.
@@ -184,7 +219,7 @@ def retrieve(snapshot, query, limit, *, scope=None, rank_refs=()):
     return dict(arm='recorder', snapshot_id=snapshot['snapshot_id'], retrieval_version=VERSION,
                 mode='corrections', hits=hits, candidate_count=len(items),
                 **(dict(reference_ranks=reference_ranks) if rank_refs else {}),
-                diagnostics_version=3, query_tokens=sorted(q), query_weights=weights,
+                diagnostics_version=4, query_tokens=sorted(q), query_weights=weights,
                 scope_tokens=sorted(scope_q), scope=scope,
                 scored_candidate_count=len(ranked),
                 legacy_documents_skipped=missing,
