@@ -83,6 +83,12 @@ run_guard '{ op item list; }';                                 assert_deny "{ } 
 run_guard 'find . -maxdepth 0 -exec op item list \;';          assert_deny "find -exec の後ろの op"
 run_guard "bash -c 'op --account x item list'";                assert_deny "bash -c の中でオプションを挟んだ op"
 run_guard "bash -c 'op --format json item list'";              assert_deny "bash -c の中で値を取るオプションを挟んだ op"
+run_guard "echo 'op item list' | bash";                        assert_deny "パイプでシェルに渡す op"
+run_guard "\"bash\" -c 'op item list'";                        assert_deny "引用符で囲んだシェルの名前"
+run_guard "python3 <<'EOF'
+import subprocess
+subprocess.run(['op', 'item', 'list'])
+EOF";                                                          assert_deny "python の heredoc から op を呼ぶ"
 
 echo ""
 echo "=== キーチェーンの秘密の読み出しはブロックする ==="
@@ -99,6 +105,14 @@ run_guard "bash -c 'security find-generic-password -a me -w'";      assert_deny 
 run_guard "bash -c 'security find-generic-password -a me -w'; ls -l"; assert_deny "別のコマンドの -l を label の指定と数えない"
 run_guard 'if security find-generic-password -s claude-profile-op-token -w; then :; fi'; assert_deny "if の条件の security"
 run_guard 'while ! security find-generic-password -a me -w; do :; done'; assert_deny "while ! の後ろの security"
+run_guard 'security -qi';                                            assert_deny "まとめて書いた -qi（対話）"
+run_guard "bash -c 'security -q -i'";                                assert_deny "bash -c の中で、ほかのオプションの後ろに置いた -i"
+run_guard "bash -c 'security find-generic-password -a me -w' -- -s example-api-key"; assert_deny "bash -c の外側の -s を、内側の service の指定と数えない"
+run_guard "bash -c 'security find-generic-password -a me -w' -s example-api-key";    assert_deny "-- が無くても、外側の -s を内側の指定と数えない"
+run_guard 'security find-generic-password -a me -w login.keychain-db -s example-api-key'; assert_deny "鍵束の名前の後ろの -s は service の指定にならない"
+run_guard 'security find-generic-password -a me -w -- -s example-api-key'; assert_deny "-- の後ろの -s は service の指定にならない"
+run_guard 'security find-generic-password -sclaude-profile-op-token -w';   assert_deny "値を続けて書いた -s でトークンを名指し"
+run_guard 'security find-generic-password 2>/dev/null -a me -w';           assert_deny "リダイレクトを挟んでも後ろの -w を数える"
 
 echo ""
 echo "=== claude-profile の差し替え変数はブロックする ==="
@@ -125,6 +139,13 @@ run_guard 'command -v op';                                      assert_pass "op 
 run_guard 'if [ -x "$(command -v op)" ]; then echo ok; fi';     assert_pass "\$( ) の中の command -v op"
 run_guard 'git commit -m "fix: op item list in docs"';          assert_pass "引用符で囲んだ文章の中の op <サブコマンド>"
 run_guard 'if security find-generic-password -s example-token >/dev/null; then echo ok; fi'; assert_pass "if の条件で属性だけを確認する"
+run_guard 'git commit -m "fix: bash wrapper for op item list"'; assert_pass "引用符で囲んだ文章の中のシェルの名前と op <サブコマンド>"
+run_guard "gh pr create --title fix --body \"bash -c 'security find-generic-password -a me -w' is now blocked\""; assert_pass "本文の中のシェルの名前と security の例"
+run_guard 'command -v op whoami';                               assert_pass "command -v に複数の名前を渡す"
+run_guard 'type op whoami';                                     assert_pass "type で種類を表示する"
+run_guard 'security find-internet-password -sexample.com -g';   assert_pass "値を続けて書いた -s で別のサービスを名指しする -g"
+run_guard 'security find-generic-password -gsexample-api-key';  assert_pass "まとめて書いた -gs に値を続けて書く"
+run_guard 'key="$(security find-generic-password -w -a "$USER" -s example-api-key 2>/dev/null)"'; assert_pass "リダイレクトの付いた、別のサービスの鍵の読み込み"
 
 echo ""
 echo "=== 結果: $PASS passed, $FAIL failed ==="
