@@ -815,3 +815,27 @@ returned volumes, not reading time, model tokens or attention. The not-found gat
 can influence self-reporting, so rates before and after rollout are not causal
 comparisons. Empty candidates, unreported use, absent replies and silence are not
 success. Human follow-up and source-grounded review remain necessary.
+
+
+### Known handoff candidate filter
+
+`user-context-bm25-v10` excludes explicit bridge and wrapped compaction
+turns before unit generation, in addition to the existing parent handoff
+frame. It resets the preceding assistant context at the excluded turn but
+retains later human turns. Originals and ordinary search/read are unchanged.
+No decision-language boost or semantic model is enabled. Ambiguous pasted
+content and review instructions are not treated as proof of machine authorship.
+
+Each new correction search records `candidate_filter` (version, reason counts,
+bounded source/line/hash references and truncation) and `reading_volume`
+(candidate exposures and preview characters). Counts cover eligible corpus
+turns, not query matches or saved reading. `context-report.candidate_filters`
+and followup packets join per-attempt exposures to original reads, in the
+latter case strictly before the first human reply. Existing use/match/reuse
+and actual replies remain separate evidence. Missing historical fields are
+unknown, retries are not independent needs, and bytes and characters must
+not be summed or interpreted as time saved. Review excluded references
+against the request's immutable snapshot when investigating a missed decision.
+
+Exclusion references and hashes stay in the stored record and diagnostic inspect;
+the normal correction response returns only the filter version, count and boost flag.

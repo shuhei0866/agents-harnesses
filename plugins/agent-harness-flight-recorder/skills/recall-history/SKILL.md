@@ -110,3 +110,6 @@ description: 過去の会話から判断・理由・訂正を出典付きで探�
 原文追加のみ自動化済み。新規要約の生成・自己改善の自動採用は未導入。
 
 既知のAI相談用セッションは `agent_consultation` と区別し、`corrections` の候補から外す。相談内容や助言は通常の `search` / `read` で出典付きで参照できるが、本人の発言として扱わない。`consultation_sources_skipped` で除外した相談ソース数が分かる。
+
+
+既知の引き継ぎ文は候補生成前に除外する（`candidate_filter.version`）。本人の判断らしい言い方への加点はしない。原文は削除せず、通常のsearch/readに残る。`candidate_filter.references` は固定snapshotの除外出典（最大20件、打切り表示あり）。除外数は検索に合う候補数や読む量の削減数ではない。`context-report.candidate_filters` と後続例の `candidate_filters` で、同じrequest/needの表示文字数、原文read件数・bytes、採用・decision_match、最初の本人返答を照合する。未記録は不明。別の版や複数の試行を独立した成功例として数えない。判断が落ちた疑いは固定snapshotの除外出典と元のneedで確認し、過去の結果を書き換えない。文字数・bytesは別々の代理指標で、読む時間や手間削減の証明ではない。意味検索はまだオフライン検証のみ。

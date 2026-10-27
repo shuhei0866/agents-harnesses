@@ -142,6 +142,10 @@ def run(root, snapshot, config):
                 read_count=sum(t < boundary for a in attempts for t in reads[a['id']]),
                 retrieval_version=versions[latest['id']] if latest else None)
             from retrieval_supplement import observations
+            from retrieval_context import filter_observations
+            filtered = filter_observations(db, [row_by_id[r] for r in need['request_ids']], boundary)
+            if filtered['records']:
+                packet['candidate_filters'] = filtered
             packet['supplements'] = observations(db, [row_by_id[r] for r in need['request_ids']], boundary, bool(packet['followups']))
             from retrieval_reuse import exposure as reuse_exposure
             packet['answer_reuse'] = reuse_exposure(db, need, boundary, packet['anchor'])
