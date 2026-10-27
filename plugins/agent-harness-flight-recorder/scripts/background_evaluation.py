@@ -10,7 +10,7 @@ import stat
 import fcntl
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from chunk_rotation import canonical_json, parse_time, safe_subdirectory
 from evaluation import _safe_name, _sha256
@@ -21,6 +21,9 @@ from vault import (
     ensure_managed_gitignore,
     vault_lock,
 )
+
+if TYPE_CHECKING:
+    from reporting import EpisodeFilter
 
 
 OUTPUT_VERSION = 1
@@ -418,6 +421,27 @@ def _is_candidate(config: dict[str, Any], card: dict[str, Any]) -> bool:
     )
 
 
+def _candidate_filter() -> "EpisodeFilter":
+    """The part of ``_is_candidate`` that SQL can decide without a card.
+
+    ``_is_candidate`` needs two or more events or a decision-bearing fact, and
+    a single-event Episode's facts are those of the event that surfaced it. The
+    filter may keep an Episode the confidence test then rejects, but it never
+    drops one that ``_is_candidate`` would take.
+    """
+    from reporting import EpisodeFilter
+
+    types = sorted(DECISION_BEARING_EVIDENCE_TYPES)
+    marks = ",".join("?" for _item in types)
+    return EpisodeFilter(
+        "(ep.member_count > 1 OR EXISTS (SELECT 1 FROM deterministic_evidence "
+        "AS d WHERE d.source_event_id = e.event_id "
+        "AND d.state IN ('success', 'failure') "
+        f"AND d.evidence_type IN ({marks})))",
+        tuple(types),
+    )
+
+
 def _source_ids(card: dict[str, Any]) -> set[str]:
     return {fact["evidence_id"] for fact in card["deterministic_evidence"]}
 
@@ -446,6 +470,16 @@ def _fingerprint(config: dict[str, Any], card: dict[str, Any]) -> str:
     )
 
 
+def _selection_fields(stats: Any) -> dict[str, Any]:
+    """Status fields for a selection that a work bound cut short."""
+    if stats.stopped is None:
+        return {}
+    return {
+        "selection_stopped": stats.stopped,
+        "selection_visited": stats.visited,
+    }
+
+
 def _summary(
     state: str,
     *,
@@ -454,8 +488,15 @@ def _summary(
     idempotent_skips: int = 0,
     attempt_skips: int = 0,
     measured_cost: int = 0,
+    selection: Any = None,
     **extra: Any,
 ) -> dict[str, Any]:
+    if selection is not None:
+        extra = {
+            "selection_visited": selection.visited,
+            "selection_stopped": selection.stopped,
+            **extra,
+        }
     return {
         "schema_version": OUTPUT_VERSION,
         "command": "auto-evaluation run",
@@ -514,7 +555,12 @@ def _failure_status(
 
 def _run_once(root: Path) -> dict[str, Any]:
     from evaluation import NO_SPEND_FAILURES, evaluate
-    from reporting import select_episode_ids
+    from reporting import (
+        SELECTION_MAX_SECONDS,
+        SELECTION_MAX_VISITS,
+        SelectionStats,
+        select_episode_ids,
+    )
 
     config = load_config(root)
     now = _now()
@@ -544,6 +590,7 @@ def _run_once(root: Path) -> dict[str, Any]:
             return False
         return True
 
+    selection = SelectionStats()
     episode_ids = select_episode_ids(
         root,
         SELECTION_WINDOW,
@@ -551,6 +598,10 @@ def _run_once(root: Path) -> dict[str, Any]:
         policy_path,
         wanted,
         config["max_evaluations_per_run"] + SELECTION_SLACK,
+        max_visits=SELECTION_MAX_VISITS,
+        max_seconds=SELECTION_MAX_SECONDS,
+        stats=selection,
+        episode_filter=_candidate_filter(),
     )
     evaluated = 0
     measured_cost = 0
@@ -622,6 +673,7 @@ def _run_once(root: Path) -> dict[str, Any]:
             status = _failure_status(
                 previous, attempts, error, now, recovered=evaluated > 0
             )
+            status.update(_selection_fields(selection))
             with vault_lock(root):
                 if attempt_fingerprint is not None:
                     _store_attempts(root, attempts)
@@ -633,6 +685,7 @@ def _run_once(root: Path) -> dict[str, Any]:
                 idempotent_skips=idempotent_skips,
                 attempt_skips=attempt_skips,
                 measured_cost=measured_cost,
+                selection=selection,
                 diagnostic_code="evaluator_failed",
                 failure_reason=status["failure_reason"],
                 next_retry_at=status["next_retry_at"],
@@ -657,6 +710,7 @@ def _run_once(root: Path) -> dict[str, Any]:
         "diagnostic_code": diagnostic_code,
         "attempt_count": len(attempts),
     }
+    status.update(_selection_fields(selection))
     if evaluated:
         # An evaluation completed, so earlier failures no longer describe the
         # evaluator. Older failed reservations stay in the ledger.
@@ -674,6 +728,7 @@ def _run_once(root: Path) -> dict[str, Any]:
         idempotent_skips=idempotent_skips,
         attempt_skips=attempt_skips,
         measured_cost=measured_cost,
+        selection=selection,
     )
 
 
