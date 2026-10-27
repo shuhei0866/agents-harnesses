@@ -55,6 +55,10 @@ class FollowupTests(unittest.TestCase):
         self.assertEqual([f['timestamp'] for f in c['followups']],[210])
         self.assertEqual(c['exposure']['decision_match'],'found')
         self.assertEqual(c['exposure']['read_count'],1)
+        filtered = c['candidate_filters']['records'][0]
+        self.assertEqual(filtered['request_id'], r['request_id'])
+        self.assertEqual(filtered['source_read_count'], 1)
+        self.assertGreater(filtered['reading_volume']['preview_characters'], 0)
         self.assertEqual(c['status'],'observing')
         self.assertEqual(c['followups'][0]['cues'],['explicit_restatement'])
         self.run_at();self.assertEqual(self.case()['status'],'window_complete')

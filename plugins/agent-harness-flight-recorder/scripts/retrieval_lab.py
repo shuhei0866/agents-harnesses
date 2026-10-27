@@ -540,6 +540,8 @@ def context_report(root, purpose=None):
         matches = {r['request_id']: r['match'] for r in db.execute('SELECT * FROM context_decision_matches')} if 'context_decision_matches' in tables else {}
         from retrieval_supplement import observations
         supplements = observations(db, rows)
+        from retrieval_context import filter_observations
+        candidate_filters = filter_observations(db, rows)
     from retrieval_needs import summarize
     from retrieval_followup import report as followup_report
     followups = None
@@ -548,7 +550,7 @@ def context_report(root, purpose=None):
             followups = {k:v for k,v in followup_report(root).items() if k != 'review_cases'}
         except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
             followups = dict(status='error', error_type=type(exc).__name__)
-    return dict(supplements=supplements, followups=followups, decision_needs=summarize(rows, uses, matches), searches=len(rows), triggers=dict(Counter(r['trigger'] for r in results)),
+    return dict(candidate_filters=candidate_filters, supplements=supplements, followups=followups, decision_needs=summarize(rows, uses, matches), searches=len(rows), triggers=dict(Counter(r['trigger'] for r in results)),
                 purposes=dict(Counter(r.get('purpose', 'task') for r in results)), requests_with_reads=len(read_ids),
                 uses=dict(Counter(u['state'] for u in uses.values())), unreported=len(ids - uses.keys()),
                 reason_codes=dict(Counter(d['reason_code'] for d in details if d['reason_code'])),

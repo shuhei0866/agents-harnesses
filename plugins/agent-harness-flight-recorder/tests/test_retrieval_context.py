@@ -366,7 +366,7 @@ class ContextTests(unittest.TestCase):
         self.assertIn('ない', r['hits'][0]['explanation']['matched_tokens'])
         for hit in r['hits']:
             self.assertAlmostEqual(hit['score'], sum(d['score'] for d in hit['explanation']['contributions']) + hit['explanation']['scope_bonus'])
-        self.assertEqual(r['diagnostics_version'], 4)
+        self.assertEqual(r['diagnostics_version'], 5)
 
     def test_hiragana_only_and_non_hiragana_queries_keep_full_weights(self):
         for query in ['ありがとう', '家', 'spreadsheet edit', 'APP-587', 'カタカナ', '']:
@@ -491,6 +491,49 @@ class ContextTests(unittest.TestCase):
         self.assertTrue(lab.search(self.root, 'constellation', sample_rate=0)['hits'])
         self.assertEqual(lab.search_corrections(self.root, 'constellation', 'resume')['hits'], [])
 
+
+class KnownHandoffTests(unittest.TestCase):
+    setUp = ContextTests.setUp
+    def test_wrapped_frame_keeps_original_and_later_human(self):
+        logs = self.base / 'wrapped'; logs.mkdir()
+        marker = 'This session is being continued from a previous conversation that ran out of context.'
+        frame = '<artifact-content-authored-by-others/>\n'+marker+' automatedneedle'
+        path = logs/'one.jsonl'
+        path.write_text(''.join(json.dumps(record(t, role))+'\n' for t, role in [
+            ('human choice', 'user'), (frame, 'user'), ('automatedneedle', 'assistant'),
+            ('human choice keep history', 'user')]))
+        lab.publish_snapshot(self.root, live.export_live([('codex', logs)], since=0))
+        snapshot = lab._snapshot(self.root)
+        self.assertIn(frame, [d['text'][m['start']:m['end']] for d in snapshot['documents'] for m in d['message_spans']])
+        result = context.retrieve(snapshot, 'human choice', 3)
+        self.assertEqual(result['candidate_count'], 2)
+        self.assertEqual(result['candidate_filter']['reason_counts'], {'wrapped_compaction': 1})
+        self.assertEqual(result['candidate_filter']['references'][0]['line'], 2)
+        self.assertFalse(result['candidate_filter']['decision_boost'])
+        self.assertEqual(context.retrieve(snapshot, 'automatedneedle', 3)['hits'], [])
+        last = next(h for h in result['hits'] if h['line']==4)
+        self.assertIsNone(last['request']); self.assertIsNone(last['prior_response'])
+        request = lab.search_corrections(self.root, 'human choice', 'resume', task='restore choices', need='history', purpose='verification')
+        inspected = lab.context_inspect(self.root, request['request_id'])
+        self.assertEqual(inspected['result']['candidate_filter'], result['candidate_filter'])
+        report = lab.context_report(self.root, purpose='verification')['candidate_filters']
+        self.assertEqual(report['measured_requests'], 1)
+        self.assertEqual(report['records'][0]['reading_volume']['candidate_exposures'], 2)
+        with lab._connect(self.root) as db:
+            rows = list(db.execute('SELECT id,created,foreground FROM queries'))
+            self.assertEqual(context.filter_observations(db, rows, boundary=0)['records'], [])
+
+    def test_preserves_human_quotes_and_review_requests(self):
+        marker = 'This session is being continued from a previous conversation that ran out of context.'
+        for text in ['引用例: '+marker, '# ゴール\n履歴は残してほしい',
+                     '<pasted_content x>Let me explain</pasted_content> 本人の希望',
+                     'あなたは独立したコードレビュアーです。\n## レビュー観点\n## PR情報',
+                     '<artifact-content-authored-by-others/> 本人の質問 '+marker]:
+            self.assertIsNone(context.known_handoff_reason(text))
+            self.assertTrue(context.conversational(text))
+        bridge = 'You are a continuing discussion partner. Answer the message directly. Do not use tools, modify files, or invoke another agent. Messages here are supplied by the bridge caller, not necessarily a human.'
+        self.assertEqual(context.known_handoff_reason(bridge), 'bridge_envelope')
+        self.assertIsNone(context.known_handoff_reason('引用: '+bridge))
 
 if __name__ == '__main__':
     unittest.main()

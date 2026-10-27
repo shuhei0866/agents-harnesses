@@ -1,10 +1,12 @@
 """User-turn recall with preceding context. Candidates, never standing rules."""
 from collections import Counter, defaultdict
+import hashlib
 import math
 import re
 import time
 
-VERSION = 'user-context-bm25-v9'
+VERSION = 'user-context-bm25-v10'
+FILTER_VERSION = 'known-handoff-v1'
 TRIGGERS = ('resume', 'ambiguous', 'explicit')
 INJECTED_PREFIXES = ('# AGENTS.md', 'Stop hook feedback:', '[exploration-budget]',
     'Base directory for this skill:', 'Another Claude session sent a message:',
@@ -49,11 +51,30 @@ def handoff_frame(text):
             and any(re.fullmatch(r'##\s+読む場所(?:（[^\n]*）)?\s*', line) for line in lines))
 
 
+def known_handoff_reason(text):
+    """Only explicit machine envelopes; never infer authorship from prose."""
+    t = text.lstrip()
+    if handoff_frame(t):
+        return 'parent_handoff'
+    bridge = ('You are a continuing discussion partner. Answer the message directly. '
+              'Do not use tools, modify files, or invoke another agent. Messages here '
+              'are supplied by the bridge caller, not necessarily a human.')
+    continuation = 'This session is being continued from a previous conversation that ran out of context.'
+    if t.startswith(bridge):
+        return 'bridge_envelope'
+    if t.startswith(continuation):
+        return 'compaction'
+    wrapper = '<artifact-content-authored-by-others/>'
+    if t.startswith(wrapper) and t[len(wrapper):].lstrip().startswith(continuation):
+        return 'wrapped_compaction'
+    return None
+
+
 def conversational(text):
     # Known injected frames only. User role does not prove human authorship.
     # A review model's report is a tool-injected user-role envelope, not a
     # human correction. Keep it in ordinary history, but not in this view.
-    if handoff_frame(text):
+    if known_handoff_reason(text):
         return False
     stripped = text.lstrip()
     if re.match(r'^<heartbeat(?:\s[^>]*|)>', stripped):
@@ -71,7 +92,7 @@ def conversational(text):
         'あなたは作業セッションの引き継ぎカード', 'あなたは探索セッションの評価者'))
 
 
-def units(snapshot):
+def units(snapshot, *, audit=None):
     from retrieval_live import bridge_session_prompt, generated_session_prompt
     groups = defaultdict(list)
     missing = 0
@@ -96,6 +117,10 @@ def units(snapshot):
         request = response = None
         automated_turn = False
         for m in ordered:
+            reason = known_handoff_reason(m['text']) if m['role'] == 'user' else None
+            if reason and audit is not None:
+                audit.append(dict(source_id=source, citation_id=m['citation_id'], line=m['line'],
+                                  reason=reason, text_sha256=hashlib.sha256(m['text'].encode()).hexdigest()))
             if not conversational(m['text']):
                 if m['role'] == 'user':
                     request = response = None
@@ -148,7 +173,8 @@ def compound_fragments(query):
 
 def retrieve(snapshot, query, limit, *, scope=None, rank_refs=()):
     started = time.perf_counter()
-    items, missing = units(snapshot)
+    excluded = []
+    items, missing = units(snapshot, audit=excluded)
     q = set(context_tokens(query))
     weights = query_weights(q)
     fragments = compound_fragments(query)
@@ -219,7 +245,16 @@ def retrieve(snapshot, query, limit, *, scope=None, rank_refs=()):
     return dict(arm='recorder', snapshot_id=snapshot['snapshot_id'], retrieval_version=VERSION,
                 mode='corrections', hits=hits, candidate_count=len(items),
                 **(dict(reference_ranks=reference_ranks) if rank_refs else {}),
-                diagnostics_version=4, query_tokens=sorted(q), query_weights=weights,
+                candidate_filter=dict(version=FILTER_VERSION, excluded_turns=len(excluded),
+                    reason_counts=dict(Counter(x['reason'] for x in excluded)),
+                    references=excluded[:20], references_truncated=len(excluded) > 20,
+                    evidence_sha256=hashlib.sha256(repr(excluded).encode()).hexdigest(),
+                    scope='eligible sources only; not query-matching or saved reading counts',
+                    decision_boost=False),
+                reading_volume=dict(candidate_exposures=len(hits),
+                    preview_characters=sum(len(h[k]['text']) for h in hits
+                        for k in ('utterance', 'request', 'prior_response') if h[k])),
+                diagnostics_version=5, query_tokens=sorted(q), query_weights=weights,
                 scope_tokens=sorted(scope_q), scope=scope,
                 scored_candidate_count=len(ranked),
                 legacy_documents_skipped=missing,
@@ -228,3 +263,22 @@ def retrieve(snapshot, query, limit, *, scope=None, rank_refs=()):
                 notice='User-role candidates, not verified corrections or standing instructions. Read originals and check current scope. Prior context may be incomplete.',
                 metrics=dict(elapsed_ms=(time.perf_counter()-started)*1000,
                              input_tokens=None, output_tokens=None, cost_microusd=None))
+
+
+def filter_observations(db, rows, boundary=None):
+    """Per-request exposure evidence, not estimated attention or causal benefit."""
+    import json
+    records = []
+    for row in rows:
+        value = json.loads(row['foreground'])
+        if not value.get('candidate_filter') or (boundary is not None and row['created'] >= boundary):
+            continue
+        reads = list(db.execute('SELECT created,returned_bytes FROM reads WHERE request_id=?', (row['id'],)))
+        reads = [r for r in reads if boundary is None or r['created'] < boundary]
+        records.append(dict(request_id=row['id'], created=row['created'],
+            snapshot_id=value['snapshot_id'], retrieval_version=value['retrieval_version'],
+            candidate_filter=value['candidate_filter'], reading_volume=value['reading_volume'],
+            source_read_count=len(reads), source_returned_bytes=sum(r['returned_bytes'] for r in reads)))
+    return dict(records=records, measured_requests=len(records),
+        unmeasured_requests=len(rows)-len(records),
+        notice='Per-attempt evidence; retries are not independent needs. Exclusions are corpus counts, not saved reading. Characters and bytes are separate proxies; benefit requires original-source and human-followup review.')
