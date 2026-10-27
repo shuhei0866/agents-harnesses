@@ -836,3 +836,6 @@ and actual replies remain separate evidence. Missing historical fields are
 unknown, retries are not independent needs, and bytes and characters must
 not be summed or interpreted as time saved. Review excluded references
 against the request's immutable snapshot when investigating a missed decision.
+
+Exclusion references and hashes stay in the stored record and diagnostic inspect;
+the normal correction response returns only the filter version, count and boost flag.

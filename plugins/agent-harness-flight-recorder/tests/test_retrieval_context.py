@@ -517,6 +517,11 @@ class KnownHandoffTests(unittest.TestCase):
         inspected = lab.context_inspect(self.root, request['request_id'])
         self.assertEqual(inspected['result']['candidate_filter'], result['candidate_filter'])
         report = lab.context_report(self.root, purpose='verification')['candidate_filters']
+        cli = json.loads(subprocess.check_output([sys.executable,
+            str(Path(lab.__file__)), '--lab', str(self.root), 'corrections', 'human choice',
+            '--trigger', 'resume', '--purpose', 'verification'], text=True))
+        self.assertNotIn('references', cli['candidate_filter'])
+        self.assertIn('references', lab.context_inspect(self.root, cli['request_id'])['result']['candidate_filter'])
         self.assertEqual(report['measured_requests'], 1)
         self.assertEqual(report['records'][0]['reading_volume']['candidate_exposures'], 2)
         with lab._connect(self.root) as db:

@@ -956,6 +956,9 @@ def main():
         if args.command == 'corrections':
             # Detailed score terms stay in the log; fetch them only for diagnosis.
             display = json.loads(canonical(result))
+            if display.get('candidate_filter'):
+                display['candidate_filter'] = {k: display['candidate_filter'][k]
+                    for k in ('version', 'excluded_turns', 'decision_boost')}
             for hit in display['hits']:
                 hit['explanation'].pop('contributions', None)
             display['diagnostics_command'] = 'context-inspect ' + result['request_id']
