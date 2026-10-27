@@ -111,8 +111,11 @@ run_guard "bash -c 'security find-generic-password -a me -w' -- -s example-api-k
 run_guard "bash -c 'security find-generic-password -a me -w' -s example-api-key";    assert_deny "-- が無くても、外側の -s を内側の指定と数えない"
 run_guard 'security find-generic-password -a me -w login.keychain-db -s example-api-key'; assert_deny "鍵束の名前の後ろの -s は service の指定にならない"
 run_guard 'security find-generic-password -a me -w -- -s example-api-key'; assert_deny "-- の後ろの -s は service の指定にならない"
+run_guard "bash -c 'security find-generic-password -a me -w login.keychain-db -s example-api-key'"; assert_deny "bash -c の中でも、鍵束の名前の後ろの -s は指定にならない"
 run_guard 'security find-generic-password -sclaude-profile-op-token -w';   assert_deny "値を続けて書いた -s でトークンを名指し"
 run_guard 'security find-generic-password 2>/dev/null -a me -w';           assert_deny "リダイレクトを挟んでも後ろの -w を数える"
+run_guard 'security find-generic-password -a 2>/dev/null me -w';           assert_deny "値の前にリダイレクトを挟んでも、値と -w を取り違えない"
+run_guard "bash -c 'security find-generic-password -a \"My User\" -w'";    assert_deny "bash -c の中で空白を含む値の後ろの -w"
 
 echo ""
 echo "=== claude-profile の差し替え変数はブロックする ==="
@@ -146,6 +149,7 @@ run_guard 'type op whoami';                                     assert_pass "typ
 run_guard 'security find-internet-password -sexample.com -g';   assert_pass "値を続けて書いた -s で別のサービスを名指しする -g"
 run_guard 'security find-generic-password -gsexample-api-key';  assert_pass "まとめて書いた -gs に値を続けて書く"
 run_guard 'key="$(security find-generic-password -w -a "$USER" -s example-api-key 2>/dev/null)"'; assert_pass "リダイレクトの付いた、別のサービスの鍵の読み込み"
+run_guard "key=\"\$(security find-generic-password -w -a 'My User' -s example-api-key)\""; assert_pass "空白を含む値の後ろに service を指定する鍵の読み込み"
 
 echo ""
 echo "=== 結果: $PASS passed, $FAIL failed ==="

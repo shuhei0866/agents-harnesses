@@ -90,28 +90,28 @@ fi
 
 STRIPPED=$(guard_strip_heredoc_bodies "$COMMAND")
 
-# 語（$1）がリダイレクトなら、読み飛ばす語の数を RW に入れる（行き先を続けて書いていれば 1、
-# 演算子だけなら次の語が行き先なので 2、リダイレクトでなければ 0）
-redirect_width() {
-  case "$1" in
-    [0-9]*[\<\>]|[\<\>]|[\<\>][\<\>]|'<<<') RW=2 ;;
-    [0-9]*[\<\>]*|[\<\>]*) RW=1 ;;
-    *) RW=0 ;;
-  esac
-}
-
-# security の後ろの引数（$@）が、キーチェーンの秘密を出す操作か
+# security の後ろの引数（$2 以降）が、キーチェーンの秘密を出す操作か。$1 は引数の分け方:
+#   strict: シェルの語に正しく分けた引数。/usr/bin/security と同じく、最初の位置引数（鍵束の
+#           名前）か -- でオプションの解釈を終える（その後ろの -s / -l は指定にならない）
+#   loose:  引用符を外して空白で分けた引数。"My User" が 2 語になるなど語の切れ目が当てに
+#           ならないので、位置引数で止めずに最後まで読む（-- や位置引数の後ろの -s で素通しに
+#           なる形は、同じ文字列を strict で読む判定が拾う）
 security_args_reveal_secret() {
-  local w opts c val secret=0 selector=0 names_token=0
+  local mode="$1" w opts c val secret=0 selector=0 names_token=0
+  local -a args=()
+  shift
+  # リダイレクトは security の引数にならないので先に除く（演算子だけなら次の語が行き先）
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      [0-9]*[\<\>]|[\<\>]|[\<\>][\<\>]|'<<<') shift; [ "$#" -gt 0 ] && shift ;;
+      [0-9]*[\<\>]*|[\<\>]*) shift ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  set -- ${args[@]+"${args[@]}"}
   # サブコマンドの前の全体のオプション。-i（対話）と -p（プロンプト付きの対話）は標準入力から
   # コマンドを読むので、ほかの文字とまとめて書いても（-qi）止める
   while [ "$#" -gt 0 ]; do
-    redirect_width "$1"
-    if [ "$RW" -gt 0 ]; then
-      shift
-      [ "$RW" -eq 2 ] && [ "$#" -gt 0 ] && shift
-      continue
-    fi
     case "$1" in
       --) shift; break ;;
       -*[ip]*) return 0 ;;
@@ -125,19 +125,12 @@ security_args_reveal_secret() {
     *) return 1 ;;
   esac
   while [ "$#" -gt 0 ]; do
-    redirect_width "$1"
-    if [ "$RW" -gt 0 ]; then
-      shift
-      [ "$RW" -eq 2 ] && [ "$#" -gt 0 ] && shift
-      continue
-    fi
     w="$1"
     shift
     case "$w" in
-      --) break ;;
-      -?*) ;;
-      # 鍵束の名前（位置引数）の後ろは、-s / -l もオプションとして読まれない
-      *) break ;;
+      --|-|[!-]*|'')
+        [ "$mode" = strict ] && break
+        continue ;;
     esac
     opts="${w#-}"
     while [ -n "$opts" ]; do
@@ -178,12 +171,32 @@ pieces_reveal_secret() {
     read -r -a ws <<< "$(printf '%s' "$piece" | tr ',[]' '   ')"
     i=0
     while [ "$i" -lt "${#ws[@]}" ]; do
-      if [ "${ws[$i]##*/}" = security ] && security_args_reveal_secret "${ws[@]:$((i + 1))}"; then
+      if [ "${ws[$i]##*/}" = security ] && security_args_reveal_secret loose "${ws[@]:$((i + 1))}"; then
         return 0
       fi
       i=$((i + 1))
     done
   done < <(printf '%s\n' "$1" | tr ';&|()`' '\n')
+  return 1
+}
+
+# 文字列（$1）をコマンドの区切りごとにシェルの語に分け、security の秘密を出す操作があるか見る
+words_reveal_secret() {
+  local seg w t
+  local -a ws
+  while IFS= read -r seg; do
+    ws=()
+    while IFS= read -r w; do
+      ws+=("$w")
+    done < <(guard_shell_tokens "$seg")
+    t=0
+    while [ "$t" -lt "${#ws[@]}" ]; do
+      if [ "${ws[$t]##*/}" = security ] && security_args_reveal_secret strict "${ws[@]:$((t + 1))}"; then
+        return 0
+      fi
+      t=$((t + 1))
+    done
+  done < <(guard_split_segments "$1")
   return 1
 }
 
@@ -207,11 +220,11 @@ security_secret_anywhere() {
   printf '%s' "$NORM" | grep -qE "$SECURITY_WORD" || return 1
   printf '%s' "$NORM" | grep -qE '(^|[^[:alnum:]_-])dump-keychain([^[:alnum:]_-]|$)' && return 0
   pieces_reveal_secret "$NORM" && return 0
-  # 引用符で囲んだ文字列は、その中だけでも見る。bash -c '...' -s x のような外側の引数を、
-  # 内側の service / label の指定と数えないため
+  # 引用符で囲んだ文字列は、その中をシェルの語に分け直して見る。bash -c '...' -s x のような
+  # 外側の引数を、内側の service / label の指定と数えないため
   local text
   while IFS= read -r -d '' text; do
-    pieces_reveal_secret "$(printf '%s' "$text" | tr -d "\"'\\\\")" && return 0
+    words_reveal_secret "$text" && return 0
   done < <(quoted_texts "$STRIPPED" 0)
   return 1
 }
@@ -281,7 +294,7 @@ while IFS= read -r seg; do
           k=$((k + 1))
         done ;;
       security)
-        security_args_reveal_secret "${words[@]:$((t + 1))}" && deny ;;
+        security_args_reveal_secret strict "${words[@]:$((t + 1))}" && deny ;;
     esac
     t=$((t + 1))
   done
