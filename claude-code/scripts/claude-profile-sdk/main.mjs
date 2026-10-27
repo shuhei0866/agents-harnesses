@@ -133,14 +133,18 @@ async function main() {
     process.exit(1);
   }
   const usageOf = {
+    status: "使い方: claude-profile status",
+    list: "使い方: claude-profile list",
     get: "使い方: claude-profile get <項目> [<キー>]",
     set: "使い方: claude-profile set <項目> < 値",
     rename: "使い方: claude-profile rename <項目> <新しい名前>",
     untag: "使い方: claude-profile untag <項目> <タグ>",
     archive: "使い方: claude-profile archive <項目>",
   };
-  if (cmd in usageOf) {
-    if (args.length < (cmd === "rename" || cmd === "untag" ? 2 : 1)) die(usageOf[cmd]);
+  // 引数が余るときも止める（引用符を忘れて分かれた名前の後ろを、黙って捨てない）
+  const argCounts = { status: [0], list: [0], get: [1, 2], set: [1], rename: [2], untag: [2], archive: [1] };
+  if (!argCounts[cmd].includes(args.length)) die(usageOf[cmd]);
+  if (args.length > 0) {
     validName(args[0]);
     if (cmd === "rename") validName(args[1]);
     if (cmd === "untag" && !args[1]) die("タグが空です");

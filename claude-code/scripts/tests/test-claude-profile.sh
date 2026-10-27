@@ -216,6 +216,11 @@ run rename 無い項目 何か;            check "無い項目の名前は変え
 run rename 身元 身元2;               check "ログインとメモ以外の種類の名前は変えない" 1 "この種類の項目（Identity）は claude-profile では書き換えません"
 run rename 氏名 ../Personal/x;       check "新しい名前も確かめる" 1 "項目名が不正"
 run rename 氏名;                     check "新しい名前が無ければ使い方を出す" 1 "使い方: claude-profile rename"
+run rename 氏名 新しい 名前;         check "名前が分かれて引数が余ったら、変えずに使い方を出す" 1 "使い方: claude-profile rename"
+ok "引数が余ったら SDK を呼ばない" no_calls
+run untag 診察券/〇〇歯科 LastPass 余り; check "untag も引数が余ったら使い方を出す" 1 "使い方: claude-profile untag"
+run archive 無い項目 余り;           check "archive も引数が余ったら使い方を出す" 1 "使い方: claude-profile archive"
+run list 余り;                       check "list も引数が余ったら使い方を出す" 1 "使い方: claude-profile list"
 run untag 診察券/〇〇歯科 無いタグ;  check "無いタグは外さず、今のタグを知らせる" 1 "タグが見つかりません: 無いタグ（この項目のタグ: LastPass）"
 ok "無いタグには put を送らない" bash -c '! grep -q "items.put" "$1"' _ "$T/calls"
 run untag 身元 Claude;               check "ログインとメモ以外の種類のタグは外さない" 1 "この種類の項目（Identity）は claude-profile では書き換えません"
