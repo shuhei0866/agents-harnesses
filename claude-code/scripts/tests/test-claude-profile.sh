@@ -178,8 +178,8 @@ unset STDIN_FILE
 
 echo ""
 echo "=== 名前の変更・タグ・アーカイブ ==="
-# 取り込んだままのログインの項目（欄・URL と、取り込みで入れ子になった日本語のタグつき）と、
-# 欄が消えたときの確かめに使う項目を足す
+# 取り込んだままのログインの項目（欄・URL と、取り込みで入れ子になった日本語のタグつき）を足す。
+# ほかに、日本語のタグが2つある項目と、欄が消えたときの確かめに使う項目も足す
 jq '.items += [
   {"id":"r1","title":"〇〇歯科","category":"Login","vaultId":"v1","version":2,
    "fields":[{"id":"username","title":"username","fieldType":"Text","value":"keep-me"}],"sections":[],
@@ -189,7 +189,10 @@ jq '.items += [
    "notes":"x","tags":["Claude"],"websites":[]},
   {"id":"r3","title":"欄の確かめ2","category":"Login","vaultId":"v1","version":1,
    "fields":[{"id":"username","title":"username","fieldType":"Text","value":"keep-me"}],"sections":[],
-   "notes":"x","tags":["Claude","LastPass"],"websites":[]}]' \
+   "notes":"x","tags":["Claude","LastPass"],"websites":[]},
+  {"id":"r4","title":"△△眼科","category":"Login","vaultId":"v1","version":1,
+   "fields":[{"id":"username","title":"username","fieldType":"Text","value":"keep-me"}],"sections":[],
+   "notes":"x","tags":["Claude/診察券","通院"],"websites":[]}]' \
   "$T/state.json" > "$T/state.next" && mv "$T/state.next" "$T/state.json"
 run rename 〇〇歯科 診察券/〇〇歯科;  check "日本語のタグがある項目は SDK で保存できないと知らせる" 1 "タグに ASCII 以外の文字があり"
 ok "保存できなかった項目の名前は変わらない" json_ok '.items[] | select(.id == "r1") | .title == "〇〇歯科"' "$T/state.json"
@@ -217,12 +220,14 @@ run untag 診察券/〇〇歯科 無いタグ;  check "無いタグは外さず�
 ok "無いタグには put を送らない" bash -c '! grep -q "items.put" "$1"' _ "$T/calls"
 run untag 身元 Claude;               check "ログインとメモ以外の種類のタグは外さない" 1 "この種類の項目（Identity）は claude-profile では書き換えません"
 run untag 診察券/〇〇歯科;           check "タグが無ければ使い方を出す" 1 "使い方: claude-profile untag"
+run untag △△眼科 Claude/診察券;      check "日本語のタグが残ると、外しても保存できずアプリで直すよう知らせる" 1 "ユーザーがアプリでタグを直してください"
+ok "保存できなかった項目のタグは変わらない" json_ok '.items[] | select(.id == "r4") | .tags == ["Claude/診察券","通院"]' "$T/state.json"
 CLAUDE_PROFILE_TEST_PUT_DROPS_FIELD=1 run rename 欄の確かめ1 欄の確かめ1b; check "名前の変更で他の欄が消えたら止めて知らせる" 1 "名前以外の欄が変わりました"
 CLAUDE_PROFILE_TEST_PUT_DROPS_FIELD=1 run untag 欄の確かめ2 LastPass;   check "タグを外すときに他の欄が消えたら止めて知らせる" 1 "タグ以外の欄が変わりました"
 run archive 住所;                    check "アーカイブする" 0 "アーカイブしました: 住所"
 ok "アーカイブは専用の保管庫の項目に送る" jq -se 'any(.[]; .op == "items.archive" and .vaultId == "v1")' "$T/calls"
 run list
-ok "アーカイブした項目は一覧に出ない" bash -c '! printf "%s\n" "$1" | grep -qx "住所"' _ "$OUT"
+ok "アーカイブした項目は一覧に出ない" bash -c '[ "$1" -eq 0 ] && ! printf "%s\n" "$2" | grep -qx "住所"' _ "$STATUS" "$OUT"
 run archive 無い項目;                check "無い項目はアーカイブしない" 1 "項目が見つかりません"
 ok "無い項目には archive を送らない" bash -c '! grep -q "items.archive" "$1"' _ "$T/calls"
 printf '東京都' > "$T/in"; STDIN_FILE="$T/in"

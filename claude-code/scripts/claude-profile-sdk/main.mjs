@@ -45,9 +45,10 @@ function reason(e) {
   if (/unauthori[sz]ed|forbidden|\b40[13]\b|\btoken\b|\bauth/i.test(text)) {
     return "認証に失敗しました（トークンが失効しているか、保管庫への権限がありません）";
   }
-  // SDK は ASCII 以外の文字を含むタグの項目を保存しない（取り込みで入れ子のタグになったフォルダ名など）
+  // SDK は ASCII 以外の文字を含むタグの項目を保存しない（取り込みで入れ子のタグになったフォルダ名など）。
+  // 保存のたびに項目のタグをすべて確かめるので、そうしたタグが2つ以上あると untag で1つずつ外しても保存できない
   if (/tags list contains non-ascii/i.test(text)) {
-    return "この項目のタグに ASCII 以外の文字があり、1Password の SDK では保存できません（claude-profile untag でそのタグを外すか、ユーザーがアプリで直してください）";
+    return "この項目のタグに ASCII 以外の文字があり、1Password の SDK では保存できません（claude-profile untag でそのタグを外してください。untag も同じ理由で止まるときは、ASCII 以外のタグがほかにも残っているので、ユーザーがアプリでタグを直してください）";
   }
   return `1Password の操作に失敗しました（${e?.name || "Error"}）`;
 }
