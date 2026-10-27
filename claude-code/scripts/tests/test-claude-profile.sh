@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Tests for scripts/claude-profile
 # （1Password の SDK の代わりに偽物を差し込み、専用の保管庫の外を読まないこと、トークンを
-#   出力に出さないこと、上書きでメモ以外の欄を壊さないこと、差し替えは両方そろえたときだけ
-#   効くこと、本体には決まった環境変数だけを渡すことを固定する）
+#   出力に出さないこと、上書きでメモ以外の欄を壊さないこと、名前の変更でタイトル以外の欄を、
+#   タグを外すときにタグ以外の欄を壊さないこと、日本語のタグがある項目は SDK で保存できないと
+#   知らせること、アーカイブした項目を数えないこと、差し替えは両方そろえたときだけ効くこと、
+#   本体には決まった環境変数だけを渡すことを固定する）
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -36,7 +38,8 @@ export async function createClient({ auth }) {
     items: {
       list: async (vaultId) => {
         log({ op: "items.list", vaultId });
-        return load().items.filter((i) => i.vaultId === vaultId).map(({ id, title, vaultId, tags }) => ({ id, title, vaultId, tags }));
+        return load().items.filter((i) => i.vaultId === vaultId)
+          .map(({ id, title, vaultId, tags, state }) => ({ id, title, vaultId, tags, state: state ?? "active" }));
       },
       get: async (vaultId, id) => {
         log({ op: "items.get", vaultId, id });
@@ -46,6 +49,10 @@ export async function createClient({ auth }) {
       },
       put: async (item) => {
         log({ op: "items.put", vaultId: item.vaultId, id: item.id });
+        // 本物の SDK と同じく、ASCII 以外の文字を含むタグの項目は保存しない
+        if ((item.tags ?? []).some((t) => /[^\x00-\x7f]/.test(t))) {
+          throw new Error("invalid user input: encountered the following errors: tags list contains non-ascii characters");
+        }
         const s = load();
         const next = structuredClone(item);
         if (process.env.CLAUDE_PROFILE_TEST_PUT_DROPS_FIELD === "1") next.fields = next.fields.filter((f) => f.id !== "username");
@@ -61,6 +68,14 @@ export async function createClient({ auth }) {
         s.items.push(item);
         save(s);
         return item;
+      },
+      archive: async (vaultId, id) => {
+        log({ op: "items.archive", vaultId, id });
+        const s = load();
+        const item = s.items.find((i) => i.id === id && i.vaultId === vaultId);
+        if (!item) throw new Error("not found");
+        item.state = "archived";
+        save(s);
       },
     },
   };
@@ -160,6 +175,70 @@ ok "書き換えない種類には put を送らない" bash -c '! grep -q "item
 : > "$T/empty"; STDIN_FILE="$T/empty"
 run set 住所;                      check "空の入力は保存しない" 1 "標準入力が空です"
 unset STDIN_FILE
+
+echo ""
+echo "=== 名前の変更・タグ・アーカイブ ==="
+# 取り込んだままのログインの項目（欄・URL と、取り込みで入れ子になった日本語のタグつき）を足す。
+# ほかに、日本語のタグが2つある項目と、欄が消えたときの確かめに使う項目も足す
+jq '.items += [
+  {"id":"r1","title":"〇〇歯科","category":"Login","vaultId":"v1","version":2,
+   "fields":[{"id":"username","title":"username","fieldType":"Text","value":"keep-me"}],"sections":[],
+   "notes":"診察券番号: 2222-3333","tags":["Claude/診察券","LastPass"],"websites":[{"url":"http://sn","label":"website"}]},
+  {"id":"r2","title":"欄の確かめ1","category":"Login","vaultId":"v1","version":1,
+   "fields":[{"id":"username","title":"username","fieldType":"Text","value":"keep-me"}],"sections":[],
+   "notes":"x","tags":["Claude"],"websites":[]},
+  {"id":"r3","title":"欄の確かめ2","category":"Login","vaultId":"v1","version":1,
+   "fields":[{"id":"username","title":"username","fieldType":"Text","value":"keep-me"}],"sections":[],
+   "notes":"x","tags":["Claude","LastPass"],"websites":[]},
+  {"id":"r4","title":"△△眼科","category":"Login","vaultId":"v1","version":1,
+   "fields":[{"id":"username","title":"username","fieldType":"Text","value":"keep-me"}],"sections":[],
+   "notes":"x","tags":["Claude/診察券","通院"],"websites":[]}]' \
+  "$T/state.json" > "$T/state.next" && mv "$T/state.next" "$T/state.json"
+run rename 〇〇歯科 診察券/〇〇歯科;  check "日本語のタグがある項目は SDK で保存できないと知らせる" 1 "タグに ASCII 以外の文字があり"
+ok "保存できなかった項目の名前は変わらない" json_ok '.items[] | select(.id == "r1") | .title == "〇〇歯科"' "$T/state.json"
+run untag 〇〇歯科 Claude/診察券;    check "タグを外す" 0 "タグを外しました: 〇〇歯科（Claude/診察券）"
+ok "外したタグのほかの欄とタグは残る" json_ok '
+  .items[] | select(.id == "r1")
+  | (.title == "〇〇歯科") and (.notes == "診察券番号: 2222-3333") and (.tags == ["LastPass"])
+    and (.websites[0].url == "http://sn") and ([.fields[] | select(.id == "username") | .value] == ["keep-me"])' "$T/state.json"
+run rename 〇〇歯科 診察券/〇〇歯科;  check "名前を変える" 0 "名前を変えました: 〇〇歯科 → 診察券/〇〇歯科"
+ok "名前だけが変わり、メモ・欄・タグ・URL は残る" json_ok '
+  .items[] | select(.id == "r1")
+  | (.title == "診察券/〇〇歯科") and (.notes == "診察券番号: 2222-3333") and (.tags == ["LastPass"])
+    and (.websites[0].url == "http://sn") and ([.fields[] | select(.id == "username") | .value] == ["keep-me"])' "$T/state.json"
+ok "名前の変更は専用の保管庫の中だけで行う" only_claude_vault
+run get 診察券/〇〇歯科;             check "新しい名前で引ける" 0 "診察券番号: 2222-3333"
+run get 〇〇歯科;                    check "古い名前では引けない" 1 "項目が見つかりません"
+run rename 氏名 住所;                check "すでにある名前へは変えない" 1 "同じ名前の項目がすでにあります: 住所"
+ok "すでにある名前へは put を送らない" bash -c '! grep -q "items.put" "$1"' _ "$T/calls"
+run rename 氏名 氏名;                check "今と同じ名前への変更は止める" 1 "新しい名前が今の名前と同じです"
+run rename 無い項目 何か;            check "無い項目の名前は変えない" 1 "項目が見つかりません"
+run rename 身元 身元2;               check "ログインとメモ以外の種類の名前は変えない" 1 "この種類の項目（Identity）は claude-profile では書き換えません"
+run rename 氏名 ../Personal/x;       check "新しい名前も確かめる" 1 "項目名が不正"
+run rename 氏名;                     check "新しい名前が無ければ使い方を出す" 1 "使い方: claude-profile rename"
+run rename 氏名 新しい 名前;         check "名前が分かれて引数が余ったら、変えずに使い方を出す" 1 "使い方: claude-profile rename"
+ok "引数が余ったら SDK を呼ばない" no_calls
+run untag 診察券/〇〇歯科 LastPass 余り; check "untag も引数が余ったら使い方を出す" 1 "使い方: claude-profile untag"
+run archive 無い項目 余り;           check "archive も引数が余ったら使い方を出す" 1 "使い方: claude-profile archive"
+run list 余り;                       check "list も引数が余ったら使い方を出す" 1 "使い方: claude-profile list"
+run untag 診察券/〇〇歯科 無いタグ;  check "無いタグは外さず、今のタグを知らせる" 1 "タグが見つかりません: 無いタグ（この項目のタグ: LastPass）"
+ok "無いタグには put を送らない" bash -c '! grep -q "items.put" "$1"' _ "$T/calls"
+run untag 身元 Claude;               check "ログインとメモ以外の種類のタグは外さない" 1 "この種類の項目（Identity）は claude-profile では書き換えません"
+run untag 診察券/〇〇歯科;           check "タグが無ければ使い方を出す" 1 "使い方: claude-profile untag"
+run untag △△眼科 Claude/診察券;      check "日本語のタグが残ると、外しても保存できずアプリで直すよう知らせる" 1 "ユーザーがアプリでタグを直してください"
+ok "保存できなかった項目のタグは変わらない" json_ok '.items[] | select(.id == "r4") | .tags == ["Claude/診察券","通院"]' "$T/state.json"
+CLAUDE_PROFILE_TEST_PUT_DROPS_FIELD=1 run rename 欄の確かめ1 欄の確かめ1b; check "名前の変更で他の欄が消えたら止めて知らせる" 1 "名前以外の欄が変わりました"
+CLAUDE_PROFILE_TEST_PUT_DROPS_FIELD=1 run untag 欄の確かめ2 LastPass;   check "タグを外すときに他の欄が消えたら止めて知らせる" 1 "タグ以外の欄が変わりました"
+run archive 住所;                    check "アーカイブする" 0 "アーカイブしました: 住所"
+ok "アーカイブは専用の保管庫の項目に送る" jq -se 'any(.[]; .op == "items.archive" and .vaultId == "v1")' "$T/calls"
+run list
+ok "アーカイブした項目は一覧に出ない" bash -c '[ "$1" -eq 0 ] && ! printf "%s\n" "$2" | grep -qx "住所"' _ "$STATUS" "$OUT"
+run archive 無い項目;                check "無い項目はアーカイブしない" 1 "項目が見つかりません"
+ok "無い項目には archive を送らない" bash -c '! grep -q "items.archive" "$1"' _ "$T/calls"
+printf '東京都' > "$T/in"; STDIN_FILE="$T/in"
+run set 住所;                        check "アーカイブした名前で作り直せる" 0 "保存しました: 住所"
+unset STDIN_FILE
+run;                                 check "使い方に rename と archive を載せる" 1 "claude-profile archive <項目>"
 
 echo ""
 echo "=== トークンと差し替え ==="
