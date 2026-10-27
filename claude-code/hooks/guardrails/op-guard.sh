@@ -110,10 +110,12 @@ security_args_reveal_secret() {
   done
   set -- ${args[@]+"${args[@]}"}
   # サブコマンドの前の全体のオプション。-i（対話）と -p（プロンプト付きの対話）は標準入力から
-  # コマンドを読むので、ほかの文字とまとめて書いても（-qi）止める
+  # コマンドを読むので、ほかの文字とまとめて書いても（-qi）止める。security に長いオプションは
+  # 無く、--help のような語は最初の文字で使い方を表示して終わるので数えない
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --) shift; break ;;
+      --*) shift ;;
       -*[ip]*) return 0 ;;
       -?*) shift ;;
       *) break ;;

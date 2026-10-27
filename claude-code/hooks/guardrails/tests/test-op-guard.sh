@@ -136,6 +136,7 @@ run_guard 'security find-generic-password -s example-token';    assert_pass "属
 run_guard 'key="$(security find-generic-password -w -a "$USER" -s example-api-key)"'; assert_pass "別のサービスの鍵を値を出さずに変数へ読む"
 run_guard 'security find-internet-password -s example.com -g'; assert_pass "別のサービスを名指しする -g"
 run_guard 'security list-keychains';                            assert_pass "security list-keychains"
+run_guard 'security --help';                                    assert_pass "security --help（-i / -p の文字を含む長いオプション）"
 run_guard 'bash claude-code/scripts/tests/test-claude-profile.sh'; assert_pass "テストの実行"
 run_guard 'npm run stop';                                       assert_pass "op を含む別の語"
 run_guard 'command -v op';                                      assert_pass "op が入っているかの確認"
