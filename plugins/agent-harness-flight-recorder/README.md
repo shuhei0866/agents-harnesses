@@ -813,7 +813,7 @@ Evaluation is explicit, tool-free, budgeted and cached; AI judgments remain prov
 
 ### Compound-word ranking
 
-The user-context ranker v8 keeps Japanese bigram recall, but scales a query
+The user-context ranker v9 keeps Japanese bigram recall, but scales a query
 bigram's lexical contribution to 0.25 when it belongs only to a katakana run
 of at least four characters and none of its query-word owners occurs in that
 candidate field. A separately queried shorter word can still supply a full
@@ -826,3 +826,11 @@ Spelling variants and abbreviations can lose rank. Test fixed source snapshots,
 known required citations, and conditional supplement reachability before
 rollout; removing a distractor does not establish that the desired judgment
 was found. Original logs and private regression evidence stay outside Git.
+
+Explicit parent-session handoff frames are excluded from human-decision
+candidates when the opening handoff label, parent-session attribution, request
+heading, and reference-location heading all agree. This is a narrow envelope
+recognizer, not a claim to detect every generated message. A mention or quoted
+example of a handoff stays eligible. The frame's following assistant context
+is not attached to a later human turn; later human decisions remain eligible.
+Original documents remain available to ordinary history search.

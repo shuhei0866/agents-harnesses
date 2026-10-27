@@ -4,7 +4,7 @@ import math
 import re
 import time
 
-VERSION = 'user-context-bm25-v8'
+VERSION = 'user-context-bm25-v9'
 TRIGGERS = ('resume', 'ambiguous', 'explicit')
 INJECTED_PREFIXES = ('# AGENTS.md', 'Stop hook feedback:', '[exploration-budget]',
     'Base directory for this skill:', 'Another Claude session sent a message:',
@@ -35,10 +35,26 @@ def validate_spans(text, first, last, spans):
     return spans
 
 
+def handoff_frame(text):
+    """Recognize an explicit parent-session handoff envelope, not a topic.
+
+    Exclude only this turn and its assistant context. Later human turns in
+    the same source remain eligible; ordinary search keeps the original.
+    """
+    lines = text.lstrip().splitlines()
+    if not lines or not re.match(r'^引き継ぎ[:：]', lines[0]):
+        return False
+    return ('親セッション' in lines[0]
+            and any(re.fullmatch(r'##\s+依頼\s*', line) for line in lines)
+            and any(re.fullmatch(r'##\s+読む場所(?:（[^\n]*）)?\s*', line) for line in lines))
+
+
 def conversational(text):
     # Known injected frames only. User role does not prove human authorship.
     # A review model's report is a tool-injected user-role envelope, not a
     # human correction. Keep it in ordinary history, but not in this view.
+    if handoff_frame(text):
+        return False
     stripped = text.lstrip()
     if re.match(r'^<heartbeat(?:\s[^>]*|)>', stripped):
         return False

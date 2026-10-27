@@ -98,6 +98,28 @@ class ContextTests(unittest.TestCase):
         shorter = context.retrieve(snapshot, 'ボックス', 10)
         self.assertTrue(any(h['utterance']['text'].startswith('ボックス') for h in shorter['hits']))
 
+    def test_parent_handoff_is_not_a_human_decision_or_context(self):
+        frame = '引き継ぎ: TASK-123（親セッションより）\n\n## 依頼\n秘密語の作業\n## 読む場所（参照）\ndocs/guide.md'
+        self.assertFalse(context.conversational(frame))
+        for human in ['引き継ぎは原文を残してほしい',
+                      '引き継ぎ: 親セッションの判断を確認したい',
+                      '引用例です\n' + frame,
+                      frame.replace('（親セッションより）', '')]:
+            self.assertTrue(context.conversational(human))
+        logs = self.base / 'handoff'
+        logs.mkdir()
+        values = [record('元の本人判断'), record(frame),
+                  record('秘密語の引き継ぎに従う', 'assistant'), record('後の本人判断')]
+        (logs / 'one.jsonl').write_text(''.join(json.dumps(x)+'\n' for x in values))
+        lab.publish_snapshot(self.root, live.export_live([('codex', logs)], since=0))
+        snapshot = lab._snapshot(self.root)
+        self.assertIn(frame, snapshot['documents'][0]['text'])
+        items, _ = context.units(snapshot)
+        self.assertEqual([x['utterance']['text'] for x in items], ['元の本人判断', '後の本人判断'])
+        self.assertIsNone(items[-1]['request'])
+        self.assertIsNone(items[-1]['prior_response'])
+        self.assertEqual(context.retrieve(snapshot, '秘密語', 3)['hits'], [])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
