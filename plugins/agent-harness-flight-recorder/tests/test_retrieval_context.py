@@ -76,6 +76,28 @@ class ContextTests(unittest.TestCase):
         result = context.retrieve(lab._snapshot(self.root), '配置', 3, scope='家')
         self.assertGreater(result['hits'][0]['explanation']['scope_bonus'], 0)
 
+    def test_compound_katakana_softens_only_unowned_fragments(self):
+        self.assertIn('ボッ', context.compound_fragments('サンドボックス 権限'))
+        self.assertIn('ボックス', context.compound_fragments('サンドボックス ボックス')['ボッ'])
+        self.assertEqual(context.compound_fragments('箱 権限'), {})
+        logs = self.base / 'compounds'
+        logs.mkdir()
+        for name, text in [('full', 'サンドボックスの設定を維持する'),
+                           ('partial', 'ボックスの設定を維持する'),
+                           ('related', '権限の設定を維持する')]:
+            (logs / (name + '.jsonl')).write_text(json.dumps(record(text)) + '\n')
+        lab.publish_snapshot(self.root, live.export_live([('codex', logs)], since=0))
+        snapshot = lab._snapshot(self.root)
+        result = context.retrieve(snapshot, 'サンドボックス 権限', 10)
+        partial = next(h for h in result['hits'] if h['utterance']['text'].startswith('ボックス'))
+        full = next(h for h in result['hits'] if h['utterance']['text'].startswith('サンド'))
+        self.assertLess(full['rank'], partial['rank'])
+        self.assertTrue(all(c['compound_weight'] == .25 for c in partial['explanation']['contributions']))
+        self.assertTrue(all(c['compound_weight'] == 1 for c in full['explanation']['contributions']))
+        # An explicit shorter query is still usable; there is no hard filter.
+        shorter = context.retrieve(snapshot, 'ボックス', 10)
+        self.assertTrue(any(h['utterance']['text'].startswith('ボックス') for h in shorter['hits']))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -322,7 +344,7 @@ class ContextTests(unittest.TestCase):
         self.assertIn('ない', r['hits'][0]['explanation']['matched_tokens'])
         for hit in r['hits']:
             self.assertAlmostEqual(hit['score'], sum(d['score'] for d in hit['explanation']['contributions']) + hit['explanation']['scope_bonus'])
-        self.assertEqual(r['diagnostics_version'], 3)
+        self.assertEqual(r['diagnostics_version'], 4)
 
     def test_hiragana_only_and_non_hiragana_queries_keep_full_weights(self):
         for query in ['ありがとう', '家', 'spreadsheet edit', 'APP-587', 'カタカナ', '']:

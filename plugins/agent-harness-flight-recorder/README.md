@@ -810,3 +810,19 @@ measurement snapshots, and excludes known retrieval/evaluation sessions. See
 [Historical work-resumption replay](docs/RESUME_REPLAY.md) mines bounded interruption
 cases and compares next-action proposals with and without a cited resumption memo.
 Evaluation is explicit, tool-free, budgeted and cached; AI judgments remain provisional.
+
+### Compound-word ranking
+
+The user-context ranker v8 keeps Japanese bigram recall, but scales a query
+bigram's lexical contribution to 0.25 when it belongs only to a katakana run
+of at least four characters and none of its query-word owners occurs in that
+candidate field. A separately queried shorter word can still supply a full
+match. Scope remains bounded by the resulting lexical score; candidates are
+not removed. Diagnostics v4 exposes `compound_weight` separately from
+`query_weight`. This applies to both primary and query-only supplement ranking.
+
+This is a lexical heuristic, not word segmentation or semantic disambiguation.
+Spelling variants and abbreviations can lose rank. Test fixed source snapshots,
+known required citations, and conditional supplement reachability before
+rollout; removing a distractor does not establish that the desired judgment
+was found. Original logs and private regression evidence stay outside Git.
