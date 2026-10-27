@@ -18,17 +18,25 @@
 # 判定（誤って許可するより、誤って拒否する側に倒す）:
 #   1) 高速経路: 引用符とバックスラッシュを外した文字列に op・security・差し替えの変数が
 #      語として無ければ素通しする
-#   2) 別の実行経路: $( )・バッククォート・シェル（bash/sh/zsh/ksh/dash/fish）・eval/source/exec・
-#      インタプリタ（python*/pypy*/node/deno/bun/ruby/perl/php/osascript/awk）があり、
-#      「op <サブコマンド>」か security の秘密を出す操作が現れるなら拒否する
+#   2) 別の実行経路: $( )・バッククォートがあるか、シェル（bash/sh/zsh/ksh/dash/fish）・
+#      eval/source/exec・インタプリタ（python*/pypy*/node/deno/bun/ruby/perl/php/osascript/awk）が
+#      引用符の外の語としてあり、「op <サブコマンド>」か security の秘密を出す操作が文字列の
+#      どこかに現れるなら拒否する。引用符で囲んだ文章の中のシェルの名前
+#      （git commit -m "... bash ..." など）は数えない。security の service / label の指定は、
+#      引用符で囲んだ文字列ごとにも数え直す（bash -c '...' -s x の外側の -s を、内側の指定と
+#      数えない）
 #   3) 直接実行: heredoc 本文を除き、コマンドの区切りごとにシェルの語に分けて見る
-#      （引用符で囲んだ文字列は 1 語）。
+#      （引用符で囲んだ文字列は 1 語）。command -v / -V・type・which で始まる区切りは、場所や
+#      種類を表示するだけなので見ない。
 #      a) どの位置でも、op の後ろに同じ区切りの中でサブコマンドが続くものと、security の
 #         秘密を出す操作は止める。if・!・{ } や find -exec の後ろに置いても実行されるため
 #      b) 先頭の語が op なら、サブコマンドが無くても止める。変数の代入、if・while・! などの
-#         予約語、env・sudo・xargs などの前置きは飛ばす。command -v / -V は場所を表示する
-#         だけなので数えない
+#         予約語、env・sudo・xargs などの前置きは飛ばす
 #      grep op のように、サブコマンドの続かない引数としての op は止めない
+#   security の引数は /usr/bin/security と同じ getopt の規則で読む。まとめ書き（-qi・-gs <service>・
+#   -sexample.com）は 1 文字ずつ見て、値を取る文字は残りの文字か次の語を値にする。最初の位置引数
+#   （鍵束の名前）か -- でオプションは終わり、その後ろの -s / -l は指定にならない。リダイレクトは
+#   引数に数えない
 #
 # 許可されるもの:
 #   - claude-profile 経由の読み書き（このフックからは内部の op / security の呼び出しが見えない）
@@ -38,8 +46,8 @@
 #
 # 限界: 変数展開、実行時に組み立てる名前、ファイルに書いたスクリプトの中身は、文字列の
 #   照合では検出できない。env -S・watch・ssh・tmux や cmux の send のように、引用符で囲んだ
-#   文字列を別の場所で実行させる前置きも数えない。事故と素朴な指示の注入を止めるための
-#   もので、敵対的な回避への完全な防御ではない。
+#   文字列を別の場所で実行させる前置きも数えない（その文字列の中にシェルの名前があっても同じ）。
+#   事故と素朴な指示の注入を止めるためのもので、敵対的な回避への完全な防御ではない。
 
 set -uo pipefail
 
@@ -80,22 +88,146 @@ if printf '%s' "$NORM" | grep -qE "${OVERRIDE_RE}="; then
   deny
 fi
 
+STRIPPED=$(guard_strip_heredoc_bodies "$COMMAND")
+
+# security の後ろの引数（$2 以降）が、キーチェーンの秘密を出す操作か。$1 は引数の分け方:
+#   strict: シェルの語に正しく分けた引数。/usr/bin/security と同じく、最初の位置引数（鍵束の
+#           名前）か -- でオプションの解釈を終える（その後ろの -s / -l は指定にならない）
+#   loose:  引用符を外して空白で分けた引数。"My User" が 2 語になるなど語の切れ目が当てに
+#           ならないので、位置引数で止めずに最後まで読む（-- や位置引数の後ろの -s で素通しに
+#           なる形は、同じ文字列を strict で読む判定が拾う）
+security_args_reveal_secret() {
+  local mode="$1" w opts c val secret=0 selector=0 names_token=0
+  local -a args=()
+  shift
+  # リダイレクトは security の引数にならないので先に除く（演算子だけなら次の語が行き先）
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      [0-9]*[\<\>]|[\<\>]|[\<\>][\<\>]|'<<<') shift; [ "$#" -gt 0 ] && shift ;;
+      [0-9]*[\<\>]*|[\<\>]*) shift ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  set -- ${args[@]+"${args[@]}"}
+  # サブコマンドの前の全体のオプション。-i（対話）と -p（プロンプト付きの対話）は標準入力から
+  # コマンドを読むので、ほかの文字とまとめて書いても（-qi）止める。security に長いオプションは
+  # 無く、--help のような語は最初の文字で使い方を表示して終わるので数えない
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --) shift; break ;;
+      --*) shift ;;
+      -*[ip]*) return 0 ;;
+      -?*) shift ;;
+      *) break ;;
+    esac
+  done
+  case "${1:-}" in
+    dump-keychain) return 0 ;;
+    find-generic-password|find-internet-password) shift ;;
+    *) return 1 ;;
+  esac
+  while [ "$#" -gt 0 ]; do
+    w="$1"
+    shift
+    case "$w" in
+      --|-|[!-]*|'')
+        [ "$mode" = strict ] && break
+        continue ;;
+    esac
+    opts="${w#-}"
+    while [ -n "$opts" ]; do
+      c="${opts:0:1}"
+      opts="${opts:1}"
+      case "$c" in
+        g|w) secret=1; continue ;;
+        [aCcDdGjlPprst]) ;;
+        *) continue ;;
+      esac
+      # 値を取る文字は、残りの文字か次の語を値にする（-sexample.com、-gs <service>）
+      if [ -n "$opts" ]; then
+        val="$opts"
+        opts=""
+      elif [ "$#" -gt 0 ]; then
+        val="$1"
+        shift
+      else
+        continue
+      fi
+      case "$c" in
+        s|l)
+          selector=1
+          [ "$val" = "$TOKEN_SERVICE" ] && names_token=1 ;;
+      esac
+    done
+  done
+  # 秘密を出す -w / -g があり、トークンを名指しするか service / label の指定が無ければ止める
+  [ "$secret" -eq 1 ] && { [ "$names_token" -eq 1 ] || [ "$selector" -eq 0 ]; }
+}
+
+# 引用符を外した文字列（$1）を、コマンドの区切りごとに語に分け、security の秘密を出す操作が
+# あるか見る（python の ['security', '-w'] のような並びも語に分ける）
+pieces_reveal_secret() {
+  local piece i
+  local -a ws
+  while IFS= read -r piece; do
+    read -r -a ws <<< "$(printf '%s' "$piece" | tr ',[]' '   ')"
+    i=0
+    while [ "$i" -lt "${#ws[@]}" ]; do
+      if [ "${ws[$i]##*/}" = security ] && security_args_reveal_secret loose "${ws[@]:$((i + 1))}"; then
+        return 0
+      fi
+      i=$((i + 1))
+    done
+  done < <(printf '%s\n' "$1" | tr ';&|()`' '\n')
+  return 1
+}
+
+# 文字列（$1）をコマンドの区切りごとにシェルの語に分け、security の秘密を出す操作があるか見る
+words_reveal_secret() {
+  local seg w t
+  local -a ws
+  while IFS= read -r seg; do
+    ws=()
+    while IFS= read -r w; do
+      ws+=("$w")
+    done < <(guard_shell_tokens "$seg")
+    t=0
+    while [ "$t" -lt "${#ws[@]}" ]; do
+      if [ "${ws[$t]##*/}" = security ] && security_args_reveal_secret strict "${ws[@]:$((t + 1))}"; then
+        return 0
+      fi
+      t=$((t + 1))
+    done
+  done < <(guard_split_segments "$1")
+  return 1
+}
+
+# 空白を含む語（引用符で囲んだ文字列）を、入れ子の分も含めて 3 段まで NUL 区切りで出す
+quoted_texts() {
+  local text="$1" depth="$2" seg w
+  [ "$depth" -lt 3 ] || return 0
+  while IFS= read -r seg; do
+    while IFS= read -r w; do
+      case "$w" in
+        *[[:space:]]*)
+          printf '%s\0' "$w"
+          quoted_texts "$w" $((depth + 1)) ;;
+      esac
+    done < <(guard_shell_tokens "$seg")
+  done < <(guard_split_segments "$text")
+}
+
 # security の秘密を出す操作が文字列のどこかにあるか（別の実行経路の判定に使う）
 security_secret_anywhere() {
   printf '%s' "$NORM" | grep -qE "$SECURITY_WORD" || return 1
   printf '%s' "$NORM" | grep -qE '(^|[^[:alnum:]_-])dump-keychain([^[:alnum:]_-]|$)' && return 0
-  printf '%s' "$NORM" | grep -qE '(^|[^[:alnum:]_.-])security[[:space:],]+-[ip]([^[:alnum:]_-]|$)' && return 0
-  # find-*-password は、コマンドの区切りごとに、その中だけで秘密の出力と指定の有無を見る
-  # （ls -l の -l のような、別のコマンドの引数を service / label の指定と数えない）
-  local piece
-  while IFS= read -r piece; do
-    printf '%s' "$piece" | grep -qE "$SECURITY_WORD" || continue
-    printf '%s' "$piece" | grep -qE '(^|[^[:alnum:]_-])find-(generic|internet)-password([^[:alnum:]_-]|$)' || continue
-    printf '%s' "$piece" | grep -qE '(^|[^[:alnum:]_-])-[[:alpha:]]*[wg][[:alpha:]]*([^[:alnum:]_-]|$)' || continue
-    # トークンを名指しするか、service / label を指定せずに秘密を出すものだけを止める
-    printf '%s' "$piece" | grep -qF -- "$TOKEN_SERVICE" && return 0
-    printf '%s' "$piece" | grep -qE '(^|[^[:alnum:]_-])-[[:alpha:]]*[sl]([^[:alnum:]_-]|$)' || return 0
-  done < <(printf '%s\n' "$NORM" | tr ';&|()`' '\n')
+  pieces_reveal_secret "$NORM" && return 0
+  # 引用符で囲んだ文字列は、その中をシェルの語に分け直して見る。bash -c '...' -s x のような
+  # 外側の引数を、内側の service / label の指定と数えないため
+  local text
+  while IFS= read -r -d '' text; do
+    words_reveal_secret "$text" && return 0
+  done < <(quoted_texts "$STRIPPED" 0)
   return 1
 }
 
@@ -103,8 +235,19 @@ security_secret_anywhere() {
 #    ようなオプションを挟んでも、サブコマンドが続けば実行とみなす
 OP_SUBCOMMANDS='item vault read run inject signin signout account service-account document user group environment whoami connect events-api plugin update completion daemon'
 OP_SUB_RE="(^|[^[:alnum:]_.-])op([[:space:],]+-[^[:space:],]*([[:space:],]+[^-[:space:],][^[:space:],]*)?)*[[:space:],]+(${OP_SUBCOMMANDS// /|})([^[:alnum:]_-]|$)"
-EXEC_RE='(^|[;&|[:space:](/])((ba|z|k|da|a)?sh|fish|eval|source|exec|python[0-9.]*|pypy[0-9.]*|node|deno|bun|ruby|perl|php|osascript|g?awk)([[:space:];&|<>)]|$)'
-if printf '%s' "$COMMAND" | grep -qF -e '$(' -e '`' || printf '%s' "$NORM" | grep -qE "$EXEC_RE"; then
+EXEC_WORD_RE='^([^[:space:]]*/)?((ba|z|k|da|a)?sh|fish|eval|source|exec|python[0-9.]*|pypy[0-9.]*|node|deno|bun|ruby|perl|php|osascript|g?awk)([<>].*)?$'
+
+# シェル・インタプリタが引用符の外の語としてあるか（bash -c '...'、... | sh、python3 <<EOF、
+# bash<<<'...' など）。引用符で囲んだ文章の中の言及は数えない
+exec_word_outside_quotes() {
+  local seg tokens=""
+  while IFS= read -r seg; do
+    tokens+="$(guard_shell_tokens "$seg")"$'\n'
+  done < <(guard_split_segments "$STRIPPED")
+  grep -qE "$EXEC_WORD_RE" <<< "$tokens"
+}
+
+if printf '%s' "$COMMAND" | grep -qF -e '$(' -e '`' || exec_word_outside_quotes; then
   if printf '%s' "$NORM" | grep -qE "$OP_SUB_RE" || security_secret_anywhere; then
     deny
   fi
@@ -116,39 +259,7 @@ is_op_subcommand() {
   return 1
 }
 
-# words[$1] が security のとき、同じ区切りの中の後ろの語が秘密を出す操作か
-security_reveals_secret() {
-  local j=$(($1 + 1)) sub="" w secret=0 selector=0 names_token=0
-  while [ "$j" -lt "$n" ]; do
-    case "${words[$j]}" in
-      -i|-p) return 0 ;;
-      -*) j=$((j + 1)) ;;
-      *) sub="${words[$j]}"; break ;;
-    esac
-  done
-  case "$sub" in
-    dump-keychain) return 0 ;;
-    find-generic-password|find-internet-password) ;;
-    *) return 1 ;;
-  esac
-  # 秘密を出す -w / -g があり、トークンを名指しするか service / label の指定が無ければ止める
-  j=$((j + 1))
-  while [ "$j" -lt "$n" ]; do
-    w="${words[$j]}"
-    case "$w" in
-      --*) ;;
-      -*)
-        case "$w" in -*[wg]*) secret=1 ;; esac
-        case "$w" in -*[sl]) selector=1 ;; esac ;;
-    esac
-    [ "$w" = "$TOKEN_SERVICE" ] && names_token=1
-    j=$((j + 1))
-  done
-  [ "$secret" -eq 1 ] && { [ "$names_token" -eq 1 ] || [ "$selector" -eq 0 ]; }
-}
-
 # 3) 直接実行: コマンドの区切りごとに、シェルの語に分けて見る
-STRIPPED=$(guard_strip_heredoc_bodies "$COMMAND")
 while IFS= read -r seg; do
   [ -n "$seg" ] || continue
   words=()
@@ -156,6 +267,23 @@ while IFS= read -r seg; do
     words+=("$w")
   done < <(guard_shell_tokens "$seg")
   n=${#words[@]}
+
+  # 先頭の語: 変数の代入と、if・while・! などの予約語（後ろの語もコマンドとして実行される）を飛ばす
+  h=0
+  while [ "$h" -lt "$n" ]; do
+    case "${words[$h]}" in
+      [A-Za-z_]*=*|if|then|elif|else|while|until|do|'!'|'{') h=$((h + 1)) ;;
+      *) break ;;
+    esac
+  done
+  [ "$h" -lt "$n" ] || continue
+
+  # command -v / -V・type・which は場所や種類を表示するだけで、後ろの語を実行しない
+  case "${words[$h]##*/}" in
+    type|which) continue ;;
+    command)
+      case "${words[$((h + 1))]:-}" in -*[vV]*) continue ;; esac ;;
+  esac
 
   # a) どの位置でも、op の後ろにサブコマンドが続くものと、security の秘密を出す操作を止める
   t=0
@@ -168,25 +296,20 @@ while IFS= read -r seg; do
           k=$((k + 1))
         done ;;
       security)
-        security_reveals_secret "$t" && deny ;;
+        security_args_reveal_secret strict "${words[@]:$((t + 1))}" && deny ;;
     esac
     t=$((t + 1))
   done
 
   # b) 先頭の語が op なら、サブコマンドが無くても止める
-  i=0
+  i=$h
   while [ "$i" -lt "$n" ]; do
     case "${words[$i]}" in
       [A-Za-z_]*=*) i=$((i + 1)); continue ;;
-      # if・while・! などの後ろの語もコマンドとして実行される
       if|then|elif|else|while|until|do|'!'|'{') i=$((i + 1)); continue ;;
     esac
     case "${words[$i]##*/}" in
       env|sudo|command|exec|nohup|time|xargs|nice|caffeinate|stdbuf|timeout|doas)
-        # command -v / -V は場所を表示するだけで実行しない
-        if [ "${words[$i]##*/}" = command ]; then
-          case "${words[$((i + 1))]:-}" in -v|-V) i=$n; break ;; esac
-        fi
         i=$((i + 1))
         while [ "$i" -lt "$n" ]; do
           case "${words[$i]}" in
