@@ -7,17 +7,21 @@ from typing import Literal
 from mcp.server.fastmcp import FastMCP
 from .runner import dispatch, status
 from .store import ACTIVE, DEFAULT_TIMEOUT, Store
+from . import dialogue
 
 mcp = FastMCP("local-sessions", instructions=(
     "Consult a persistent Codex or Claude Code partner when another perspective helps compare "
     "designs, challenge an important assumption, or unblock a stalled investigation. Follow the "
     "caller's standing authorization; proactive consultation does not need a fresh explicit "
     "invocation. Reuse a partner for the same project and topic; skip trivial work. "
-    "Start with one exchange, share only necessary context, and verify the advice. "
+    "Share unfinished ideas and follow up on results when useful; verify advice. "
     "Use agent_create once, "
     "then agent_send repeatedly with the same session name. Each send needs a new request_id; "
     "reuse it only to retry the exact same send. Poll agent_status until completed. "
-    "Do not recursively relay messages or run open-ended autonomous discussions. "
+    "For an explicitly requested bounded discussion, use dialogue_start with a topic and limits. "
+    "Keep polling dialogue_status with its next_cursor and share meaningful new ideas, disagreements, "
+    "and changed assumptions while doing independent work between polls. "
+    "Do not build recursive or open-ended relay loops. "
     "These are bridge-owned CLI sessions, not the caller's currently open chat."), log_level="WARNING")
 
 
@@ -83,6 +87,58 @@ def agent_interrupt(job_id: str) -> dict:
 def agent_history(session: str, limit: int = 10) -> dict:
     """Read the bridge's most recent sent messages and results (maximum 100)."""
     return {"messages": Store().history(session, limit)}
+
+
+
+@mcp.tool()
+def dialogue_start(topic: str, max_rounds: int, time_budget_seconds: int, request_id: str,
+                   codex_model: str | None = None, claude_model: str | None = None,
+                   turn_timeout_seconds: int = DEFAULT_TIMEOUT) -> dict:
+    """Start an explicitly authorized bounded Codex/Claude dialogue; return without waiting.
+
+    Creates two dedicated native conversations and resumes them on every turn.
+    One round is one Codex reply then one Claude reply. Limits: 1-50 rounds,
+    10-14400 active seconds (pauses excluded), 5-600 seconds per reply.
+    Calls use the CLIs' existing auth/quota; there is no combined dollar cap.
+    Supply only a topic safe to share with BOTH providers. Existing chats are not imported.
+    Retry the same start with the same request_id and identical parameters.
+    Model defaults come from each CLI; set only a model authorized by the user.
+    """
+    return dialogue.start(Store(), topic, max_rounds, time_budget_seconds, request_id,
+                          codex_model, claude_model, turn_timeout_seconds)
+
+
+@mcp.tool()
+async def dialogue_status(dialogue_id: str, after_turn: int = 0, limit: int = 20,
+                          wait_seconds: int = 0) -> dict:
+    """Read progress and paginated finished replies, including reported usage/cache counts.
+
+    Use next_cursor as after_turn on the next call. In-flight replies do not
+    advance the cursor. completed means the round limit was reached, not that
+    an idea is correct. Codex tokens and Claude cost snapshots are session-cumulative; do not sum them.
+    A missing token count is unknown, not zero. Wait at most 30 seconds.
+    """
+    store = Store()
+    deadline = asyncio.get_running_loop().time() + max(0, min(30, wait_seconds))
+    while True:
+        result = dialogue.inspect(store, dialogue_id, after_turn, limit)
+        if result['turns'] or result['status'] not in ACTIVE or asyncio.get_running_loop().time() >= deadline:
+            return result
+        await asyncio.sleep(.25)
+
+
+@mcp.tool()
+def dialogue_control(dialogue_id: str, action: Literal['pause', 'resume', 'stop']) -> dict:
+    """Pause after the current reply, resume with remaining limits, or stop immediately.
+
+    Pause lets the current reply finish and keeps both sessions. Resume uses
+    their native histories; it does not restore expired provider caches.
+    Stop interrupts the current reply and is terminal. Expired budgets and
+    failed/interrupted/uncertain child turns cannot be replayed or auto-retried.
+    A lost coordinator can resume only when its linked child is still running
+    or completed. Inspect status to confirm any requested stop/pause took effect.
+    """
+    return dialogue.control(Store(), dialogue_id, action)
 
 
 def main():

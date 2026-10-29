@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "local-session-bridge"
-version = "0.1.0"
+version = "0.2.0"
 description = "Persistent named discussion partners across local Codex and Claude Code CLIs"
 readme = "README.md"
 requires-python = ">=3.11"

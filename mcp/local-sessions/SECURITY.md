@@ -56,6 +56,24 @@ short SIGINT/SIGTERM/SIGKILL grace periods. It is not a provider billing ceiling
 Shutdown, disk exhaustion and hangs outside the supervised event loop remain
 limitations of this alpha.
 
+## Bounded dialogue
+
+Starting a dialogue authorizes a sequence of model calls, up to its explicit
+round and active-time limits. Both providers receive the topic and the partner's
+completed replies. Use only material appropriate for that sharing scope.
+Partner text is untrusted discussion material; it does not authorize tool use,
+changed safety flags, more rounds, or a new budget.
+
+Pause is a reply-boundary operation; stop requests interruption immediately.
+Inspect status to confirm either. If a coordinator disappears, the child keeps
+its persisted deadline. An uncertain child is not replayed. Native history
+and prompt caching are separate: no cache hit or total billing ceiling is
+promised. No new credential access or auth configuration is introduced.
+
+Usage persistence keeps only numeric allowlisted fields and source labels.
+It does not retain raw model-usage payloads, thinking text or pricing guesses.
+The existing plaintext-state and trusted-local-user boundaries still apply.
+
 ## Reporting
 
 Report vulnerabilities privately to the repository maintainer through an

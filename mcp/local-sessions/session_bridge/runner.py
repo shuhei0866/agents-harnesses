@@ -16,6 +16,7 @@ import tomllib
 from pathlib import Path
 
 from .store import ACTIVE, DEFAULT_TIMEOUT, ROOT, Store
+from .usage import accounting
 
 
 def claude_budget():
@@ -62,8 +63,8 @@ def command(session):
     return args
 
 
-def dispatch(store, session, prompt, request_id, timeout=DEFAULT_TIMEOUT):
-    job, fresh = store.reserve(session, prompt, request_id, timeout)
+def dispatch(store, session, prompt, request_id, timeout=DEFAULT_TIMEOUT, **ownership):
+    job, fresh = store.reserve(session, prompt, request_id, timeout, **ownership)
     if fresh:
         try:
             env = os.environ.copy()
@@ -187,6 +188,11 @@ class Events:
         previous_phase = self.progress["phase"]
         self.observe(event)
         kind = event.get("type")
+        usage = accounting(self.session["provider"], event)
+        if usage is not None:
+            self.store.save_usage(self.job_id, usage)
+        if kind == "system" and event.get("subtype") == "compact_boundary":
+            self.progress["compactions"] = self.progress.get("compactions", 0) + 1
         native = event.get("thread_id") if kind == "thread.started" else None
         if self.session["provider"] == "claude":
             native = event.get("session_id")
@@ -223,6 +229,10 @@ def run(store, job_id):
         if store.job(job_id)["cancel"]:
             store.update(job_id, status="interrupted")
             return
+        hard_deadline = store.job_deadline(job_id)
+        if hard_deadline is not None and hard_deadline <= time.time():
+            store.update(job_id, status="timed_out", error="Dialogue time budget expired before CLI launch.")
+            return
         process = None
         events = Events(store, session, job_id)
         events.flush(force=True)
@@ -253,7 +263,10 @@ def run(store, job_id):
                     stdin=stdin, stdout=subprocess.PIPE, stderr=stderr, start_new_session=True)
                 selector = selectors.DefaultSelector()
                 selector.register(process.stdout, selectors.EVENT_READ)
-                deadline, heartbeat, pending = time.monotonic() + job["timeout"], 0, b""
+                allowance = job["timeout"]
+                if hard_deadline is not None:
+                    allowance = min(allowance, max(0, hard_deadline - time.time()))
+                deadline, heartbeat, pending = time.monotonic() + allowance, 0, b""
                 output_bytes = 0
                 try:
                     while selector.get_map():
@@ -261,7 +274,7 @@ def run(store, job_id):
                         if store.job(job_id)["cancel"]:
                             final_status = "interrupted"
                             break
-                        if now >= deadline:
+                        if now >= deadline or (hard_deadline is not None and time.time() >= hard_deadline):
                             final_status = "timed_out"
                             break
                         if now - heartbeat >= 2:

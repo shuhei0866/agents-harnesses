@@ -48,6 +48,23 @@ class Store:
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS one_active_job ON jobs(session_id)
                     WHERE status IN ('queued','running');
+                CREATE TABLE IF NOT EXISTS dialogues (
+                    id TEXT PRIMARY KEY, request_id TEXT UNIQUE NOT NULL, config TEXT NOT NULL,
+                    codex_session TEXT NOT NULL, claude_session TEXT NOT NULL,
+                    status TEXT NOT NULL, control TEXT, reason TEXT, error TEXT,
+                    remaining_seconds REAL NOT NULL, deadline REAL,
+                    created REAL NOT NULL, updated REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS dialogue_participants (
+                    session_id TEXT PRIMARY KEY, dialogue_id TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS dialogue_turns (
+                    dialogue_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+                    job_id TEXT NOT NULL UNIQUE, deadline REAL NOT NULL, PRIMARY KEY(dialogue_id, ordinal)
+                );
+                CREATE TABLE IF NOT EXISTS job_usage (
+                    job_id TEXT PRIMARY KEY REFERENCES jobs(id), payload TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS job_progress (
                     job_id TEXT PRIMARY KEY REFERENCES jobs(id), payload TEXT NOT NULL
                 );
@@ -99,7 +116,7 @@ class Store:
                 "FROM sessions s LEFT JOIN jobs j ON s.id=j.session_id "
                 "AND j.status IN ('queued','running') ORDER BY s.created")]
 
-    def reserve(self, name_or_id, prompt, request_id, timeout=DEFAULT_TIMEOUT):
+    def reserve(self, name_or_id, prompt, request_id, timeout=DEFAULT_TIMEOUT, *, dialogue_id=None, ordinal=None):
         if not prompt or len(prompt) > 32000:
             raise ValueError("prompt must contain 1-32000 characters")
         if not request_id or len(request_id) > 128:
@@ -109,6 +126,21 @@ class Store:
         session = self.session(name_or_id)
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
+            owner = db.execute("SELECT dialogue_id FROM dialogue_participants WHERE session_id=?",
+                               (session["id"],)).fetchone()
+            if owner and owner[0] != dialogue_id:
+                raise ValueError("session is owned by a dialogue; use dialogue controls")
+            if dialogue_id:
+                dialogue = db.execute("SELECT * FROM dialogues WHERE id=?", (dialogue_id,)).fetchone()
+                if not owner or owner[0] != dialogue_id or not dialogue:
+                    raise ValueError("invalid dialogue participant")
+                if dialogue["status"] != "running" or dialogue["control"] is not None:
+                    raise ValueError("dialogue is not accepting a new turn")
+                if not dialogue["deadline"] or dialogue["deadline"] - time.time() < timeout:
+                    raise ValueError("dialogue has insufficient time for this turn")
+                count = db.execute("SELECT count(*) FROM dialogue_turns WHERE dialogue_id=?", (dialogue_id,)).fetchone()[0]
+                if ordinal != count + 1:
+                    raise ValueError("dialogue turn already reserved or out of order")
             old = db.execute("SELECT * FROM jobs WHERE session_id=? AND request_id=?",
                              (session["id"], request_id)).fetchone()
             if old:
@@ -127,6 +159,8 @@ class Store:
             now = time.time()
             db.execute("INSERT INTO jobs(id,session_id,request_id,prompt,status,created,updated,timeout) "
                        "VALUES (?,?,?,?,?,?,?,?)", (jid, session["id"], request_id, prompt, "queued", now, now, timeout))
+            if dialogue_id:
+                db.execute("INSERT INTO dialogue_turns VALUES (?,?,?,?)", (dialogue_id, ordinal, jid, dialogue["deadline"]))
         return self.job(jid), True
 
     def job(self, job_id):
@@ -166,12 +200,27 @@ class Store:
             row = db.execute("SELECT payload FROM job_progress WHERE job_id=?", (job_id,)).fetchone()
         return json.loads(row[0]) if row else None
 
+    def job_deadline(self, job_id):
+        with self.db() as db:
+            row = db.execute("SELECT deadline FROM dialogue_turns WHERE job_id=?", (job_id,)).fetchone()
+        return row[0] if row else None
+
+    def save_usage(self, job_id, usage):
+        with self.db() as db:
+            db.execute("INSERT INTO job_usage VALUES (?,?) ON CONFLICT(job_id) "
+                       "DO UPDATE SET payload=excluded.payload", (job_id, json.dumps(usage)))
+
+    def usage(self, job_id):
+        with self.db() as db:
+            row = db.execute("SELECT payload FROM job_usage WHERE job_id=?", (job_id,)).fetchone()
+        return json.loads(row[0]) if row else None
+
     def history(self, session, limit=10):
         sid = self.session(session)["id"]
         with self.db() as db:
             rows = db.execute("SELECT * FROM jobs WHERE session_id=? ORDER BY created DESC LIMIT ?",
                               (sid, max(1, min(100, limit)))).fetchall()
-        return [dict(r) for r in reversed(rows)]
+        return [dict(r) | {"usage": self.usage(r["id"])} for r in reversed(rows)]
 
     def public_job(self, job_id):
         job = self.job(job_id)
@@ -183,4 +232,4 @@ class Store:
         return {k: job[k] for k in ("id", "session_id", "request_id", "status", "response", "error", "created", "updated")} | {
             "native_session_id": session["native_id"], "name": session["name"],
             "timeout_seconds": job["timeout"], "elapsed_seconds": round(end - job["created"], 1),
-            "progress": progress}
+            "progress": progress, "usage": self.usage(job_id)}
