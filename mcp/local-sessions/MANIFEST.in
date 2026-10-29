@@ -1,0 +1,9 @@
+include README.md LICENSE SECURITY.md AGENTS.md
+recursive-include docs *.md
+recursive-include tests *.py
+include scripts/check_distribution.py
+exclude run.py
+global-exclude *.pyc *.sqlite* *.db *.log *.stderr .env*
+prune .state
+prune .venv
+prune build

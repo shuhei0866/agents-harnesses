@@ -1,6 +1,6 @@
 # agents-harnesses
 
-AI コーディングエージェント（Claude Code / Codex）の生産性を高めるスキル・ループ・Hooks のコレクション。
+AI コーディングエージェント（Claude Code / Codex）の生産性を高めるスキル・ループ・Hooks・MCP のコレクション。
 
 ## ディレクトリ構成
 
@@ -9,6 +9,8 @@ agents-harnesses/
 ├── packs/
 │   ├── git-safety/               # Git事故防止の導入パック
 │   └── exploration-budget/       # 探索セッションに時間予算・台帳・境界フックを与えるパック
+├── mcp/
+│   └── local-sessions/          # Codex / Claude Codeの会話を継続するMCP
 ├── plugins/
 │   └── agent-harness-flight-recorder/ # Claude Code / Codex 共通の観測プラグイン
 ├── claude-code/
@@ -75,6 +77,21 @@ PACK="$PWD/packs/exploration-budget"
 
 台帳・hook・runner の役割、配線、停止条件、Claude Code の連続 block 上限の実測は
 [Exploration Budget Pack README](packs/exploration-budget/README.md) を参照してください。
+
+## Local Sessions MCP — 同じ相談相手と会話を続ける
+
+Codex と Claude Code から、名前を付けた相手へ相談し、次回も同じ会話を再開できます。
+MCP が相手・送受信・ジョブを SQLite に保存し、メッセージごとのワーカーが
+各 CLI の native session ID で再開します。呼び出し元の会話全体は自動転送しません。
+
+Python 3.11以上と認証済みのCLIを使うmacOS/Linux向けのalphaです。
+通常のCLI履歴に加え、MCP側も送受信をローカルへ平文保存するため、信頼した
+同一ユーザーでの利用を前提にしています。新しい設定をインストールしても、
+既存のMCP設定・会話保存先は自動で切り替えません。
+
+[導入と使い方](mcp/local-sessions/README.md) ·
+[アーキテクチャ](mcp/local-sessions/docs/architecture.md) ·
+[安全性と保存データ](mcp/local-sessions/SECURITY.md)
 
 ## Claude Code
 
