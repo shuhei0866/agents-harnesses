@@ -35,7 +35,21 @@ the webhook does not solve cloud-computer collisions or serialize other routines
 Pass the existing URL and key as `GROK_BOT_WEBHOOK_URL` and
 `GROK_BOT_WEBHOOK_KEY` from the caller's secret manager. Pin the separately
 verified HTTPS scheme/host/port as `GROK_BOT_WEBHOOK_ORIGIN`; do not derive it from
-an unverified URL just to satisfy the check. The script accepts HTTPS,
+an unverified URL just to satisfy the check. Alternatively, `--credentials-stdin`
+reads one UTF-8 JSON object with exactly `endpoint` and `key` string fields from
+standard input (at most 8 KiB). The origin still comes from the independent
+environment setting. Feed it directly from an authorized secret manager or
+operator-controlled hidden input; never paste credentials into a chat or command
+argument. With this option, `--dry-run` validates the configuration without
+networking or reserving an attempt. Without it, dry-run needs no credentials.
+
+Use a caller that is already permitted to make this request. Verify public-origin
+connectivity from that execution environment before handling credentials. A UI
+tool's child process can have different network permissions from ordinary command
+execution. Do not bridge a restricted runtime through another process to evade
+its network boundary, or weaken protection to make the request work.
+
+The script accepts HTTPS,
 does not follow redirects, sends one POST and does not retry. Its output reports
 `accepted`, `not_accepted`, `unknown` or `not_sent` and a task ID; it never reports
 research completion. Unexpected 2xx/3xx and server errors are conservatively
@@ -54,6 +68,23 @@ For `unknown`, inspect the owning Bot's chat/run history for the task ID before 
 action. Do not resend because a local timeout expired. A matching chat receipt
 and real artifacts are separate evidence. An idempotency field in the request
 would not establish server-side deduplication, so none is assumed here.
+
+After checking delivery, an operator may explicitly authorize **one** deliberate
+retry of the exact same task and payload. Keep a non-secret reconciliation JSON
+record with `task_id`, `request_sha256` from the original marker,
+`prior_marker_sha256` (the SHA-256 of its exact bytes, prefixed `sha256:`),
+`decision: "retry_once"`, a timezone-aware `observed_at`, an `observation` describing
+what was actually inspected and any remaining uncertainty, and the actual
+`user_instruction` authorizing the retry. This record documents a decision; it
+does not grant permission or prove human approval by itself. Never put a URL/key
+in the record. Use `--reconciled-retry PATH` only after this human decision.
+
+The CLI checks the task, payload, prior marker and pinned origin, leaves the
+original marker unchanged, and atomically reserves
+`.grok-webhook-retry-attempt.json` before the new network attempt. The same run
+directory permits at most this one deliberate retry. Repeating the command is
+refused. This is still not provider-side deduplication; preserve that uncertainty
+and inspect receipt rather than resending if the result is again `unknown`.
 
 Ask the routine owner to return `bundle.json`, `report.md` and any appendices as
 one submission with the task ID. Download the actual files. Local and cloud paths

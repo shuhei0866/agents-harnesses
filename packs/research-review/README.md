@@ -34,6 +34,16 @@ python3 "$PACK/scripts/grok_webhook.py" "$RUN_DIR/bundle.json"
 [Grokアダプター](references/grok-bot.md)を参照してください。
 **受付は完了ではありません。** チャットで成果物を確認してダウンロードします。
 
+資格情報は`--credentials-stdin`でも受け取れます。許可済みの秘密管理または本人の
+非表示入力から`endpoint`と`key`だけを持つJSONを直接渡し、originは別に照合します。
+秘密値をチャット・引数・一時ファイルへ貼らないでください。送信する実行環境で先に
+公開originへの疎通を確かめ、通信制限された別のruntimeを迂回する中継は作りません。
+
+受付不明のあとに本人が再試行を判断した場合は、同じtask・payload・元markerに結びつく
+非秘密の確認記録を用意し、`--reconciled-retry PATH`で1回だけ明示的に試せます。
+元markerは保持し、再試行用markerを送信前に予約します。確認記録だけで許可が生まれる
+ものではなく、自動再送や送達保証にもなりません。詳しい条件は上のアダプター文書にあります。
+
 ```bash
 # 以下は調査担当が返したbundle.jsonと実ファイルに対して実行する
 python3 "$PACK/scripts/research_review.py" target "$RUN_DIR/bundle.json"
