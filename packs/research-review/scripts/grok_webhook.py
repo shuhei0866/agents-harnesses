@@ -36,8 +36,9 @@ def valid_configuration(endpoint, key, expected_origin):
                     and not origin.query and not origin.fragment and origin.path in {"", "/"}
                     and (url.hostname.lower(), url.port or 443)
                     == (origin.hostname.lower(), origin.port or 443)
-                    and key.strip() and not any(c in endpoint + key + expected_origin
-                                               for c in "\r\n"))
+                    and key.strip() and (endpoint + key).isascii()
+                    and not any(c in endpoint + key + expected_origin
+                                for c in "\r\n"))
     except ValueError:
         return False
 

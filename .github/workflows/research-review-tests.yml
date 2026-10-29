@@ -8,6 +8,9 @@ on:
     branches: [main]
     paths: ['packs/research-review/**', '.github/workflows/research-review-tests.yml']
 
+permissions:
+  contents: read
+
 jobs:
   research-review-tests:
     strategy:

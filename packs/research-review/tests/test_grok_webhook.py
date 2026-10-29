@@ -81,10 +81,28 @@ class WebhookTests(unittest.TestCase):
                               (self.url + "#fragment", self.key),
                               ("https://other.example/endpoint", self.key),
                               ("https://example.org:444/endpoint", self.key),
-                              (self.url, ""), (self.url, "key\nInjected: value")):
+                              (self.url, ""), (self.url, "key\nInjected: value"),
+                              (self.url + "/調査", self.key), (self.url, "キー")):
             result = self.send(endpoint=endpoint, key=key, opener=opener)
             self.assertEqual(result["status"], "not_sent")
         opener.open.assert_not_called()
+
+    def test_cli_invalid_encoding_never_reserves_attempt(self):
+        with tempfile.TemporaryDirectory() as root:
+            run = Path(root) / "run"
+            rr.initialize(Mock(directory=str(run), question="public",
+                               recipient="Coordinator", max_chars=None))
+            for endpoint, key in ((self.url + "/調査", self.key), (self.url, "キー")):
+                config = {"GROK_BOT_WEBHOOK_URL": endpoint, "GROK_BOT_WEBHOOK_KEY": key,
+                          "GROK_BOT_WEBHOOK_ORIGIN": self.origin}
+                with patch.object(sys, "argv", ["grok_webhook", str(run / "bundle.json")]), \
+                        patch.dict(gw.os.environ, config), \
+                        patch.object(gw, "send_once") as send, \
+                        patch("sys.stdout", new_callable=io.StringIO) as output:
+                    self.assertEqual(gw.main(), 2)
+                    self.assertEqual(json.loads(output.getvalue())["status"], "not_sent")
+                    send.assert_not_called()
+                    self.assertFalse((run / ".grok-webhook-attempt.json").exists())
 
     def test_cli_dry_run_needs_no_provider_configuration(self):
         with tempfile.TemporaryDirectory() as root:
