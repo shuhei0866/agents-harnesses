@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-session-bridge"
+version = "0.1.0"
+description = "Persistent named discussion partners across local Codex and Claude Code CLIs"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = ["mcp==1.27.2"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Operating System :: POSIX",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development",
+]
+
+[project.scripts]
+session-mcp = "session_bridge.server:main"
+
+[tool.setuptools]
+packages = ["session_bridge"]
+include-package-data = false
