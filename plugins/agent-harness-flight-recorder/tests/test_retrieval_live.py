@@ -153,12 +153,26 @@ class LiveTests(unittest.TestCase):
         text = str(result['documents'])
         self.assertIn('genuine request', text)
         self.assertIn('genuine correction', text)
-        self.assertNotIn('injected', text)
+        self.assertIn('injected', text)  # Raw structured envelope retained for history.
         from retrieval_context import units
         for doc in result['documents']:
             doc['citation_id'] = 'synthetic'
         items, _ = units(result)
         self.assertEqual(len(items), 2)
+
+    def test_structured_prefix_retains_original_and_human_tail(self):
+        raw = ('# AGENTS.md instructions for /example\n<INSTRUCTIONS>machine rule</INSTRUCTIONS>'
+               '\n<environment_context>runtime</environment_context>\nKeep my grades')
+        self.write(self.codex, 'mixed.jsonl', encode(codex(raw)))
+        result = live.export_live(self.roots, since=0)
+        self.assertIn(raw, result['documents'][0]['text'])
+        from retrieval_context import units, conversational
+        for doc in result['documents']:
+            doc['citation_id'] = 'synthetic'
+        items, _ = units(result)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]['utterance']['text'].strip(), 'Keep my grades')
+        self.assertTrue(conversational(raw))
 
     def test_late_verification_overrides_routine_recall(self):
         for flag in ['--purpose verification', '--purpose=verification', '--purpose "verification"']:

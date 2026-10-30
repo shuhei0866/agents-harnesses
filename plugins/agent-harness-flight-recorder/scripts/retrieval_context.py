@@ -5,8 +5,8 @@ import math
 import re
 import time
 
-VERSION = 'user-context-bm25-v10'
-FILTER_VERSION = 'known-handoff-v1'
+VERSION = 'user-context-bm25-v11'
+FILTER_VERSION = 'message-origin-v1'
 TRIGGERS = ('resume', 'ambiguous', 'explicit')
 INJECTED_PREFIXES = ('# AGENTS.md', 'Stop hook feedback:', '[exploration-budget]',
     'Base directory for this skill:', 'Another Claude session sent a message:',
@@ -70,12 +70,15 @@ def known_handoff_reason(text):
     return None
 
 
-def conversational(text):
+def conversational(text, *, provenance=True):
     # Known injected frames only. User role does not prove human authorship.
     # A review model's report is a tool-injected user-role envelope, not a
     # human correction. Keep it in ordinary history, but not in this view.
     if known_handoff_reason(text):
         return False
+    if provenance:
+        from retrieval_provenance import view
+        _, text = view(text)
     stripped = text.lstrip()
     if re.match(r'^<heartbeat(?:\s[^>]*|)>', stripped):
         return False
@@ -92,7 +95,7 @@ def conversational(text):
         'あなたは作業セッションの引き継ぎカード', 'あなたは探索セッションの評価者'))
 
 
-def units(snapshot, *, audit=None):
+def units(snapshot, *, audit=None, provenance=True):
     from retrieval_live import bridge_session_prompt, generated_session_prompt
     groups = defaultdict(list)
     missing = 0
@@ -116,12 +119,27 @@ def units(snapshot, *, audit=None):
             continue
         request = response = None
         automated_turn = False
-        for m in ordered:
+        for original in ordered:
+            m = dict(original)
+            if m['role'] == 'user' and provenance:
+                from retrieval_provenance import view
+                origin, visible = view(m['text'])
+                injected = [r for r in origin['regions'] if r['kind'] == 'injected']
+                if injected:
+                    request = response = None
+                    if audit is not None:
+                        for region in injected:
+                            audit.append(dict(source_id=source, citation_id=m['citation_id'],
+                                line=m['line'], reason=region['basis'],
+                                start=region['start'], end=region['end'],
+                                text_sha256=region['text_sha256'], provenance_version=origin['version']))
+                m['provenance'] = origin
+                m['text'] = visible
             reason = known_handoff_reason(m['text']) if m['role'] == 'user' else None
             if reason and audit is not None:
                 audit.append(dict(source_id=source, citation_id=m['citation_id'], line=m['line'],
                                   reason=reason, text_sha256=hashlib.sha256(m['text'].encode()).hexdigest()))
-            if not conversational(m['text']):
+            if not conversational(m['text'], provenance=provenance):
                 if m['role'] == 'user':
                     request = response = None
                     automated_turn = True
@@ -175,6 +193,10 @@ def retrieve(snapshot, query, limit, *, scope=None, rank_refs=()):
     started = time.perf_counter()
     excluded = []
     items, missing = units(snapshot, audit=excluded)
+    # Freeze BM25 normalization to the pre-provenance view of this snapshot.
+    # Filtering must not rerank unchanged human candidates via IDF/length drift.
+    # These units supply statistics only, never returned candidate text.
+    statistics_items, _ = units(snapshot, provenance=False)
     q = set(context_tokens(query))
     weights = query_weights(q)
     fragments = compound_fragments(query)
@@ -201,11 +223,24 @@ def retrieve(snapshot, query, limit, *, scope=None, rank_refs=()):
             counts.append(c)
             texts.append(text)
             frequency.update(c.keys())
-        average = sum(sum(c.values()) for c in counts) / max(1, len(items))
+        statistics_counts = []
+        frequency = Counter()
+        for item in statistics_items:
+            text = item['utterance']['text'] if field == 'utterance' else '\n'.join(
+                item[k]['text'][:2000] for k in ('request', 'prior_response') if item[k])
+            c = Counter(context_tokens(text))
+            for token in q | scope_q:
+                if len(token) == 1 and re.fullmatch(r'[\u3040-\u30ff\u3400-\u9fff]', token):
+                    occurrences = text.count(token)
+                    if occurrences:
+                        c[token] = occurrences
+            statistics_counts.append(c)
+            frequency.update(c.keys())
+        average = sum(sum(c.values()) for c in statistics_counts) / max(1, len(statistics_items))
         for i, c in enumerate(counts):
             length = sum(c.values())
             for token in sorted((q | scope_q) & c.keys()):
-                idf = math.log(1 + (len(items) - frequency[token] + .5) / (frequency[token] + .5))
+                idf = math.log(1 + (len(statistics_items) - frequency[token] + .5) / (frequency[token] + .5))
                 contribution = (weights.get(token, scope_weights.get(token, 1.0))) * weight * idf * c[token] * 2.2 / (
                     c[token] + 1.2 * (.25 + .75 * length / max(1, average)))
                 if token in scope_q:
@@ -244,8 +279,10 @@ def retrieve(snapshot, query, limit, *, scope=None, rank_refs=()):
         hits.append(hit)
     return dict(arm='recorder', snapshot_id=snapshot['snapshot_id'], retrieval_version=VERSION,
                 mode='corrections', hits=hits, candidate_count=len(items),
+                scoring_statistics='pre-provenance-view-v10',
                 **(dict(reference_ranks=reference_ranks) if rank_refs else {}),
-                candidate_filter=dict(version=FILTER_VERSION, excluded_turns=len(excluded),
+                candidate_filter=dict(version=FILTER_VERSION, excluded_turns=len({(x['source_id'], x['line']) for x in excluded}),
+                    excluded_regions=len(excluded),
                     reason_counts=dict(Counter(x['reason'] for x in excluded)),
                     references=excluded[:20], references_truncated=len(excluded) > 20,
                     evidence_sha256=hashlib.sha256(repr(excluded).encode()).hexdigest(),
