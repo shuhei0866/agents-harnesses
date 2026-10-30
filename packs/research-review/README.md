@@ -6,6 +6,9 @@ XやWebの調査をGrok Botなどへ渡し、返却された本文・付録・�
 - **スキル**: [SKILL.md](SKILL.md)。Claude Code / Codexなど、ファイルを読めるエージェントが使う共通の手順。
 - **契約とlint**: 1つの`bundle.json`が原資料、主張、本文・付録、レビュー記録を結ぶ。
 - **Grokアダプター**: 既に許可されたWebhookへ1回だけ送信。UI経由の場合の手順も含む。
+- **Macの日常利用**: [任意のローカルruntime](references/runtime.md)。専用routineと
+  非公開のDrive出力先を最初に許可し、鍵をKeychainへ保存すると、通常の依頼ごとの鍵入力と
+  画面からのファイル回収を省ける。設定と実接続テストが済むまでは利用可能とみなさない。
 
 ## 最小の流れ
 
@@ -33,6 +36,7 @@ python3 "$PACK/scripts/grok_webhook.py" "$RUN_DIR/bundle.json"
 応答本文は標準出力へ出しません。送信前の範囲確認、受付不明時の扱い、手動経路は
 [Grokアダプター](references/grok-bot.md)を参照してください。
 **受付は完了ではありません。** チャットで成果物を確認してダウンロードします。
+設定済みのローカルruntimeでは、専用Driveフォルダの実ファイルを回収します。
 
 資格情報は`--credentials-stdin`でも受け取れます。許可済みの秘密管理または本人の
 非表示入力から`endpoint`と`key`だけを持つJSONを直接渡し、originは別に照合します。
