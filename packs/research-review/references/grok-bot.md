@@ -87,12 +87,17 @@ what was actually inspected and any remaining uncertainty, and the actual
 does not grant permission or prove human approval by itself. Never put a URL/key
 in the record. Use `--reconciled-retry PATH` only after this human decision.
 
-The CLI checks the task, payload, prior marker and pinned origin, leaves the
-original marker unchanged, and atomically reserves
+The CLI checks the task, payload, prior marker, pinned origin and exact endpoint
+hash, leaves the original marker unchanged, and atomically reserves
 `.grok-webhook-retry-attempt.json` before the new network attempt. The same run
 directory permits at most this one deliberate retry. Repeating the command is
 refused. This is still not provider-side deduplication; preserve that uncertainty
 and inspect receipt rather than resending if the result is again `unknown`.
+
+The marker stores an `endpoint_sha256` fingerprint, never the URL or key. A
+different routine on the same origin is not an authorized retry destination.
+Older markers without this fingerprint cannot use `--reconciled-retry`; retain
+them and stop rather than retroactively inventing the original endpoint binding.
 
 Ask the routine owner to return `bundle.json`, `report.md` and any appendices as
 one submission with the task ID. Download the actual files. Local and cloud paths

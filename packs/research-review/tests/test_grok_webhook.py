@@ -273,6 +273,8 @@ class WebhookTests(unittest.TestCase):
                     self.assertTrue(retry.exists())
                     self.assertEqual(original.read_bytes(), prior)
                     self.assertEqual(json.loads(retry.read_text())["retry_of"], gw.sha(prior))
+                    self.assertEqual(json.loads(retry.read_text())["endpoint_sha256"],
+                                     gw.sha(self.url.encode()))
                     return {"status": "accepted", "research_complete": False}
                 with patch.object(sys, "argv", ["grok_webhook", str(path),
                                                 "--reconciled-retry", str(record)]), \
@@ -283,6 +285,48 @@ class WebhookTests(unittest.TestCase):
                 self.assertEqual(original.read_bytes(), prior)
                 self.assertNotIn(self.key, retry.read_text() + output.getvalue())
                 self.assertNotIn(self.url, retry.read_text() + output.getvalue())
+
+    def test_retry_rejects_other_endpoint_on_same_origin_and_unbound_legacy_marker(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy), tempfile.TemporaryDirectory() as root:
+                run = Path(root) / "run"
+                rr.initialize(Mock(directory=str(run), question="public",
+                                   recipient="Coordinator", max_chars=None))
+                path = run / "bundle.json"
+                original = run / ".grok-webhook-attempt.json"
+                retry = run / ".grok-webhook-retry-attempt.json"
+                record = run / "operator-reconciliation.json"
+                config = {"GROK_BOT_WEBHOOK_URL": self.url, "GROK_BOT_WEBHOOK_KEY": self.key,
+                          "GROK_BOT_WEBHOOK_ORIGIN": self.origin}
+                with patch.dict(gw.os.environ, config), \
+                        patch("sys.stdout", new_callable=io.StringIO) as output:
+                    with patch.object(sys, "argv", ["grok_webhook", str(path)]), \
+                            patch.object(gw, "send_once", return_value={"status": "unknown"}):
+                        self.assertEqual(gw.main(), 75)
+                    prior = json.loads(original.read_text())
+                    self.assertEqual(prior["endpoint_sha256"], gw.sha(self.url.encode()))
+                    if legacy:
+                        del prior["endpoint_sha256"]
+                        original.write_text(json.dumps(prior))
+                    prior_raw = original.read_bytes()
+                    record.write_text(json.dumps({
+                        "task_id": prior["task_id"], "request_sha256": prior["request_sha256"],
+                        "prior_marker_sha256": gw.sha(prior_raw), "decision": "retry_once",
+                        "observed_at": "2026-01-01T12:00:00+00:00",
+                        "observation": "No run observed", "user_instruction": "One retry approved"}))
+                    updated = {} if legacy else {"GROK_BOT_WEBHOOK_URL": self.url + "/other",
+                                                 "GROK_BOT_WEBHOOK_KEY": "other-test-key"}
+                    with patch.dict(gw.os.environ, updated), \
+                            patch.object(sys, "argv", ["grok_webhook", str(path),
+                                                      "--reconciled-retry", str(record)]), \
+                            patch.object(gw, "send_once") as send, \
+                            patch("sys.stderr", new_callable=io.StringIO) as error:
+                        self.assertEqual(gw.main(), 2)
+                        send.assert_not_called()
+                        self.assertFalse(retry.exists())
+                        self.assertEqual(original.read_bytes(), prior_raw)
+                        self.assertNotIn(self.url, output.getvalue() + error.getvalue())
+                        self.assertNotIn(self.key, output.getvalue() + error.getvalue())
 
     def test_reconciliation_must_bind_exact_original_task_payload_and_marker(self):
         with tempfile.TemporaryDirectory() as root:

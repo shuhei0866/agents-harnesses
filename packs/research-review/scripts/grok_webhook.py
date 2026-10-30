@@ -40,7 +40,7 @@ def credentials_from_stdin():
     return value["endpoint"], value["key"]
 
 
-def retry_record(path, directory, bundle, payload, origin):
+def retry_record(path, directory, bundle, payload, endpoint, origin):
     """Check a recorded operator decision, not proof of human authorization."""
     with (directory / ".grok-webhook-attempt.json").open("rb") as file:
         prior, prior_raw = read_object(file)
@@ -49,6 +49,7 @@ def retry_record(path, directory, bundle, payload, origin):
     expected = {"task_id": bundle["task"]["id"], "request_sha256": sha(payload)}
     if (any(prior.get(k) != v or record.get(k) != v for k, v in expected.items())
             or prior.get("origin_sha256") != sha(origin.encode())
+            or prior.get("endpoint_sha256") != sha(endpoint.encode())
             or record.get("prior_marker_sha256") != sha(prior_raw)
             or record.get("decision") != "retry_once"):
         raise ContractError("reconciliation does not match original attempt")
@@ -184,7 +185,7 @@ def main():
                 extra = {}
                 if args.reconciled_retry:
                     extra = retry_record(args.reconciled_retry, args.bundle.parent,
-                                         bundle, payload, origin)
+                                         bundle, payload, endpoint, origin)
                     marker = args.bundle.parent / ".grok-webhook-retry-attempt.json"
                 try:
                     fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -196,6 +197,7 @@ def main():
                     with os.fdopen(fd, "w", encoding="utf-8") as file:
                         json.dump({"task_id": bundle["task"]["id"],
                                    "request_sha256": sha(payload), "origin_sha256": sha(origin.encode()),
+                                   "endpoint_sha256": sha(endpoint.encode()),
                                    "reserved_at": datetime.now(timezone.utc).isoformat(), **extra}, file)
                         file.flush()
                         os.fsync(file.fileno())
