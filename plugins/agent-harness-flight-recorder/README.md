@@ -839,3 +839,39 @@ recognizer, not a claim to detect every generated message. A mention or quoted
 example of a handoff stays eligible. The frame's following assistant context
 is not attached to a later human turn; later human decisions remain eligible.
 Original documents remain available to ordinary history search.
+
+### Message provenance in judgment recall
+
+`user-context-bm25-v11` derives a versioned `message-origin-v1` view from
+immutable message spans. A leading sequence of complete, known envelopes
+(plugin recommendations, AGENTS instructions, environment/app context) is
+classified by structural evidence. Character offsets, original/region SHA-256,
+classification basis and version accompany candidates. Remaining text is
+`unknown`, never automatically certified as human-authored or a valid decision.
+Quoted examples, ordinary mentions and unrecognized boundaries are not newly
+classified as injected. Existing legacy whole-turn exclusions still apply.
+
+Judgment recall removes those identified regions before lexical scoring and
+preceding-context construction; the conditional supplement uses the same units.
+A mixed message retains its unclassified remainder and original citation/line.
+No decision-language bonus, semantic ranking or human-utterance deduplication is
+introduced. `candidate_filter.excluded_turns` counts distinct affected turns;
+`excluded_regions` counts region/legacy exclusion records, not saved reads.
+References remain bounded to 20 with a truncation flag. Candidate provenance is
+stored with the search result, so replay need not overwrite past results.
+
+New collection retains complete structured envelopes for ordinary history and
+source inspection. Original logs and existing snapshots are never rewritten.
+Previously omitted material only becomes available on a later source import;
+a collector version bump alone does not restore omitted historical text.
+Follow-up eligibility also recognizes these envelopes, preventing retained
+machine-only messages from being counted as human replies. Unknown provenance,
+no adoption, or a completed follow-up window is not a success/failure label.
+
+This rollout deliberately keeps BM25 document-frequency and average-length
+statistics from the pre-provenance v10 view of the **same** snapshot. They are
+normalization data only: injected text cannot become a candidate or match via
+preceding context. Unchanged candidate text/context therefore keeps its old
+score while newly exposed mixed-message remainders can compete. The result
+records `scoring_statistics`; replacing this compatibility policy needs a
+separate ranking evaluation, not an implicit change during source filtering.

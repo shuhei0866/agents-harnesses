@@ -20,6 +20,7 @@ import time
 
 from retrieval_snapshot import _message
 from retrieval_context import INJECTED_PREFIXES
+from retrieval_provenance import view
 
 MAX_FILES = 10_000
 MAX_ENTRIES = 100_000
@@ -32,7 +33,7 @@ MAX_DOCUMENT_CHARS = 100_000
 MAX_MANIFEST_BYTES = 60 * 1024 * 1024
 WINDOW_LINES = 40
 ADAPTERS = {'claude-code', 'codex'}
-COLLECTOR_VERSION = 'structured-message-context-v11-blocks'
+COLLECTOR_VERSION = 'structured-message-context-v12-provenance'
 
 
 BRIDGE_PROMPT = (
@@ -420,13 +421,19 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                             break
                         message = _message(value, adapter)
                         if message and message[0] == 'user':
-                            if not seen_user and bridge_session_prompt(message[1]):
+                            substantive = view(message[1])[1].strip()
+                            if not seen_user and bridge_session_prompt(substantive):
                                 source_kind = 'agent_consultation'
-                            if not seen_user and generated_session_prompt(message[1]):
+                            if not seen_user and generated_session_prompt(substantive):
                                 reason = 'generated'
                                 break
-                            seen_user = True
-                        if message and message[0] == 'user' and message[1].lstrip().startswith(INJECTED_PREFIXES):
+                            if substantive:
+                                seen_user = True
+                        # Preserve complete structured envelopes for ordinary history.
+                        # The judgment-search view filters regions without changing originals.
+                        from retrieval_provenance import classify
+                        structured = message and any(r['kind'] == 'injected' for r in classify(message[1]))
+                        if message and message[0] == 'user' and not structured and message[1].lstrip().startswith(INJECTED_PREFIXES):
                             report['omitted_injected_messages'] += 1
                             continue
                         if message:

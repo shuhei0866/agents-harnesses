@@ -65,6 +65,23 @@ class LiveTests(unittest.TestCase):
         self.assertIn('Explain this prompt', str(result['documents']))
         self.assertIn('human request', str(result['documents']))
 
+    def test_leading_machine_frames_preserve_consultation_classification(self):
+        import retrieval_context as context
+        frame = '<environment_context>machine</environment_context>'
+        for root, message in [(self.codex, codex), (self.claude, claude)]:
+            for name, opening in [
+                ('separate', [message(frame), message(live.BRIDGE_PROMPT)]),
+                ('combined', [message(frame + '\n' + live.BRIDGE_PROMPT)]),
+            ]:
+                self.write(root, name + '.jsonl', encode(*opening,
+                    message('advice', 'assistant'), message('unwrapped followup')))
+        result = live.export_live(self.roots, since=0)
+        self.assertEqual(result['import_report']['consultation_sources'], 4)
+        self.assertTrue(all(d.get('source_kind') == 'agent_consultation'
+                            for d in result['documents']))
+        self.assertIn(frame, str(result['documents']))
+        self.assertEqual(context.units(result)[0], [])
+
     def test_generated_sessions_excluded_but_human_corrections_retained(self):
         handoff = ('あなたは作業セッションの引き継ぎカードを書く係。\n'
                    '## 現在地\n## 次の一手\n<transcript>\n'
@@ -153,12 +170,26 @@ class LiveTests(unittest.TestCase):
         text = str(result['documents'])
         self.assertIn('genuine request', text)
         self.assertIn('genuine correction', text)
-        self.assertNotIn('injected', text)
+        self.assertIn('injected', text)  # Raw structured envelope retained for history.
         from retrieval_context import units
         for doc in result['documents']:
             doc['citation_id'] = 'synthetic'
         items, _ = units(result)
         self.assertEqual(len(items), 2)
+
+    def test_structured_prefix_retains_original_and_human_tail(self):
+        raw = ('# AGENTS.md instructions for /example\n<INSTRUCTIONS>machine rule</INSTRUCTIONS>'
+               '\n<environment_context>runtime</environment_context>\nKeep my grades')
+        self.write(self.codex, 'mixed.jsonl', encode(codex(raw)))
+        result = live.export_live(self.roots, since=0)
+        self.assertIn(raw, result['documents'][0]['text'])
+        from retrieval_context import units, conversational
+        for doc in result['documents']:
+            doc['citation_id'] = 'synthetic'
+        items, _ = units(result)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]['utterance']['text'].strip(), 'Keep my grades')
+        self.assertTrue(conversational(raw))
 
     def test_late_verification_overrides_routine_recall(self):
         for flag in ['--purpose verification', '--purpose=verification', '--purpose "verification"']:
