@@ -117,8 +117,8 @@ def valid_configuration(endpoint, key, expected_origin):
                     and (url.hostname.lower(), url.port or 443)
                     == (origin.hostname.lower(), origin.port or 443)
                     and key.strip() and (endpoint + key).isascii()
-                    and not any(c in endpoint + key + expected_origin
-                                for c in "\r\n"))
+                    and not any(ord(c) <= 0x20 or ord(c) == 0x7f for c in endpoint)
+                    and not any(c in key + expected_origin for c in "\r\n"))
     except ValueError:
         return False
 

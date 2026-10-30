@@ -136,7 +136,9 @@ class WebhookTests(unittest.TestCase):
                               ("https://other.example/endpoint", self.key),
                               ("https://example.org:444/endpoint", self.key),
                               (self.url, ""), (self.url, "key\nInjected: value"),
-                              (self.url + "/調査", self.key), (self.url, "キー")):
+                              (self.url + "/調査", self.key), (self.url, "キー"),
+                              (self.url + "/a b", self.key), (self.url + "/a\tb", self.key),
+                              (self.url + "/a\x00b", self.key), (self.url + "/a\x7fb", self.key)):
             result = self.send(endpoint=endpoint, key=key, opener=opener)
             self.assertEqual(result["status"], "not_sent")
         opener.open.assert_not_called()
@@ -146,7 +148,9 @@ class WebhookTests(unittest.TestCase):
             run = Path(root) / "run"
             rr.initialize(Mock(directory=str(run), question="public",
                                recipient="Coordinator", max_chars=None))
-            for endpoint, key in ((self.url + "/調査", self.key), (self.url, "キー")):
+            for endpoint, key in ((self.url + "/調査", self.key), (self.url, "キー"),
+                                  (self.url + "/a b", self.key), (self.url + "/a\tb", self.key),
+                                  (self.url + "/a\x7fb", self.key)):
                 config = {"GROK_BOT_WEBHOOK_URL": endpoint, "GROK_BOT_WEBHOOK_KEY": key,
                           "GROK_BOT_WEBHOOK_ORIGIN": self.origin}
                 with patch.object(sys, "argv", ["grok_webhook", str(run / "bundle.json")]), \
