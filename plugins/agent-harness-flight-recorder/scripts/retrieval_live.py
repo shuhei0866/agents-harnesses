@@ -20,6 +20,7 @@ import time
 
 from retrieval_snapshot import _message
 from retrieval_context import INJECTED_PREFIXES
+from retrieval_provenance import view
 
 MAX_FILES = 10_000
 MAX_ENTRIES = 100_000
@@ -420,12 +421,14 @@ def export_live(roots: list[tuple[str, Path]], *, since: float,
                             break
                         message = _message(value, adapter)
                         if message and message[0] == 'user':
-                            if not seen_user and bridge_session_prompt(message[1]):
+                            substantive = view(message[1])[1].strip()
+                            if not seen_user and bridge_session_prompt(substantive):
                                 source_kind = 'agent_consultation'
-                            if not seen_user and generated_session_prompt(message[1]):
+                            if not seen_user and generated_session_prompt(substantive):
                                 reason = 'generated'
                                 break
-                            seen_user = True
+                            if substantive:
+                                seen_user = True
                         # Preserve complete structured envelopes for ordinary history.
                         # The judgment-search view filters regions without changing originals.
                         from retrieval_provenance import classify

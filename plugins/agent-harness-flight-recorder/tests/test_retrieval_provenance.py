@@ -23,6 +23,18 @@ def snapshot(messages):
 
 
 class ProvenanceTests(unittest.TestCase):
+    def test_machine_prefix_does_not_hide_consultation_session(self):
+        from retrieval_live import BRIDGE_PROMPT
+        for prefix in [PREFIX + FRAME + ENV, ENV]:
+            for messages in [
+                [('user', prefix), ('user', BRIDGE_PROMPT)],
+                [('user', prefix + '\n' + BRIDGE_PROMPT)],
+            ]:
+                s = snapshot(messages + [('assistant', 'advice'),
+                                         ('user', 'unwrapped followup')])
+                for enabled in [True, False]:
+                    self.assertEqual(context.units(s, provenance=enabled)[0], [])
+
     def test_complete_frames_and_unknown_tail(self):
         original = PREFIX + FRAME + ENV + '\nKeep my learning history.'
         meta, selected = view(original)

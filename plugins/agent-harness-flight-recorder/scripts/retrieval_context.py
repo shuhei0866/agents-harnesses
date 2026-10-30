@@ -113,9 +113,11 @@ def units(snapshot, *, audit=None, provenance=True):
     result = []
     for source, messages in groups.items():
         ordered = sorted(messages, key=lambda x: (x['line'], x['citation_id']))
-        first_user = next((m for m in ordered if m['role'] == 'user'), None)
-        if first_user and (bridge_session_prompt(first_user['text']) or
-                           generated_session_prompt(first_user['text'])):
+        from retrieval_provenance import view
+        first_user = next((text for m in ordered if m['role'] == 'user'
+                           if (text := view(m['text'])[1].strip())), None)
+        if first_user and (bridge_session_prompt(first_user) or
+                           generated_session_prompt(first_user)):
             continue
         request = response = None
         automated_turn = False

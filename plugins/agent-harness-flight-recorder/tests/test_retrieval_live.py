@@ -65,6 +65,23 @@ class LiveTests(unittest.TestCase):
         self.assertIn('Explain this prompt', str(result['documents']))
         self.assertIn('human request', str(result['documents']))
 
+    def test_leading_machine_frames_preserve_consultation_classification(self):
+        import retrieval_context as context
+        frame = '<environment_context>machine</environment_context>'
+        for root, message in [(self.codex, codex), (self.claude, claude)]:
+            for name, opening in [
+                ('separate', [message(frame), message(live.BRIDGE_PROMPT)]),
+                ('combined', [message(frame + '\n' + live.BRIDGE_PROMPT)]),
+            ]:
+                self.write(root, name + '.jsonl', encode(*opening,
+                    message('advice', 'assistant'), message('unwrapped followup')))
+        result = live.export_live(self.roots, since=0)
+        self.assertEqual(result['import_report']['consultation_sources'], 4)
+        self.assertTrue(all(d.get('source_kind') == 'agent_consultation'
+                            for d in result['documents']))
+        self.assertIn(frame, str(result['documents']))
+        self.assertEqual(context.units(result)[0], [])
+
     def test_generated_sessions_excluded_but_human_corrections_retained(self):
         handoff = ('あなたは作業セッションの引き継ぎカードを書く係。\n'
                    '## 現在地\n## 次の一手\n<transcript>\n'
