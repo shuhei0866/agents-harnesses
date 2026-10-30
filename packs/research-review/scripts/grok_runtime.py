@@ -217,6 +217,9 @@ def submit(root, task_id, keychain=None, sender=send_once, now=None):
 
 
 def status(root):
+    if not (root / "profile.json").exists():
+        return {"profile_present": False, "pending": None,
+                "next_action": "prepare authorized one-time setup"}
     with locked(root):
         cfg = config(root)
         result = {"profile_present": True, "output_folder": cfg["output_folder"],

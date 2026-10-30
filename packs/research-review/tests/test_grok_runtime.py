@@ -82,6 +82,13 @@ class RuntimeTests(unittest.TestCase):
         self.assertNotIn(ENDPOINT.encode(), raw)
         self.assertFalse((self.root / "pending.json").exists())
 
+    def test_unconfigured_status_does_not_create_runtime_or_read_secrets(self):
+        absent = Path(self.tmp.name) / "not-configured"
+        with patch.object(rt, "MacKeychain", side_effect=AssertionError("secret access")):
+            result = rt.status(absent)
+        self.assertFalse(result["profile_present"])
+        self.assertFalse(absent.exists())
+
     def test_one_send_pending_and_no_secret_files(self):
         task = self.prepare()
         self.assertEqual(self.submit(task)["status"], "accepted")
