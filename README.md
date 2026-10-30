@@ -8,6 +8,7 @@ AI コーディングエージェント（Claude Code / Codex）の生産性を�
 agents-harnesses/
 ├── packs/
 │   ├── git-safety/               # Git事故防止の導入パック
+│   ├── research-review/          # X/Web調査の依頼・証拠・レビュー契約とGrok Webhook
 │   └── exploration-budget/       # 探索セッションに時間予算・台帳・境界フックを与えるパック
 ├── mcp/
 │   └── local-sessions/          # Codex / Claude Codeの会話を継続するMCP
@@ -92,6 +93,16 @@ Python 3.11以上と認証済みのCLIを使うmacOS/Linux向けのalphaです�
 [導入と使い方](mcp/local-sessions/README.md) ·
 [アーキテクチャ](mcp/local-sessions/docs/architecture.md) ·
 [安全性と保存データ](mcp/local-sessions/SECURITY.md)
+
+## Research Review Pack — X/Web調査を委譲して根拠を確認する
+
+調査依頼、証拠台帳、本文・付録、独立レビューを1つの契約で結びます。
+Grok Botには設定済みの公式Webhookから1回だけ依頼を送り、受付と成果の完成を区別します。
+ローカルlintは版ずれ・欠落・宣言されたレビュー範囲を検査し、原文の真偽や実送信を保証しません。
+定期実行・権限・課金を変更するinstallerは含みません。
+
+使い方と検証範囲は [Research Review Pack](packs/research-review/README.md)、
+エージェントが読む入口は [research-review skill](packs/research-review/SKILL.md) を参照してください。
 
 ## Claude Code
 
