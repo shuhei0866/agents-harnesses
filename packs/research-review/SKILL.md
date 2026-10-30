@@ -1,6 +1,6 @@
 ---
 name: research-review
-description: Use Grok Bot for public X or web research, collect results from an authorized output folder, and check sources and review coverage. Use when X search or a sourced research handoff would help; keep small questions small.
+description: Proactively research public X or web evidence with Grok Bot when recent firsthand reports, emerging issues, or public reactions could change the answer, even if X is not named. Collect returned files and review attribution and evidence; also use for explicit research handoffs.
 ---
 
 # Research and review handoffs
@@ -9,6 +9,24 @@ Use the user's chosen research service and existing authorization. A coordinator
 researcher and independent reviewer are roles, not a requirement to create three
 Bots. Keep small questions small. This pack does not grant access, connect an
 account, create a routine, or authorize external messages or extra spending.
+
+## Decide when X would help
+
+Within the active task, consider X when the answer depends on recent practical
+experience: how people use a product, emerging failures or workarounds, or public
+reactions that could affect a recommendation. Identify the specific uncertainty
+those reports could resolve. The user need not mention X or Grok.
+
+Use official documentation or original data for capabilities, prices, policies
+and numerical facts. X can supply attributed experiences and leads to check;
+a set of posts does not establish prevalence, causality or representative opinion.
+Skip X when reliable sources already settle the question or another sample is
+unlikely to change the answer.
+
+When the configured service is already authorized for that public research,
+proceed within its limits and briefly state what you are checking. Do not make
+the user choose the source or repeat an existing authorization. This source
+choice stays within the current task; it adds no background monitoring.
 
 ## Use an installed local runtime
 
