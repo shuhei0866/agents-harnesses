@@ -58,6 +58,14 @@ shell arguments or Git. A leaked URL/key is a capability to spend usage: pause t
 routine through the supported UI, then use the provider's supported secret
 replacement procedure before resuming. This adapter cannot revoke that key.
 
+For HTTP errors the adapter reads at most 8193 bytes in memory and emits only a
+fixed `server_error_hint` category (inactive routine, authentication, JSON, usage,
+rate limit, or unrecognized). It never returns or saves raw response text, JSON
+fields, URLs, or credentials. The hint is explicitly heuristic, based on untrusted
+response text; it does not prove a cause or authorize a retry. Unsupported,
+oversized, conflicting, or unreadable responses remain unclassified. Failure to
+read the diagnostic must not change the known HTTP status or resend the request.
+
 Before networking the CLI atomically creates `.grok-webhook-attempt.json` in the
 run directory (task ID, timestamp and hashes only). It refuses another attempt
 in that same directory, including after a crash. This is a local duplicate-attempt

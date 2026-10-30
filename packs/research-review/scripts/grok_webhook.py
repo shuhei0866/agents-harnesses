@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 from research_review import ContractError, brief, load, sha, timestamp, unique_pairs
 
 INPUT_LIMIT = 8192
+ERROR_BODY_LIMIT = 8192
 
 
 def read_object(stream):
@@ -63,6 +64,43 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def failure_hint(response):
+    """Return fixed hints only; never return untrusted response text or fields."""
+    hint = {"basis": "untrusted_response_heuristic", "category": "unrecognized"}
+    try:
+        raw = response.read(ERROR_BODY_LIMIT + 1)
+    except (OSError, ValueError, http.client.HTTPException):
+        return {**hint, "body_state": "unreadable"}
+    if len(raw) > ERROR_BODY_LIMIT:
+        return {**hint, "body_state": "too_large"}
+    try:
+        value = json.loads(raw, object_pairs_hook=unique_pairs)
+    except (ValueError, RecursionError, ContractError):
+        return {**hint, "body_state": "unsupported"}
+    if not isinstance(value, dict):
+        return {**hint, "body_state": "unsupported"}
+    fields = []
+    for obj in (value, value.get("error")):
+        if isinstance(obj, dict):
+            fields.extend(obj[k] for k in ("error", "message", "title", "reason", "code")
+                          if isinstance(obj.get(k), str))
+    text = " ".join(" ".join(fields).casefold().split())
+    patterns = {
+        "routine_inactive": ("automation is paused", "routine is paused",
+                             "automation is disabled", "routine is disabled",
+                             "paused automation", "paused routine"),
+        "authentication": ("invalid api key", "invalid webhook key", "invalid bearer token",
+                           "unauthorized", "authentication failed"),
+        "invalid_json": ("invalid json", "unexpected token", "unexpected end of json"),
+        "usage_limit": ("usage limit", "spending limit", "insufficient credits"),
+        "rate_limit": ("rate limit", "too many requests"),
+    }
+    matches = [category for category, phrases in patterns.items()
+               if any(phrase in text for phrase in phrases)]
+    return {**hint, "body_state": "read",
+            "category": matches[0] if len(matches) == 1 else "unrecognized"}
+
+
 def request_payload(bundle):
     return json.dumps({"schema_version": 1, "request_id": bundle["task"]["id"],
                        "task_id": bundle["task"]["id"], "request": brief(bundle)},
@@ -95,16 +133,19 @@ def send_once(bundle, endpoint, key, expected_origin, timeout=30, opener=None, p
         "Authorization": "Bearer " + key, "Content-Type": "application/json; charset=utf-8"})
     opener = opener or urllib.request.build_opener(NoRedirect())
     try:
-        # Never consume or log a response body. 200 is acceptance, not completion.
+        # Successful response bodies are unused. 200 is acceptance, not completion.
         with opener.open(request, timeout=timeout) as response:
             code = response.status
         return {**result, "status": "accepted" if code == 200 else "unknown",
                 "http_status": code}
     except urllib.error.HTTPError as exc:
         code = exc.code
-        exc.close()
+        try:
+            hint = failure_hint(exc)
+        finally:
+            exc.close()
         return {**result, "status": "not_accepted" if 400 <= code < 500 else "unknown",
-                "http_status": code}
+                "http_status": code, "server_error_hint": hint}
     except (urllib.error.URLError, OSError, socket.timeout, http.client.HTTPException, ValueError):
         return {**result, "status": "unknown", "reason": "inspect_bot_chat_before_any_retry"}
 

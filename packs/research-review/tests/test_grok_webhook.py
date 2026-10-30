@@ -74,6 +74,60 @@ class WebhookTests(unittest.TestCase):
         self.assertIsNone(handler.redirect_request(None, None, 302, "", {},
                                                    "https://other.example/"))
 
+    def test_http_error_hints_never_return_response_text_or_secrets(self):
+        cases = [("Automation is paused", "routine_inactive"),
+                 ("Invalid webhook key", "authentication"),
+                 ("Invalid JSON", "invalid_json"),
+                 ("Weekly usage limit reached", "usage_limit"),
+                 ("Automation run rate limit exceeded", "rate_limit"),
+                 ("Unrecognized failure", "unrecognized"),
+                 ("Automation is paused; invalid webhook key", "unrecognized")]
+        for message, category in cases:
+            body = io.BytesIO(json.dumps({"error": {"message": message},
+                                         "reflected": self.url + self.key}).encode())
+            opener = Mock()
+            opener.open.side_effect = urllib.error.HTTPError(self.url, 400, "hidden", {}, body)
+            result = self.send(opener=opener)
+            self.assertEqual(result["status"], "not_accepted")
+            self.assertEqual(result["server_error_hint"]["category"], category)
+            self.assertEqual(result["server_error_hint"]["basis"], "untrusted_response_heuristic")
+            self.assertNotIn(message, json.dumps(result))
+            self.assertNotIn(self.key, json.dumps(result))
+            self.assertNotIn(self.url, json.dumps(result))
+            self.assertTrue(body.closed)
+            opener.open.assert_called_once()
+
+    def test_unusable_diagnostics_keep_known_status_and_never_retry(self):
+        cases = [(b'x' * (gw.ERROR_BODY_LIMIT + 1), "too_large"),
+                 (b'<html>Automation is paused</html>', "unsupported"),
+                 (b'[]', "unsupported"),
+                 (b'\xff\x00private', "unsupported"),
+                 (b'[' * 2000 + b']' * 2000, "unsupported"),
+                 (b'{"error":"invalid json","error":"unauthorized"}', "unsupported")]
+        for data, state in cases:
+            body = Mock(wraps=io.BytesIO(data))
+            opener = Mock()
+            opener.open.side_effect = urllib.error.HTTPError(self.url, 503, "hidden", {}, body)
+            result = self.send(opener=opener)
+            self.assertEqual(result["status"], "unknown")
+            self.assertEqual(result["http_status"], 503)
+            self.assertEqual(result["server_error_hint"]["body_state"], state)
+            self.assertEqual(result["server_error_hint"]["category"], "unrecognized")
+            body.read.assert_called_once_with(gw.ERROR_BODY_LIMIT + 1)
+            opener.open.assert_called_once()
+        for error in (socket.timeout(), http.client.IncompleteRead(b'private'),
+                      OSError('private diagnostic')):
+            body = Mock()
+            body.read.side_effect = error
+            opener = Mock()
+            opener.open.side_effect = urllib.error.HTTPError(self.url, 400, "hidden", {}, body)
+            result = self.send(opener=opener)
+            self.assertEqual(result["status"], "not_accepted")
+            self.assertEqual(result["http_status"], 400)
+            self.assertEqual(result["server_error_hint"]["body_state"], "unreadable")
+            self.assertNotIn('private', json.dumps(result))
+            opener.open.assert_called_once()
+
     def test_bad_configuration_does_not_call_network(self):
         opener = Mock()
         for endpoint, key in (("http://example.org", self.key),
