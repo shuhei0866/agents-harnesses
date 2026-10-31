@@ -8,6 +8,7 @@ from mcp.server.fastmcp import FastMCP
 from .runner import dispatch, status
 from .store import ACTIVE, DEFAULT_TIMEOUT, Store
 from . import dialogue
+from . import carryovers
 
 mcp = FastMCP("local-sessions", instructions=(
     "Consult a persistent Codex or Claude Code partner when another perspective helps compare "
@@ -21,6 +22,12 @@ mcp = FastMCP("local-sessions", instructions=(
     "For an explicitly requested bounded discussion, use dialogue_start with a topic and limits. "
     "Keep polling dialogue_status with its next_cursor and share meaningful new ideas, disagreements, "
     "and changed assumptions while doing independent work between polls. "
+    "When an unfinished idea or concern might otherwise be lost, use carryover_save for a single line. "
+    "No explanation or reopening condition is required. Save only selected useful fragments, not a transcript. "
+    "A named partner's next new send includes a small rotating selection automatically. For a later bounded "
+    "dialogue in the same sharing scope, pass continue_from with its previous dialogue ID. "
+    "Keep notes scoped; do not import other partners' private notes. Inspect the frozen carryovers in status; "
+    "presentation does not mean understanding or resolution. Close a note only when intentionally set aside or resolved. "
     "Do not build recursive or open-ended relay loops. "
     "These are bridge-owned CLI sessions, not the caller's currently open chat."), log_level="WARNING")
 
@@ -93,7 +100,7 @@ def agent_history(session: str, limit: int = 10) -> dict:
 @mcp.tool()
 def dialogue_start(topic: str, max_rounds: int, time_budget_seconds: int, request_id: str,
                    codex_model: str | None = None, claude_model: str | None = None,
-                   turn_timeout_seconds: int = DEFAULT_TIMEOUT) -> dict:
+                   turn_timeout_seconds: int = DEFAULT_TIMEOUT, continue_from: str | None = None) -> dict:
     """Start an explicitly authorized bounded Codex/Claude dialogue; return without waiting.
 
     Creates two dedicated native conversations and resumes them on every turn.
@@ -103,9 +110,11 @@ def dialogue_start(topic: str, max_rounds: int, time_budget_seconds: int, reques
     Supply only a topic safe to share with BOTH providers. Existing chats are not imported.
     Retry the same start with the same request_id and identical parameters.
     Model defaults come from each CLI; set only a model authorized by the user.
+    continue_from explicitly shares that dialogue series' open one-line notes
+    with BOTH new partners. It does not import transcripts or restore old limits.
     """
     return dialogue.start(Store(), topic, max_rounds, time_budget_seconds, request_id,
-                          codex_model, claude_model, turn_timeout_seconds)
+                          codex_model, claude_model, turn_timeout_seconds, continue_from)
 
 
 @mcp.tool()
@@ -139,6 +148,42 @@ def dialogue_control(dialogue_id: str, action: Literal['pause', 'resume', 'stop'
     or completed. Inspect status to confirm any requested stop/pause took effect.
     """
     return dialogue.control(Store(), dialogue_id, action)
+
+
+@mcp.tool()
+def carryover_save(text: str, request_id: str, session: str | None = None,
+                   dialogue_id: str | None = None) -> dict:
+    """Keep one unfinished idea/concern (one line, 1-400 characters).
+
+    Supply exactly one named session or dialogue_id. Reasons and reopening
+    conditions are optional text, never required. Dialogue notes are shared
+    with BOTH providers only on an explicitly continued dialogue. Named-partner
+    notes appear on that partner's next new send. No model call is made.
+    Reuse request_id only for the same save. Repeated saves do not reopen notes.
+    """
+    return carryovers.keep(Store(), text, request_id, session=session, dialogue_id=dialogue_id)
+
+
+@mcp.tool()
+def carryover_list(session: str | None = None, dialogue_id: str | None = None,
+                   state: Literal['open', 'closed', 'all'] = 'open', offset: int = 0, limit: int = 100) -> dict:
+    """Read scoped one-line notes. Reading never closes or selects them.
+
+    Exactly one session or dialogue_id. next_offset paginates the current list;
+    it is not an immutable cursor if notes are concurrently added or closed.
+    selected_at records snapshot reservation, not provider delivery or recall.
+    """
+    return carryovers.listing(Store(), session=session, dialogue_id=dialogue_id, state=state, offset=offset, limit=limit)
+
+
+@mcp.tool()
+def carryover_update(note_id: str, state: Literal['open', 'closed']) -> dict:
+    """Explicitly close or reopen a note; no reason is required.
+
+    Closing excludes future selections. It cannot retract already reserved
+    prompts or erase notes from native histories. No automatic expiry/deletion.
+    """
+    return carryovers.set_state(Store(), note_id, state)
 
 
 def main():

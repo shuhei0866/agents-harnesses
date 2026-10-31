@@ -17,6 +17,7 @@ import uuid
 
 from .runner import dispatch, status as job_status
 from .store import ACTIVE, ROOT, Store
+from . import carryovers
 
 TERMINAL = ('completed', 'stopped', 'timed_out', 'failed')
 
@@ -61,7 +62,7 @@ def _spawn(store, did):
 
 
 def start(store, topic, max_rounds, time_budget_seconds, request_id,
-          codex_model=None, claude_model=None, turn_timeout_seconds=600):
+          codex_model=None, claude_model=None, turn_timeout_seconds=600, continue_from=None):
     if not isinstance(topic, str) or not 1 <= len(topic.strip()) <= 12000:
         raise ValueError('topic must contain 1-12000 characters')
     for name, value, low, high in (
@@ -77,6 +78,11 @@ def start(store, topic, max_rounds, time_budget_seconds, request_id,
             raise ValueError('invalid model')
     config = dict(topic=topic, max_rounds=max_rounds, time_budget_seconds=time_budget_seconds,
                   turn_timeout_seconds=turn_timeout_seconds, codex_model=codex_model, claude_model=claude_model)
+    # Keep old request encodings retry-compatible when no continuation is set.
+    if continue_from is not None:
+        if not isinstance(continue_from, str) or not continue_from:
+            raise ValueError('continue_from must be a dialogue ID')
+        config['continue_from'] = continue_from
     encoded = json.dumps(config, sort_keys=True)
     fresh = False
     with store.db() as db:
@@ -87,6 +93,8 @@ def start(store, topic, max_rounds, time_budget_seconds, request_id,
                 raise ValueError('request_id was already used with different dialogue parameters')
             did = old['id']
         else:
+            if continue_from is not None:
+                carryovers.scope_for(db, dialogue_id=continue_from)
             did, now = str(uuid.uuid4()), time.time()
             sids = []
             for provider, model in (('codex', codex_model), ('claude', claude_model)):
@@ -109,6 +117,7 @@ def start(store, topic, max_rounds, time_budget_seconds, request_id,
             db.execute('INSERT INTO dialogues VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
                 (did, request_id, encoded, *sids, 'queued', None, None, None,
                  float(time_budget_seconds), None, now, now))
+            carryovers.start_dialogue(db, did, continue_from)
             fresh = True
     if fresh:
         _spawn(store, did)
@@ -165,7 +174,10 @@ def inspect(store, did, after_turn=0, limit=20):
         session = store.session(row[key])
         participants.append({k: session[k] for k in ('id', 'name', 'provider', 'model', 'native_id')})
     config = json.loads(row['config'])
+    with store.db() as db:
+        remembered = carryovers.snapshot_for_dialogue(db, did)
     return dict(id=did, status=row['status'], control=row['control'], reason=row['reason'], error=row['error'],
+        carryovers=remembered, continue_from=config.get('continue_from'),
         topic=config['topic'], max_rounds=config['max_rounds'], time_budget_seconds=config['time_budget_seconds'],
         remaining_seconds=round(_remaining(row), 2), completed_turns=sum(t['status'] == 'completed' for t in turns),
         participants=participants, turns=records, next_cursor=page[-1]['ordinal'] if page else after_turn,

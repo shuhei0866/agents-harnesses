@@ -27,3 +27,10 @@ all dialogues before switching back. A paused dialogue still has pending work
 and is not a completed migration boundary. Omitting an explicit old state
 path starts a new empty registry; it does not import or erase the old one.
 Do not commit backups, logs or exported conversations to this repository.
+
+Version 0.3 adds carryover note, dialogue-snapshot and job-snapshot tables. It
+does not rewrite existing sessions/jobs or require notes for old callers. Old
+dialogues can be used as explicit continuation sources. Old request IDs remain
+retry-compatible when `continue_from` is omitted. Older versions ignore notes;
+rolling back does not delete them and does not provide automatic resurfacing.
+Retain the same state root and stop active work before switching versions.
