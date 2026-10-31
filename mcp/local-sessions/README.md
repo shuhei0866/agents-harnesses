@@ -13,16 +13,20 @@ inject messages into an already open terminal or desktop chat.
 **Status: alpha.** Python 3.11+, macOS/Linux (POSIX process groups and
 `flock`). Windows is not supported. At least one supported CLI must be on
 PATH and authenticated. Each client chooses when to consult a partner.
-There is no scheduler or automatic back-and-forth loop.
+An explicitly started dialogue can alternate between both providers within round
+and time limits. It is local to this host, not a recurring scheduler.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    H["Codex / Claude Code MCP client"] <-->|stdio| S["MCP server: 6 tools"]
+    H["Codex / Claude Code MCP client"] <-->|stdio| S["MCP server: 9 tools"]
     S <-->|reserve / inspect| D[("SQLite registry")]
     S -->|spawn per send| W["Detached Python worker"]
     W <-->|progress / result / native ID| D
+    S -->|start / pause / resume / stop| B["Bounded dialogue coordinator"]
+    B <-->|turn reservations / remaining budget| D
+    B -->|alternate speakers| W
     W -->|stdin + JSON events| C["Codex CLI or Claude Code CLI"]
     C <-->|resume| N[("CLI-owned conversation history")]
     C <-->|authenticated generation| P["Model provider"]
@@ -124,6 +128,9 @@ These are MCP tool calls, not Python functions to import. Choose
 | `agent_status` | Read state/result; optionally wait up to 30 seconds. |
 | `agent_history` | Read the most recent bridge messages/results (up to 100). |
 | `agent_interrupt` | Request cancellation; confirm termination with status. |
+| `dialogue_start` | Create two dedicated partners and start a bounded alternating discussion. |
+| `dialogue_status` | Read paginated finished turns, active progress, remaining time and usage. |
+| `dialogue_control` | Pause at a reply boundary, resume, or stop. |
 
 Use a new `request_id` for every new message. A retry with the same ID and
 prompt returns the existing job without a second model call; a changed prompt
@@ -133,6 +140,80 @@ Only `status="completed"` is a successful turn. A response field or progress
 event alone is not proof of completion. Interrupted and failed turns can have
 response text. The worker heartbeat is distinct from provider-event progress.
 See [job states and failure handling](docs/architecture.md#ジョブの状態).
+
+### Bounded dialogue
+
+When the user asks the agents to develop a topic together, supply explicit
+limits. A round contains one Codex reply followed by one Claude reply.
+
+```python
+dialogue_start(
+    topic="Develop a small experiment for testing an unfinished design idea.",
+    max_rounds=4,
+    time_budget_seconds=900,
+    request_id="design-dialogue-1",
+)
+dialogue_status(dialogue_id="<returned-id>", after_turn=0, wait_seconds=30)
+# Use next_cursor as after_turn to receive only newly finished replies.
+dialogue_control(dialogue_id="<returned-id>", action="pause")
+dialogue_control(dialogue_id="<returned-id>", action="resume")
+# An immediate, terminal cancellation:
+dialogue_control(dialogue_id="<returned-id>", action="stop")
+```
+
+The coordinator runs independently of the MCP connection. It creates two
+bridge-owned sessions, shares the topic with **both providers**, then passes
+only the latest completed partner reply. Each provider resumes its own native
+history. Existing desktop chats and named partners are not imported. Direct
+`agent_send` into dialogue-owned sessions is rejected to preserve turn order.
+
+- Limits are 1–50 rounds and 10–14,400 active seconds, with 5–600 seconds per
+  reply. The active budget includes coordinator overhead and machine sleep; deliberate
+  pauses are excluded. An expired deadline stops work on wake. A lost coordinator does not reset its deadline.
+- `pause` lets the current reply finish; `resume` keeps the sessions and
+  remaining limits. Confirm `paused` before assuming the pause took effect.
+- `stop` interrupts the current reply. Stops, failures, and exhausted limits
+  are terminal. No partial/failed reply is forwarded and no turn is replayed.
+- A disappeared coordinator becomes `uncertain`. Explicit resume can rejoin
+  its still-running or completed child; an uncertain/failed child blocks
+  continuation. This is conservative recovery, not exactly-once delivery.
+- `completed` means the round limit was reached, not that the topic is solved
+  or a conclusion is verified. The host can share new ideas, disagreements,
+  and changed assumptions from finished replies while work continues.
+
+The host must poll `dialogue_status` to surface progress in its chat. A disconnected
+MCP client receives no push notification; reconnect and read from the last cursor.
+
+The same start `request_id` with identical parameters returns the same dialogue.
+Changing parameters with that ID is rejected. The tool does not add time or
+rounds after a limit; start a new bounded dialogue for new work. There is no
+combined dollar cap: existing CLI authentication and quota settings still apply.
+
+### Native history and prompt caching
+
+A fresh CLI process can resume a native conversation and reuse a provider's
+cached prompt prefix. Keeping an idle process alive is not required for this.
+The bridge keeps initial instructions stable and sends only the next message;
+it does not rebuild or repeatedly summarize the whole conversation. Cache TTL,
+model changes, CLI configuration and compaction can affect reuse. A resumed
+conversation can remain usable even after its cache expires.
+
+`agent_status`, `agent_history` and finished dialogue turns expose allowlisted
+`usage` fields reported by the CLI. Missing metrics are `null`, never assumed
+zero. On the tested Codex version, `turn.completed` tokens are session-cumulative
+snapshots, labeled `token_scope="session_cumulative"`; do not sum them across
+resumed calls. Cached tokens are a subset of input tokens; cache-write counts are exposed when reported. Claude reports
+uncached input, cache reads and cache writes separately. Claude's
+`estimated_session_cost_usd` is a cumulative session snapshot: **do not sum
+snapshots across resumed turns**. It is not a bill or incremental subscription
+charge. No price estimates are invented for Codex.
+
+No cache-warming calls, keepalive requests, TTL overrides, or billing changes
+are made. Native history can compact; continuity does not promise lossless
+retention. Observed compaction events increment a counter without storing
+summary/thinking payloads. See [Claude prompt caching](https://code.claude.com/docs/en/prompt-caching)
+and [SDK cost accounting](https://code.claude.com/docs/en/agent-sdk/cost-tracking).
+Codex snapshot scope was verified against the [0.164.0 JSONL adapter](https://github.com/openai/codex/blob/rust-v0.164.0/codex-rs/exec/src/event_processor_with_jsonl_output.rs).
 
 ### Choosing when to consult
 
