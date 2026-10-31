@@ -20,7 +20,7 @@ and time limits. It is local to this host, not a recurring scheduler.
 
 ```mermaid
 flowchart LR
-    H["Codex / Claude Code MCP client"] <-->|stdio| S["MCP server: 9 tools"]
+    H["Codex / Claude Code MCP client"] <-->|stdio| S["MCP server: 12 tools"]
     S <-->|reserve / inspect| D[("SQLite registry")]
     S -->|spawn per send| W["Detached Python worker"]
     W <-->|progress / result / native ID| D
@@ -131,6 +131,9 @@ These are MCP tool calls, not Python functions to import. Choose
 | `dialogue_start` | Create two dedicated partners and start a bounded alternating discussion. |
 | `dialogue_status` | Read paginated finished turns, active progress, remaining time and usage. |
 | `dialogue_control` | Pause at a reply boundary, resume, or stop. |
+| `carryover_save` | Keep one unfinished idea or concern for one partner or dialogue series. |
+| `carryover_list` | Read open/closed notes without consuming them. |
+| `carryover_update` | Explicitly close or reopen a note. |
 
 Use a new `request_id` for every new message. A retry with the same ID and
 prompt returns the existing job without a second model call; a changed prompt
@@ -188,6 +191,56 @@ The same start `request_id` with identical parameters returns the same dialogue.
 Changing parameters with that ID is rejected. The tool does not add time or
 rounds after a limit; start a new bounded dialogue for new work. There is no
 combined dollar cap: existing CLI authentication and quota settings still apply.
+
+### Carry an unfinished idea into the next conversation
+
+The host can keep a single line before an idea or concern disappears. A reason,
+evaluation, or condition for reopening it is **not required**. This is selective
+note-taking by the host, not automatic transcript extraction or an extra model call.
+
+```python
+carryover_save(session="design-partner", text="The simpler option still feels worth exploring.",
+               request_id="fragment-1")
+agent_send(session="design-partner", prompt="Here is a new observation...", request_id="next-send")
+# The saved fragment is inserted automatically before this new message.
+carryover_list(session="design-partner")
+carryover_update(note_id="<returned-note-id>", state="closed")
+```
+
+Notes are one line, at most 400 characters. Each new send selects up to three
+open notes, choosing the least recently selected first. Omitted counts are
+visible; additional notes are kept and rotate into later sends. Reading or
+presenting a note does not close it. There is no expiry or required explanation.
+Reopening is explicit; retrying a save does not reopen a closed note.
+
+Bounded dialogues use an explicit continuation, because each start creates two
+new partners. Notes saved with `dialogue_id` are for **both providers**:
+
+```python
+carryover_save(dialogue_id="<previous-dialogue-id>", text="An unresolved concern, without a reason yet.",
+               request_id="fragment-2")
+dialogue_start(topic="Continue with a new observation", max_rounds=3,
+               time_budget_seconds=600, request_id="next-discussion",
+               continue_from="<previous-dialogue-id>")
+```
+
+Only open one-line notes are carried over, not the previous transcript, native
+sessions, or remaining limits. Omit `continue_from` to start an unrelated series.
+There is no topic-name matching or global pool. A private partner's notes cannot
+be implicitly promoted into a two-provider dialogue; saving against a
+dialogue-owned session is rejected unless `dialogue_id` is explicitly supplied.
+
+The chosen notes are frozen when a send/start is reserved, in the same SQLite
+transaction. Both dialogue partners receive the same opening snapshot on their
+first reply only. Retries and pause/resume retain it; later saves or closures
+apply to future reservations. Status/history expose `carryovers` with note IDs,
+text, open count and omitted count. `selected_at` means snapshot selection,
+not proof of delivery, attention, understanding, or useful recall. Notes are
+unverified discussion material, not instructions. The host can share a useful
+connection without forcing every fragment into the conversation.
+
+Closing a note prevents future selection, but cannot retract queued prompts or
+erase existing native histories. Keep only material safe for its explicit scope.
 
 ### Native history and prompt caching
 

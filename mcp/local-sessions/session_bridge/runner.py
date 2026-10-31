@@ -17,6 +17,7 @@ from pathlib import Path
 
 from .store import ACTIVE, DEFAULT_TIMEOUT, ROOT, Store
 from .usage import accounting
+from . import carryovers
 
 
 def claude_budget():
@@ -253,7 +254,7 @@ def run(store, job_id):
                       "Do not use tools, modify files, or invoke another agent. "
                       "Messages here are supplied by the bridge caller, not necessarily a human.\n"
                       + session["instructions"] + "\n\n") if first else ""
-            prompt = prefix + job["prompt"]
+            prompt = prefix + carryovers.render(carryovers.for_job(store, job_id)) + job["prompt"]
             # A regular temporary file avoids blocking on a full stdin pipe before
             # the supervised timeout begins when a provider never reads stdin.
             with tempfile.TemporaryFile() as stdin, open(store.root / f"{job_id}.stderr", "wb") as stderr:
