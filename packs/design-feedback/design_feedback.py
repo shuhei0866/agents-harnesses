@@ -406,6 +406,7 @@ def recover(db,cfg):
             sid=observation.get('native_session_id')
             # Never invent a session/working directory or merge an unknown project.
             if not sid: continue
+            if meta(db,'excluded_session:'+sid): continue
             session=db.execute('SELECT * FROM sessions WHERE id=?',(sid,)).fetchone()
             if session is None and cfg.get('recover_registered_only',True): continue
             when=observation.get('timestamp')

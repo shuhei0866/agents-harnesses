@@ -250,6 +250,10 @@ class FeedbackTest(unittest.TestCase):
             self.assertEqual(row['project'],'unassigned'); self.assertEqual(json.loads(row['artifacts']),[])
             with self.assertRaises(ValueError): f.record(db,self.case(row['id']))
             self.assertEqual(f.recover(db,cfg)['status'],'unchanged')
+            f.meta(db,'excluded_session:new-native','generated_suggestions')
+            snapshot['snapshot_id']='b'*64
+            rows[0]['utterance']['text']='この画面の配色が悪い'
+            self.assertEqual(f.recover(db,cfg)['captures'],0)
 
     def test_consultation_stays_excluded_on_later_turns(self):
         with f.database(self.home) as db:
