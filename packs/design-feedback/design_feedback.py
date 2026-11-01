@@ -255,7 +255,7 @@ def context(db,cfg,query,cwd,sid=''):
         usable.append((score,c))
     chosen=[c for _,c in sorted(usable,key=lambda x:(x[0],x[1]['observed_at']),reverse=True)[:5]]
     pending=[dict(r) for r in db.execute("SELECT id,created,project FROM events WHERE disposition='pending' AND (session=? OR project=? OR project='unassigned') ORDER BY created DESC LIMIT 8",(sid,project))]
-    return dict(guideline=dict(checkout=cfg.get('guidance_checkout'),ref='origin/main',path=cfg.get('guideline_path')),
+    return dict(session_id=sid or None,guideline=dict(checkout=cfg.get('guidance_checkout'),ref='origin/main',path=cfg.get('guideline_path')),
         cases=chosen,pending=pending,pipeline_health=dict(last_sweep=meta(db,'last_sweep'),publish_error=meta(db,'publish_error')),
         notice='Pending captures are unassessed. Current instructions and scoped exceptions take precedence.')
 

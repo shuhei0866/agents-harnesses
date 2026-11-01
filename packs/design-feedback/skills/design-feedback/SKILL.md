@@ -5,11 +5,11 @@ description: Capture a user's feedback on a screen, layout, interaction, or word
 
 Use the installed `design-feedback` command. It has no model/API dependency. Hook context supplies the current event ID when available.
 
-Before UI work, run `design-feedback context --query 'the screen purpose and relevant design topic' --cwd "$PWD"`. Read the canonical guideline path it returns and use relevant cases with their scope and exceptions. Pending captures are requests to assess, not accepted guidance.
+Before UI work, run `design-feedback context --query 'the screen purpose and relevant design topic' --cwd "$PWD" --session SESSION_ID`. Use the `session_id` supplied in hook context. The CLI also accepts the native session environment variable when present, but do not assume either runtime exports it. Read the canonical guideline path it returns and use relevant cases with their scope and exceptions. Pending captures are requests to assess, not accepted guidance.
 
 Before showing a local mock, register its exact version:
 
-`design-feedback exhibit --file /absolute/path/mock.html --label 'range picker' --presented`
+`design-feedback exhibit --file /absolute/path/mock.html --label 'range picker' --session SESSION_ID --presented`
 
 This saves a private immutable copy and digest. For Git-owned screens use a code pointer in the decision instead of claiming a current screenshot is historical. If several variants were shown, record the chosen label only when the user's words or explicit submitted response identify it. Otherwise leave the association unresolved.
 
