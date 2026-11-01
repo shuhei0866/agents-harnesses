@@ -137,6 +137,7 @@ class FeedbackTest(unittest.TestCase):
         cfg=dict(guidance_checkout=str(owner),guideline_path='docs/guidance.md',case_dir='docs/cases',publish_mode='trunk-direct')
         with f.database(self.home) as db:
             eid=f.capture(db,self.payload,'codex',self.payload['prompt'])
+            for n in range(100): f.record(db,self.case(eid,key='private-'+str(n),safe_to_share=False))
             f.record(db,self.case(eid,scope='common',generalization='explicit',guideline_action='add'))
             receipt=f.publish(self.home,db,cfg)
             self.assertEqual(receipt['published'],1)
@@ -145,11 +146,21 @@ class FeedbackTest(unittest.TestCase):
             self.assertEqual(f.publish(self.home,db,cfg)['status'],'idle')
             with f.database(self.root/'another-runtime') as other:
                 self.assertEqual(len(f.context(other,cfg,'comparison',str(self.project))['cases']),1)
+            external=self.root/'external'; run('git','clone','--branch','main',str(remote),str(external))
+            for key,value in [('user.name','Example'),('user.email','example@example.invalid')]: run('git','config',key,value,cwd=external)
+            case_file=next((external/'docs/cases').glob('*.json')); correction=json.loads(case_file.read_text())
+            correction.update(id='df-'+'b'*32,summary='Corrected shared guidance',supersedes=[correction['id']])
+            (case_file.parent/(correction['id']+'.json')).write_text(json.dumps(correction))
+            f.project_guidance(external,cfg)
+            run('git','add','.',cwd=external); run('git','commit','-m','external correction',cwd=external); run('git','push','origin','main',cwd=external)
+            self.assertTrue(f.publish(self.home,db,cfg)['guidance_synced'])
+            with f.database(self.root/'another-runtime') as other:
+                self.assertEqual([c['id'] for c in f.context(other,cfg,'comparison',str(self.project))['cases']],[correction['id']])
             doc.write_text(doc.read_text()+'foreign uncommitted edit\n')
             eid=f.capture(db,dict(self.payload,turn_id='next'),'codex','この画面は余白が大きすぎる')
             f.record(db,self.case(eid))
             with self.assertRaises(ValueError): f.publish(self.home,db,cfg)
-            self.assertEqual(db.execute('SELECT count(*) FROM cases WHERE delivered IS NULL').fetchone()[0],1)
+            self.assertEqual(db.execute("SELECT count(*) FROM cases WHERE delivered IS NULL AND json_extract(payload,'$.safe_to_share')=1").fetchone()[0],1)
 
     def test_installer_preserves_existing_handlers_and_is_idempotent(self):
         initial=dict(env=dict(EXAMPLE='preserve'),hooks=dict(UserPromptSubmit=[dict(hooks=[dict(type='command',command='existing-guard')])]))

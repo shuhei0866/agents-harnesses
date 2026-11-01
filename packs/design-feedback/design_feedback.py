@@ -302,9 +302,8 @@ def project_guidance(checkout,cfg):
 
 
 def publish(home,db,cfg):
-    pending=[json.loads(r['payload']) for r in db.execute('SELECT payload FROM cases WHERE delivered IS NULL ORDER BY created LIMIT 100')]
-    pending=[c for c in pending if c['safe_to_share']]
-    if not pending: return dict(status='idle',published=0)
+    pending=[json.loads(r['payload']) for r in db.execute("SELECT payload FROM cases WHERE delivered IS NULL AND json_extract(payload,'$.safe_to_share')=1 ORDER BY created LIMIT 100")]
+    if not pending and not cfg.get('guidance_checkout'): return dict(status='idle',published=0)
     if cfg.get('publish_mode')!='trunk-direct': raise ValueError('automatic publication requires configured trunk-direct owner')
     checkout=Path(cfg['guidance_checkout']).expanduser()
     if checkout.is_symlink(): raise ValueError('publisher checkout symlink')
@@ -319,6 +318,8 @@ def publish(home,db,cfg):
         ahead=git(checkout,'log','--format=%s','origin/main..HEAD').splitlines()
         if any(not s.startswith('design-feedback: ') for s in ahead): raise ValueError('foreign commits in publisher checkout')
         git(checkout,'rebase','origin/main')
+        meta(db,'last_guidance_sync',dict(at=time.time(),revision=git(checkout,'rev-parse','origin/main')))
+        if not pending: return dict(status='idle',published=0,guidance_synced=True)
         folder=repo_target(checkout,cfg['case_dir']); folder.mkdir(parents=True,exist_ok=True)
         for c in pending:
             p=folder/(c['id']+'.json')
