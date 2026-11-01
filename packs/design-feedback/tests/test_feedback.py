@@ -124,6 +124,23 @@ class FeedbackTest(unittest.TestCase):
             self.assertEqual(f.context(db,self.cfg,'comparison',str(self.project))['cases'],[])
         self.assertFalse(self.home.exists())
 
+    def test_readonly_context_reports_current_health_without_persisting_it(self):
+        cfg=dict(self.cfg,guidance_checkout=str(self.project))
+        with f.database(self.home) as db:
+            f.meta(db,'case_index_error','old error')
+        before=(self.home/'feedback.sqlite3').read_bytes()
+        archive=f.io.BytesIO()
+        with f.tarfile.open(fileobj=archive,mode='w'): pass
+        healthy=subprocess.CompletedProcess([],0,stdout=archive.getvalue())
+        with f.database(self.home,read_only=True) as db, patch.object(f,'project_id',return_value='test-project'):
+            with patch.object(f.subprocess,'run',side_effect=subprocess.TimeoutExpired('git',5)):
+                result=f.context(db,cfg,'comparison',str(self.project))
+                self.assertEqual(result['pipeline_health']['case_index_error'],'TimeoutExpired')
+            with patch.object(f.subprocess,'run',return_value=healthy):
+                result=f.context(db,cfg,'comparison',str(self.project))
+                self.assertIsNone(result['pipeline_health']['case_index_error'])
+        self.assertEqual((self.home/'feedback.sqlite3').read_bytes(),before)
+
     def test_correction_retires_prior_in_same_scope(self):
         with f.database(self.home) as db:
             eid=f.capture(db,self.payload,'codex',self.payload['prompt'])

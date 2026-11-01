@@ -29,6 +29,10 @@ BEGIN = '<!-- design-feedback:begin -->'
 END = '<!-- design-feedback:end -->'
 
 
+class Connection(sqlite3.Connection):
+    """Keep request-local diagnostic updates without modifying read-only evidence."""
+
+
 def digest(value):
     raw = value if isinstance(value, bytes) else json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()
     return hashlib.sha256(raw).hexdigest()
@@ -69,8 +73,9 @@ def database(home,read_only=False):
         raise ValueError('database must not be a symlink')
     existing=p.exists()
     if read_only and existing:
-        db=sqlite3.connect(p.as_uri()+'?mode=ro',uri=True,timeout=5)
-    else: db=sqlite3.connect(':memory:' if read_only else p,timeout=5)
+        db=sqlite3.connect(p.as_uri()+'?mode=ro',uri=True,timeout=5,factory=Connection)
+    else: db=sqlite3.connect(':memory:' if read_only else p,timeout=5,factory=Connection)
+    db.request_meta={}
     db.row_factory=sqlite3.Row
     if not read_only and p.stat().st_mode&0o777!=0o600: os.chmod(p,0o600)
     if not read_only or not existing: db.executescript('''
@@ -95,8 +100,11 @@ def database(home,read_only=False):
 
 def meta(db, key, value=UNSET):
     if value is not UNSET:
-        if db.execute('PRAGMA query_only').fetchone()[0]: return value
+        if db.execute('PRAGMA query_only').fetchone()[0]:
+            db.request_meta[key]=value
+            return value
         db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', (key,json.dumps(value)))
+    if key in db.request_meta: return db.request_meta[key]
     row=db.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
     return json.loads(row[0]) if row else None
 
