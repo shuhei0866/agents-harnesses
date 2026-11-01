@@ -256,20 +256,31 @@ def context(db,cfg,query,cwd,sid=''):
     chosen=[c for _,c in sorted(usable,key=lambda x:(x[0],x[1]['observed_at']),reverse=True)[:5]]
     pending=[dict(r) for r in db.execute("SELECT id,created,project FROM events WHERE disposition='pending' AND (session=? OR project=? OR project='unassigned') ORDER BY created DESC LIMIT 8",(sid,project))]
     return dict(guideline=dict(checkout=cfg.get('guidance_checkout'),ref='origin/main',path=cfg.get('guideline_path')),
-        cases=chosen,pending=pending,notice='Pending captures are unassessed. Current instructions and scoped exceptions take precedence.')
+        cases=chosen,pending=pending,pipeline_health=dict(last_sweep=meta(db,'last_sweep'),publish_error=meta(db,'publish_error')),
+        notice='Pending captures are unassessed. Current instructions and scoped exceptions take precedence.')
 
 
 def relative(path):
     p=Path(path)
-    if p.is_absolute() or '..' in p.parts or not p.parts: raise ValueError('unsafe repository-relative path')
+    if p.is_absolute() or '..' in p.parts or '.git' in p.parts or not p.parts: raise ValueError('unsafe repository-relative path')
     return p.as_posix()
 
 
+def repo_target(checkout,name):
+    rel=relative(name); path=checkout/rel
+    if not path.resolve().is_relative_to(checkout.resolve()): raise ValueError('repository path escapes checkout')
+    current=checkout
+    for part in Path(rel).parts:
+        current=current/part
+        if current.is_symlink(): raise ValueError('repository path contains symlink')
+    return path
+
+
 def project_guidance(checkout,cfg):
-    path=checkout/relative(cfg['guideline_path'])
+    path=repo_target(checkout,cfg['guideline_path'])
     if path.is_symlink() or not path.is_file(): raise ValueError('canonical guideline missing')
     text=path.read_text(); cases=[]
-    folder=checkout/relative(cfg['case_dir'])
+    folder=repo_target(checkout,cfg['case_dir'])
     if folder.exists():
         for p in sorted(folder.glob('*.json')):
             if p.is_symlink(): raise ValueError('case symlink')
@@ -295,8 +306,9 @@ def publish(home,db,cfg):
     pending=[c for c in pending if c['safe_to_share']]
     if not pending: return dict(status='idle',published=0)
     if cfg.get('publish_mode')!='trunk-direct': raise ValueError('automatic publication requires configured trunk-direct owner')
-    checkout=Path(cfg['guidance_checkout']).expanduser().resolve()
+    checkout=Path(cfg['guidance_checkout']).expanduser()
     if checkout.is_symlink(): raise ValueError('publisher checkout symlink')
+    checkout=checkout.resolve()
     lock=home/'publish.lock'
     with open(lock,'a+') as f:
         os.chmod(lock,0o600)
@@ -307,7 +319,7 @@ def publish(home,db,cfg):
         ahead=git(checkout,'log','--format=%s','origin/main..HEAD').splitlines()
         if any(not s.startswith('design-feedback: ') for s in ahead): raise ValueError('foreign commits in publisher checkout')
         git(checkout,'rebase','origin/main')
-        folder=checkout/relative(cfg['case_dir']); folder.mkdir(parents=True,exist_ok=True)
+        folder=repo_target(checkout,cfg['case_dir']); folder.mkdir(parents=True,exist_ok=True)
         for c in pending:
             p=folder/(c['id']+'.json')
             if p.is_symlink(): raise ValueError('case symlink')
@@ -362,7 +374,9 @@ def recover(db,cfg):
                 (eid,sid,'source-line-'+str(u['line']),session['harness'] if session else 'unknown',session['project'] if session else 'unassigned',when,text,json.dumps(ref),'[]'))
             count+=int(db.total_changes>before)
         meta(db,'recovery_snapshot',snapshot['snapshot_id'])
-        return dict(status='updated',captures=count)
+        report=snapshot.get('import_report',{})
+        coverage={k:v for k,v in report.items() if k in ('deferred_sources','deferred_source_ids','missing_sources','mismatched_sources','bounded_windows','legacy_documents_skipped')}
+        return dict(status='updated',captures=count,upstream_coverage=coverage,scope='registered_ui_sessions' if cfg.get('recover_registered_only',True) else 'unregistered_candidates_enabled')
 
 
 def hook(home,db,cfg,payload,harness):
@@ -402,7 +416,9 @@ def main(argv=None):
     p=sub.add_parser('assign-project'); p.add_argument('id'); p.add_argument('--cwd',required=True); p.add_argument('--reason',required=True)
     p=sub.add_parser('dismiss'); p.add_argument('id'); p.add_argument('--reason',required=True)
     for name in ['pending','status','publish','sweep']: sub.add_parser(name)
-    args=parser.parse_args(argv); home=args.home.expanduser().resolve(); cfg=profile(home)
+    args=parser.parse_args(argv); home=args.home.expanduser()
+    if home.is_symlink(): raise ValueError('state home symlink')
+    home=home.resolve(); cfg=profile(home)
     with database(home) as db:
         try:
             if args.command=='hook': result=hook(home,db,cfg,json.load(sys.stdin),args.harness)

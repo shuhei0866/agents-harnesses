@@ -124,6 +124,8 @@ class FeedbackTest(unittest.TestCase):
             for filename in (p,link):
                 with self.assertRaises(ValueError): f.exhibit(self.home,db,self.cfg,str(filename),'x','s',str(self.project))
             with self.assertRaises(ValueError): f.relative('../secret')
+            with self.assertRaises(ValueError): f.relative('.git/config')
+            with self.assertRaises(ValueError): f.repo_target(self.project,'link.html')
 
     def test_git_projection_and_remote_context(self):
         remote=self.root/'remote.git'; run('git','init','--bare',str(remote))
