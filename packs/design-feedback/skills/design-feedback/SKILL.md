@@ -5,6 +5,8 @@ description: Capture a user's feedback on a screen, layout, interaction, or word
 
 Use the installed `design-feedback` command. It has no model/API dependency. Hook context supplies the current event ID when available.
 
+Context, status, pending and event reads do not write the evidence store. Recording, dismissal, exhibit snapshots and publication do write it. If the private store is outside the current project's sandbox, use the runtime's formal per-command authorization path for those mutations, as with other approved local tools. Do not add writable roots or alter sandbox/approval/hook-trust settings. A denied write leaves the hook's original capture pending; report it as undelivered and continue independent screen work. `source` may also require authorization for the existing retrieval snapshot lock.
+
 Before UI work, run `design-feedback context --query 'the screen purpose and relevant design topic' --cwd "$PWD" --session SESSION_ID`. Use the `session_id` supplied in hook context. The CLI also accepts the native session environment variable when present, but do not assume either runtime exports it. Read the canonical guideline path it returns and use relevant cases with their scope and exceptions. Pending captures are requests to assess, not accepted guidance.
 
 Before showing a local mock, register its exact version:

@@ -29,6 +29,10 @@ BEGIN = '<!-- design-feedback:begin -->'
 END = '<!-- design-feedback:end -->'
 
 
+class Connection(sqlite3.Connection):
+    """Keep request-local diagnostic updates without modifying read-only evidence."""
+
+
 def digest(value):
     raw = value if isinstance(value, bytes) else json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()
     return hashlib.sha256(raw).hexdigest()
@@ -58,17 +62,23 @@ def atomic(path, value):
 
 
 @contextlib.contextmanager
-def database(home):
+def database(home,read_only=False):
     if home.is_symlink():
         raise ValueError('state home must not be a symlink')
-    home.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(home, 0o700)
+    if not read_only:
+        home.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if home.stat().st_mode&0o777!=0o700: os.chmod(home,0o700)
     p = home/'feedback.sqlite3'
     if p.is_symlink():
         raise ValueError('database must not be a symlink')
-    db = sqlite3.connect(p, timeout=5); db.row_factory = sqlite3.Row
-    os.chmod(p, 0o600)
-    db.executescript('''
+    existing=p.exists()
+    if read_only and existing:
+        db=sqlite3.connect(p.as_uri()+'?mode=ro',uri=True,timeout=5,factory=Connection)
+    else: db=sqlite3.connect(':memory:' if read_only else p,timeout=5,factory=Connection)
+    db.request_meta={}
+    db.row_factory=sqlite3.Row
+    if not read_only and p.stat().st_mode&0o777!=0o600: os.chmod(p,0o600)
+    if not read_only or not existing: db.executescript('''
     CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, session TEXT, turn TEXT,
       harness TEXT, project TEXT, created REAL, text TEXT, source TEXT, artifacts TEXT,
       disposition TEXT DEFAULT 'pending', note TEXT DEFAULT '', reminded INTEGER DEFAULT 0);
@@ -80,16 +90,21 @@ def database(home):
       created REAL, delivered TEXT);
     CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
     ''')
+    if read_only: db.execute('PRAGMA query_only=ON')
     try:
         yield db
-        db.commit()
+        if not read_only: db.commit()
     finally:
         db.close()
 
 
 def meta(db, key, value=UNSET):
     if value is not UNSET:
+        if db.execute('PRAGMA query_only').fetchone()[0]:
+            db.request_meta[key]=value
+            return value
         db.execute('INSERT OR REPLACE INTO meta VALUES(?,?)', (key,json.dumps(value)))
+    if key in db.request_meta: return db.request_meta[key]
     row=db.execute('SELECT value FROM meta WHERE key=?',(key,)).fetchone()
     return json.loads(row[0]) if row else None
 
@@ -468,7 +483,7 @@ def main(argv=None):
     args=parser.parse_args(argv); home=args.home.expanduser()
     if home.is_symlink(): raise ValueError('state home symlink')
     home=home.resolve(); cfg=profile(home)
-    with database(home) as db:
+    with database(home,read_only=args.command in ('context','status','pending','event','source')) as db:
         try:
             if args.command=='hook': result=hook(home,db,cfg,json.load(sys.stdin),args.harness)
             elif args.command=='context': result=context(db,cfg,args.query,args.cwd,args.session)
