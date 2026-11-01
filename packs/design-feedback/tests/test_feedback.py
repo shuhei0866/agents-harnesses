@@ -109,6 +109,21 @@ class FeedbackTest(unittest.TestCase):
             other=self.root/'other'; other.mkdir()
             self.assertEqual(f.context(db,self.cfg,'comparison',str(other))['cases'],[])
 
+    def test_readonly_context_does_not_chmod_or_write_private_store(self):
+        with f.database(self.home) as db:
+            eid=f.capture(db,self.payload,'codex',self.payload['prompt']); f.record(db,self.case(eid))
+        before=(self.home/'feedback.sqlite3').read_bytes()
+        with patch.object(f.os,'chmod',side_effect=PermissionError('sandbox write denied')):
+            with f.database(self.home,read_only=True) as db:
+                self.assertEqual(len(f.context(db,self.cfg,'comparison',str(self.project))['cases']),1)
+                with self.assertRaises(f.sqlite3.OperationalError): db.execute("DELETE FROM events")
+        self.assertEqual((self.home/'feedback.sqlite3').read_bytes(),before)
+
+    def test_readonly_context_before_first_capture_creates_no_files(self):
+        with f.database(self.home,read_only=True) as db:
+            self.assertEqual(f.context(db,self.cfg,'comparison',str(self.project))['cases'],[])
+        self.assertFalse(self.home.exists())
+
     def test_correction_retires_prior_in_same_scope(self):
         with f.database(self.home) as db:
             eid=f.capture(db,self.payload,'codex',self.payload['prompt'])
