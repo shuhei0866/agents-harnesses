@@ -117,6 +117,24 @@ class FeedbackTest(unittest.TestCase):
             second=f.record(db,self.case(eid2,summary='Use navigation on narrow screens',supersedes=[first]))['case_id']
             self.assertEqual([c['id'] for c in f.context(db,self.cfg,'comparison',str(self.project))['cases']],[second])
 
+    def test_project_correction_does_not_retire_common_guidance(self):
+        with f.database(self.home) as db:
+            eid=f.capture(db,self.payload,'codex',self.payload['prompt'])
+            common=f.record(db,self.case(eid,scope='common',generalization='explicit'))['case_id']
+            local=f.record(db,self.case(eid,key='local',supersedes=[common]))['case_id']
+            ids={c['id'] for c in f.context(db,self.cfg,'comparison',str(self.project))['cases']}
+            self.assertEqual(ids,{common,local})
+
+    def test_shared_index_timeout_and_bad_case_preserve_local_context(self):
+        cfg=dict(self.cfg,guidance_checkout=str(self.project))
+        with f.database(self.home) as db:
+            eid=f.capture(db,self.payload,'codex',self.payload['prompt'])
+            cid=f.record(db,self.case(eid))['case_id']
+            with patch.object(f.subprocess,'run',side_effect=subprocess.TimeoutExpired('git',5)):
+                self.assertEqual([c['id'] for c in f.all_cases(db,cfg)],[cid])
+            self.assertFalse(f.valid_case({'id':'wrong'}))
+            self.assertEqual(f.meta(db,'case_index_error'),'TimeoutExpired')
+
     def test_artifact_boundary(self):
         p=self.root/'outside.html'; p.write_text('private')
         link=self.project/'link.html'; link.symlink_to(p)
@@ -139,7 +157,13 @@ class FeedbackTest(unittest.TestCase):
             eid=f.capture(db,self.payload,'codex',self.payload['prompt'])
             for n in range(100): f.record(db,self.case(eid,key='private-'+str(n),safe_to_share=False))
             f.record(db,self.case(eid,scope='common',generalization='explicit',guideline_action='add'))
-            receipt=f.publish(self.home,db,cfg)
+            original_git=f.git
+            def concurrent_hook(cwd,*args):
+                if args[0] in ('fetch','push'):
+                    with f.database(self.home) as concurrent:
+                        f.meta(concurrent,'concurrent_hook_probe',True)
+                return original_git(cwd,*args)
+            with patch.object(f,'git',side_effect=concurrent_hook): receipt=f.publish(self.home,db,cfg)
             self.assertEqual(receipt['published'],1)
             self.assertIn('Keep this paragraph.',doc.read_text()); self.assertIn('List and detail',doc.read_text())
             self.assertNotIn(self.payload['prompt'],doc.read_text())
@@ -161,6 +185,14 @@ class FeedbackTest(unittest.TestCase):
             f.record(db,self.case(eid))
             with self.assertRaises(ValueError): f.publish(self.home,db,cfg)
             self.assertEqual(db.execute("SELECT count(*) FROM cases WHERE delivered IS NULL AND json_extract(payload,'$.safe_to_share')=1").fetchone()[0],1)
+            run('git','restore','docs/guidance.md',cwd=owner)
+            eid2=f.capture(db,dict(self.payload,turn_id='collision'),'codex','この比較画面は配置が悪い')
+            collision=f.record(db,self.case(eid2))['case_id']
+            conflicting=json.loads(db.execute('SELECT payload FROM cases WHERE id=?',(collision,)).fetchone()[0]); conflicting['summary']='different existing decision'
+            (owner/'docs/cases'/(collision+'.json')).write_text(json.dumps(conflicting))
+            run('git','add','.',cwd=owner); run('git','commit','-m','conflicting fixture',cwd=owner);run('git','push','origin','main',cwd=owner)
+            with self.assertRaises(ValueError): f.publish(self.home,db,cfg)
+            self.assertEqual(run('git','status','--porcelain',cwd=owner),'')
 
     def test_installer_preserves_existing_handlers_and_is_idempotent(self):
         initial=dict(env=dict(EXAMPLE='preserve'),hooks=dict(UserPromptSubmit=[dict(hooks=[dict(type='command',command='existing-guard')])]))
@@ -183,6 +215,24 @@ class FeedbackTest(unittest.TestCase):
         self.assertTrue(json.loads((self.home/'installation.json').read_text())['codex_hook_trust_required'])
         run(*args)
         self.assertEqual(json.loads((user/'.codex/hooks.json').read_text()),hooks)
+
+    def test_prepare_omits_unrelated_settings_and_install_rolls_back_all_targets(self):
+        user=(self.root/'rollback-user').resolve(); (user/'.codex').mkdir(parents=True); (user/'.claude').mkdir()
+        settings=user/'.claude/settings.json'; settings.write_text(json.dumps(dict(env=dict(PRIVATE_SENTINEL='do-not-copy-in-review'))))
+        self.home.mkdir(); profile=self.home/'profile.json'; profile.write_text('{}')
+        skill=user/'.agents/skills/design-feedback/SKILL.md'; skill.parent.mkdir(parents=True); skill.write_text('existing skill')
+        args=['install.py','--home',str(self.home),'--user-home',str(user),'--guidance-checkout',str(self.project),'--guideline-path','docs/guidance.md','--case-dir','docs/cases']
+        with patch.object(sys,'argv',args): installer.main()
+        for file in (self.home/'prepared').rglob('*'):
+            if file.is_file(): self.assertNotIn('do-not-copy-in-review',file.read_text())
+        original=installer.write
+        def failing_write(path,raw,mode=0o600):
+            if path==user/'.codex/hooks.json': raise OSError('simulated config failure')
+            return original(path,raw,mode)
+        with patch.object(sys,'argv',args+['--apply']),patch.object(installer,'write',side_effect=failing_write):
+            with self.assertRaises(OSError): installer.main()
+        self.assertEqual(profile.read_text(),'{}'); self.assertEqual(skill.read_text(),'existing skill')
+        self.assertFalse((user/'.local/bin/design-feedback').exists())
 
     def test_recovery_preserves_unknown_project_and_historical_artifact_missingness(self):
         # Exercise the published retrieval interfaces with a synthetic adapter.

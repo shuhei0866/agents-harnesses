@@ -10,15 +10,20 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 
 def write(path, raw, mode=0o600):
     path.parent.mkdir(parents=True,exist_ok=True)
     if path.is_symlink(): raise ValueError('refusing symlink destination: '+str(path))
-    temp=path.with_name(path.name+'.design-feedback.tmp')
-    with open(temp,'xb') as f: os.chmod(temp,mode); f.write(raw); f.flush(); os.fsync(f.fileno())
-    os.replace(temp,path)
+    fd,temp=tempfile.mkstemp(prefix='.'+path.name+'.',dir=path.parent)
+    try:
+        with os.fdopen(fd,'wb') as f:
+            os.fchmod(f.fileno(),mode); f.write(raw); f.flush(); os.fsync(f.fileno())
+        os.replace(temp,path)
+    finally:
+        if os.path.exists(temp): os.unlink(temp)
 
 
 def merged_hooks(data,command,codex):
@@ -57,14 +62,18 @@ def main():
         refresh_before_recover=False,recover_registered_only=True,source_release=version)
     prior_profile=home/'profile.json'
     if prior_profile.is_symlink(): raise ValueError('profile symlink')
-    previous=json.loads(prior_profile.read_text()) if prior_profile.exists() else {}
+    previous=json.loads(prior_profile.read_text(encoding='utf-8')) if prior_profile.exists() else {}
     cfg['started_at']=previous.get('started_at',time.time())
-    destinations={}
+    launcher='#!'+sys.executable+'\nimport os,sys\nos.execv('+repr(sys.executable)+', ['+repr(sys.executable)+', '+repr(str(release/'design_feedback.py'))+', "--home", '+repr(str(home))+']+sys.argv[1:])\n'
+    destinations={home/'profile.json':(json.dumps(cfg,ensure_ascii=False,indent=2)+'\n').encode()}
+    for relative in ('.agents/skills/design-feedback/SKILL.md','.claude/skills/design-feedback/SKILL.md'):
+        destinations[user/relative]=files['skills/design-feedback/SKILL.md']
+    destinations[user/'.local/bin/design-feedback']=launcher.encode()
     expected={}
     for codex,relative in ((True,'.codex/hooks.json'),(False,'.claude/settings.json')):
         path=user/relative
         if path.is_symlink(): raise ValueError('hook config is symlink')
-        data=json.loads(path.read_text()) if path.exists() else {}
+        data=json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
         expected[path]=path.read_bytes() if path.exists() else None
         command=shlex.join([sys.executable,str(release/'design_feedback.py'),'--home',str(home),'hook','--harness','codex' if codex else 'claude-code'])
         updated=merged_hooks(data,command,codex)
@@ -72,7 +81,7 @@ def main():
     for relative in ('.codex/AGENTS.md','.claude/CLAUDE.md'):
         path=user/relative
         if path.is_symlink(): raise ValueError('instruction file is symlink')
-        text=path.read_text() if path.exists() else ''
+        text=path.read_text(encoding='utf-8') if path.exists() else ''
         expected[path]=path.read_bytes() if path.exists() else None
         begin='<!-- design-feedback:instructions -->'; end='<!-- /design-feedback:instructions -->'
         block=begin+'\n画面・UIの制作前と、本人がその画面へ反応したときは `design-feedback` スキルを使う。共有指針と用途に合う事例を取り出し、評価は画面の版・理由・適用範囲と組で記録する。手順とコマンドはスキルを正本とし、未確認の一般化は候補に残す。\n'+end
@@ -88,11 +97,21 @@ def main():
     job_path=user/'Library/LaunchAgents/io.agents-harnesses.design-feedback.plist'
     destinations[job_path]=plistlib.dumps(job)
     expected[job_path]=job_path.read_bytes() if job_path.exists() else None
+    for path in destinations:
+        if path.is_symlink(): raise ValueError('destination symlink')
+        expected.setdefault(path,path.read_bytes() if path.exists() else None)
     plan=dict(version=version,applied=False,codex_hook_trust_required=True,native_session_acceptance_pending=True,
         destinations=[str(x) for x in destinations],profile=cfg)
-    # Review files never contain secrets from unrelated settings; diffs are local-only.
+    # The review plan contains only our handlers and digests, never other settings.
     candidate=home/'prepared'/version; candidate.mkdir(parents=True,exist_ok=True,mode=0o700)
-    for path,raw in destinations.items(): write(candidate/(hashlib.sha256(str(path).encode()).hexdigest()[:12]+path.suffix),raw)
+    changes=[]
+    for path,raw in destinations.items():
+        item=dict(path=str(path),after_sha256=hashlib.sha256(raw).hexdigest())
+        if path in (user/'.codex/hooks.json',user/'.claude/settings.json'):
+            data=json.loads(raw)
+            item['new_handlers']={event:[h for group in groups for h in group.get('hooks',[]) if 'design_feedback.py' in h.get('command','')] for event,groups in data.get('hooks',{}).items() if any('design_feedback.py' in h.get('command','') for g in groups for h in g.get('hooks',[]))}
+        changes.append(item)
+    write(candidate/'changes.json',(json.dumps(changes,ensure_ascii=False,indent=2)+'\n').encode())
     write(candidate/'plan.json',(json.dumps(plan,ensure_ascii=False,indent=2)+'\n').encode())
     if not a.apply:
         print(json.dumps(dict(status='prepared',plan=str(candidate/'plan.json')),ensure_ascii=False)); return
@@ -113,27 +132,27 @@ def main():
     changed=[]
     try:
         for path,raw in destinations.items():
-            write(path,raw); changed.append(path)
+            write(path,raw,0o700 if path==user/'.local/bin/design-feedback' else 0o600); changed.append(path)
     except Exception:
         for path in reversed(changed):
             if path.read_bytes()!=destinations[path]: continue
             old=expected[path]
             if old is None: path.unlink()
-            else: write(path,old)
+            else: write(path,old,0o700 if path==user/'.local/bin/design-feedback' else 0o600)
         raise
-    write(home/'profile.json',(json.dumps(cfg,ensure_ascii=False,indent=2)+'\n').encode())
-    for relative in ('.agents/skills/design-feedback/SKILL.md','.claude/skills/design-feedback/SKILL.md'):
-        write(user/relative,files['skills/design-feedback/SKILL.md'])
-    launcher='#!'+sys.executable+'\nimport os,sys\nos.execv('+repr(sys.executable)+', ['+repr(sys.executable)+', '+repr(str(release/'design_feedback.py'))+', "--home", '+repr(str(home))+']+sys.argv[1:])\n'
-    write(user/'.local/bin/design-feedback',launcher.encode(),0o700)
     write(backup/'manifest.json',(json.dumps(manifest,indent=2)+'\n').encode())
     plan.update(applied=True,backup=str(backup),installed_at=time.time())
     if a.start_worker:
-        domain='gui/'+str(os.getuid())
-        subprocess.run(['launchctl','bootout',domain+'/'+job['Label']],capture_output=True)
-        r=subprocess.run(['launchctl','bootstrap',domain,str(job_path)],capture_output=True,text=True)
-        plan['worker_loaded']=r.returncode==0
-        if r.returncode: plan['worker_error']=r.stderr.strip()[:300]
+        plan['worker_loaded']=False
+        if sys.platform!='darwin': plan['worker_error']='launchd is available only on macOS'
+        else:
+            try:
+                domain='gui/'+str(os.getuid())
+                subprocess.run(['/bin/launchctl','bootout',domain+'/'+job['Label']],capture_output=True,check=False)
+                r=subprocess.run(['/bin/launchctl','bootstrap',domain,str(job_path)],capture_output=True,text=True,check=False)
+                plan['worker_loaded']=r.returncode==0
+                if r.returncode: plan['worker_error']=r.stderr.strip()[:300]
+            except OSError as e: plan['worker_error']=str(e)[:300]
     write(home/'installation.json',(json.dumps(plan,ensure_ascii=False,indent=2)+'\n').encode())
     print(json.dumps(dict(status='installed',receipt=str(home/'installation.json'),codex_hook_trust_required=True),ensure_ascii=False))
 

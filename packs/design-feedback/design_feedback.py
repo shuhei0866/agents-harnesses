@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 
 VERSION = 1
@@ -41,16 +42,19 @@ def profile(home):
     p = home/'profile.json'
     if p.is_symlink():
         raise ValueError('profile must not be a symlink')
-    return json.loads(p.read_text()) if p.exists() else {}
+    return json.loads(p.read_text(encoding='utf-8')) if p.exists() else {}
 
 
 def atomic(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name+'.'+str(os.getpid())+'.tmp')
     raw = value if isinstance(value, bytes) else (json.dumps(value, ensure_ascii=False, indent=2)+'\n').encode()
-    with open(temp, 'xb') as f:
-        os.chmod(temp, 0o600); f.write(raw); f.flush(); os.fsync(f.fileno())
-    os.replace(temp, path)
+    fd,temp=tempfile.mkstemp(prefix='.'+path.name+'.',dir=path.parent)
+    try:
+        with os.fdopen(fd,'wb') as f:
+            os.fchmod(f.fileno(),0o600); f.write(raw); f.flush(); os.fsync(f.fileno())
+        os.replace(temp,path)
+    finally:
+        if os.path.exists(temp): os.unlink(temp)
 
 
 @contextlib.contextmanager
@@ -222,6 +226,18 @@ def record(db, value):
     return dict(case_id=cid,delivery='queued' if data['safe_to_share'] else 'private_only')
 
 
+def valid_case(c):
+    if not isinstance(c,dict) or c.get('schema_version')!=VERSION or not re.fullmatch(r'df-[a-f0-9]{32}',str(c.get('id',''))): return False
+    if c.get('scope') not in ('common','project') or c.get('authority') not in ('user_explicit','candidate'): return False
+    if any(not isinstance(c.get(k),str) or len(c[k])>1200 for k in ('summary','purpose','conditions','observed_at')): return False
+    if any(not isinstance(c.get(k,[]),list) or any(not isinstance(x,str) for x in c.get(k,[])) for k in ('tags','supersedes','exception_of')): return False
+    if c['scope']=='project' and not isinstance(c.get('project'),str): return False
+    if c['scope']=='common' and c['authority']=='user_explicit' and c.get('generalization')!='explicit': return False
+    if any(c.get(k) is not None and not isinstance(c[k],str) for k in ('reason','inferred_reason')): return False
+    if not isinstance(c.get('safe_to_share'),bool): return False
+    return True
+
+
 def all_cases(db,cfg):
     result={r['id']:json.loads(r['payload']) for r in db.execute('SELECT id,payload FROM cases')}
     repo=cfg.get('guidance_checkout')
@@ -230,13 +246,16 @@ def all_cases(db,cfg):
         try:
             proc=subprocess.run(['git','-C',str(repo),'archive','origin/main','--',case_dir],capture_output=True,timeout=5)
             if proc.returncode==0 and len(proc.stdout)<=20_000_000:
+                meta(db,'case_index_error',None)
                 with tarfile.open(fileobj=io.BytesIO(proc.stdout)) as archive:
                     for entry in archive.getmembers()[:3000]:
                         if entry.isfile() and entry.name.endswith('.json') and entry.size<20000:
-                            c=json.load(archive.extractfile(entry)); result.setdefault(c['id'],c)
-        except (RuntimeError,ValueError,OSError):
-            pass
-    return list(result.values())
+                            c=json.load(archive.extractfile(entry))
+                            if valid_case(c): result.setdefault(c['id'],c)
+                            else: meta(db,'case_index_error','invalid shared case omitted')
+        except (RuntimeError,ValueError,OSError,KeyError,TypeError,tarfile.TarError,subprocess.SubprocessError) as e:
+            meta(db,'case_index_error',type(e).__name__)
+    return [c for c in result.values() if valid_case(c)]
 
 
 def context(db,cfg,query,cwd,sid=''):
@@ -244,9 +263,12 @@ def context(db,cfg,query,cwd,sid=''):
     cases=all_cases(db,cfg)
     # Only an accepted, explicitly common correction can retire common guidance.
     retired=set()
+    by_id={c['id']:c for c in cases}
     for c in cases:
         if c['authority']=='user_explicit' and (c['scope']=='common' or c.get('project')==project):
-            retired.update(c.get('supersedes',[]))
+            for old in c.get('supersedes',[]):
+                target=by_id.get(old)
+                if target and (c['scope']=='common' or (target['scope']=='project' and target.get('project')==c.get('project'))): retired.add(old)
     usable=[]
     for c in cases:
         if c['id'] in retired or c['authority']!='user_explicit' or (c['scope']=='project' and c.get('project')!=project): continue
@@ -256,7 +278,7 @@ def context(db,cfg,query,cwd,sid=''):
     chosen=[c for _,c in sorted(usable,key=lambda x:(x[0],x[1]['observed_at']),reverse=True)[:5]]
     pending=[dict(r) for r in db.execute("SELECT id,created,project FROM events WHERE disposition='pending' AND (session=? OR project=? OR project='unassigned') ORDER BY created DESC LIMIT 8",(sid,project))]
     return dict(session_id=sid or None,guideline=dict(checkout=cfg.get('guidance_checkout'),ref='origin/main',path=cfg.get('guideline_path')),
-        cases=chosen,pending=pending,pipeline_health=dict(last_sweep=meta(db,'last_sweep'),publish_error=meta(db,'publish_error')),
+        cases=chosen,pending=pending,pipeline_health=dict(last_sweep=meta(db,'last_sweep'),publish_error=meta(db,'publish_error'),case_index_error=meta(db,'case_index_error')),
         notice='Pending captures are unassessed. Current instructions and scoped exceptions take precedence.')
 
 
@@ -279,18 +301,18 @@ def repo_target(checkout,name):
 def project_guidance(checkout,cfg):
     path=repo_target(checkout,cfg['guideline_path'])
     if path.is_symlink() or not path.is_file(): raise ValueError('canonical guideline missing')
-    text=path.read_text(); cases=[]
+    text=path.read_text(encoding='utf-8'); cases=[]
     folder=repo_target(checkout,cfg['case_dir'])
     if folder.exists():
         for p in sorted(folder.glob('*.json')):
             if p.is_symlink(): raise ValueError('case symlink')
-            cases.append(json.loads(p.read_text()))
+            cases.append(json.loads(p.read_text(encoding='utf-8')))
     retired={x for c in cases if c['scope']=='common' and c['authority']=='user_explicit' for x in c.get('supersedes',[])}
     rules=[c for c in cases if c['id'] not in retired and c['scope']=='common' and c['authority']=='user_explicit' and c.get('guideline_action')=='add']
     lines=[BEGIN,'','## フィードバックから明示された共通方針','']
     for c in rules:
         rel=os.path.relpath(folder/(c['id']+'.json'),path.parent)
-        clean=lambda s:' '.join(s.split()).replace('<!--','').replace('-->','')
+        clean=lambda s:' '.join(s.split()).replace('<','&lt;').replace('>','&gt;')
         lines.append('- '+clean(c['summary'])+' 適用条件: '+clean(c['conditions'])+' ['+c['id']+']('+rel+')')
     lines+=['',END]
     block='\n'.join(lines)
@@ -298,10 +320,11 @@ def project_guidance(checkout,cfg):
         if text.count(BEGIN)!=1 or text.count(END)!=1 or text.index(BEGIN)>text.index(END): raise ValueError('managed section malformed')
         text=text[:text.index(BEGIN)]+block+text[text.index(END)+len(END):]
     elif rules: text=text.rstrip()+'\n\n'+block+'\n'
-    if text!=path.read_text(): path.write_text(text)
+    if text!=path.read_text(encoding='utf-8'): atomic(path,text.encode('utf-8'))
 
 
 def publish(home,db,cfg):
+    db.commit()  # Hooks must not wait for a SQLite writer throughout network I/O.
     pending=[json.loads(r['payload']) for r in db.execute("SELECT payload FROM cases WHERE delivered IS NULL AND json_extract(payload,'$.safe_to_share')=1 ORDER BY created LIMIT 100")]
     if not pending and not cfg.get('guidance_checkout'): return dict(status='idle',published=0)
     if cfg.get('publish_mode')!='trunk-direct': raise ValueError('automatic publication requires configured trunk-direct owner')
@@ -319,17 +342,37 @@ def publish(home,db,cfg):
         if any(not s.startswith('design-feedback: ') for s in ahead): raise ValueError('foreign commits in publisher checkout')
         git(checkout,'rebase','origin/main')
         meta(db,'last_guidance_sync',dict(at=time.time(),revision=git(checkout,'rev-parse','origin/main')))
+        db.commit()
         if not pending: return dict(status='idle',published=0,guidance_synced=True)
         folder=repo_target(checkout,cfg['case_dir']); folder.mkdir(parents=True,exist_ok=True)
+        guideline=repo_target(checkout,cfg['guideline_path']); original=guideline.read_bytes()
+        text=original.decode('utf-8')
+        if BEGIN in text or END in text:
+            if text.count(BEGIN)!=1 or text.count(END)!=1 or text.index(BEGIN)>text.index(END): raise ValueError('managed section malformed')
+        for existing in folder.glob('*.json'):
+            if existing.is_symlink() or not valid_case(json.loads(existing.read_text(encoding='utf-8'))): raise ValueError('invalid existing case')
+        targets=[]
         for c in pending:
             p=folder/(c['id']+'.json')
             if p.is_symlink(): raise ValueError('case symlink')
-            if p.exists() and json.loads(p.read_text())!=c: raise ValueError('published case collision')
-            p.write_text(json.dumps(c,ensure_ascii=False,indent=2)+'\n')
-        project_guidance(checkout,cfg)
-        git(checkout,'add','--',relative(cfg['case_dir']),relative(cfg['guideline_path']))
-        if git(checkout,'diff','--cached','--name-only'):
-            git(checkout,'commit','-m','design-feedback: record scoped UI judgments')
+            if p.exists() and json.loads(p.read_text(encoding='utf-8'))!=c: raise ValueError('published case collision')
+            targets.append((p,c))
+        created=[]; baseline=git(checkout,'rev-parse','HEAD'); ours_guidance=None
+        try:
+            for p,c in targets:
+                if not p.exists(): atomic(p,c); created.append(p)
+            project_guidance(checkout,cfg)
+            ours_guidance=guideline.read_bytes()
+            git(checkout,'add','--',relative(cfg['case_dir']),relative(cfg['guideline_path']))
+            if git(checkout,'diff','--cached','--name-only'):
+                git(checkout,'commit','-m','design-feedback: record scoped UI judgments')
+        except Exception:
+            if git(checkout,'rev-parse','HEAD')==baseline:
+                for p in created:
+                    if p.exists() and json.loads(p.read_text(encoding='utf-8'))==dict(targets)[p]: p.unlink()
+                if ours_guidance is not None and guideline.read_bytes()==ours_guidance: atomic(guideline,original)
+                git(checkout,'reset','--',relative(cfg['case_dir']),relative(cfg['guideline_path']))
+            raise
         revision=git(checkout,'rev-parse','HEAD')
         git(checkout,'push','origin','HEAD:main')
         remote=git(checkout,'ls-remote','origin','refs/heads/main').split()[0]
@@ -346,6 +389,8 @@ def recover(db,cfg):
     """Read the existing normalized retrieval snapshot through its own lock/validator."""
     scripts=cfg.get('retrieval_scripts'); lab=cfg.get('retrieval_lab')
     if not scripts or not lab: return dict(status='not_configured')
+    if cfg.get('recover_registered_only',True) and not db.execute('SELECT 1 FROM sessions LIMIT 1').fetchone():
+        return dict(status='no_registered_ui_sessions',captures=0)
     sys.path.insert(0,str(Path(scripts).expanduser()))
     from retrieval_lab import snapshot_lock, _snapshot
     from retrieval_opportunities import turns, user_text
@@ -427,7 +472,7 @@ def main(argv=None):
             elif args.command=='exhibit':
                 if not args.session: raise ValueError('session ID required')
                 result=exhibit(home,db,cfg,args.file,args.label,args.session,args.cwd,args.presented)
-            elif args.command=='record': result=record(db,json.loads(Path(args.file).read_text()))
+            elif args.command=='record': result=record(db,json.loads(Path(args.file).read_text(encoding='utf-8')))
             elif args.command=='dismiss':
                 if not args.reason.strip(): raise ValueError('dismiss reason required')
                 db.execute("UPDATE events SET disposition='dismissed',note=? WHERE id=? AND disposition='pending'",(args.reason[:500],args.id)); result=dict(disposition='dismissed')
