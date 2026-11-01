@@ -121,6 +121,8 @@ def capture(db, payload, harness, text, source=None, force=False):
         return None
     if text.lstrip().startswith('You are a continuing discussion partner.'):
         meta(db,'excluded_session:'+sid,'agent_consultation')
+    if text.lstrip().startswith('# Overview\n\nGenerate 0 to 3 hyperpersonalized suggestions for what this user can do with Codex'):
+        meta(db,'excluded_session:'+sid,'generated_suggestions')
     if meta(db,'excluded_session:'+sid) or payload.get('agent_id') or payload.get('is_sidechain'):
         return None
     if not text.strip() or MACHINE.search(text) or len(text)>32000:

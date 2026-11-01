@@ -256,5 +256,11 @@ class FeedbackTest(unittest.TestCase):
             self.assertIsNone(f.capture(db,self.payload,'claude-code','You are a continuing discussion partner. Answer the message directly.'))
             self.assertIsNone(f.capture(db,dict(self.payload,turn_id='later'),'claude-code','画面の配置が見づらい'))
 
+    def test_generated_suggestion_job_is_not_human_feedback(self):
+        with f.database(self.home) as db:
+            text='# Overview\n\nGenerate 0 to 3 hyperpersonalized suggestions for what this user can do with Codex in this local project: example\n画面を見やすくする'
+            self.assertIsNone(f.capture(db,self.payload,'codex',text))
+            self.assertIsNone(f.capture(db,dict(self.payload,turn_id='later'),'codex','この画面は右の方がいい'))
+
 
 if __name__=='__main__': unittest.main()
