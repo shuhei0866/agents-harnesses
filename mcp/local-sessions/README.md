@@ -167,8 +167,9 @@ and observed actual model, status, error, native ID, usage and fallback reason.
 The first quota failure remains in that history even when the overall request
 completes on Opus. `fallback_used` and `actual_model` are also exposed by status;
 an absent provider model is unknown, never inferred from a requested alias.
-Top-level `usage` remains the latest attempt's accounting snapshot; inspect
-the attempts for the complete invocation history. Session model preferences
+Top-level `usage` remains the latest attempt's accounting snapshot, and is
+unknown when that attempt reported none; inspect the attempts for the
+complete invocation history. Session model preferences
 remain unchanged. Explicit Fable sessions therefore try Fable on each new
 send; when the model is omitted, later model selection on resume still belongs
 to the CLI. Failed native turns remain part of native history.

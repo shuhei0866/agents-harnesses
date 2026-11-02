@@ -230,6 +230,9 @@ class Store:
     def start_attempt(self, job_id, ordinal, requested_model, native_id, *, reason=None):
         now = time.time()
         with self.db() as db:
+            # Top-level usage is the latest attempt's snapshot. A new attempt starts
+            # unknown, so an earlier refusal's zero accounting cannot stand in for it.
+            db.execute("DELETE FROM job_usage WHERE job_id=?", (job_id,))
             db.execute("INSERT INTO job_attempts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job_id, ordinal, requested_model, None, "running", "", None,
                  native_id, None, reason, now, now))

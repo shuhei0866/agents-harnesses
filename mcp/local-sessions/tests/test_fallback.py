@@ -198,6 +198,11 @@ class QuotaFallbackTests(unittest.TestCase):
         self.assertEqual(len(result['attempts']),2)
         self.assertLess(time.monotonic()-began,8)
         self.assertIn('exceeded 5s',result['error'])
+        # The timed-out fallback reported no accounting: unknown, not the refusal's zero.
+        self.assertEqual(result['attempts'][0]['usage']['output_tokens'],0)
+        self.assertIsNone(result['attempts'][1]['usage'])
+        self.assertIsNone(result['usage'])
+        self.assertIsNone(Store(self.store.root).history('synthetic-partner')[-1]['usage'])
 
 
 if __name__=='__main__':unittest.main()
