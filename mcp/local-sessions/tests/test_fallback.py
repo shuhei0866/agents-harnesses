@@ -183,6 +183,14 @@ class QuotaFallbackTests(unittest.TestCase):
                 result=self.store.public_job(job['id'])
                 self.assertEqual(len(result['attempts']),1)
 
+    def test_invalid_fallback_target_keeps_refusal_in_job_error(self):
+        with patch.dict(os.environ,{'SESSION_BRIDGE_CLAUDE_QUOTA_FALLBACK_MODEL':'not valid!'}):
+            result=self.execute()
+        self.assertEqual(result['status'],'failed')
+        self.assertEqual(len(result['attempts']),1)
+        self.assertIn('Invalid SESSION_BRIDGE_CLAUDE_QUOTA_FALLBACK_MODEL',result['error'])
+        self.assertIn('out of usage credits',result['error'])
+
     def test_cli_default_needs_observed_fable_identity_and_actual_model_is_not_inferred(self):
         self.store.create('default','claude')
         job,_=self.store.reserve('default','quota','one',5)

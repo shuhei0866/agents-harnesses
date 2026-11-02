@@ -360,7 +360,8 @@ def run(store, job_id):
             try:
                 target = quota_fallback(selected, events, final_status) if ordinal == 1 else None
             except ValueError as exc:
-                events.error = str(exc)
+                # Keep the confirmed refusal visible next to the configuration error.
+                events.error = f'{exc}; first attempt: {events.error}'
                 target = None
             if not target or store.job(job_id)['cancel'] or time.monotonic() >= deadline:
                 store.update(job_id, status=final_status, response=events.response, error=events.error)
