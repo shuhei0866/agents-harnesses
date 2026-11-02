@@ -18,6 +18,7 @@ from pathlib import Path
 from .store import ACTIVE, DEFAULT_TIMEOUT, ROOT, Store
 from .usage import accounting
 from . import carryovers
+from .fallback import quota_fallback
 
 
 def claude_budget():
@@ -122,6 +123,9 @@ class Events:
         self.response, self.error, self.completed = "", None, False
         self.native_id = session["native_id"]
         self.native_id_observed = False
+        self.actual_model, self.usage, self.terminal_error = None, None, False
+        self.auth_source = None
+        self.generation_seen = False
         self.last_flush = 0
         self.progress = {"phase": "starting", "events_received": 0, "thinking_deltas": 0,
                          "text_deltas": 0, "answer_chars": 0, "retry_events": 0}
@@ -155,6 +159,7 @@ class Events:
             if event_type == "content_block_start":
                 block_type = detail.get("content_block", {}).get("type")
                 if block_type in ("thinking", "redacted_thinking"):
+                    self.generation_seen = True
                     p["phase"] = "thinking"
                 elif block_type == "text":
                     p["phase"] = "writing"
@@ -171,6 +176,12 @@ class Events:
                     p["last_content_at"] = now
         if kind in ("assistant", "item.completed"):
             p.setdefault("first_response_at", now)
+        if kind == 'assistant':
+            message = event.get('message', {})
+            # CLI-generated synthetic quota messages are refusals, not model
+            # output. Any real content, even without stream deltas, blocks retry.
+            if message.get('model') != '<synthetic>' and message.get('content'):
+                self.generation_seen = True
         if kind in ("result", "turn.completed", "turn.failed"):
             p["phase"] = "result_received"
             for key in ("duration_ms", "duration_api_ms"):
@@ -191,7 +202,16 @@ class Events:
         kind = event.get("type")
         usage = accounting(self.session["provider"], event)
         if usage is not None:
+            self.usage = usage
             self.store.save_usage(self.job_id, usage)
+        model = (event.get('message', {}).get('model') if kind == 'assistant'
+                 else event.get('model') if kind == 'system' else None)
+        if isinstance(model, str) and 0 < len(model) <= 128 and not model.startswith('<'):
+            self.actual_model = model
+        if kind == 'system' and 'apiKeySource' in event:
+            source = event['apiKeySource']
+            self.auth_source = ('subscription' if source in ('none', 'oauth', 'subscription')
+                                else 'other')
         if kind == "system" and event.get("subtype") == "compact_boundary":
             self.progress["compactions"] = self.progress.get("compactions", 0) + 1
         native = event.get("thread_id") if kind == "thread.started" else None
@@ -213,116 +233,141 @@ class Events:
             self.completed = not event.get("is_error", False) and event.get("subtype") == "success"
             if not self.completed:
                 self.error = self.response or json.dumps(event.get("errors", event), ensure_ascii=False)
+            self.terminal_error = event.get('is_error') is True
         self.flush(force=previous_phase != self.progress["phase"] or kind in ("result", "turn.completed", "turn.failed"))
+
+
+def _invoke(store, session, job, prompt, env, deadline, hard_deadline, ordinal):
+    """One supervised provider attempt within the original job deadline."""
+    job_id = job['id']
+    events = Events(store, session, job_id)
+    events.progress['attempt_ordinal'] = ordinal
+    events.flush(force=True)
+    process, final_status = None, None
+    stderr_path = store.root / (f"{job_id}.stderr" if ordinal == 1 else f"{job_id}.attempt-{ordinal}.stderr")
+    try:
+        if time.monotonic() >= deadline or (hard_deadline is not None and time.time() >= hard_deadline):
+            final_status = 'timed_out'
+            return 'timed_out', events
+        # A regular file cannot block on stdin before timeout supervision.
+        with tempfile.TemporaryFile() as stdin, stderr_path.open('wb') as stderr:
+            stdin.write(prompt.encode())
+            stdin.seek(0)
+            process = subprocess.Popen(command(session), cwd=session['cwd'], env=env,
+                stdin=stdin, stdout=subprocess.PIPE, stderr=stderr, start_new_session=True)
+            selector = selectors.DefaultSelector()
+            selector.register(process.stdout, selectors.EVENT_READ)
+            heartbeat, pending, output_bytes = 0, b'', 0
+            try:
+                while selector.get_map():
+                    now = time.monotonic()
+                    if store.job(job_id)['cancel']:
+                        final_status = 'interrupted'
+                        break
+                    if now >= deadline or (hard_deadline is not None and time.time() >= hard_deadline):
+                        final_status = 'timed_out'
+                        break
+                    if now - heartbeat >= 2:
+                        events.flush()
+                        store.update(job_id)
+                        heartbeat = now
+                    for key, _ in selector.select(.2):
+                        chunk = os.read(key.fd, 65536)
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                            break
+                        output_bytes += len(chunk)
+                        if output_bytes > 8 * 1024 * 1024:
+                            raise ValueError('provider output exceeded 8 MiB')
+                        pending += chunk
+                        while b'\n' in pending:
+                            line, pending = pending.split(b'\n', 1)
+                            if line.strip():
+                                events.accept(json.loads(line))
+                if pending.strip() and final_status is None:
+                    events.accept(json.loads(pending))
+            finally:
+                selector.close()
+            if final_status:
+                stop_process(process)
+            else:
+                try:
+                    code = process.wait(timeout=max(.1, deadline-time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    final_status = 'timed_out'
+                    stop_process(process)
+                else:
+                    if events.completed and not events.native_id_observed:
+                        events.error = 'Provider did not report a native session ID; cannot guarantee continuation.'
+                    final_status = 'completed' if code == 0 and events.completed and not events.error else 'failed'
+            if final_status == 'failed' and not events.error:
+                events.error = 'Provider did not complete the turn. ' + stderr_path.read_text(errors='replace')[-2000:]
+    except BaseException as exc:
+        final_status, events.error = 'failed', str(exc)
+    finally:
+        if process:
+            stop_process(process)
+            process.stdout.close()
+        if final_status == 'timed_out':
+            events.error = events.timeout_error(job['timeout']) + (' ' + events.error if events.error else '')
+        events.flush(force=True)
+    return final_status or 'failed', events
 
 
 def run(store, job_id):
     job = store.job(job_id)
-    session = store.session(job["session_id"])
-    with open(store.root / f"{session['id']}.lock", "a") as lock:
+    session = store.session(job['session_id'])
+    with open(store.root / f"{session['id']}.lock", 'a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return
-        if store.job(job_id)["status"] != "queued":
+        if store.job(job_id)['status'] != 'queued':
             return
-        store.update(job_id, status="running")
-        if store.job(job_id)["cancel"]:
-            store.update(job_id, status="interrupted")
+        store.update(job_id, status='running')
+        if store.job(job_id)['cancel']:
+            store.update(job_id, status='interrupted')
             return
         hard_deadline = store.job_deadline(job_id)
         if hard_deadline is not None and hard_deadline <= time.time():
-            store.update(job_id, status="timed_out", error="Dialogue time budget expired before CLI launch.")
+            store.update(job_id, status='timed_out', error='Dialogue time budget expired before CLI launch.')
             return
-        process = None
-        events = Events(store, session, job_id)
-        events.flush(force=True)
-        final_status = None
-        try:
-            env = os.environ.copy()
-            env.pop("CLAUDECODE", None)
-            # Explicit opt-in lets a caller choose local subscription auth over
-            # an inherited API key. Never read or copy credential files.
-            if env.get("SESSION_BRIDGE_CLAUDE_AUTH") == "subscription":
-                env.pop("ANTHROPIC_API_KEY", None)
-                env.pop("ANTHROPIC_AUTH_TOKEN", None)
-            if env.get("SESSION_BRIDGE_CODEX_AUTH") == "subscription":
-                env.pop("OPENAI_API_KEY", None)
-                env.pop("CODEX_API_KEY", None)
-            first = not session["native_id"]
-            prefix = ("You are a continuing discussion partner. Answer the message directly. "
-                      "Do not use tools, modify files, or invoke another agent. "
-                      "Messages here are supplied by the bridge caller, not necessarily a human.\n"
-                      + session["instructions"] + "\n\n") if first else ""
-            prompt = prefix + carryovers.render(carryovers.for_job(store, job_id)) + job["prompt"]
-            # A regular temporary file avoids blocking on a full stdin pipe before
-            # the supervised timeout begins when a provider never reads stdin.
-            with tempfile.TemporaryFile() as stdin, open(store.root / f"{job_id}.stderr", "wb") as stderr:
-                stdin.write(prompt.encode())
-                stdin.seek(0)
-                process = subprocess.Popen(command(session), cwd=session["cwd"], env=env,
-                    stdin=stdin, stdout=subprocess.PIPE, stderr=stderr, start_new_session=True)
-                selector = selectors.DefaultSelector()
-                selector.register(process.stdout, selectors.EVENT_READ)
-                allowance = job["timeout"]
-                if hard_deadline is not None:
-                    allowance = min(allowance, max(0, hard_deadline - time.time()))
-                deadline, heartbeat, pending = time.monotonic() + allowance, 0, b""
-                output_bytes = 0
-                try:
-                    while selector.get_map():
-                        now = time.monotonic()
-                        if store.job(job_id)["cancel"]:
-                            final_status = "interrupted"
-                            break
-                        if now >= deadline or (hard_deadline is not None and time.time() >= hard_deadline):
-                            final_status = "timed_out"
-                            break
-                        if now - heartbeat >= 2:
-                            events.flush()
-                            store.update(job_id)
-                            heartbeat = now
-                        for key, _ in selector.select(0.2):
-                            chunk = os.read(key.fd, 65536)
-                            if not chunk:
-                                selector.unregister(key.fileobj)
-                                break
-                            output_bytes += len(chunk)
-                            if output_bytes > 8 * 1024 * 1024:
-                                raise ValueError("provider output exceeded 8 MiB")
-                            pending += chunk
-                            while b"\n" in pending:
-                                line, pending = pending.split(b"\n", 1)
-                                if line.strip():
-                                    events.accept(json.loads(line))
-                    if pending.strip() and final_status is None:
-                        events.accept(json.loads(pending))
-                finally:
-                    selector.close()
-                if final_status:
-                    stop_process(process)
-                else:
-                    try:
-                        code = process.wait(timeout=max(0.1, deadline - time.monotonic()))
-                    except subprocess.TimeoutExpired:
-                        final_status = "timed_out"
-                        stop_process(process)
-                    else:
-                        if events.completed and not events.native_id_observed:
-                            events.error = "Provider did not report a native session ID; cannot guarantee continuation."
-                        final_status = "completed" if code == 0 and events.completed and not events.error else "failed"
-                if final_status == "failed" and not events.error:
-                    events.error = "Provider did not complete the turn. " + (store.root / f"{job_id}.stderr").read_text(errors="replace")[-2000:]
-        except BaseException as exc:
-            final_status, events.error = "failed", str(exc)
-        finally:
-            if process:
-                stop_process(process)
-                process.stdout.close()
-            if final_status == "timed_out":
-                events.error = events.timeout_error(job["timeout"]) + (" " + events.error if events.error else "")
-            events.flush(force=True)
-            store.update(job_id, status=final_status or "failed", response=events.response, error=events.error)
+        allowance = job['timeout']
+        if hard_deadline is not None:
+            allowance = min(allowance, max(0, hard_deadline-time.time()))
+        deadline = time.monotonic() + allowance
+        env = os.environ.copy()
+        env.pop('CLAUDECODE', None)
+        if env.get('SESSION_BRIDGE_CLAUDE_AUTH') == 'subscription':
+            env.pop('ANTHROPIC_API_KEY', None)
+            env.pop('ANTHROPIC_AUTH_TOKEN', None)
+        if env.get('SESSION_BRIDGE_CODEX_AUTH') == 'subscription':
+            env.pop('OPENAI_API_KEY', None)
+            env.pop('CODEX_API_KEY', None)
+        prefix = ('You are a continuing discussion partner. Answer the message directly. '
+                  'Do not use tools, modify files, or invoke another agent. '
+                  'Messages here are supplied by the bridge caller, not necessarily a human.\n'
+                  + session['instructions'] + '\n\n') if not session['native_id'] else ''
+        prompt = prefix + carryovers.render(carryovers.for_job(store, job_id)) + job['prompt']
+        selected, ordinal, reason = dict(session), 1, None
+        while True:
+            store.start_attempt(job_id, ordinal, selected['model'], selected['native_id'], reason=reason)
+            final_status, events = _invoke(store, selected, job, prompt, env, deadline, hard_deadline, ordinal)
+            store.finish_attempt(job_id, ordinal, actual_model=events.actual_model, status=final_status,
+                response=events.response, error=events.error, native_id=events.native_id, usage=events.usage)
+            # Only one confirmed pre-generation subscription refusal may retry;
+            # the job remains running and retains the original deadline/ID.
+            try:
+                target = quota_fallback(selected, events, final_status) if ordinal == 1 else None
+            except ValueError as exc:
+                # Keep the confirmed refusal visible next to the configuration error.
+                events.error = f'{exc}; first attempt: {events.error}'
+                target = None
+            if not target or store.job(job_id)['cancel'] or time.monotonic() >= deadline:
+                store.update(job_id, status=final_status, response=events.response, error=events.error)
+                return
+            selected = dict(session, model=target, native_id=events.native_id)
+            ordinal, reason = 2, 'claude_subscription_quota'
 
 
 if __name__ == "__main__":

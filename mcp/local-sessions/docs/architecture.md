@@ -87,6 +87,12 @@ stateDiagram-v2
 プロバイダーが受信した直後にworkerが消えた可能性を否定できないので、
 `uncertain` は自動再送せず、その相手への新規送信も止めます。
 
+Claudeの明示subscription認証で、Fableが生成開始前にusage-credit上限を返した
+場合だけ、runningの同じjob内で一度だけOpus aliasを試します。これは終了済みjobの
+再送ではありません。job_attemptsが要求/観測model・失敗・使用量・native IDを
+試行ごとに保持し、元request IDと全体期限を維持します。一般エラー・不確実な
+実行・部分応答は切り替えず、認証・provider・ツール制限も変更しません。
+
 進捗の `thinking` や `result_received`、返答フィールドの存在だけでは完了としません。
 成功イベントとCLI正常終了の両方を確認して `completed` にします。
 heartbeatはworkerが動いている証拠で、モデルが応答している証拠とは分けます。

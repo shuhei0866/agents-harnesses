@@ -86,6 +86,7 @@ operator's control; installing this server does not grant blanket permission.
 | `SESSION_BRIDGE_CLAUDE_MAX_BUDGET_USD` | Positive finite CLI budget limit per invocation; default `10`. It is passed to Claude's `--max-budget-usd`, not an account-wide budget or a promise about billing. |
 | `SESSION_BRIDGE_CLAUDE_AUTH=subscription` | Removes inherited `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` only from the child environment so the CLI can use its existing login. |
 | `SESSION_BRIDGE_CODEX_AUTH=subscription` | Removes inherited `OPENAI_API_KEY` and `CODEX_API_KEY` only from the child environment so the CLI can use its existing login. |
+| `SESSION_BRIDGE_CLAUDE_QUOTA_FALLBACK_MODEL` | Subscription-mode Fable quota fallback target; default CLI alias `opus`. Set an empty value to disable it. An alias requests a model; the returned observed model identifies what actually ran. |
 
 Without the auth overrides, CLI authentication selection is unchanged. The
 bridge never copies credential files or transfers logins between machines.
@@ -143,6 +144,40 @@ Only `status="completed"` is a successful turn. A response field or progress
 event alone is not proof of completion. Interrupted and failed turns can have
 response text. The worker heartbeat is distinct from provider-event progress.
 See [job states and failure handling](docs/architecture.md#ジョブの状態).
+
+### Subscription-model quota fallback
+
+With `SESSION_BRIDGE_CLAUDE_AUTH=subscription`, a terminal Claude quota refusal
+from Fable may make **one** additional invocation using the `opus` CLI alias.
+The original request ID, native conversation and overall timeout stay fixed.
+Both attempts retain the tools-disabled/MCP isolation flags and the same
+authentication selection. The bridge never switches credentials, enables an
+API route, or changes provider to obtain more quota. An explicitly configured
+third-party route or a reported API-key helper disables this fallback.
+
+Only a recognized pre-generation usage-credit/usage-limit refusal in a failed
+`result.is_error` qualifies. Normal answers quoting quota text, authentication
+errors, budget limits, generic rate/overload errors, timeouts, missing native
+identity, partial answers and thinking output are not retried. If Opus is also
+unavailable, the request remains failed after that second attempt. This is a
+separate condition from the CLI's generic `--fallback-model` overload feature.
+
+`agent_status` and `agent_history` expose `attempts`, including each requested
+and observed actual model, status, error, native ID, usage and fallback reason.
+The first quota failure remains in that history even when the overall request
+completes on Opus. `fallback_used` and `actual_model` are also exposed by status;
+an absent provider model is unknown, never inferred from a requested alias.
+Top-level `usage` remains the latest attempt's accounting snapshot, and is
+unknown when that attempt reported none; inspect the attempts for the
+complete invocation history. Session model preferences
+remain unchanged. Explicit Fable sessions therefore try Fable on each new
+send; when the model is omitted, later model selection on resume still belongs
+to the CLI. Failed native turns remain part of native history.
+
+No new MCP tools are added. Existing installations need the updated package;
+reload the MCP connection after selecting the new release. Synthetic tests can
+verify routing and persistence without consuming provider quota. A real
+successful Opus turn must be verified separately for the authenticated account.
 
 ### Bounded dialogue
 

@@ -70,6 +70,13 @@ class Store:
                 CREATE TABLE IF NOT EXISTS job_progress (
                     job_id TEXT PRIMARY KEY REFERENCES jobs(id), payload TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS job_attempts (
+                    job_id TEXT NOT NULL REFERENCES jobs(id), ordinal INTEGER NOT NULL,
+                    requested_model TEXT, actual_model TEXT, status TEXT NOT NULL,
+                    response TEXT NOT NULL DEFAULT '', error TEXT, native_id TEXT,
+                    usage TEXT, reason TEXT, created REAL NOT NULL, updated REAL NOT NULL,
+                    PRIMARY KEY(job_id, ordinal)
+                );
             """)
 
             db.executescript(carryovers.SCHEMA)
@@ -220,21 +227,56 @@ class Store:
             row = db.execute("SELECT payload FROM job_usage WHERE job_id=?", (job_id,)).fetchone()
         return json.loads(row[0]) if row else None
 
+    def start_attempt(self, job_id, ordinal, requested_model, native_id, *, reason=None):
+        now = time.time()
+        with self.db() as db:
+            # Top-level usage is the latest attempt's snapshot. A new attempt starts
+            # unknown, so an earlier refusal's zero accounting cannot stand in for it.
+            db.execute("DELETE FROM job_usage WHERE job_id=?", (job_id,))
+            db.execute("INSERT INTO job_attempts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (job_id, ordinal, requested_model, None, "running", "", None,
+                 native_id, None, reason, now, now))
+
+    def finish_attempt(self, job_id, ordinal, *, actual_model, status, response,
+                       error, native_id, usage):
+        with self.db() as db:
+            db.execute("UPDATE job_attempts SET actual_model=?, status=?, response=?, error=?, "
+                       "native_id=?, usage=?, updated=? WHERE job_id=? AND ordinal=?",
+                (actual_model, status, response, error, native_id,
+                 json.dumps(usage) if usage is not None else None, time.time(), job_id, ordinal))
+
+    def attempts(self, job_id):
+        with self.db() as db:
+            rows = db.execute("SELECT * FROM job_attempts WHERE job_id=? ORDER BY ordinal",
+                              (job_id,)).fetchall()
+        result = []
+        for row in rows:
+            value = dict(row)
+            value['usage'] = json.loads(value['usage']) if value['usage'] else None
+            result.append(value)
+        return result
+
     def history(self, session, limit=10):
         sid = self.session(session)["id"]
         with self.db() as db:
             rows = db.execute("SELECT * FROM jobs WHERE session_id=? ORDER BY created DESC LIMIT ?",
                               (sid, max(1, min(100, limit)))).fetchall()
-        return [dict(r) | {"usage": self.usage(r["id"]), "carryovers": carryovers.for_job(self, r['id'])} for r in reversed(rows)]
+        return [dict(r) | {"usage": self.usage(r["id"]), "carryovers": carryovers.for_job(self, r['id']),
+                           "attempts": self.attempts(r['id'])} for r in reversed(rows)]
 
     def public_job(self, job_id):
         job = self.job(job_id)
         session = self.session(job["session_id"])
         end = time.time() if job["status"] in ACTIVE else job["updated"]
         progress = self.progress(job_id)
+        attempts = self.attempts(job_id)
         if progress and progress.get("last_event_at"):
             progress["seconds_since_last_event"] = round(max(0, end - progress["last_event_at"]), 1)
         return {k: job[k] for k in ("id", "session_id", "request_id", "status", "response", "error", "created", "updated")} | {
             "native_session_id": session["native_id"], "name": session["name"],
             "timeout_seconds": job["timeout"], "elapsed_seconds": round(end - job["created"], 1),
-            "progress": progress, "usage": self.usage(job_id), "carryovers": carryovers.for_job(self, job_id)}
+            "progress": progress, "usage": self.usage(job_id), "carryovers": carryovers.for_job(self, job_id),
+            "requested_model": session['model'],
+            "actual_model": attempts[-1]['actual_model'] if attempts else None,
+            "fallback_used": any(row['reason'] == 'claude_subscription_quota' for row in attempts),
+            "attempts": attempts}

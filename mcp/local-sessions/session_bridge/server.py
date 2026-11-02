@@ -56,6 +56,8 @@ def agent_send(session: str, prompt: str, request_id: str, timeout_seconds: int 
     Use the name or bridge session ID. One active send per session. Same request_id
     and prompt returns the previous job without a second model call. Workers keep
     running when the MCP client disconnects, up to timeout_seconds (5-600, default 600).
+    A confirmed pre-generation Fable subscription-quota refusal may use one Opus
+    fallback within that same job/deadline. Status exposes both attempts/models.
     Keep polling agent_status; deep reasoning may take several minutes.
     """
     return dispatch(Store(), session, prompt, request_id, timeout_seconds)
@@ -66,7 +68,8 @@ async def agent_status(job_id: str, wait_seconds: int = 0) -> dict:
     """Read a job's result, optionally waiting up to 30 seconds. Only completed is success.
 
     uncertain means the worker disappeared; inspect native history before retrying.
-    failed, interrupted and timed_out never cause automatic resubmission.
+    Terminal failed/interrupted/timed_out jobs never cause automatic resubmission.
+    Inspect attempts/fallback_used/actual_model for an in-job quota fallback.
     progress reports provider event timings and counters, never thinking text.
     updated is a worker heartbeat, not evidence of provider progress.
     """
