@@ -82,9 +82,10 @@ class QuotaFallbackTests(unittest.TestCase):
         env = patch.dict(os.environ,dict(
             PATH=str(self.bin)+os.pathsep+os.environ['PATH'],
             FIXTURE_CALLS=str(self.calls), SESSION_BRIDGE_CLAUDE_AUTH='subscription',
-            SESSION_BRIDGE_CLAUDE_QUOTA_FALLBACK_MODEL='opus',
-            ANTHROPIC_API_KEY='SYNTHETIC_KEY',ANTHROPIC_BASE_URL='',
-            CLAUDE_CODE_USE_BEDROCK='',CLAUDE_CODE_USE_VERTEX='',CLAUDE_CODE_USE_FOUNDRY=''))
+            SESSION_BRIDGE_CLAUDE_QUOTA_FALLBACK_MODEL='opus',ANTHROPIC_BASE_URL='',
+            CLAUDE_CODE_USE_BEDROCK='',CLAUDE_CODE_USE_VERTEX='',CLAUDE_CODE_USE_FOUNDRY='',
+            # Synthetic inherited key: subscription mode must strip it from the child.
+            **{'ANTHROPIC_API_KEY': 'SYNTHETIC_KEY'}))
         env.start()
         self.addCleanup(env.stop)
         self.store = Store(self.root/'state')
