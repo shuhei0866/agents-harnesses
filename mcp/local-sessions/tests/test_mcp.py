@@ -13,6 +13,47 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 class MCPTests(unittest.IsolatedAsyncioTestCase):
+    async def test_quota_fallback_survives_mcp_reconnect_without_duplicate_turn(self):
+        from test_fallback import CLI, NATIVE
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bindir = root/'bin'; bindir.mkdir()
+            cli = bindir/'claude'; cli.write_text(CLI); cli.chmod(0o755)
+            calls = root/'calls.jsonl'
+            env = {**os.environ, 'SESSION_BRIDGE_HOME': str(root/'state'),
+                'PATH': str(bindir)+os.pathsep+os.environ['PATH'],
+                'FIXTURE_CALLS': str(calls), 'SESSION_BRIDGE_CLAUDE_AUTH': 'subscription',
+                'SESSION_BRIDGE_CLAUDE_QUOTA_FALLBACK_MODEL': 'opus',
+                'ANTHROPIC_BASE_URL': '', 'CLAUDE_CODE_USE_BEDROCK': '',
+                'CLAUDE_CODE_USE_VERTEX': '', 'CLAUDE_CODE_USE_FOUNDRY': ''}
+            params = StdioServerParameters(command=sys.executable, args=['-m','session_bridge'], env=env)
+
+            async def call(client, name, args):
+                result = await client.call_tool(name, args)
+                self.assertFalse(result.isError, result)
+                return json.loads(result.content[0].text)
+
+            request = dict(session='test', prompt='quota', request_id='one')
+            async with stdio_client(params) as (read, write):
+                async with ClientSession(read, write) as client:
+                    await client.initialize()
+                    await call(client, 'agent_create', dict(name='test', provider='claude', model='fable'))
+                    sent = await call(client, 'agent_send', request)
+            async with stdio_client(params) as (read, write):
+                async with ClientSession(read, write) as client:
+                    await client.initialize()
+                    done = await call(client, 'agent_status', dict(job_id=sent['id'], wait_seconds=10))
+                    self.assertEqual(done['status'], 'completed', done)
+                    self.assertEqual(done['native_session_id'], NATIVE)
+                    self.assertTrue(done['fallback_used'])
+                    self.assertEqual(done['actual_model'], 'claude-opus-fixture')
+                    self.assertEqual([attempt['status'] for attempt in done['attempts']], ['failed','completed'])
+                    history = await call(client, 'agent_history', dict(session='test'))
+                    self.assertEqual(history['messages'][0]['attempts'], done['attempts'])
+                    repeated = await call(client, 'agent_send', request)
+                    self.assertEqual(repeated['id'], done['id'])
+                    self.assertEqual(len(calls.read_text().splitlines()), 2)
+
     async def test_reconnect_keeps_same_partner_and_reports_tool_errors(self):
         with tempfile.TemporaryDirectory() as state:
             params = StdioServerParameters(command=sys.executable, args=["-m", "session_bridge"],

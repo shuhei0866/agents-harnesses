@@ -49,7 +49,11 @@ guarantee at the provider: a process may disappear after the provider accepted
 a request. Such stale jobs become `uncertain` and block new sends to that
 partner. Inspect native history and use a new partner; do not edit the DB to
 pretend the request never happened. Failed/interrupted/timed-out jobs are not
-automatically replayed.
+automatically replayed. A still-running Claude subscription job can make one
+explicit Opus invocation after a confirmed pre-generation Fable quota refusal.
+The same native ID, deadline, authentication selection and restrictions are
+retained; both attempts remain inspectable. This is not recovery from an
+uncertain worker or a permission to change credentials/providers.
 
 The timeout (5–600 seconds) bounds normal worker supervision; termination has
 short SIGINT/SIGTERM/SIGKILL grace periods. It is not a provider billing ceiling.
