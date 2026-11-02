@@ -9,6 +9,8 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
+from . import carryovers
+
 ACTIVE = ("queued", "running")
 DEFAULT_TIMEOUT = 600
 ROOT = Path(__file__).resolve().parent.parent
@@ -69,6 +71,8 @@ class Store:
                     job_id TEXT PRIMARY KEY REFERENCES jobs(id), payload TEXT NOT NULL
                 );
             """)
+
+            db.executescript(carryovers.SCHEMA)
 
     @contextmanager
     def db(self):
@@ -161,6 +165,7 @@ class Store:
                        "VALUES (?,?,?,?,?,?,?,?)", (jid, session["id"], request_id, prompt, "queued", now, now, timeout))
             if dialogue_id:
                 db.execute("INSERT INTO dialogue_turns VALUES (?,?,?,?)", (dialogue_id, ordinal, jid, dialogue["deadline"]))
+            carryovers.reserve_job(db, jid, session['id'], dialogue_id, ordinal)
         return self.job(jid), True
 
     def job(self, job_id):
@@ -220,7 +225,7 @@ class Store:
         with self.db() as db:
             rows = db.execute("SELECT * FROM jobs WHERE session_id=? ORDER BY created DESC LIMIT ?",
                               (sid, max(1, min(100, limit)))).fetchall()
-        return [dict(r) | {"usage": self.usage(r["id"])} for r in reversed(rows)]
+        return [dict(r) | {"usage": self.usage(r["id"]), "carryovers": carryovers.for_job(self, r['id'])} for r in reversed(rows)]
 
     def public_job(self, job_id):
         job = self.job(job_id)
@@ -232,4 +237,4 @@ class Store:
         return {k: job[k] for k in ("id", "session_id", "request_id", "status", "response", "error", "created", "updated")} | {
             "native_session_id": session["native_id"], "name": session["name"],
             "timeout_seconds": job["timeout"], "elapsed_seconds": round(end - job["created"], 1),
-            "progress": progress, "usage": self.usage(job_id)}
+            "progress": progress, "usage": self.usage(job_id), "carryovers": carryovers.for_job(self, job_id)}

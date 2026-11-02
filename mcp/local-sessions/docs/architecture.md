@@ -28,11 +28,12 @@ sequenceDiagram
 
 | モジュール | 役割 |
 |---|---|
-| `server.py` | FastMCPによるstdio窓口。相談相手の6ツールと継続対話の3ツール。 |
+| `server.py` | FastMCPによるstdio窓口。相談相手6・継続対話3・一行メモ3のツール。 |
 | `store.py` | SQLiteで相手とジョブを保持。名前とnative IDの対応、重複送信・同時実行を制御。 |
 | `runner.py` | detached workerの起動、CLIコマンド構築、JSONイベントの解釈、時間制限・中断。 |
 | `dialogue.py` | 専用の2セッションで交互に発言。往復・時間上限、一時停止・再開・停止を制御。 |
 | `usage.py` | CLIが報告したトークン・キャッシュ・累積費用を許可した項目だけ保存。 |
+| `carryovers.py` | 相手／明示した対話系列の一行メモと、予約時点の投入snapshot。 |
 
 MCPサーバーは各ホストが起動できます。同じ保存先を指定すれば、双方から同じ相手へ
 接続できます。各相手のCLIは一回の返答で終了します。次の送信時に
@@ -49,6 +50,14 @@ BridgeのSQLiteには次の状態があります。
 - dialogues: 不変の開始条件、専用セッションID、状態・制御要求、残り時間と締切。
 - dialogue_participants: 専用セッションの所有関係。通常のagent_sendによる割り込みを防止。
 - dialogue_turns: 順番とjob ID、予約時点の絶対締切。job予約と同じtransactionで保存。
+- carryover_notes: scope、一行の案・引っかかり、open/closed、保存request ID、選択時刻。
+- dialogue_carryovers: 対話系列のscopeと開始時snapshot。両参加者の最初の発言へ同じ内容を渡す。
+- job_carryovers: job予約時のsnapshot。元のpromptやnative履歴を書き換えず追加する。
+
+一行メモは理由・再開条件を必須にしない。hostが必要な断片だけを保存し、通常送信では
+同じ相手、次の上限付き対話では明示した `continue_from` の系列だけから自動で取り出す。
+毎回最大3件を未選択・選択の古い順で回す。提示・読み取りでcloseせず、重複送信も選択を進めない。
+新しいモデル呼出しやスケジュールはない。snapshotは入力予約の証跡で、実際に拾えたという評価ではない。
 
 次回の推論に使う会話履歴はCLI自身が管理します。Bridgeのjobsを再送して記憶を
 再構成する仕組みではありません。したがって、CLI側の履歴を失うとSQLiteだけでは

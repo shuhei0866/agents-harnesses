@@ -39,6 +39,16 @@ cover conservative failure handling and deadline checks. The live test did
 not migrate an existing MCP installation; adoption under that installation's
 outer sandbox remains a separate acceptance step.
 
+## Carryover validation
+
+Synthetic tests cover one-line validation, concurrent/idempotent saves, explicit
+scope isolation, legacy dialogues, read-only pagination, non-consuming rotation,
+close/reopen, and immutable reservation snapshots. An MCP reconnect test saves a
+fragment, restarts the host, and verifies that the synthetic CLI actually receives
+it before a fresh prompt without manual copying. Continued dialogues deliver the
+same opening notes to both partners once and retain native resume on later turns.
+These checks establish routing and persistence, not model attention or idea quality.
+
 ## Accounting interpretation
 
 The tested Codex JSONL adapter emits session totals on `turn.completed`.

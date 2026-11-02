@@ -74,6 +74,20 @@ Usage persistence keeps only numeric allowlisted fields and source labels.
 It does not retain raw model-usage payloads, thinking text or pricing guesses.
 The existing plaintext-state and trusted-local-user boundaries still apply.
 
+## Scoped one-line carryovers
+
+Carryovers are plaintext in the existing local registry. No new service,
+credential, schedule, or background summarization is added. The host explicitly
+selects a named partner or a dialogue series; dialogue continuations share notes
+with both providers. The bridge does not match notes by topic or search other
+conversations. These scope checks prevent accidental routing, not access by a
+hostile user of the same local account.
+
+Open notes remain until the host explicitly closes them. Reservation snapshots
+are immutable; closure is not recall of a previously submitted prompt or deletion
+from native history. A fragment may contain mistaken or adversarial text and is
+labeled untrusted discussion material. It does not expand tool permissions.
+
 ## Reporting
 
 Report vulnerabilities privately to the repository maintainer through an

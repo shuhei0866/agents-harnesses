@@ -23,7 +23,8 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                     tools = (await client.list_tools()).tools
                     self.assertEqual({t.name for t in tools}, {"agent_create", "agent_list", "agent_send",
                         "agent_status", "agent_interrupt", "agent_history",
-                        "dialogue_start", "dialogue_status", "dialogue_control"})
+                        "dialogue_start", "dialogue_status", "dialogue_control",
+                        "carryover_save", "carryover_list", "carryover_update"})
                     send_tool = next(t for t in tools if t.name == "agent_send")
                     self.assertEqual(send_tool.inputSchema["properties"]["timeout_seconds"]["default"], 600)
                     created = await client.call_tool("agent_create", {"name": "test", "provider": "claude"})
@@ -37,6 +38,66 @@ class MCPTests(unittest.IsolatedAsyncioTestCase):
                     await client.initialize()
                     result = await client.call_tool("agent_list", {})
                     self.assertEqual(json.loads(result.content[0].text)["sessions"][0]["id"], sid)
+
+    async def test_carryovers_survive_reconnect_and_reach_cli_without_manual_copy(self):
+        from test_dialogue import FIXTURE
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bindir = root / 'bin'; bindir.mkdir()
+            for name in ('codex', 'claude'):
+                cli = bindir / name
+                cli.write_text(FIXTURE); cli.chmod(0o755)
+            calls = root / 'calls.jsonl'
+            env = {**os.environ, 'SESSION_BRIDGE_HOME': str(root/'state'),
+                'CODEX_HOME': str(root/'config'), 'PATH': str(bindir)+os.pathsep+os.environ['PATH'],
+                'DIALOGUE_TEST_CALLS': str(calls), 'DIALOGUE_TEST_DELAY': '.1', 'DIALOGUE_TEST_MODE': ''}
+            params = StdioServerParameters(command=sys.executable, args=['-m','session_bridge'], env=env)
+
+            async def call(client, name, args):
+                result = await client.call_tool(name, args)
+                self.assertFalse(result.isError, result)
+                return json.loads(result.content[0].text)
+
+            async with stdio_client(params) as (read, write):
+                async with ClientSession(read, write) as client:
+                    await client.initialize()
+                    await call(client, 'agent_create', dict(name='test', provider='claude'))
+                    note = await call(client, 'carryover_save', dict(session='test', text='PRIVATE_FRAGMENT', request_id='note'))
+            async with stdio_client(params) as (read, write):
+                async with ClientSession(read, write) as client:
+                    await client.initialize()
+                    notes = await call(client, 'carryover_list', dict(session='test'))
+                    self.assertEqual(notes['notes'][0]['id'], note['id'])
+                    job = await call(client, 'agent_send', dict(session='test', prompt='Fresh question', request_id='send'))
+                    done = await call(client, 'agent_status', dict(job_id=job['id'], wait_seconds=10))
+                    self.assertEqual(done['status'], 'completed', done)
+                    self.assertEqual(done['carryovers']['notes'][0]['id'], note['id'])
+                    log = [json.loads(x) for x in calls.read_text().splitlines()]
+                    self.assertIn('PRIVATE_FRAGMENT', log[0]['prompt'])
+                    self.assertLess(log[0]['prompt'].index('PRIVATE_FRAGMENT'), log[0]['prompt'].index('Fresh question'))
+                    await call(client, 'carryover_update', dict(note_id=note['id'], state='closed'))
+                    same = await call(client, 'agent_send', dict(session='test', prompt='Fresh question', request_id='send'))
+                    self.assertEqual(same['id'], job['id'])
+                    self.assertEqual(same['carryovers'], done['carryovers'])
+
+                    first = await call(client, 'dialogue_start', dict(topic='First topic', max_rounds=1, time_budget_seconds=40, request_id='first'))
+                    for _ in range(60):
+                        state = await call(client, 'dialogue_status', dict(dialogue_id=first['id']))
+                        if state['status'] == 'completed': break
+                        await asyncio.sleep(.1)
+                    self.assertEqual(state['status'], 'completed', state)
+                    await call(client, 'carryover_save', dict(dialogue_id=first['id'], text='SHARED_FRAGMENT', request_id='shared'))
+                    second = await call(client, 'dialogue_start', dict(topic='New topic', max_rounds=1,
+                        time_budget_seconds=40, request_id='second', continue_from=first['id']))
+                    for _ in range(60):
+                        state = await call(client, 'dialogue_status', dict(dialogue_id=second['id']))
+                        if state['status'] == 'completed': break
+                        await asyncio.sleep(.1)
+                    self.assertEqual(state['status'], 'completed', state)
+                    log = [json.loads(x) for x in calls.read_text().splitlines()]
+                    self.assertEqual(len(log), 5)
+                    self.assertTrue(all('SHARED_FRAGMENT' in x['prompt'] for x in log[-2:]))
+                    self.assertTrue(all('PRIVATE_FRAGMENT' not in x['prompt'] for x in log[1:]))
 
     async def test_detached_worker_resume_across_mcp_reconnect(self):
         with tempfile.TemporaryDirectory() as tmp:
