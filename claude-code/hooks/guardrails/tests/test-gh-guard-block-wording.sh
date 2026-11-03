@@ -217,6 +217,31 @@ assert_blocked "GUARD_LEVEL=deny のクラウド代理 approve（ターゲット
 assert_declaration_matches "クラウドの代理 approve（deny・ターゲット不明）の宣言が実挙動と一致する"
 assert_text "クラウドでも判定できなかったことを書く" "判定できませんでした"
 
+echo "gh-guard: 昇格の実行条件は、止めたかどうかに合わせて書く"
+# warn（止めていない）: 本人が対象・影響を含めて本番反映を明示的に許可した場合だけ
+# agent が実行してよい、という条件を示す。人間専用の作業とは書かない。
+run_case "" "" 0 main me "$MERGE"
+assert_text "warn の main 向け merge は本人の明示的な許可を実行条件として示す" "明示的に許可"
+assert_text "warn の main 向け merge は実装の依頼だけを許可とみなさないと書く" "実装の依頼だけを許可とみなさず"
+assert_no_text "warn の main 向け merge を人間専用の作業とは書かない" "人間が実行してください"
+
+run_case "" "" 0 unknown me "$MERGE"
+assert_text "warn のターゲット不明 merge も実行条件を示す" "明示的に許可"
+assert_no_text "warn のターゲット不明 merge も人間専用とは書かない" "人間が実行してください"
+
+# deny（実際に止めた）: 許可の有無にかかわらず止めているので、人間が実行すると書く。
+run_case deny "" 0 main me "$MERGE"
+assert_text "deny の main 向け merge は人間が実行すると書く" "人間が実行してください"
+assert_no_text "deny では許可があれば実行できるとは書かない" "明示的に許可"
+
+# approve は merge の実行条件とは別で、warn でも deny でも人間が行う。
+run_case "" "" 0 main me "$APPROVE"
+assert_text "warn の approve は承認を人間が行うと書く" "承認は人間が行ってください"
+assert_no_text "warn の approve は merge の実行まで人間限定とは書かない" "承認・実行"
+
+run_case deny "" 0 main me "$APPROVE"
+assert_text "deny の approve は人間が承認・実行すると書く" "人間が承認・実行してください"
+
 echo
 echo "PASS: $PASS  FAIL: $FAIL"
 [ "$FAIL" -eq 0 ]
