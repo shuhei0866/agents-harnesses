@@ -359,7 +359,10 @@ is_proxy_approve() {
 
 # --- ヘルパー: 昇格元ブランチ（develop）を持つ repo かどうか ---
 #
-# このガードは「develop → main の昇格は人間が行う」という運用を前提にしている。
+# このガードは「develop → main の昇格は原則として人間が行う。本人が対象・影響を含めて
+# 本番反映を明示的に許可した場合に限り、agent が merge を実行してよい（approve は人間のまま）」
+# という運用を前提にしている。許可の有無はガードには判定できないので、warn のときは実行条件を
+# 文言で示すだけで止めず、deny のときは許可があっても止める（deny を外すのは人間の設定変更）。
 # ところが develop を持たない repo では feature → main が唯一の経路なので、
 # その前提が成立せず、正しい操作に対して誤った警告を出していた。実例として
 # orbit-social-graph は registry で「feature branch から main への PR マージ」を
@@ -457,9 +460,13 @@ _gh_guard_review_is_approve() {
 # 実行を止めていないことを明記する。ターゲットブランチを判定できなかったときは、
 # main 向けと確認できたときと区別して「判定できませんでした」と書く。
 #
-# _gh_guard_respond <対象（判定できたとき）> <操作名> <base|""> <補足>
+# _gh_guard_respond <対象（判定できたとき）> <操作名> <base|""> <補足> [<warn のときの補足>]
+#
+# 補足は、実際に止めたとき（deny）と止めなかったとき（warn）で言うべきことが違う場合がある。
+# 昇格の merge は、deny なら「人間が実行する」と言い切れるが、warn では止めていないので、
+# 本人の明示的な許可があれば agent が実行してよいという実行条件を示す。省略時は deny と同じ補足を使う。
 _gh_guard_respond() {
-  local subject="$1" action="$2" base="$3" tail="$4" message=""
+  local subject="$1" action="$2" base="$3" tail="$4" warn_tail="${5:-$4}" message=""
 
   if guard_respond_denies "advisory"; then
     if [ "$base" = "__UNKNOWN__" ]; then
@@ -473,6 +480,7 @@ _gh_guard_respond() {
     else
       message="${subject}を検出しました。警告のみで、実行は止めていません。"
     fi
+    tail="$warn_tail"
   fi
   guard_respond "advisory" "GH ガード" "${message} ${tail}"
 }
@@ -497,7 +505,8 @@ if ! guard_is_trunk_direct; then
         if is_proxy_approve "$PR_TARGET" "$GH_SEGMENT" "$GH_DIR" "$GH_CONTEXT_UNKNOWN"; then
           if should_deny_approve "$BASE" "$GH_SEGMENT" "$GH_DIR"; then
             _gh_guard_respond "main 向け PR の代理 approve" "代理 approve" "$BASE" \
-              "develop → main の昇格は人間が承認・実行してください。"
+              "develop → main の昇格は人間が承認・実行してください。" \
+              "develop → main の昇格 PR の承認は人間が行ってください。"
           fi
         else
           _gh_guard_respond "VPS 環境での自己 approve" "自己 approve" "" \
@@ -505,14 +514,16 @@ if ! guard_is_trunk_direct; then
         fi
       elif should_deny_approve "$BASE" "$GH_SEGMENT" "$GH_DIR"; then
         _gh_guard_respond "main 向け PR の approve" "approve" "$BASE" \
-          "develop → main の昇格は人間が承認・実行してください。"
+          "develop → main の昇格は人間が承認・実行してください。" \
+          "develop → main の昇格 PR の承認は人間が行ってください。"
       fi
     elif [ "$GH_OP" = "merge" ]; then
       PR_TARGET=$(extract_pr_target "$GH_SEGMENT" "merge")
       BASE=$(get_pr_base "$PR_TARGET" "$GH_SEGMENT" "$GH_DIR" "$GH_CONTEXT_UNKNOWN")
       if should_deny_merge "$BASE" "$GH_SEGMENT" "$GH_DIR"; then
         _gh_guard_respond "main 向け PR のマージ" "マージ" "$BASE" \
-          "develop → main の昇格は人間が実行してください。"
+          "develop → main の昇格は人間が実行してください。" \
+          "develop → main の昇格は、本人が対象・影響を含めて本番反映を明示的に許可した場合だけ実行してください。実装の依頼だけを許可とみなさず、許可が無ければ実行せず人間に依頼してください。"
       fi
     fi
     GH_INDEX=$((GH_INDEX + 1))
