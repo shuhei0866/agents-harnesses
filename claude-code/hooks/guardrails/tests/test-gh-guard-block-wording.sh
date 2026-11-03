@@ -222,6 +222,7 @@ echo "gh-guard: 昇格の実行条件は、止めたかどうかに合わせて�
 # agent が実行してよい、という条件を示す。人間専用の作業とは書かない。
 run_case "" "" 0 main me "$MERGE"
 assert_text "warn の main 向け merge は本人の明示的な許可を実行条件として示す" "明示的に許可"
+assert_text "warn の main 向け merge は許可に対象・影響を含めると書く" "対象・影響を含めて"
 assert_text "warn の main 向け merge は実装の依頼だけを許可とみなさないと書く" "実装の依頼だけを許可とみなさず"
 assert_no_text "warn の main 向け merge を人間専用の作業とは書かない" "人間が実行してください"
 
