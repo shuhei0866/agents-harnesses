@@ -30,6 +30,7 @@ from vault import (
     HASH_KEY_PATH,
     VaultError,
     authorized_key,
+    external_recovery_identity,
     load_config,
     run,
     vault_lock,
@@ -424,9 +425,19 @@ def indexed_blob_oid(root: Path, relative: str) -> str:
     return text_output(git(root, ["rev-parse", f":{relative}"])).strip()
 
 
+
+def chunk_decryption_command(root: Path, config: dict[str, object]) -> list[str]:
+    _, identity = local_device(config, root)
+    command = ["age", "-d", "-i", str(identity)]
+    recovery = external_recovery_identity(root, config)
+    if recovery is not None:
+        command.extend(["-i", str(recovery)])
+    return command
+
+
 def validate_candidate_chunks(root: Path) -> None:
     config = load_config(root)
-    _, identity = local_device(config, root)
+    decryption_command = chunk_decryption_command(root, config)
     receipts = load_receipts(root)
     devices = root / "devices"
     if not devices.exists():
@@ -444,7 +455,7 @@ def validate_candidate_chunks(root: Path) -> None:
         receipt = receipts.get(relative)
         if receipt is not None and receipt["blob_oid"] != blob_oid:
             raise VaultError("immutable encrypted chunk was replaced")
-        plaintext = run(["age", "-d", "-i", str(identity), str(artifact)])
+        plaintext = run([*decryption_command, str(artifact)])
         validate_plaintext(plaintext, match, config)
 
 
@@ -516,7 +527,7 @@ def validate_plaintext(
 
 def import_chunks(root: Path) -> bool:
     config = load_config(root)
-    _, identity = local_device(config, root)
+    decryption_command = chunk_decryption_command(root, config)
     receipts = load_receipts(root)
     receipt_directory = safe_subdirectory(root, "index")
     safe_subdirectory(root, "cache", "imported")
@@ -532,7 +543,7 @@ def import_chunks(root: Path) -> bool:
         receipt = receipts.get(relative)
         if receipt is not None and receipt["blob_oid"] != blob_oid:
             raise VaultError("immutable encrypted chunk was replaced")
-        plaintext = run(["age", "-d", "-i", str(identity), str(artifact)])
+        plaintext = run([*decryption_command, str(artifact)])
         canonical_plaintext, digest = validate_plaintext(plaintext, match, config)
         if receipt is not None and receipt["chunk_id"] != f"sha256:{digest}":
             raise VaultError("immutable encrypted chunk receipt conflicts")

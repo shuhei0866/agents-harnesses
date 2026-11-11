@@ -30,6 +30,7 @@ from vault import (
     ensure_managed_gitignore,
     ensure_safe_existing_root,
     load_config,
+    external_recovery_identity,
 )
 
 
@@ -200,14 +201,19 @@ def _expected(root: Path, platform: str) -> dict[Path, bytes]:
     cli = _cli_path()
     runtime_path = _runtime_path()
     targets = _targets(platform)
+    recovery = (
+        external_recovery_identity(root, load_config(root))
+        if os.environ.get("FLIGHT_RECORDER_RECOVERY_IDENTITY") is not None
+        else None
+    )
+    environment = {"FLIGHT_RECORDER_STATE_DIR": str(root), "PATH": runtime_path}
+    if recovery is not None:
+        environment["FLIGHT_RECORDER_RECOVERY_IDENTITY"] = str(recovery)
     if platform == "macos":
         value = {
             "Label": LABEL,
             "ProgramArguments": [str(cli), "scheduler", "run"],
-            "EnvironmentVariables": {
-                "FLIGHT_RECORDER_STATE_DIR": str(root),
-                "PATH": runtime_path,
-            },
+            "EnvironmentVariables": environment,
             "StartInterval": WAKE_INTERVAL_SECONDS,
             "RunAtLoad": True,
             "ProcessType": "Background",
@@ -215,13 +221,15 @@ def _expected(root: Path, platform: str) -> dict[Path, bytes]:
         return {
             targets[0]: plistlib.dumps(value, sort_keys=True)
         }
+    rendered_environment = " ".join(
+        _systemd_quote(f"{key}={value}") for key, value in environment.items()
+    )
     service = (
         "[Unit]\n"
         "Description=Agent Harness Flight Recorder sync\n\n"
         "[Service]\n"
         "Type=oneshot\n"
-        f"Environment={_systemd_quote(f'FLIGHT_RECORDER_STATE_DIR={root}')} "
-        f"{_systemd_quote(f'PATH={runtime_path}')}\n"
+        f"Environment={rendered_environment}\n"
         f"ExecStart={_systemd_exec_quote(str(cli))} scheduler run\n"
     ).encode()
     timer = (

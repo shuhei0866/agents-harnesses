@@ -656,6 +656,39 @@ def authorized_key(root: Path, identity_argument: str | None) -> bytes:
     return decrypt(envelope, identity)
 
 
+
+def external_recovery_identity(root: Path, config: dict[str, object]) -> Path | None:
+    """Use only an explicitly configured, owner-only recovery identity."""
+    raw = os.environ.get("FLIGHT_RECORDER_RECOVERY_IDENTITY")
+    if raw is None:
+        return None
+    identity = Path(raw).expanduser()
+    if not identity.is_absolute() or any(c in str(identity) for c in "\r\n\0"):
+        raise VaultError("recovery identity path is invalid")
+    try:
+        metadata = identity.lstat()
+        parent = identity.parent.lstat()
+        inside = identity.resolve().is_relative_to(root.resolve())
+    except OSError as error:
+        raise VaultError("recovery identity is unavailable or unsafe") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or metadata.st_mode & 0o077
+        or not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.geteuid()
+        or parent.st_mode & 0o077
+        or inside
+    ):
+        raise VaultError("recovery identity must be owner-only and outside the Vault")
+    if derive_recipient(identity) not in config["recovery_recipients"]:
+        raise VaultError("identity is not a registered recovery recipient")
+    key = authorized_key(root, str(identity))
+    verify_recipient_state_hmac(config, key)
+    return identity
+
+
 def materialize_local_key(root: Path, key: bytes) -> None:
     local_key = root / HASH_KEY_PATH
     if local_key.is_symlink():

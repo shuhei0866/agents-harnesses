@@ -225,6 +225,17 @@ recipient before older chunks are created lets its adopted identity decrypt
 those chunks; otherwise retain access to the recovery identity when historical
 import is required.
 
+For historical chunks created before this device was enrolled, explicitly set
+`FLIGHT_RECORDER_RECOVERY_IDENTITY=/secure/offline-recovery.agekey` when running
+`sync`. The file and its parent must be owner-only, outside the Vault, and the
+identity must match an authenticated registered recovery recipient. No default
+credential search is performed. Both the new device identity and this recovery
+identity are offered to age; ciphertext, immutable blob receipts, and source
+validation remain unchanged. Set the same variable during `scheduler install`
+to retain the external path in the local-only job configuration. The recovery
+private key is never copied into the Vault or committed. Without this explicit
+configuration, historical decryption continues to fail closed.
+
 Session Atlas requires the Python `sqlite3` runtime to use SQLite 3.25 or
 newer with the JSON1 extension enabled. These provide the ordered window
 aggregates and bounded `json_each` list query used by the projection.
