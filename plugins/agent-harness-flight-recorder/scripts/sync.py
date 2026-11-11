@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -400,7 +401,26 @@ def load_receipts(root: Path) -> dict[str, dict[str, str]]:
         )
     ):
         raise VaultError("import receipt is invalid")
+    if any("authenticator" in receipt for receipt in value["chunks"].values()):
+        config = load_config(root)
+        key = authorized_key(root, None)
+        verify_recipient_state_hmac(config, key)
+        for relative, receipt in value["chunks"].items():
+            if "authenticator" in receipt and not hmac.compare_digest(
+                receipt["authenticator"], receipt_authenticator(config, key, relative, receipt)
+            ):
+                raise VaultError("import receipt authentication failed")
     return value["chunks"]
+
+
+def receipt_authenticator(
+    config: dict[str, object], key: bytes, relative: str, receipt: dict[str, str]
+) -> str:
+    payload = canonical_json({
+        "vault_id": config["vault_id"], "path": relative,
+        "blob_oid": receipt["blob_oid"], "chunk_id": receipt["chunk_id"],
+    })
+    return hmac.new(key, b"agent-harness-flight-recorder/import-receipt-v1\0" + payload, hashlib.sha256).hexdigest()
 
 
 def valid_receipt(path: object, receipt: object) -> bool:
@@ -408,7 +428,11 @@ def valid_receipt(path: object, receipt: object) -> bool:
         isinstance(path, str)
         and CHUNK_PATH_RE.fullmatch(path) is not None
         and isinstance(receipt, dict)
-        and set(receipt) == {"blob_oid", "chunk_id"}
+        and set(receipt) in ({"blob_oid", "chunk_id"}, {"blob_oid", "chunk_id", "authenticator"})
+        and ("authenticator" not in receipt or (
+            isinstance(receipt["authenticator"], str)
+            and re.fullmatch(r"[0-9a-f]{64}", receipt["authenticator"]) is not None
+        ))
         and isinstance(receipt["blob_oid"], str)
         and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", receipt["blob_oid"])
         is not None
@@ -455,6 +479,9 @@ def validate_candidate_chunks(root: Path) -> None:
         receipt = receipts.get(relative)
         if receipt is not None and receipt["blob_oid"] != blob_oid:
             raise VaultError("immutable encrypted chunk was replaced")
+        if receipt is not None and "authenticator" in receipt:
+            # load_receipts verified the MAC binding Vault/path/blob/plaintext ID.
+            continue
         plaintext = run([*decryption_command, str(artifact)])
         validate_plaintext(plaintext, match, config)
 
@@ -543,7 +570,14 @@ def import_chunks(root: Path) -> bool:
         receipt = receipts.get(relative)
         if receipt is not None and receipt["blob_oid"] != blob_oid:
             raise VaultError("immutable encrypted chunk was replaced")
-        plaintext = run([*decryption_command, str(artifact)])
+        digest = match.group("digest")
+        target = root / "cache/imported" / match.group("device") / match.group("year") / match.group("month") / match.group("day") / f"{digest}.jsonl"
+        if target.is_symlink() or (target.exists() and not target.is_file()):
+            raise VaultError("imported chunk cache is unsafe")
+        if receipt is not None and "authenticator" in receipt and target.is_file():
+            plaintext = target.read_bytes()
+        else:
+            plaintext = run([*decryption_command, str(artifact)])
         canonical_plaintext, digest = validate_plaintext(plaintext, match, config)
         if receipt is not None and receipt["chunk_id"] != f"sha256:{digest}":
             raise VaultError("immutable encrypted chunk receipt conflicts")
@@ -570,6 +604,7 @@ def import_chunks(root: Path) -> bool:
 
     changed = any(
         not target.exists() or receipts.get(relative) is None
+        or "authenticator" not in receipts[relative]
         for relative, _match, _plaintext, _digest, _blob_oid, target in plans
     )
     if changed:
@@ -577,6 +612,8 @@ def import_chunks(root: Path) -> bool:
         # crash after source publication must never leave a durable ready
         # marker that a later idempotent import cannot repair.
         request_index_refresh_locked(root)
+    receipt_key = authorized_key(root, None)
+    verify_recipient_state_hmac(config, receipt_key)
     for relative, match, canonical_plaintext, digest, blob_oid, target in plans:
         target_directory = safe_subdirectory(
             root,
@@ -597,6 +634,9 @@ def import_chunks(root: Path) -> bool:
             "blob_oid": blob_oid,
             "chunk_id": f"sha256:{digest}",
         }
+        expected_receipt["authenticator"] = receipt_authenticator(
+            config, receipt_key, relative, expected_receipt
+        )
         if receipts.get(relative) != expected_receipt:
             receipts[relative] = expected_receipt
     if changed or not (root / RECEIPT_PATH).exists():

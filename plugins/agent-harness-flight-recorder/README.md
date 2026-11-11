@@ -226,15 +226,21 @@ those chunks; otherwise retain access to the recovery identity when historical
 import is required.
 
 For historical chunks created before this device was enrolled, explicitly set
-`FLIGHT_RECORDER_RECOVERY_IDENTITY=/secure/offline-recovery.agekey` when running
+`FLIGHT_RECORDER_RECOVERY_IDENTITY=/secure/offline-recovery.agekey` for the first
 `sync`. The file and its parent must be owner-only, outside the Vault, and the
 identity must match an authenticated registered recovery recipient. No default
-credential search is performed. Both the new device identity and this recovery
-identity are offered to age; ciphertext, immutable blob receipts, and source
-validation remain unchanged. Set the same variable during `scheduler install`
-to retain the external path in the local-only job configuration. The recovery
-private key is never copied into the Vault or committed. Without this explicit
-configuration, historical decryption continues to fail closed.
+credential search is performed, and the private key is never copied.
+
+Successful imports authenticate each local receipt with the Vault correlation
+key, binding the Vault ID, source path, immutable Git blob OID and plaintext
+chunk ID. Later syncs can reuse an authenticated receipt and validated cache
+without decrypting historical ciphertext again. Legacy unsigned receipts are
+upgraded only after real decryption. Changed ciphertext, forged receipts and
+corrupt caches fail closed. If a historical cache is lost, explicitly supply
+the recovery identity again to restore it. The scheduler never retains the
+recovery path; ordinary sync uses only the current device identity. Old client
+versions do not understand authenticated receipts; use the upgraded CLI and
+keep a pre-upgrade local backup before migrating this local-only format.
 
 Session Atlas requires the Python `sqlite3` runtime to use SQLite 3.25 or
 newer with the JSON1 extension enabled. These provide the ordered window

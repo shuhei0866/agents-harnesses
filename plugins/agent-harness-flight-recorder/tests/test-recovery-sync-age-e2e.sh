@@ -24,6 +24,7 @@ FLIGHT_RECORDER_STATE_DIR="$B" "$CLI" device join --identity "$RECOVERY"
 if age -d -i "$B/keys/device.agekey" "$B/$OLD_PATH" >/dev/null 2>&1; then echo 'FAIL: historical chunk unexpectedly enrolled new identity'; exit 1; fi
 if FLIGHT_RECORDER_STATE_DIR="$B" "$CLI" sync >"$TEST_ROOT/without-opt-in.log" 2>&1; then echo 'FAIL: history sync must require explicit opt-in'; exit 1; fi
 FLIGHT_RECORDER_STATE_DIR="$B" FLIGHT_RECORDER_RECOVERY_IDENTITY="$RECOVERY" "$CLI" sync
+FLIGHT_RECORDER_STATE_DIR="$B" "$CLI" sync
 [[ "$(git -C "$B" hash-object "$OLD_PATH")" == "$OLD_OID" ]]
 FLIGHT_RECORDER_STATE_DIR="$B" AGENT_FLIGHT_RECORDER_NOW=2026-07-25T06:01:00Z "$PLUGIN/scripts/record-event" --harness codex < "$PLUGIN/tests/fixtures/claude-code-stop.json"
 FLIGHT_RECORDER_STATE_DIR="$B" FLIGHT_RECORDER_RECOVERY_IDENTITY="$RECOVERY" "$CLI" sync
@@ -32,14 +33,15 @@ PYTHONPATH="$PLUGIN/scripts" TEST_ROOT="$TEST_ROOT" FLIGHT_RECORDER_STATE_DIR="$
 import json,os,plistlib,stat
 from pathlib import Path
 from vault import external_recovery_identity,load_config,VaultError
+from sync import load_receipts, sync
 from scheduler import _expected
 root=Path(os.environ['FLIGHT_RECORDER_STATE_DIR']);config=load_config(root)
 recovery=Path(os.environ['FLIGHT_RECORDER_RECOVERY_IDENTITY'])
 mac=_expected(root,'macos')
-assert plistlib.loads(next(iter(mac.values())))['EnvironmentVariables']['FLIGHT_RECORDER_RECOVERY_IDENTITY']==str(recovery)
+assert 'FLIGHT_RECORDER_RECOVERY_IDENTITY' not in plistlib.loads(next(iter(mac.values())))['EnvironmentVariables']
 linux=_expected(root,'linux')
 service=next(v for k,v in linux.items() if str(k).endswith('.service'))
-assert ('FLIGHT_RECORDER_RECOVERY_IDENTITY='+str(recovery)).encode() in service
+assert b'FLIGHT_RECORDER_RECOVERY_IDENTITY' not in service
 for bad in ['relative.agekey', str(root/'keys/device.agekey')]:
  os.environ['FLIGHT_RECORDER_RECOVERY_IDENTITY']=bad
  try: external_recovery_identity(root,config)
@@ -57,9 +59,34 @@ os.environ['FLIGHT_RECORDER_RECOVERY_IDENTITY']=str(link)
 try: external_recovery_identity(root,config)
 except VaultError: pass
 else: raise AssertionError('symlink identity accepted')
+os.environ.pop('FLIGHT_RECORDER_RECOVERY_IDENTITY',None)
+receipt_path=root/'index/imported-chunks.json';original_receipts=receipt_path.read_bytes()
+data=json.loads(original_receipts);relative=next(iter(data['chunks']))
+assert all('authenticator' in r for r in data['chunks'].values())
+data['chunks'][relative]['authenticator']='0'*64
+receipt_path.write_text(json.dumps(data))
+try:
+ try: load_receipts(root)
+ except VaultError: pass
+ else: raise AssertionError('forged receipt accepted')
+finally: receipt_path.write_bytes(original_receipts)
+artifact=root/relative;ciphertext=artifact.read_bytes();artifact.write_bytes(ciphertext+b'tamper')
+try:
+ try: sync(root)
+ except VaultError: pass
+ else: raise AssertionError('changed ciphertext accepted via cache')
+finally: artifact.write_bytes(ciphertext)
+# A corrupted cache must still be validated against its immutable plaintext ID.
+cache=next((root/'cache/imported').rglob('*.jsonl'));original_cache=cache.read_bytes();cache.write_bytes(b'corrupt\n')
+try:
+ try: sync(root)
+ except VaultError: pass
+ else: raise AssertionError('corrupt cache accepted')
+finally: cache.write_bytes(original_cache)
+sync(root)
 assert len(list((root/'cache/imported').rglob('*.jsonl')))==2
 assert config['vault_id']==json.loads((Path(os.environ['TEST_ROOT'])/'a/vault.json').read_text())['vault_id']
-print('PASS: explicit historical recovery, immutable ciphertext, scheduler paths, unsafe-key rejection')
+print('PASS: explicit historical recovery, immutable ciphertext, no routine recovery access, authenticated receipts, tamper rejection')
 PY
 if git --git-dir="$REMOTE" ls-tree -r --name-only main | grep -Eq '(agekey|hash\.key|scheduler/|cache/)'; then echo 'FAIL: local-only state published'; exit 1; fi
 echo 'PASS: recovery identity never enters Git Vault'
