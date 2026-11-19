@@ -166,6 +166,11 @@ else
   run_crlf "$W/noeol.txt"
   check "missing final newline is preserved (no newline added)" converted "$W/noeol.txt" "$W/noeol.expected"
 
+  printf 'one\r\n\r' > "$W/trailing-cr.txt"
+  printf 'one\n' > "$W/trailing-cr.expected"
+  run_crlf "$W/trailing-cr.txt"
+  check "a standalone final CR does not remove the preceding line break" converted "$W/trailing-cr.txt" "$W/trailing-cr.expected"
+
   printf 'linked\r\n' > "$W/target.txt"
   printf 'linked\n' > "$W/target.expected"
   ln -s "$W/target.txt" "$W/link.txt"

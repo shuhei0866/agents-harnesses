@@ -62,14 +62,25 @@ last_byte() {
 TMP_FILE=$(mktemp "${TMPDIR:-/tmp}/fix-crlf.XXXXXX" 2>/dev/null) || exit 0
 trap 'rm -f "$TMP_FILE"' EXIT
 
-# 行末の CR のみ除去 (行中の CR は残す)。LC_ALL=C で不正バイト列でも失敗させない
-if ! LC_ALL=C sed "s/${CR}\$//" "$FILE_PATH" > "$TMP_FILE" 2>/dev/null; then
+# 末尾改行のない入力は、sed に渡す前に LF を足して出力を揃える。
+# 除去するのはここで足した LF だけなので、入力にあった改行は残る。
+added_lf=0
+if [ "$(last_byte "$FILE_PATH")" != "0a" ]; then
+  added_lf=1
+fi
+
+# 行末の CR のみ除去 (行中の CR は残す)。
+if ! {
+  cat -- "$FILE_PATH" || exit 1
+  if [ "$added_lf" -eq 1 ]; then
+    printf '\n'
+  fi
+} 2>/dev/null | LC_ALL=C sed "s/${CR}\$//" > "$TMP_FILE" 2>/dev/null; then
   exit 0
 fi
 
 # 元ファイルへは上書きで戻す (inode・パーミッション・シンボリックリンクを維持)。
-# BSD sed は末尾に改行が無いファイルへ改行を補うので、その場合は取り除く
-if [ "$(last_byte "$FILE_PATH")" != "0a" ] && [ "$(last_byte "$TMP_FILE")" = "0a" ]; then
+if [ "$added_lf" -eq 1 ]; then
   TMP_BYTES=$(($(wc -c < "$TMP_FILE")))
   head -c "$((TMP_BYTES - 1))" "$TMP_FILE" > "$FILE_PATH" 2>/dev/null || exit 0
 else
