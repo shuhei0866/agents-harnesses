@@ -59,33 +59,57 @@ last_byte() {
   tail -c 1 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \t\n'
 }
 
-TMP_FILE=$(mktemp "${TMPDIR:-/tmp}/fix-crlf.XXXXXX" 2>/dev/null) || exit 0
-trap 'rm -f "$TMP_FILE"' EXIT
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/fix-crlf.XXXXXX" 2>/dev/null) || exit 0
+ORIGINAL="$TMP_DIR/original"
+CONVERTED="$TMP_DIR/converted"
+keep_backup=0
+cleanup() {
+  if [ "$keep_backup" -eq 0 ]; then
+    rm -f -- "$ORIGINAL" "$CONVERTED"
+    rmdir -- "$TMP_DIR"
+  else
+    printf '[CRLF 修正] 復旧用コピーを保持しました: %s\n' "$ORIGINAL" >&2
+  fi
+}
+trap cleanup EXIT
+
+# 元ファイルを開き直す前に、失敗時に戻せるコピーを用意する。
+cat -- "$FILE_PATH" > "$ORIGINAL" 2>/dev/null || exit 0
 
 # 末尾改行のない入力は、sed に渡す前に LF を足して出力を揃える。
 # 除去するのはここで足した LF だけなので、入力にあった改行は残る。
 added_lf=0
-if [ "$(last_byte "$FILE_PATH")" != "0a" ]; then
+if [ "$(last_byte "$ORIGINAL")" != "0a" ]; then
   added_lf=1
 fi
 
 # 行末の CR のみ除去 (行中の CR は残す)。
 if ! {
-  cat -- "$FILE_PATH" || exit 1
+  cat -- "$ORIGINAL" || exit 1
   if [ "$added_lf" -eq 1 ]; then
     printf '\n'
   fi
-} 2>/dev/null | LC_ALL=C sed "s/${CR}\$//" > "$TMP_FILE" 2>/dev/null; then
+} 2>/dev/null | LC_ALL=C sed "s/${CR}\$//" > "$CONVERTED" 2>/dev/null; then
   exit 0
 fi
 
-# 元ファイルへは上書きで戻す (inode・パーミッション・シンボリックリンクを維持)。
+# 上書きで inode・パーミッション・シンボリックリンクを維持する。
+# 書き戻しに失敗した場合は元の内容へ戻す。復元も失敗したらコピーを保持する。
 if [ "$added_lf" -eq 1 ]; then
-  TMP_BYTES=$(($(wc -c < "$TMP_FILE")))
-  head -c "$((TMP_BYTES - 1))" "$TMP_FILE" > "$FILE_PATH" 2>/dev/null || exit 0
+  CONVERTED_BYTES=$(wc -c < "$CONVERTED") || exit 0
+  set -- head -c "$((CONVERTED_BYTES - 1))" "$CONVERTED"
 else
-  cat "$TMP_FILE" > "$FILE_PATH" 2>/dev/null || exit 0
+  set -- cat "$CONVERTED"
 fi
+keep_backup=1
+if ! { "$@" > "$FILE_PATH"; } 2>/dev/null; then
+  if { cat "$ORIGINAL" > "$FILE_PATH"; } 2>/dev/null; then
+    keep_backup=0
+    printf '[CRLF 修正] 書き戻しに失敗したため元の内容を復元しました: %s\n' "$FILE_PATH" >&2
+  fi
+  exit 0
+fi
+keep_backup=0
 
 echo "[CRLF 修正] ${FILE_PATH} の改行を LF に変換しました" >&2
 

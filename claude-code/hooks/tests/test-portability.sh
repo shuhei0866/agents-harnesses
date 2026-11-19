@@ -209,6 +209,50 @@ else
   LEFTOVER=$(ls "$HOOK_TMP" 2>/dev/null | grep -c '^fix-crlf\.' || true)
   no_leftover() { [ "${LEFTOVER:-0}" -eq 0 ]; }
   check "no temp files are left behind" no_leftover
+
+  # Simulate a short write after truncation. The backup copy should restore the
+  # original bytes, or remain available if the restore write also fails.
+  REAL_WRITE_CAT=$(command -v cat)
+  cat > "$STRICT_BIN/cat" <<'EOF'
+#!/bin/sh
+case "${1:-}" in
+  */fix-crlf.*/original)
+    if [ "${FAIL_RESTORE:-0}" -eq 1 ]; then
+      printf 'on'
+      exit 1
+    fi
+    ;;
+  */fix-crlf.*/converted|*/fix-crlf.*)
+    printf 'on'
+    exit 1
+    ;;
+esac
+exec "$REAL_WRITE_CAT" "$@"
+EOF
+  chmod +x "$STRICT_BIN/cat"
+  export REAL_WRITE_CAT
+
+  printf 'one\r\n' > "$W/write-failure.txt"
+  cp "$W/write-failure.txt" "$W/write-failure.expected"
+  run_crlf "$W/write-failure.txt"
+  write_restored() {
+    [ "$STATUS" -eq 0 ] && [ -z "$OUT" ] && same "$1" "$2" &&
+      [[ "$ERR" == *"元の内容を復元しました"* ]]
+  }
+  check "failed write restores the original bytes" write_restored "$W/write-failure.txt" "$W/write-failure.expected"
+
+  FAIL_RESTORE=1 run_crlf "$W/write-failure.txt"
+  backup_retained() {
+    local backup
+    backup=${ERR##*: }
+    [ "$STATUS" -eq 0 ] && [ -z "$OUT" ] &&
+      [[ "$ERR" == *"復旧用コピーを保持しました"* ]] &&
+      [[ "$backup" == "$HOOK_TMP/"*/original ]] &&
+      same "$backup" "$W/write-failure.expected"
+  }
+  check "failed write and restore retain the original in a recovery file" backup_retained
+  rm -f "$STRICT_BIN/cat"
+  unset REAL_WRITE_CAT
 fi
 
 # ---------------------------------------------------------------------------
