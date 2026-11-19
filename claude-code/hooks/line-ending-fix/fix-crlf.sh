@@ -3,6 +3,9 @@
 #
 # Write/Edit 後にファイルの改行コードをチェックし、CRLF が検出された場合は
 # LF に自動変換する。バイナリファイルはスキップ。
+#
+# macOS (Bash 3.2 / BSD grep・sed) と Linux (GNU) の両方で動くよう、
+# `grep -P` や `sed -i` などの GNU 拡張は使わない。
 
 set -uo pipefail
 
@@ -19,20 +22,95 @@ if [ -z "${FILE_PATH:-}" ]; then
   exit 0
 fi
 
-# ファイルが存在しない場合はスキップ
-if [ ! -f "$FILE_PATH" ]; then
+# ファイルが存在しない / 読み書きできない場合はスキップ
+if [ ! -f "$FILE_PATH" ] || [ ! -r "$FILE_PATH" ] || [ ! -w "$FILE_PATH" ]; then
   exit 0
 fi
 
 # バイナリファイルはスキップ (file コマンドで判定)
-if file "$FILE_PATH" | grep -qE 'binary|executable|image|archive|compressed'; then
+# -b でパス名を除き、-L で実際に書き換えるリンク先を判定する。
+if file -b -L -- "$FILE_PATH" 2>/dev/null | grep -qE 'binary|executable|image|archive|compressed'; then
   exit 0
 fi
 
-# CRLF チェック & 修正 — grep -cP で直接 \r を検出（file コマンドより確実）
-if grep -qP '\r$' "$FILE_PATH" 2>/dev/null; then
-  sed -i 's/\r$//' "$FILE_PATH"
-  echo "[CRLF 修正] ${FILE_PATH} の改行を LF に変換しました" >&2
+# NUL バイトを含まないバイナリも、file のエンコーディング判定で除外する。
+if [ "$(file -b -L --mime-encoding -- "$FILE_PATH" 2>/dev/null)" = "binary" ]; then
+  exit 0
 fi
+
+# バイナリファイルはスキップ (NUL バイトを含むものはテキストとして扱わない)
+# file コマンドが "data" としか言わないバイナリや UTF-16 もここで除外する
+TOTAL_BYTES=$(($(wc -c < "$FILE_PATH" 2>/dev/null)))
+TEXT_BYTES=$(($(LC_ALL=C tr -d '\000' < "$FILE_PATH" 2>/dev/null | wc -c)))
+if [ "$TOTAL_BYTES" -ne "$TEXT_BYTES" ]; then
+  exit 0
+fi
+
+# リテラルの CR。BSD grep/sed は正規表現中の \r を解釈しないため直接埋め込む
+CR=$(printf '\r')
+
+# CRLF チェック (行末の CR を検出)
+if ! LC_ALL=C grep -q "${CR}\$" "$FILE_PATH" 2>/dev/null; then
+  exit 0
+fi
+
+# ファイル末尾 1 バイトを 16 進で返す
+last_byte() {
+  tail -c 1 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \t\n'
+}
+
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/fix-crlf.XXXXXX" 2>/dev/null) || exit 0
+ORIGINAL="$TMP_DIR/original"
+CONVERTED="$TMP_DIR/converted"
+keep_backup=0
+cleanup() {
+  if [ "$keep_backup" -eq 0 ]; then
+    rm -f -- "$ORIGINAL" "$CONVERTED"
+    rmdir -- "$TMP_DIR"
+  else
+    printf '[CRLF 修正] 復旧用コピーを保持しました: %s\n' "$ORIGINAL" >&2
+  fi
+}
+trap cleanup EXIT
+
+# 元ファイルを開き直す前に、失敗時に戻せるコピーを用意する。
+cat -- "$FILE_PATH" > "$ORIGINAL" 2>/dev/null || exit 0
+
+# 末尾改行のない入力は、sed に渡す前に LF を足して出力を揃える。
+# 除去するのはここで足した LF だけなので、入力にあった改行は残る。
+added_lf=0
+if [ "$(last_byte "$ORIGINAL")" != "0a" ]; then
+  added_lf=1
+fi
+
+# 行末の CR のみ除去 (行中の CR は残す)。
+if ! {
+  cat -- "$ORIGINAL" || exit 1
+  if [ "$added_lf" -eq 1 ]; then
+    printf '\n'
+  fi
+} 2>/dev/null | LC_ALL=C sed "s/${CR}\$//" > "$CONVERTED" 2>/dev/null; then
+  exit 0
+fi
+
+# 上書きで inode・パーミッション・シンボリックリンクを維持する。
+# 書き戻しに失敗した場合は元の内容へ戻す。復元も失敗したらコピーを保持する。
+if [ "$added_lf" -eq 1 ]; then
+  CONVERTED_BYTES=$(wc -c < "$CONVERTED") || exit 0
+  set -- head -c "$((CONVERTED_BYTES - 1))" "$CONVERTED"
+else
+  set -- cat "$CONVERTED"
+fi
+keep_backup=1
+if ! { "$@" > "$FILE_PATH"; } 2>/dev/null; then
+  if { cat "$ORIGINAL" > "$FILE_PATH"; } 2>/dev/null; then
+    keep_backup=0
+    printf '[CRLF 修正] 書き戻しに失敗したため元の内容を復元しました: %s\n' "$FILE_PATH" >&2
+  fi
+  exit 0
+fi
+keep_backup=0
+
+echo "[CRLF 修正] ${FILE_PATH} の改行を LF に変換しました" >&2
 
 exit 0
