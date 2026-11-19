@@ -21,9 +21,16 @@ import time
 VERSION = 1
 UNSET = object()
 DESIGN = re.compile(r'design|mockup|dashboard|\bUI\b|layout|デザイン|画面|モック|配置|余白|配色|見やす|見づら|キャッチコピー|アフォーダンス|図表', re.I)
-REACTION = re.compile(r'見やす|見づら|分かり[やづに]|わかり[やづに]|邪魔|使い[やづに]|しづら|好き|嫌|いい|良い|悪い|(?:左|右|上|下)(?:の方|側|に置|へ移)|やめ|不要|残し|詰め|OK|better|worse|prefer|hard to|keep|remove', re.I)
+# Perceptual reactions describe how a screen reads; within an active design window they count alone.
+REACTION = re.compile(r'見やす|見づら|分かり[やづに]|わかり[やづに]|邪魔|使い[やづに]|しづら|(?:左|右|上|下)(?:の方|側|に置|へ移)|詰め|better|worse|prefer|hard to', re.I)
+# Generic approval/removal words also steer model operations ("旧サービスはなしでOK", "それはやめて").
+# They count only next to a UI noun or right after an exhibit was presented.
+WEAK_REACTION = re.compile(r'好き|嫌|いい|良い|悪い|やめ|不要|残し|OK|keep|remove', re.I)
+UI_NOUN = re.compile(r'ナビ|メニュー|ボタン|タブ|カード|一覧|見出し|ラベル|アイコン|ヘッダ|フッタ|サイドバー|モーダル|ダイアログ|フォーム|グラフ|バー|表示|表情|顔|遷移|色|文字|フォント|\b(?:nav|menu|button|tab|card|label|icon|header|sidebar|modal|font|color)s?\b', re.I)
+DESIGN_WINDOW = 14400
+EXHIBIT_WINDOW = 1800
 UNRELATED_CREATION = re.compile(r'案内文|メール(?:の|を|本文)|小説|議事録|翻訳|文章(?:の|を)|translate|write (?:an? )?(?:email|story|essay)',re.I)
-MACHINE = re.compile(r'^\s*(?:\[design-feedback\]|<heartbeat\b|<system-reminder>|<subagent_notification>|<task-notification>|# AGENTS\.md|<environment_context>|Stop hook feedback:|This session is being continued|You are a continuing discussion partner|Base directory for this skill:)')
+MACHINE = re.compile(r'^\s*(?:\[design-feedback\]|<heartbeat\b|<event kind=|<system-reminder>|<subagent_notification>|<task-notification>|# AGENTS\.md|<environment_context>|Stop hook feedback:|This session is being continued|You are a continuing discussion partner|Base directory for this skill:)')
 CASE_FIELDS = {'event_id','key','summary','reason','inferred_reason','purpose','scope','tags','authority','generalization','guideline_action','conditions','artifact_id','supersedes','exception_of','safe_to_share'}
 BEGIN = '<!-- design-feedback:begin -->'
 END = '<!-- design-feedback:end -->'
@@ -144,8 +151,13 @@ def capture(db, payload, harness, text, source=None, force=False):
         return None
     project=project_id(payload.get('cwd',os.getcwd()))
     prior=db.execute('SELECT * FROM sessions WHERE id=?',(sid,)).fetchone()
-    active=bool(prior and prior['active_until']>time.time())
-    relevant=bool(DESIGN.search(text)) or (active and len(text)<2000 and REACTION.search(text) and not UNRELATED_CREATION.search(text))
+    now=time.time()
+    designed=bool(DESIGN.search(text))
+    active=bool(prior and prior['active_until']>now)
+    shown=db.execute('SELECT 1 FROM exhibits WHERE session=? AND presented=1 AND created>?',(sid,now-EXHIBIT_WINDOW)).fetchone() is not None
+    reacted=bool(REACTION.search(text)) and (active or shown)
+    weak=bool(WEAK_REACTION.search(text)) and (shown or (active and UI_NOUN.search(text)))
+    relevant=designed or (len(text)<2000 and (reacted or weak) and not UNRELATED_CREATION.search(text))
     if not relevant and not force:
         return None
     source_version=None
@@ -164,7 +176,9 @@ def capture(db, payload, harness, text, source=None, force=False):
     source=source or dict(kind='hook',session_id=sid,turn_id=turn,transcript=payload.get('transcript_path'))
     db.execute('INSERT OR IGNORE INTO events(id,session,turn,harness,project,created,text,source,artifacts) VALUES(?,?,?,?,?,?,?,?,?)',
         (eid,sid,turn,harness,project,time.time(),text,json.dumps(source),json.dumps(artifacts)))
-    db.execute('INSERT OR REPLACE INTO sessions VALUES(?,?,?,?,?,?)',(sid,project,time.time()+14400,payload.get('transcript_path'),harness,eid))
+    # Only explicit design talk opens or extends the window; reactions inside it must not keep it alive.
+    until=now+DESIGN_WINDOW if designed else (prior['active_until'] if prior else 0)
+    db.execute('INSERT OR REPLACE INTO sessions VALUES(?,?,?,?,?,?)',(sid,project,until,payload.get('transcript_path'),harness,eid))
     if meta(db,'capture_started_at') is None: meta(db,'capture_started_at',time.time())
     return eid
 
@@ -429,7 +443,7 @@ def recover(db,cfg):
             u=item['utterance']; text=user_text(u['text'])
             # Existing prompt digests deduplicate hook and sweep captures despite different turn IDs.
             if db.execute('SELECT 1 FROM events WHERE session=? AND text=?',(sid,text)).fetchone(): continue
-            if not DESIGN.search(text) or not REACTION.search(text): continue
+            if not DESIGN.search(text) or not (REACTION.search(text) or WEAK_REACTION.search(text)): continue
             ref=dict(kind='recall',snapshot_id=snapshot['snapshot_id'],source_id=item['source_id'],citation_id=u['citation_id'],line=u['line'])
             if MACHINE.search(text): continue
             eid='evt-'+digest(['recall',sid,when,digest(text)])[:32]
