@@ -3,7 +3,7 @@
 A local, provider-independent feedback loop for UI work. The pack calls no model or network API. Its CLI is shared by Codex and Claude Code; the ordinary agent interprets the user's feedback during its existing turn.
 
 - `UserPromptSubmit` captures relevant turns, binds already-presented artifact versions, and supplies the skill, canonical guidance pointer, scoped cases, and pending IDs.
-  A design word opens a 4-hour window; reaction-only captures do not extend it. Inside the window, perceptual reactions (easy/hard to read, left side, …) count alone, while generic words (OK, いい, やめ, 不要, keep, remove) count only next to a UI noun. Within 30 minutes of a presented exhibit, both kinds count. Tool-result envelopes such as `<event kind=…>` are never captured.
+  A design word opens a 4-hour window; reaction-only captures do not extend it. Inside the window, perceptual reactions (見やすい, 分かりやすい, 邪魔, 左の方, `hard to`, `prefer`, …) count alone, while generic words (OK, いい, やめ, 不要, keep, remove) count only next to a UI noun. Within 30 minutes of a presented exhibit, both kinds count. Tool-result envelopes such as `<event kind=…>` are never captured.
 - `Stop` registers local inline previews and requests at most one continuation to record or dismiss an unprocessed capture. `stop_hook_active` prevents loops.
 - `SessionStart` reminds about pending captures in that session.
 - The scheduled `sweep` reads the existing collector's validated immutable snapshot through its lock, recovers new design reactions in registered UI conversations, and serially projects shareable cases into the configured Git owner. It does not start a new corpus refresh by default.
