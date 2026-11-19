@@ -77,6 +77,49 @@ class FeedbackTest(unittest.TestCase):
             self.assertEqual(Path(first['snapshot']).read_text(),'<button>Open details</button>')
             self.assertNotIn('original',c['artifact'])
 
+    def test_reaction_only_capture_does_not_extend_design_window(self):
+        start=1_000_000.0
+        with f.database(self.home) as db:
+            with patch('time.time',return_value=start):
+                self.assertIsNotNone(f.capture(db,self.payload,'codex',self.payload['prompt']))
+            until=db.execute('SELECT active_until FROM sessions').fetchone()[0]
+            with patch('time.time',return_value=start+3*3600):
+                self.assertIsNotNone(f.capture(db,dict(self.payload,turn_id='two'),'codex','さっきより分かりやすくなった'))
+            self.assertEqual(db.execute('SELECT active_until FROM sessions').fetchone()[0],until)
+            with patch('time.time',return_value=start+f.DESIGN_WINDOW+1):
+                self.assertIsNone(f.capture(db,dict(self.payload,turn_id='three'),'codex','こっちの方が分かりやすい'))
+
+    def test_operational_instructions_in_design_window_are_not_reactions(self):
+        tool_result='<event kind="repl-eval" at="2026-01-01T00:00:00Z" eval="3" status="settled">\n<result>OK workspace:1</result>\n</event>'
+        with f.database(self.home) as db:
+            f.capture(db,self.payload,'codex',self.payload['prompt'])
+            for i,text in enumerate(('1: 消しましょう。\n3: 切り替えましょう、旧サービスはなしでOK','あー待って。今から起動なのね。それはやめて。',
+                    'OK~, こちらで引き取っちゃおうか。','OK~ いいよ。ちなみに起動から停止までのリードタイムはどれぐらい？',
+                    '不要なpodは消しておいて',tool_result)):
+                self.assertIsNone(f.capture(db,dict(self.payload,turn_id='op%d'%i),'codex',text),text)
+
+    def test_ui_evaluations_without_design_words_are_still_captured(self):
+        with f.database(self.home) as db:
+            f.capture(db,self.payload,'codex',self.payload['prompt'])
+            for i,text in enumerate(('OK、ナビに出す名前は、もうちょっと一般的な感じにしたいかな。',
+                    'お〜、いいね。表情も会話に応じてもう少し自然に変わるようにしてみようか。',
+                    '2本のバーの方が分かりやすいね。この方向で実装を進めて。',
+                    '別の画面に行ったら、ナビから消えちゃったかも。')):
+                self.assertIsNotNone(f.capture(db,dict(self.payload,turn_id='ui%d'%i),'codex',text),text)
+
+    def test_generic_approval_counts_only_shortly_after_presentation(self):
+        page=self.project/'mock.html'; page.write_text('<p>mock</p>')
+        start=1_000_000.0; approval='いいね、そのまま本番にも反映しておいて〜。'
+        with f.database(self.home) as db:
+            with patch('time.time',return_value=start):
+                f.exhibit(self.home,db,self.cfg,str(page),'mock','synthetic-session',str(self.project))
+            with patch('time.time',return_value=start+600):
+                eid=f.capture(db,dict(self.payload,turn_id='soon'),'codex',approval)
+            self.assertIsNotNone(eid)
+            self.assertEqual(db.execute('SELECT active_until FROM sessions').fetchone()[0],0)
+            with patch('time.time',return_value=start+f.EXHIBIT_WINDOW+600):
+                self.assertIsNone(f.capture(db,dict(self.payload,turn_id='late'),'codex','いいね、それで進めて。'))
+
     def test_multiple_variants_stay_unresolved_without_choice(self):
         with f.database(self.home) as db:
             for name in ('table','board'):
